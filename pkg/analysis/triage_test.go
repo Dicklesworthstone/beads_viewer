@@ -3990,3 +3990,43 @@ func TestExtractDescendantSubgraph_IgnoresAssociativeLinks(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildUnblocksMap_RetainsFutureDeferredBlockerWithholdingDeferredSuccessor(t *testing.T) {
+	now := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
+	future := now.Add(24 * time.Hour)
+	closedAt := now.Add(-time.Hour)
+	issues := []model.Issue{
+		{ID: "DEF-BLOCKER", Title: "Snoozed blocker", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 1, DeferUntil: &future, CreatedAt: now, UpdatedAt: now},
+		{
+			ID: "WAITING", Title: "Non-deferred dependent", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 1, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "WAITING", DependsOnID: "DEF-BLOCKER", Type: model.DepBlocks}},
+		},
+		{ID: "OPEN-BLOCKER", Title: "Ready blocker", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 2, CreatedAt: now, UpdatedAt: now},
+		{
+			ID: "DEF-SUCCESSOR", Title: "Deferred dependent", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 2, DeferUntil: &future, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "DEF-SUCCESSOR", DependsOnID: "OPEN-BLOCKER", Type: model.DepBlocks}},
+		},
+		{ID: "CLOSED-BLOCKER", Title: "Already closed", Status: model.StatusClosed, IssueType: model.TypeTask, Priority: 2, CreatedAt: closedAt, UpdatedAt: closedAt, ClosedAt: &closedAt},
+	}
+
+	an := NewAnalyzer(issues)
+	an.SetNow(now)
+	res := ComputeTriageWithOptionsAndTime(issues, TriageOptions{WaitForPhase2: true}, now)
+
+	// Positive observable: future-deferred blocker retains UnblocksMap["DEF-BLOCKER"] == ["WAITING"], matching Analyzer.ComputeUnblocks!
+	want := []string{"WAITING"}
+	if !reflect.DeepEqual(an.ComputeUnblocks("DEF-BLOCKER"), want) {
+		t.Fatalf("Analyzer.ComputeUnblocks(DEF-BLOCKER) = %v, want %v", an.ComputeUnblocks("DEF-BLOCKER"), want)
+	}
+	if !reflect.DeepEqual(res.UnblocksMap["DEF-BLOCKER"], want) {
+		t.Fatalf("UnblocksMap[DEF-BLOCKER] = %v, want %v", res.UnblocksMap["DEF-BLOCKER"], want)
+	}
+
+	// Planted negative controls: deferred successor stays withheld, and closed blocker stays omitted.
+	if got := res.UnblocksMap["OPEN-BLOCKER"]; len(got) != 0 {
+		t.Fatalf("UnblocksMap[OPEN-BLOCKER] = %v, want empty (deferred successor must stay withheld)", got)
+	}
+	if _, exists := res.UnblocksMap["CLOSED-BLOCKER"]; exists {
+		t.Fatalf("closed blocker must not appear in UnblocksMap: %v", res.UnblocksMap)
+	}
+}

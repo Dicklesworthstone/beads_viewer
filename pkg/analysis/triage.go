@@ -1096,10 +1096,9 @@ func ComputeStaleness(history *correlation.HistoryReport, issues []model.Issue, 
 // buildUnblocksMap computes what each issue unblocks in a single completion step.
 func buildUnblocksMap(ctx *TriageContext) map[string][]string {
 	unblocksMap := make(map[string][]string, len(ctx.analyzer.issueMap))
-	now := ctx.analyzer.Now()
 
 	for id, issue := range ctx.analyzer.issueMap {
-		if isClosedLikeStatus(issue.Status) || issue.IsDeferredAt(now) {
+		if isClosedLikeStatus(issue.Status) {
 			continue
 		}
 		unblocks := ctx.analyzer.computeUnblocks(id)
