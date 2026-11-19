@@ -48,8 +48,8 @@ pub fn betweenness(graph: &DiGraph) -> Vec<f64> {
 /// * `seed` - Optional seed for deterministic sampling (None for random)
 pub fn betweenness_approx(graph: &DiGraph, sample_size: usize, seed: Option<u64>) -> Vec<f64> {
     let n = graph.len();
-    if n == 0 {
-        return Vec::new();
+    if n == 0 || sample_size == 0 {
+        return vec![0.0; n];
     }
 
     // For small graphs or when sample size >= node count, use exact algorithm
@@ -367,5 +367,32 @@ mod tests {
         assert_eq!(recommend_sample_size(200), 50); // Medium: 20% but min 50
         assert_eq!(recommend_sample_size(500), 100); // Large: fixed
         assert_eq!(recommend_sample_size(5000), 200); // XL: larger fixed
+    }
+
+    #[test]
+    fn test_betweenness_approx_zero_samples_returns_zeros() {
+        let empty = DiGraph::new();
+        assert!(betweenness_approx(&empty, 0, Some(1)).is_empty());
+
+        let mut graph = DiGraph::new();
+        for i in 0..5 {
+            graph.add_node(&format!("n{}", i));
+        }
+        for i in 0..4 {
+            graph.add_edge(i, i + 1);
+        }
+
+        // Zero samples must return finite 0.0 scores rather than 0.0 * (n / 0.0) == NaN.
+        let zero_scores = betweenness_approx(&graph, 0, Some(1));
+        assert_eq!(zero_scores.len(), 5);
+        for &score in &zero_scores {
+            assert!(score.is_finite(), "expected finite score, got {}", score);
+            assert_eq!(score, 0.0);
+        }
+
+        // Positive control: positive sample size yields positive finite interior scores.
+        let pos_scores = betweenness_approx(&graph, 3, Some(1));
+        assert!(pos_scores.iter().all(|s| s.is_finite()));
+        assert!(pos_scores.iter().any(|&s| s > 0.0));
     }
 }
