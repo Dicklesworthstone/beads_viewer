@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"io/fs"
 	"math"
 	"os"
 	"path/filepath"
@@ -1363,17 +1364,11 @@ func robotDiskCacheEnabled() bool {
 func beadsDirModTime() time.Time {
 	beadsDir := ""
 	var redirectTrace []string
-	if dbPath := env.BeadsDB.Get(); dbPath != "" {
+	if dbPath := strings.TrimSpace(env.BeadsDB.Get()); dbPath != "" {
 		info, err := os.Stat(dbPath)
 		if err == nil {
 			if !info.IsDir() {
-				latest := info.ModTime()
-				for _, suffix := range []string{"-wal", "-journal"} {
-					if sInfo, sErr := os.Stat(dbPath + suffix); sErr == nil && sInfo.ModTime().After(latest) {
-						latest = sInfo.ModTime()
-					}
-				}
-				return latest
+				return foldFileAndSQLiteSidecars(dbPath, time.Time{})
 			}
 			if resolved, trace, rErr := loader.ResolveBeadsDirWithTrace(dbPath); rErr == nil && resolved != "" {
 				beadsDir = resolved
@@ -1390,7 +1385,7 @@ func beadsDirModTime() time.Time {
 		if resolved, trace, err := loader.GetBeadsDirWithTrace(""); err == nil && resolved != "" {
 			beadsDir = resolved
 			redirectTrace = trace
-		} else if envDir := env.BeadsDir.Get(); envDir != "" {
+		} else if envDir := strings.TrimSpace(env.BeadsDir.Get()); envDir != "" {
 			beadsDir = envDir
 		} else {
 			cwd, cwdErr := os.Getwd()
@@ -1419,10 +1414,14 @@ func looksLikeBeadsDBFile(dbPath string) bool {
 	}
 }
 
+func isBeadsAuthorityDirName(lower string) bool {
+	return lower == "dolt" || lower == "embeddeddolt"
+}
+
 func isBeadsAuthorityEntry(name string, isDir bool) bool {
 	lower := strings.ToLower(name)
 	if isDir {
-		return lower == "dolt"
+		return isBeadsAuthorityDirName(lower)
 	}
 	if strings.HasSuffix(lower, "-shm") || strings.HasSuffix(lower, ".lock") {
 		return false
@@ -1447,41 +1446,149 @@ func isBeadsAuthorityEntry(name string, isDir bool) bool {
 	return false
 }
 
-// beadsTreeModTime returns the most recent modification time among the
-// .beads/ directory itself and its issue-bearing/authority store entries.
+func foldFileAndSQLiteSidecars(filePath string, latest time.Time) time.Time {
+	info, err := os.Stat(filePath)
+	if err == nil && info.ModTime().After(latest) {
+		latest = info.ModTime()
+	}
+	for _, suffix := range []string{"-wal", "-journal"} {
+		if sInfo, sErr := os.Stat(filePath + suffix); sErr == nil && sInfo.ModTime().After(latest) {
+			latest = sInfo.ModTime()
+		}
+	}
+	if realPath, evalErr := filepath.EvalSymlinks(filePath); evalErr == nil {
+		cleanOrig := filepath.Clean(filePath)
+		cleanReal := filepath.Clean(realPath)
+		if cleanReal != cleanOrig {
+			if rInfo, rErr := os.Stat(cleanReal); rErr == nil && rInfo.ModTime().After(latest) {
+				latest = rInfo.ModTime()
+			}
+			for _, suffix := range []string{"-wal", "-journal"} {
+				if sInfo, sErr := os.Stat(cleanReal + suffix); sErr == nil && sInfo.ModTime().After(latest) {
+					latest = sInfo.ModTime()
+				}
+			}
+		}
+	}
+	return latest
+}
+
+func foldBeadsDirStoreModTime(dirPath string, latest time.Time) time.Time {
+	const maxBoundedWalkEntries = 512
+	info, err := os.Stat(dirPath)
+	if err != nil || !info.IsDir() {
+		return latest
+	}
+	if info.ModTime().After(latest) {
+		latest = info.ModTime()
+	}
+	rootPath := dirPath
+	if evalRoot, evalErr := filepath.EvalSymlinks(dirPath); evalErr == nil {
+		rootPath = evalRoot
+		if rInfo, rErr := os.Stat(rootPath); rErr == nil && rInfo.ModTime().After(latest) {
+			latest = rInfo.ModTime()
+		}
+	}
+	seen := 0
+	_ = filepath.WalkDir(rootPath, func(p string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+		lower := strings.ToLower(d.Name())
+		if strings.HasSuffix(lower, "-shm") || strings.HasSuffix(lower, ".lock") {
+			return nil
+		}
+		seen++
+		if seen > maxBoundedWalkEntries {
+			return fs.SkipAll
+		}
+		if pInfo, sErr := os.Stat(p); sErr == nil && pInfo.ModTime().After(latest) {
+			latest = pInfo.ModTime()
+		}
+		return nil
+	})
+	return latest
+}
+
+// beadsTreeModTime returns the most recent modification time strictly across
+// issue-bearing/authority store entries in beadsDir (or zero time if none exist).
 //
-// Only top-level store entries (plus any top-level dolt directory) are
-// consulted. Read-only SQLite WAL readers touch beads.db-shm on open, and UI /
-// auxiliary sidecars (feedback.json, correlation_feedback.jsonl, sprints.jsonl,
-// *.lock, and snapshot subdirectories like .br_history/) never alter the issue
-// graph; skipping them prevents self-inflicted robot disk cache thrashing while
-// keeping validation O(top-level store entries) (#192).
+// The .beads/ directory inode mtime itself is deliberately NOT included because
+// atomic CreateTemp+Rename sidecar writes (FeedbackData.Save, SaveSprintsToFile),
+// transient *.lock files, and SQLite WAL -shm create/unlink operations advance
+// the directory inode mtime without changing issue authority. Authority entries
+// are stat'ed via os.Stat (following symlinks, including -wal/-journal sidecars
+// next to symlink targets) plus any custom database/jsonl_export configured in
+// metadata.json.
 func beadsTreeModTime(beadsDir string) time.Time {
 	info, err := os.Stat(beadsDir)
-	if err != nil {
-		return time.Time{}
-	}
-	if !info.IsDir() {
+	if err != nil || !info.IsDir() {
 		return time.Time{}
 	}
 
-	latest := info.ModTime()
+	var latest time.Time
 	entries, err := os.ReadDir(beadsDir)
 	if err != nil {
 		return time.Time{}
 	}
+	hasMetadata := false
 	for _, entry := range entries {
-		if !isBeadsAuthorityEntry(entry.Name(), entry.IsDir()) {
+		name := entry.Name()
+		lower := strings.ToLower(name)
+		// Check both file and dir candidacy before os.Stat so symlinked files/dirs are handled accurately.
+		if !isBeadsAuthorityEntry(name, false) && !isBeadsAuthorityEntry(name, true) {
 			continue
 		}
-		finfo, err := entry.Info()
+		if lower == "metadata.json" {
+			hasMetadata = true
+		}
+		entryPath := filepath.Join(beadsDir, name)
+		eInfo, err := os.Stat(entryPath)
 		if err != nil {
 			continue
 		}
-		if finfo.ModTime().After(latest) {
-			latest = finfo.ModTime()
+		if eInfo.IsDir() {
+			if isBeadsAuthorityEntry(name, true) {
+				latest = foldBeadsDirStoreModTime(entryPath, latest)
+			}
+			continue
+		}
+		if isBeadsAuthorityEntry(name, false) {
+			latest = foldFileAndSQLiteSidecars(entryPath, latest)
 		}
 	}
+
+	if hasMetadata {
+		metaPath := filepath.Join(beadsDir, "metadata.json")
+		if rawMeta, err := os.ReadFile(metaPath); err == nil && len(rawMeta) <= 64*1024 {
+			var meta struct {
+				Database    string `json:"database"`
+				JSONLExport string `json:"jsonl_export"`
+			}
+			if jsonErr := json.Unmarshal(rawMeta, &meta); jsonErr == nil {
+				for _, target := range []string{meta.Database, meta.JSONLExport} {
+					trimmed := strings.TrimSpace(target)
+					if trimmed == "" {
+						continue
+					}
+					resolved := trimmed
+					if !filepath.IsAbs(resolved) {
+						resolved = filepath.Join(beadsDir, resolved)
+					}
+					tInfo, tErr := os.Stat(resolved)
+					if tErr != nil {
+						continue
+					}
+					if tInfo.IsDir() {
+						latest = foldBeadsDirStoreModTime(resolved, latest)
+					} else {
+						latest = foldFileAndSQLiteSidecars(resolved, latest)
+					}
+				}
+			}
+		}
+	}
+
 	return latest
 }
 
