@@ -1246,3 +1246,67 @@ func TestParkedBeads_NoStalenessUrgencyOrStaleRecommendation(t *testing.T) {
 		}
 	}
 }
+
+func TestCountTransitiveUnblocks_UnscopedParentPropagatesToScopedChildren(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "ROOT", Title: "Scoped root", Status: model.StatusOpen, Labels: []string{"lane"}, Priority: 1},
+		// Intermediate parent P has NO "lane" label, so SetUnblockScope excludes P itself!
+		{
+			ID: "P", Title: "Unscoped parent epic", Status: model.StatusOpen, IssueType: model.TypeEpic, Priority: 2,
+			Dependencies: []*model.Dependency{
+				{IssueID: "P", DependsOnID: "ROOT", Type: model.DepBlocks},
+			},
+		},
+	}
+	unblockScope := map[string]bool{"ROOT": true}
+	for i := 1; i <= 5; i++ {
+		id := fmt.Sprintf("CHILD-%d", i)
+		issues = append(issues, model.Issue{
+			ID: id, Title: id, Status: model.StatusOpen, IssueType: model.TypeTask, Labels: []string{"lane"}, Priority: 2,
+			Dependencies: []*model.Dependency{
+				{IssueID: id, DependsOnID: "P", Type: model.DepParentChild},
+			},
+		})
+		unblockScope[id] = true
+	}
+	// Multi-hop downstream dependent of CHILD-1 in scope -> must also be reached!
+	issues = append(issues,
+		model.Issue{
+			ID: "LEAF-6", Title: "Scoped transitive leaf", Status: model.StatusOpen, Labels: []string{"lane"}, Priority: 2,
+			Dependencies: []*model.Dependency{
+				{IssueID: "LEAF-6", DependsOnID: "CHILD-1", Type: model.DepBlocks},
+			},
+		},
+		// Planted negative control: out-of-scope child of P must NOT increment scoped count.
+		model.Issue{
+			ID: "OUT-CHILD", Title: "Foreign child", Status: model.StatusOpen, Labels: []string{"other"}, Priority: 2,
+			Dependencies: []*model.Dependency{
+				{IssueID: "OUT-CHILD", DependsOnID: "P", Type: model.DepParentChild},
+			},
+		},
+	)
+	unblockScope["LEAF-6"] = true
+
+	an := analysis.NewAnalyzer(issues)
+	an.SetReadinessScope(model.NewReadinessIndex(issues), map[string]bool{"ROOT": true})
+	an.SetUnblockScope(unblockScope)
+	stats := an.Analyze()
+
+	gotUnblocks := an.ComputeUnblocks("ROOT")
+	wantUnblocks := []string{"CHILD-1", "CHILD-2", "CHILD-3", "CHILD-4", "CHILD-5"}
+	if !reflect.DeepEqual(gotUnblocks, wantUnblocks) {
+		t.Fatalf("scoped ComputeUnblocks(ROOT) = %v, want %v (unscoped P and OUT-CHILD excluded)", gotUnblocks, wantUnblocks)
+	}
+
+	delta, err := an.ComputeWhatIfDeltaFromStats("ROOT", &stats)
+	if err != nil {
+		t.Fatalf("ComputeWhatIfDeltaFromStats(ROOT): %v", err)
+	}
+	// Positive observable: CHILD-1..5 + LEAF-6 = 6 scoped transitive unblocks (unscoped P and OUT-CHILD excluded!).
+	if delta.TransitiveUnblocks != 6 {
+		t.Fatalf("scoped TransitiveUnblocks = %d, want 6 (CHILD-1..5 + LEAF-6; delta=%+v)", delta.TransitiveUnblocks, delta)
+	}
+
+	// Planted negative control: parked fixture reports 0 unblocks.
+	assertParkedDependentsStayWithheld(t, issues, "ROOT")
+}

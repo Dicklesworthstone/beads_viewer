@@ -961,3 +961,102 @@ func TestSQLiteReader_OpensRelativePath(t *testing.T) {
 		t.Fatalf("opened wrong SQLite database: got issue %q", issue.ID)
 	}
 }
+
+func TestJSONLReader_EnforcesFusedCorruptionValidationAndCloseState(t *testing.T) {
+	t.Setenv("BV_ROBOT", "1")
+
+	// 1. Planted negative control A: high malformed rate (>10%) must fail via NewReader / JSONLReader.LoadIssues.
+	highErrPath := filepath.Join(t.TempDir(), "corrupt.jsonl")
+	highErrContent := strings.Join([]string{
+		`{"id":"OK-1","title":"Valid one","status":"open","issue_type":"task"}`,
+		`{corrupt json line 2`,
+		`{corrupt json line 3`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(highErrPath, []byte(highErrContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	corruptReader, err := NewReader(DataSource{Type: SourceTypeJSONLLocal, Path: highErrPath})
+	if err != nil {
+		t.Fatalf("NewReader(corrupt.jsonl): %v", err)
+	}
+	if issues, err := corruptReader.LoadIssues(); err == nil {
+		t.Fatalf("expected high-malformed-rate JSONL to be rejected by JSONLReader.LoadIssues, got %d issues", len(issues))
+	}
+	if rep := corruptReader.LoadReport(); rep.Valid != 1 || rep.Errors != 2 {
+		t.Fatalf("expected retained LoadReport accounting (Valid=1, Errors=2) on rejected JSONL, got %+v", rep)
+	}
+	_ = corruptReader.Close()
+
+	// 2. Planted negative control B: non-issue metadata-only JSONL (0 valid issues, Skipped > 0) must be rejected.
+	metaOnlyPath := filepath.Join(t.TempDir(), "sprints-only.jsonl")
+	metaOnlyContent := strings.Join([]string{
+		`{"_type":"sprint","id":"sp-1","name":"Sprint 1"}`,
+		`{"_type":"memory","id":"mem-1","text":"note"}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(metaOnlyPath, []byte(metaOnlyContent), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	metaReader, err := NewReader(DataSource{Type: SourceTypeJSONLLocal, Path: metaOnlyPath})
+	if err != nil {
+		t.Fatalf("NewReader(sprints-only.jsonl): %v", err)
+	}
+	if issues, err := metaReader.LoadIssues(); err == nil {
+		t.Fatalf("expected non-issue-only JSONL (0 valid, Skipped>0) to be rejected, got %d issues", len(issues))
+	}
+	if rep := metaReader.LoadReport(); rep.Valid != 0 || rep.Skipped != 2 {
+		t.Fatalf("expected LoadReport (Valid=0, Skipped=2) on metadata-only JSONL, got %+v", rep)
+	}
+	_ = metaReader.Close()
+
+	// 3. Positive observable: valid JSONL with <=10% errors (10 valid + 1 malformed + 1 tombstone) loads 10 visible issues,
+	// and empty JSONL (0 bytes) remains valid with 0 issues.
+	validPath := filepath.Join(t.TempDir(), "valid.jsonl")
+	var sb strings.Builder
+	for i := 0; i < 10; i++ {
+		fmt.Fprintf(&sb, `{"id":"V-%02d","title":"Valid %d","status":"open","issue_type":"task"}`+"\n", i, i)
+	}
+	sb.WriteString(`{"id":"V-TOMB","title":"Deleted","status":"tombstone","issue_type":"task"}` + "\n")
+	sb.WriteString(`{minor single-line glitch under 10%` + "\n")
+	if err := os.WriteFile(validPath, []byte(sb.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	validReader, err := NewReader(DataSource{Type: SourceTypeJSONLLocal, Path: validPath})
+	if err != nil {
+		t.Fatalf("NewReader(valid.jsonl): %v", err)
+	}
+	loaded, err := validReader.LoadIssues()
+	if err != nil {
+		t.Fatalf("expected <=10%% error rate JSONL to succeed, got error: %v", err)
+	}
+	if len(loaded) != 10 {
+		t.Fatalf("loaded %d visible issues, want 10 (tombstone filtered)", len(loaded))
+	}
+
+	// 4. Planted negative control C: once Close() is called, subsequent LoadIssues / CountIssues / GetIssueByID fail!
+	if err := validReader.Close(); err != nil {
+		t.Fatalf("Close(): %v", err)
+	}
+	if _, err := validReader.LoadIssues(); err == nil {
+		t.Fatal("expected LoadIssues() on closed JSONLReader to return error")
+	}
+	if _, err := validReader.CountIssues(); err == nil {
+		t.Fatal("expected CountIssues() on closed JSONLReader to return error")
+	}
+	if _, err := validReader.GetIssueByID("V-00"); err == nil {
+		t.Fatal("expected GetIssueByID() on closed JSONLReader to return error")
+	}
+
+	emptyPath := filepath.Join(t.TempDir(), "empty.jsonl")
+	if err := os.WriteFile(emptyPath, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	emptyReader, err := NewReader(DataSource{Type: SourceTypeJSONLLocal, Path: emptyPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer emptyReader.Close()
+	emptyIssues, err := emptyReader.LoadIssues()
+	if err != nil || len(emptyIssues) != 0 {
+		t.Fatalf("empty JSONL must succeed with 0 issues, got len=%d err=%v", len(emptyIssues), err)
+	}
+}

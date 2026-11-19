@@ -214,15 +214,13 @@ func (a *Analyzer) GetExecutionPlan() ExecutionPlan {
 	}
 }
 
-// computeUnblocks finds direct hard-dependency successors that would become
-// actionable if the given issue were closed. Parent-child edges are not direct
-// successors, but a successor whose parent chain remains blocked is not reported
-// as actionable. Scheduler-deferred successors are withheld as well.
+// computeUnblocks finds in-graph issues whose readiness transitions from false
+// to true if issueID were closed in a single step, including DepParentChild
+// descendants of an unblocked parent whose own blockers are otherwise satisfied.
+// Already-ready issues (e.g., children of an already-ready parent) and
+// scheduler-deferred successors are never reported as newly unblocked.
 func (a *Analyzer) computeUnblocks(issueID string) []string {
-	var unblocks []string
-
-	blockerNodeID, ok := a.idToNode[issueID]
-	if !ok {
+	if _, ok := a.idToNode[issueID]; !ok {
 		return nil
 	}
 	blocker, ok := a.issueMap[issueID]
@@ -231,15 +229,18 @@ func (a *Analyzer) computeUnblocks(issueID string) []string {
 		return nil
 	}
 
-	completed := map[string]bool{issueID: true}
+	frontier := a.directUnlockFrontier(issueID)
+	if len(frontier) == 0 {
+		return nil
+	}
 
-	dependents := a.g.To(blockerNodeID)
-
-	for dependents.Next() {
-		dependentNode := dependents.Node()
-		dependentID := a.nodeToID[dependentNode.ID()]
-		if a.isActionableAfterCompletions(dependentID, completed) {
-			unblocks = append(unblocks, dependentID)
+	var unblocks []string
+	for _, candID := range frontier {
+		if candID == issueID {
+			continue
+		}
+		if !a.isActionableAfterSingleCompletion(candID, "") && a.isActionableAfterSingleCompletion(candID, issueID) {
+			unblocks = append(unblocks, candID)
 		}
 	}
 

@@ -314,8 +314,10 @@ func (a *Analyzer) ComputeImpactScoresFromStats(stats *GraphStats, now time.Time
 		// Compute urgency signal
 		urgencyNorm, urgencyExplanation := computeUrgency(&issue, now)
 
-		// Compute risk signals (bv-82)
-		riskSignals := ComputeRiskSignalsWithReadiness(&issue, stats, a.issueMap, readiness, now, riskWeights)
+		// Compute risk signals (bv-82) using canonical dependency order so floating-point
+		// variance reductions remain 0-ULP invariant under input dependency permutations.
+		issueForRisk := canonicalIssueForRisk(issue)
+		riskSignals := ComputeRiskSignalsWithReadiness(&issueForRisk, stats, a.issueMap, readiness, now, riskWeights)
 
 		// Compute weighted score with the analyzer's (possibly feedback-adjusted) weights
 		breakdown := ScoreBreakdown{
@@ -980,6 +982,69 @@ func (a *Analyzer) ComputeWhatIfDeltaFromStats(issueID string, stats *GraphStats
 	return delta, nil
 }
 
+func canonicalIssueForRisk(issue model.Issue) model.Issue {
+	if len(issue.Dependencies) < 2 {
+		return issue
+	}
+	sorted := true
+	for i := 1; i < len(issue.Dependencies); i++ {
+		if !dependencyLessForRisk(issue.Dependencies[i-1], issue.Dependencies[i]) &&
+			dependencyLessForRisk(issue.Dependencies[i], issue.Dependencies[i-1]) {
+			sorted = false
+			break
+		}
+	}
+	if sorted {
+		return issue
+	}
+	deps := make([]*model.Dependency, len(issue.Dependencies))
+	copy(deps, issue.Dependencies)
+	sort.Slice(deps, func(i, j int) bool {
+		return dependencyLessForRisk(deps[i], deps[j])
+	})
+	issue.Dependencies = deps
+	return issue
+}
+
+func dependencyLessForRisk(a, b *model.Dependency) bool {
+	if a == nil || b == nil {
+		return a == nil && b != nil
+	}
+	if a.DependsOnID != b.DependsOnID {
+		return a.DependsOnID < b.DependsOnID
+	}
+	return a.Type < b.Type
+}
+
+// computeDirectBlockingUnblocks finds direct hard-dependency (DepBlocks) graph
+// neighbors that transition to actionable when issueID completes. WhatIfDelta
+// distinguishes direct edge unblocks from hierarchy/chain cascades (counted in
+// TransitiveUnblocks via countTransitiveUnblocks).
+func (a *Analyzer) computeDirectBlockingUnblocks(issueID string) []string {
+	blockerNodeID, ok := a.idToNode[issueID]
+	if !ok {
+		return nil
+	}
+	blocker, ok := a.issueMap[issueID]
+	if !ok || isClosedLikeStatus(blocker.Status) {
+		return nil
+	}
+
+	var unblocks []string
+	dependents := a.g.To(blockerNodeID)
+	for dependents.Next() {
+		dependentID := a.nodeToID[dependents.Node().ID()]
+		if dependentID == issueID {
+			continue
+		}
+		if !a.isActionableAfterSingleCompletion(dependentID, "") && a.isActionableAfterSingleCompletion(dependentID, issueID) {
+			unblocks = append(unblocks, dependentID)
+		}
+	}
+	sort.Strings(unblocks)
+	return unblocks
+}
+
 // computeWhatIfDeltaFromStats calculates the impact of completing an issue
 // using graph statistics already owned by the caller.
 func (a *Analyzer) computeWhatIfDeltaFromStats(issueID string, stats *GraphStats) *WhatIfDelta {
@@ -987,8 +1052,8 @@ func (a *Analyzer) computeWhatIfDeltaFromStats(issueID string, stats *GraphStats
 		return a.computeWhatIfDelta(issueID)
 	}
 
-	// Get direct unblocks using existing method
-	directUnblocks := a.computeUnblocks(issueID)
+	// Get direct hard-dependency unblocks; hierarchy/chain cascades are reflected in TransitiveUnblocks.
+	directUnblocks := a.computeDirectBlockingUnblocks(issueID)
 	directCount := len(directUnblocks)
 
 	// Compute transitive unblocks (cascade effect)
@@ -1042,46 +1107,18 @@ func (a *Analyzer) computeWhatIfDeltaFromStats(issueID string, stats *GraphStats
 	}
 }
 
-// cascadeCandidates indexes the immutable graph once across completion simulations.
-// Readiness and simulated completions remain query-local; only adjacency is shared.
-func (a *Analyzer) cascadeCandidates(issueID string) []string {
-	a.cascadeOnce.Do(func() {
-		a.cascadeFrontiers = make(map[string][]string, len(a.issueMap))
-		for id, nodeID := range a.idToNode {
-			candidateSet := make(map[string]bool)
-			dependents := a.g.To(nodeID)
-			for dependents.Next() {
-				candidateSet[a.nodeToID[dependents.Node().ID()]] = true
-			}
-			for _, childID := range a.childrenByParent[id] {
-				candidateSet[childID] = true
-			}
-			if len(candidateSet) == 0 {
-				continue
-			}
-			ids := make([]string, 0, len(candidateSet))
-			for candidateID := range candidateSet {
-				ids = append(ids, candidateID)
-			}
-			sort.Strings(ids)
-			a.cascadeFrontiers[id] = ids
-		}
-	})
-	return a.cascadeFrontiers[issueID]
-}
-
 // countTransitiveUnblocks counts total issues unblocked by a hypothetical completion of issueID,
-// including cascading effects (diamonds, chains) via simulation.
+// including cascading effects (diamonds, chains, and DepParentChild hierarchies) via simulation.
 func (a *Analyzer) countTransitiveUnblocks(issueID string) int {
 	issue, exists := a.issueMap[issueID]
 	if !exists || isClosedLikeStatus(issue.Status) {
 		return 0
 	}
-	nodeID := a.idToNode[issueID]
-	if a.g.To(nodeID).Len() == 0 && len(a.childrenByParent[issueID]) == 0 {
+	if len(a.directUnlockFrontier(issueID)) == 0 {
 		return 0
 	}
 
+	readiness := a.Readiness()
 	// Set of "conceptually closed" issues: initially just the starting issue
 	simulatedClosed := map[string]bool{issueID: true}
 
@@ -1092,17 +1129,26 @@ func (a *Analyzer) countTransitiveUnblocks(issueID string) int {
 		curr := queue[0]
 		queue = queue[1:]
 
-		for _, candidateID := range a.cascadeCandidates(curr) {
-			// Existing ready work is not caused by this completion. Check only
-			// the affected frontier with the same source scope/reference time;
-			// enumerating every ready issue here made a batch quadratic in N.
-			if simulatedClosed[candidateID] || a.isActionableAfterCompletions(candidateID, nil) {
+		for _, candidateID := range a.directUnlockFrontier(curr) {
+			if simulatedClosed[candidateID] {
 				continue
 			}
-			if a.isActionableAfterCompletions(candidateID, simulatedClosed) {
+			if _, candExists := a.issueMap[candidateID]; !candExists {
+				continue
+			}
+			// Existing ready work is not caused by this completion. Evaluate
+			// underlying readiness transitions independent of SetUnblockScope so an
+			// out-of-scope intermediate parent/node still propagates unlock state to
+			// in-scope descendants, while counting only in-scope unblock candidates.
+			if readiness.Ready(candidateID, a.now) {
+				continue
+			}
+			if readiness.ReadyAfter(candidateID, a.now, simulatedClosed) {
+				if a.isActionableAfterCompletions(candidateID, simulatedClosed) {
+					count++
+				}
 				simulatedClosed[candidateID] = true
 				queue = append(queue, candidateID)
-				count++
 			}
 		}
 	}

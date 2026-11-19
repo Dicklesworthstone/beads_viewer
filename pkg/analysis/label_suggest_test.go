@@ -1095,3 +1095,104 @@ func BenchmarkSortLabelMatchesByConfidence(b *testing.B) {
 
 // Ensure sort is imported and used
 var _ = sort.Slice
+
+func TestSuggestLabels_PreservesCanonicalCasingAndSourceRepoIsolation(t *testing.T) {
+	origin := suggestionTestOrigin("bv-1")
+	issues := []model.Issue{
+		// Canonical casing "area:Auth" appears twice vs lowercase typo "area:auth" once -> "area:Auth" wins.
+		// Builtin keyword label "Security" has capital S in project -> "Security" wins over builtin "security".
+		{
+			ID: "API-HIST-1", Title: "OAuth token validation flow", Status: model.StatusClosed,
+			Labels: []string{"area:Auth", "Security"}, SourceRepo: "api",
+		},
+		{
+			ID: "API-HIST-2", Title: "OAuth token refresh endpoint", Status: model.StatusClosed,
+			Labels: []string{"area:Auth", "Security"}, SourceRepo: "api",
+		},
+		{
+			ID: "API-HIST-3", Title: "OAuth token expiry check", Status: model.StatusClosed,
+			Labels: []string{"area:auth"}, SourceRepo: "api",
+		},
+		// Foreign repo "web" uses "web:NextJS" on identical keywords -> must NOT leak into SourceRepo="api".
+		{
+			ID: "WEB-HIST-1", Title: "OAuth token validation flow", Status: model.StatusClosed,
+			Labels: []string{"web:NextJS"}, SourceRepo: "web",
+		},
+		{
+			ID: "WEB-HIST-2", Title: "OAuth token validation login", Status: model.StatusClosed,
+			Labels: []string{"web:NextJS"}, SourceRepo: "web",
+		},
+		{
+			ID: "WEB-HIST-3", Title: "OAuth token validation auth", Status: model.StatusClosed,
+			Labels: []string{"web:NextJS"}, SourceRepo: "web",
+		},
+		// Target api issue needing canonical suggestions.
+		{
+			ID: "API-NEW-1", Title: "Fix auth login OAuth token validation", Status: model.StatusOpen,
+			SourceRepo: "api", Origin: origin,
+		},
+		// Planted negative control: issue already carrying lowercase "area:auth" must NOT re-suggest "area:Auth".
+		{
+			ID: "API-DUP-CASE", Title: "OAuth token validation refresh", Status: model.StatusOpen,
+			Labels: []string{"area:auth", "security"}, SourceRepo: "api", Origin: origin,
+		},
+	}
+
+	cfg := DefaultLabelSuggestionConfig()
+	cfg.MinConfidence = 0.2
+	cfg.MaxSuggestionsPerIssue = 5
+	suggestions := SuggestLabels(issues, cfg)
+
+	foundAreaAuth := false
+	foundSecurity := false
+	for _, sug := range suggestions {
+		gotLabel, _ := sug.Metadata["suggested_label"].(string)
+		if sug.TargetBead == "API-DUP-CASE" && (strings.EqualFold(gotLabel, "area:Auth") || strings.EqualFold(gotLabel, "Security")) {
+			t.Fatalf("case-insensitive duplicate label suppression failed on API-DUP-CASE: %+v", sug)
+		}
+		if sug.TargetBead != "API-NEW-1" {
+			continue
+		}
+		if strings.EqualFold(gotLabel, "web:NextJS") {
+			t.Fatalf("foreign SourceRepo=web label leaked into SourceRepo=api suggestion: %+v", sug)
+		}
+		if gotLabel == "area:auth" || gotLabel == "security" {
+			t.Fatalf("emitted lowercased wrong-case label %q instead of project canonical casing: %+v", gotLabel, sug)
+		}
+		if gotLabel == "area:Auth" {
+			foundAreaAuth = true
+			if !strings.Contains(sug.Summary, "'area:Auth'") {
+				t.Fatalf("Summary did not preserve canonical label 'area:Auth': %q", sug.Summary)
+			}
+			if !strings.Contains(sug.ActionCommand, "area:Auth") {
+				t.Fatalf("ActionCommand did not preserve canonical label 'area:Auth': %q", sug.ActionCommand)
+			}
+			if sug.Action == nil || len(sug.Action.Argv) == 0 || !strings.Contains(strings.Join(sug.Action.Argv, " "), "--add-label=area:Auth") {
+				t.Fatalf("live Action.Argv did not preserve --add-label=area:Auth: %+v", sug.Action)
+			}
+		}
+		if gotLabel == "Security" {
+			foundSecurity = true
+		}
+	}
+	if !foundAreaAuth || !foundSecurity {
+		t.Fatalf("expected canonical 'area:Auth' (%v) and 'Security' (%v) suggestions for API-NEW-1, got %+v", foundAreaAuth, foundSecurity, suggestions)
+	}
+
+	// Also verify GenerateAllSuggestions with CandidateIDs only emits in-scope API-NEW-1 canonical suggestions.
+	allCfg := DefaultSuggestAllConfig()
+	allCfg.EnableDuplicates = false
+	allCfg.EnableDependencies = false
+	allCfg.EnableCycles = false
+	allCfg.Labels = cfg
+	allCfg.CandidateIDs = map[string]bool{"API-NEW-1": true}
+	set := GenerateAllSuggestions(issues, allCfg, "canon-hash")
+	if len(set.Suggestions) == 0 {
+		t.Fatal("expected GenerateAllSuggestions to emit canonical label suggestions for CandidateIDs={API-NEW-1}")
+	}
+	for _, sug := range set.Suggestions {
+		if sug.TargetBead != "API-NEW-1" {
+			t.Fatalf("CandidateIDs filter leaked %s: %+v", sug.TargetBead, sug)
+		}
+	}
+}

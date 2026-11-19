@@ -19,6 +19,7 @@ import (
 	json "github.com/goccy/go-json"
 
 	"github.com/Dicklesworthstone/beads_viewer/internal/env"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/loader"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/metrics"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/xfetch"
@@ -1354,38 +1355,59 @@ func robotDiskCacheEnabled() bool {
 	return env.Robot.Bool() && !env.NoCache.Bool()
 }
 
-// beadsDirModTime returns the most recent modification time of the .beads/
-// directory. This is used as a staleness signal: if the directory has been
-// modified more recently than a cache entry was created, the entry is stale
-// because bead data may have changed (e.g., a bead was closed in br).
+// beadsDirModTime returns the most recent modification time of the active
+// .beads/ store's issue-bearing and authority files. This is used as a
+// staleness signal: if the store has been modified more recently than a cache
+// entry was created, the entry is stale because bead data may have changed.
 // Returns zero time on any error (which disables the mtime check).
 func beadsDirModTime() time.Time {
-	// Check BEADS_DB first, then BEADS_DIR, then cwd/.beads
 	beadsDir := ""
+	var redirectTrace []string
 	if dbPath := env.BeadsDB.Get(); dbPath != "" {
 		info, err := os.Stat(dbPath)
 		if err == nil {
 			if !info.IsDir() {
-				return info.ModTime()
+				latest := info.ModTime()
+				for _, suffix := range []string{"-wal", "-journal"} {
+					if sInfo, sErr := os.Stat(dbPath + suffix); sErr == nil && sInfo.ModTime().After(latest) {
+						latest = sInfo.ModTime()
+					}
+				}
+				return latest
 			}
-			beadsDir = dbPath
+			if resolved, trace, rErr := loader.ResolveBeadsDirWithTrace(dbPath); rErr == nil && resolved != "" {
+				beadsDir = resolved
+				redirectTrace = trace
+			} else {
+				beadsDir = dbPath
+			}
 		} else if looksLikeBeadsDBFile(dbPath) {
 			beadsDir = filepath.Dir(dbPath)
 		}
 	}
 
 	if beadsDir == "" {
-		beadsDir = env.BeadsDir.Get()
-		if beadsDir == "" {
-			cwd, err := os.Getwd()
-			if err != nil {
+		if resolved, trace, err := loader.GetBeadsDirWithTrace(""); err == nil && resolved != "" {
+			beadsDir = resolved
+			redirectTrace = trace
+		} else if envDir := env.BeadsDir.Get(); envDir != "" {
+			beadsDir = envDir
+		} else {
+			cwd, cwdErr := os.Getwd()
+			if cwdErr != nil {
 				return time.Time{}
 			}
 			beadsDir = filepath.Join(cwd, ".beads")
 		}
 	}
 
-	return beadsTreeModTime(beadsDir)
+	latest := beadsTreeModTime(beadsDir)
+	for _, redirectFile := range redirectTrace {
+		if rInfo, err := os.Stat(redirectFile); err == nil && rInfo.ModTime().After(latest) {
+			latest = rInfo.ModTime()
+		}
+	}
+	return latest
 }
 
 func looksLikeBeadsDBFile(dbPath string) bool {
@@ -1397,21 +1419,43 @@ func looksLikeBeadsDBFile(dbPath string) bool {
 	}
 }
 
+func isBeadsAuthorityEntry(name string, isDir bool) bool {
+	lower := strings.ToLower(name)
+	if isDir {
+		return lower == "dolt"
+	}
+	if strings.HasSuffix(lower, "-shm") || strings.HasSuffix(lower, ".lock") {
+		return false
+	}
+	switch lower {
+	case "issues.jsonl", "beads.jsonl", "beads.base.jsonl",
+		"beads.db", "beads.db-wal", "beads.db-journal",
+		"redirect", "metadata.json":
+		return true
+	}
+	if strings.HasSuffix(lower, ".db") ||
+		strings.HasSuffix(lower, ".sqlite") ||
+		strings.HasSuffix(lower, ".sqlite3") ||
+		strings.HasSuffix(lower, ".db-wal") ||
+		strings.HasSuffix(lower, ".sqlite-wal") ||
+		strings.HasSuffix(lower, ".sqlite3-wal") ||
+		strings.HasSuffix(lower, ".db-journal") ||
+		strings.HasSuffix(lower, ".sqlite-journal") ||
+		strings.HasSuffix(lower, ".sqlite3-journal") {
+		return true
+	}
+	return false
+}
+
 // beadsTreeModTime returns the most recent modification time among the
-// .beads/ directory itself and the regular files directly inside it.
+// .beads/ directory itself and its issue-bearing/authority store entries.
 //
-// Only the top level is consulted, deliberately. Every data file bv loads
-// (issues.jsonl, beads.jsonl, beads.db and its -wal sidecar) lives directly in
-// .beads/, while its subdirectories (.br_history/, .br_recovery/, history/,
-// snapshot trees) hold append-only journals that never feed the graph and can
-// hold thousands of files. Recursing into them made every cache *validation*
-// cost O(files in .beads/) of stat calls — on medium repos that was several
-// times slower than simply recomputing the graph, so the "cached" path lost to
-// --no-cache (issue #192). Individual files are still stat'ed because a file
-// rewritten in place does not bump its parent directory's mtime.
-//
-// A file that vanishes between ReadDir and Info (br's transient *.lock files)
-// is skipped rather than disabling the check.
+// Only top-level store entries (plus any top-level dolt directory) are
+// consulted. Read-only SQLite WAL readers touch beads.db-shm on open, and UI /
+// auxiliary sidecars (feedback.json, correlation_feedback.jsonl, sprints.jsonl,
+// *.lock, and snapshot subdirectories like .br_history/) never alter the issue
+// graph; skipping them prevents self-inflicted robot disk cache thrashing while
+// keeping validation O(top-level store entries) (#192).
 func beadsTreeModTime(beadsDir string) time.Time {
 	info, err := os.Stat(beadsDir)
 	if err != nil {
@@ -1427,7 +1471,7 @@ func beadsTreeModTime(beadsDir string) time.Time {
 		return time.Time{}
 	}
 	for _, entry := range entries {
-		if entry.IsDir() {
+		if !isBeadsAuthorityEntry(entry.Name(), entry.IsDir()) {
 			continue
 		}
 		finfo, err := entry.Info()

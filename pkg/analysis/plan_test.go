@@ -1,6 +1,7 @@
 package analysis_test
 
 import (
+	"fmt"
 	"reflect"
 	"sort"
 	"testing"
@@ -675,6 +676,69 @@ func TestCountStatusPartition_WithheldOpenRoutedToDeferredOrParked(t *testing.T)
 	plan := an.GetExecutionPlan()
 	if plan.TotalBlocked != 1 || plan.TotalDeferredOrParked != 3 {
 		t.Fatalf("ExecutionPlan partition mismatch: TotalBlocked=%d TotalDeferredOrParked=%d", plan.TotalBlocked, plan.TotalDeferredOrParked)
+	}
+}
+
+func TestComputeUnblocks_ParentChildUnlockPropagationAndDualEdge(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "ROOT", Title: "Root blocker", Status: model.StatusOpen, Priority: 1},
+		{ID: "OTHER-OPEN", Title: "Unrelated open blocker", Status: model.StatusOpen, Priority: 2},
+		{
+			ID: "P", Title: "Blocked parent epic", Status: model.StatusOpen, IssueType: model.TypeEpic, Priority: 1,
+			Dependencies: []*model.Dependency{
+				{IssueID: "P", DependsOnID: "ROOT", Type: model.DepBlocks},
+			},
+		},
+		// CHILD-1 has BOTH DepParentChild -> P AND DepBlocks -> ROOT (dual-edge).
+		{
+			ID: "CHILD-1", Title: "Dual-edge child", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 2,
+			Dependencies: []*model.Dependency{
+				{IssueID: "CHILD-1", DependsOnID: "P", Type: model.DepParentChild},
+				{IssueID: "CHILD-1", DependsOnID: "ROOT", Type: model.DepBlocks},
+			},
+		},
+	}
+	for i := 2; i <= 5; i++ {
+		id := fmt.Sprintf("CHILD-%d", i)
+		issues = append(issues, model.Issue{
+			ID: id, Title: id, Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 2,
+			Dependencies: []*model.Dependency{
+				{IssueID: id, DependsOnID: "P", Type: model.DepParentChild},
+			},
+		})
+	}
+	// Planted negative control 1: child still gated by OTHER-OPEN must not unlock when ROOT closes.
+	issues = append(issues, model.Issue{
+		ID: "CHILD-GATED", Title: "Still blocked child", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 2,
+		Dependencies: []*model.Dependency{
+			{IssueID: "CHILD-GATED", DependsOnID: "P", Type: model.DepParentChild},
+			{IssueID: "CHILD-GATED", DependsOnID: "OTHER-OPEN", Type: model.DepBlocks},
+		},
+	})
+	// Planted negative control 2: already-ready parent epic with already-ready child must claim 0 unblocks.
+	issues = append(issues,
+		model.Issue{ID: "READY-EPIC", Title: "Ready epic", Status: model.StatusOpen, IssueType: model.TypeEpic, Priority: 2},
+		model.Issue{
+			ID: "READY-CHILD", Title: "Ready child", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 2,
+			Dependencies: []*model.Dependency{
+				{IssueID: "READY-CHILD", DependsOnID: "READY-EPIC", Type: model.DepParentChild},
+			},
+		},
+	)
+
+	an := analysis.NewAnalyzer(issues)
+	gotRoot := an.ComputeUnblocks("ROOT")
+	wantRoot := []string{"CHILD-1", "CHILD-2", "CHILD-3", "CHILD-4", "CHILD-5", "P"}
+	if !reflect.DeepEqual(gotRoot, wantRoot) {
+		t.Fatalf("ComputeUnblocks(ROOT) = %v, want %v", gotRoot, wantRoot)
+	}
+	if gotReadyEpic := an.ComputeUnblocks("READY-EPIC"); len(gotReadyEpic) != 0 {
+		t.Fatalf("already-ready parent READY-EPIC must report 0 unblocks, got %v", gotReadyEpic)
+	}
+
+	plan := an.GetExecutionPlan()
+	if plan.Summary.HighestImpact != "ROOT" || plan.Summary.UnblocksCount != 6 {
+		t.Fatalf("ExecutionPlan Summary = %+v, want HighestImpact=ROOT UnblocksCount=6", plan.Summary)
 	}
 }
 

@@ -106,6 +106,7 @@ func GenerateAllSuggestionsAt(issues []model.Issue, config SuggestAllConfig, dat
 		if labelsCfg.MaxTotalSuggestions > 0 {
 			labelsCfg.MaxTotalSuggestions = math.MaxInt
 		}
+		labelsCfg.TargetIDs = config.CandidateIDs
 		if cyclesCfg.MaxCycles > 0 && cyclesCfg.MaxCycles < len(issues) {
 			cyclesCfg.MaxCycles = len(issues)
 		}

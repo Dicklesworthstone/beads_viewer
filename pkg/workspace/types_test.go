@@ -866,3 +866,65 @@ func TestAggregateLoader_JSONLOnlySubRepoPopulatesOriginWorkingDirectory(t *test
 		t.Fatalf("redirected .beads Origin.WorkingDirectory = %q, want %q", gotDirs["red-r-1"], filepath.Clean(wantRedir))
 	}
 }
+
+func TestFindWorkspaceConfig_RespectsCeilingAndTempRootBoundaries(t *testing.T) {
+	writeWS := func(root string) string {
+		t.Helper()
+		cfgPath := filepath.Join(root, ".bv", "workspace.yaml")
+		if err := os.MkdirAll(filepath.Dir(cfgPath), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(cfgPath, []byte("discovery:\n  enabled: true\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return cfgPath
+	}
+
+	// 1. GIT_CEILING_DIRECTORIES boundary: parent .bv/workspace.yaml at or above ceiling must NOT be returned.
+	outer := t.TempDir()
+	outerCfg := writeWS(outer)
+	ceilingDir := filepath.Join(outer, "ceiling")
+	ceilingCfg := writeWS(ceilingDir)
+	workSub := filepath.Join(ceilingDir, "project", "pkg")
+	if err := os.MkdirAll(workSub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("GIT_CEILING_DIRECTORIES", ceilingDir)
+	if got, err := workspace.FindWorkspaceConfig(workSub); !os.IsNotExist(err) {
+		t.Fatalf("FindWorkspaceConfig crossed GIT_CEILING_DIRECTORIES (%s): got %q (outer=%q ceiling=%q), err=%v", ceilingDir, got, outerCfg, ceilingCfg, err)
+	}
+
+	// Positive observable: a .bv/workspace.yaml strictly inside the ceiling IS discovered!
+	innerProject := filepath.Join(ceilingDir, "project")
+	wantInnerCfg := writeWS(innerProject)
+	gotInner, err := workspace.FindWorkspaceConfig(workSub)
+	if err != nil {
+		t.Fatalf("FindWorkspaceConfig within ceiling failed: %v", err)
+	}
+	if filepath.Clean(gotInner) != filepath.Clean(wantInnerCfg) {
+		t.Fatalf("FindWorkspaceConfig within ceiling = %q, want %q", gotInner, wantInnerCfg)
+	}
+
+	// 2. os.TempDir() boundary: when TMPDIR sits below an ancestor with .bv/workspace.yaml (or itself contains .bv/workspace.yaml),
+	// walking upward from inside TMPDIR/child must stop BEFORE TMPDIR, and starting at TMPDIR itself must return os.ErrNotExist.
+	t.Setenv("GIT_CEILING_DIRECTORIES", "")
+	hostWithWS := t.TempDir()
+	_ = writeWS(hostWithWS)
+	customTmpRoot := filepath.Join(hostWithWS, "custom-tmp")
+	_ = writeWS(customTmpRoot)
+	nestedScratch := filepath.Join(customTmpRoot, "scratch-job", "sub")
+	if err := os.MkdirAll(nestedScratch, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TMPDIR", customTmpRoot)
+	t.Setenv("TMP", customTmpRoot)
+	t.Setenv("TEMP", customTmpRoot)
+
+	if got, err := workspace.FindWorkspaceConfig(nestedScratch); !os.IsNotExist(err) {
+		t.Fatalf("FindWorkspaceConfig walked into/past os.TempDir() (%s): got %q, err=%v", customTmpRoot, got, err)
+	}
+	if got, err := workspace.FindWorkspaceConfig(customTmpRoot); !os.IsNotExist(err) {
+		t.Fatalf("FindWorkspaceConfig at os.TempDir() root (%s) should return os.ErrNotExist, got %q, err=%v", customTmpRoot, got, err)
+	}
+}

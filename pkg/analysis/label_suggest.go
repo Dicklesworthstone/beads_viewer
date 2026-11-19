@@ -29,6 +29,10 @@ type LabelSuggestionConfig struct {
 	// BuiltinMappings enables built-in keyword-to-label mappings
 	// Default: true
 	BuiltinMappings bool
+
+	// TargetIDs optionally restricts which non-closed issues receive label
+	// suggestions while still learning canonical label vocabulary from issues.
+	TargetIDs map[string]bool
 }
 
 // DefaultLabelSuggestionConfig returns sensible defaults
@@ -101,24 +105,79 @@ type LabelMatch struct {
 	MatchedWords []string `json:"matched_words,omitempty"`
 }
 
+type labelVocabulary struct {
+	allLabels        map[string]bool
+	canonicalByLower map[string]string
+	learnedMappings  map[string]map[string]int
+}
+
+func buildLabelVocabulary(issues []model.Issue, learnFromExisting bool) *labelVocabulary {
+	allLabels := make(map[string]bool)
+	rawCounts := make(map[string]map[string]int)
+	for _, issue := range issues {
+		for _, label := range issue.Labels {
+			if label == "" {
+				continue
+			}
+			lower := strings.ToLower(label)
+			allLabels[lower] = true
+			if rawCounts[lower] == nil {
+				rawCounts[lower] = make(map[string]int)
+			}
+			rawCounts[lower][label]++
+		}
+	}
+
+	canonicalByLower := make(map[string]string, len(rawCounts))
+	for lower, variants := range rawCounts {
+		bestRaw := ""
+		bestCount := -1
+		for raw, count := range variants {
+			if count > bestCount || (count == bestCount && raw < bestRaw) {
+				bestRaw = raw
+				bestCount = count
+			}
+		}
+		canonicalByLower[lower] = bestRaw
+	}
+
+	var learned map[string]map[string]int
+	if learnFromExisting {
+		learned = learnLabelMappings(issues)
+	}
+
+	return &labelVocabulary{
+		allLabels:        allLabels,
+		canonicalByLower: canonicalByLower,
+		learnedMappings:  learned,
+	}
+}
+
 // SuggestLabels analyzes issues for potential label suggestions
 func SuggestLabels(issues []model.Issue, config LabelSuggestionConfig) []Suggestion {
 	if len(issues) == 0 || config.MaxSuggestionsPerIssue <= 0 || config.MaxTotalSuggestions <= 0 {
 		return nil
 	}
 
-	// Build learned mappings from existing labeled issues
-	learnedMappings := make(map[string]map[string]int) // keyword -> label -> count
-	if config.LearnFromExisting {
-		learnedMappings = learnLabelMappings(issues)
-	}
-
-	// Find all existing labels for validation
-	allLabels := make(map[string]bool)
-	for _, issue := range issues {
-		for _, label := range issue.Labels {
-			allLabels[strings.ToLower(label)] = true
+	vocabByRepo := make(map[string]*labelVocabulary)
+	getVocab := func(sourceRepo string) *labelVocabulary {
+		repo := strings.TrimSpace(sourceRepo)
+		if cached, ok := vocabByRepo[repo]; ok {
+			return cached
 		}
+		scopeIssues := issues
+		if repo != "" {
+			scopeIssues = make([]model.Issue, 0, len(issues))
+			for _, iss := range issues {
+				otherRepo := strings.TrimSpace(iss.SourceRepo)
+				if otherRepo == "" || otherRepo == repo {
+					scopeIssues = append(scopeIssues, iss)
+				}
+			}
+		}
+		built := buildLabelVocabulary(scopeIssues, config.LearnFromExisting)
+		vocabByRepo[repo] = built
+		return built
 	}
 
 	var matches []LabelMatch
@@ -128,9 +187,16 @@ func SuggestLabels(issues []model.Issue, config LabelSuggestionConfig) []Suggest
 		if isClosedLikeStatus(issue.Status) {
 			continue
 		}
+		if config.TargetIDs != nil && !config.TargetIDs[issue.ID] {
+			continue
+		}
 
-		// Get existing labels for this issue
-		existingLabels := make(map[string]bool)
+		vocab := getVocab(issue.SourceRepo)
+		allLabels := vocab.allLabels
+		learnedMappings := vocab.learnedMappings
+
+		// Get existing labels for this issue (case-insensitive suppression)
+		existingLabels := make(map[string]bool, len(issue.Labels))
 		for _, l := range issue.Labels {
 			existingLabels[strings.ToLower(l)] = true
 		}
@@ -138,7 +204,7 @@ func SuggestLabels(issues []model.Issue, config LabelSuggestionConfig) []Suggest
 		// Extract keywords
 		keywords := extractKeywords(issue.Title, issue.Description)
 
-		// Score potential labels
+		// Score potential labels (keyed by lowercased label)
 		labelScores := make(map[string]float64)
 		labelReasons := make(map[string][]string)
 
@@ -147,9 +213,10 @@ func SuggestLabels(issues []model.Issue, config LabelSuggestionConfig) []Suggest
 			for _, keyword := range keywords {
 				if labels, ok := builtinLabelMappings[keyword]; ok {
 					for _, label := range labels {
-						if !existingLabels[label] && allLabels[label] {
-							labelScores[label] += 0.3
-							labelReasons[label] = append(labelReasons[label], keyword)
+						lower := strings.ToLower(label)
+						if !existingLabels[lower] && allLabels[lower] {
+							labelScores[lower] += 0.3
+							labelReasons[lower] = append(labelReasons[lower], keyword)
 						}
 					}
 				}
@@ -207,6 +274,11 @@ func SuggestLabels(issues []model.Issue, config LabelSuggestionConfig) []Suggest
 				break
 			}
 
+			canonicalLabel := vocab.canonicalByLower[candidate.label]
+			if canonicalLabel == "" {
+				canonicalLabel = candidate.label
+			}
+
 			reasons := labelReasons[candidate.label]
 			uniqueReasons := uniqueStrings(reasons)
 			sort.Strings(uniqueReasons)
@@ -214,7 +286,7 @@ func SuggestLabels(issues []model.Issue, config LabelSuggestionConfig) []Suggest
 
 			matches = append(matches, LabelMatch{
 				IssueID:      issue.ID,
-				Label:        candidate.label,
+				Label:        canonicalLabel,
 				Confidence:   score,
 				Reason:       reason,
 				MatchedWords: uniqueReasons,

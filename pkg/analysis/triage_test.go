@@ -3885,3 +3885,108 @@ func TestComputeTriage_GroupedSlicesNonNilWhenEmpty(t *testing.T) {
 		})
 	}
 }
+
+func TestBuildUnblocksMap_ParentChildAndDualEdgePropagation(t *testing.T) {
+	now := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
+	issues := []model.Issue{
+		{ID: "ROOT", Title: "Root blocker", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 0, CreatedAt: now, UpdatedAt: now},
+		{
+			ID: "P", Title: "Blocked parent epic", Status: model.StatusOpen, IssueType: model.TypeEpic, Priority: 1, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{
+				{IssueID: "P", DependsOnID: "ROOT", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID: "CHILD-1", Title: "Dual-edge child", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 1, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{
+				{IssueID: "CHILD-1", DependsOnID: "P", Type: model.DepParentChild},
+				{IssueID: "CHILD-1", DependsOnID: "ROOT", Type: model.DepBlocks},
+			},
+		},
+		{ID: "READY-EPIC", Title: "Already ready epic", Status: model.StatusOpen, IssueType: model.TypeEpic, Priority: 2, CreatedAt: now, UpdatedAt: now},
+		{
+			ID: "READY-CHILD", Title: "Already ready child", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 2, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{
+				{IssueID: "READY-CHILD", DependsOnID: "READY-EPIC", Type: model.DepParentChild},
+			},
+		},
+	}
+	for i := 2; i <= 5; i++ {
+		id := fmt.Sprintf("CHILD-%d", i)
+		issues = append(issues, model.Issue{
+			ID: id, Title: id, Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 2, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{
+				{IssueID: id, DependsOnID: "P", Type: model.DepParentChild},
+			},
+		})
+	}
+
+	res := ComputeTriageWithOptionsAndTime(issues, TriageOptions{WaitForPhase2: true}, now)
+	wantRoot := []string{"CHILD-1", "CHILD-2", "CHILD-3", "CHILD-4", "CHILD-5", "P"}
+	if !reflect.DeepEqual(res.UnblocksMap["ROOT"], wantRoot) {
+		t.Fatalf("UnblocksMap[ROOT] = %v, want %v", res.UnblocksMap["ROOT"], wantRoot)
+	}
+	if len(res.BlockersToClear) == 0 || res.BlockersToClear[0].ID != "ROOT" || res.BlockersToClear[0].UnblocksCount != 6 {
+		t.Fatalf("BlockersToClear = %+v, want ROOT leading with UnblocksCount=6", res.BlockersToClear)
+	}
+
+	// Planted negative controls:
+	// 1. Blocked epic P cannot unblock dual-edge CHILD-1 while ROOT remains open.
+	for _, u := range res.UnblocksMap["P"] {
+		if u == "CHILD-1" {
+			t.Fatalf("blocked epic P falsely credited with unblocking dual-edge CHILD-1: %v", res.UnblocksMap["P"])
+		}
+	}
+	// 2. Closing an already-ready epic READY-EPIC must report 0 unblocks for READY-CHILD.
+	if got := res.UnblocksMap["READY-EPIC"]; len(got) != 0 {
+		t.Fatalf("UnblocksMap[READY-EPIC] = %v, want nil/empty", got)
+	}
+}
+
+func TestExtractDescendantSubgraph_IgnoresAssociativeLinks(t *testing.T) {
+	now := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
+	issues := []model.Issue{
+		{ID: "ROOT", Title: "Root", Status: model.StatusOpen, IssueType: model.TypeEpic, Priority: 1, CreatedAt: now, UpdatedAt: now},
+		{
+			ID: "BLK-1", Title: "Blocked child", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 1, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "BLK-1", DependsOnID: "ROOT", Type: model.DepBlocks}},
+		},
+		{
+			ID: "PC-1", Title: "Hierarchy descendant", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 2, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "PC-1", DependsOnID: "BLK-1", Type: model.DepParentChild}},
+		},
+		{
+			ID: "COND-1", Title: "Conditional blocker descendant", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 2, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "COND-1", DependsOnID: "ROOT", Type: model.DepConditionalBlocks}},
+		},
+		// Planted negative controls: associative DepRelated and DepDiscoveredFrom must not leak into --graph-root.
+		{
+			ID: "REL-LEAK", Title: "Associative related", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 0, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "REL-LEAK", DependsOnID: "ROOT", Type: model.DepRelated}},
+		},
+		{
+			ID: "DISC-LEAK", Title: "Discovered-from note", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 0, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "DISC-LEAK", DependsOnID: "BLK-1", Type: model.DepDiscoveredFrom}},
+		},
+	}
+
+	sub := extractDescendantSubgraph(issues, "ROOT")
+	gotIDs := make([]string, len(sub))
+	for i, iss := range sub {
+		gotIDs[i] = iss.ID
+	}
+	wantIDs := []string{"ROOT", "BLK-1", "PC-1", "COND-1"}
+	if !reflect.DeepEqual(gotIDs, wantIDs) {
+		t.Fatalf("extractDescendantSubgraph(ROOT) = %v, want %v (associative edges leaked)", gotIDs, wantIDs)
+	}
+
+	res := ComputeTriageWithOptionsAndTime(issues, TriageOptions{
+		WaitForPhase2: true,
+		RootIssueID:   "ROOT",
+	}, now)
+	for _, rec := range res.Recommendations {
+		if rec.ID == "REL-LEAK" || rec.ID == "DISC-LEAK" {
+			t.Fatalf("RootIssueID=ROOT triage leaked associative node %s: %+v", rec.ID, res.Recommendations)
+		}
+	}
+}

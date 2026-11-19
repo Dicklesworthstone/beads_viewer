@@ -16,6 +16,7 @@ type JSONLReader struct {
 	silent   bool
 	reportMu sync.Mutex
 	report   LoadReport
+	closed   bool
 }
 
 // NewJSONLReader creates a reader for a JSONL data source.
@@ -30,26 +31,52 @@ func newJSONLReader(source DataSource, silent bool) (*JSONLReader, error) {
 	return &JSONLReader{path: source.Path, silent: silent}, nil
 }
 
-// LoadIssues returns all non-tombstone issues from the JSONL file.
-// Parse accounting is retained by this reader so records dropped during
-// load (malformed JSON, failed validation) stay visible to callers (#190).
-func (r *JSONLReader) LoadIssues() ([]model.Issue, error) {
-	rec := newLoadRecorderWithSilence(r.path, r.silent)
-	all, err := loader.LoadIssuesFromFileWithOptions(r.path, rec.options())
-	r.reportMu.Lock()
-	r.report = rec.finish(all, err == nil)
-	r.reportMu.Unlock()
+func fusedLoadJSONL(path string, opts ValidationOptions, silent bool) ([]model.Issue, LoadReport, error) {
+	rec := newLoadRecorderWithSilence(path, silent)
+	all, err := loader.LoadIssuesFromFileWithOptions(path, rec.options())
 	if err != nil {
-		return nil, err
+		return nil, rec.finish(all, false), err
 	}
-	// Filter out tombstone issues to match the IssueReader contract.
+	stats := rec.stats
+
+	maxRate := opts.MaxJSONLErrorRate
+	if rate := stats.ErrorRate(); rate > maxRate {
+		return nil, rec.finish(all, false), fmt.Errorf("%s: too many errors: %.1f%% (max %.1f%%)", path, rate*100, maxRate*100)
+	}
+	if stats.Valid == 0 && stats.Errors+stats.Skipped > 0 {
+		return nil, rec.finish(all, false), fmt.Errorf("%s: no issue records (%d non-issue/error lines, 0 valid issues)", path, stats.Errors+stats.Skipped)
+	}
+
+	report := rec.finish(all, true)
 	out := make([]model.Issue, 0, len(all))
 	for i := range all {
 		if !all[i].Status.IsTombstone() {
 			out = append(out, all[i])
 		}
 	}
-	return out, nil
+	return out, report, nil
+}
+
+// LoadIssues returns all non-tombstone issues from the JSONL file after
+// enforcing the fused corruption/non-issue validation gates.
+// Parse accounting is retained by this reader so records dropped during
+// load (malformed JSON, failed validation) stay visible to callers (#190).
+func (r *JSONLReader) LoadIssues() ([]model.Issue, error) {
+	r.reportMu.Lock()
+	closed := r.closed
+	r.reportMu.Unlock()
+	if closed {
+		return nil, fmt.Errorf("jsonl reader is closed: %s", r.path)
+	}
+
+	issues, report, err := fusedLoadJSONL(r.path, DefaultValidationOptions(), r.silent)
+	r.reportMu.Lock()
+	r.report = report
+	r.reportMu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	return issues, nil
 }
 
 func (r *JSONLReader) LoadReport() LoadReport {
@@ -123,7 +150,10 @@ func (r *JSONLReader) GetLastModified() (time.Time, error) {
 	return latest, nil
 }
 
-// Close is a no-op for JSONL (no persistent resources to release).
+// Close marks the JSONL reader closed so subsequent reads fail consistently.
 func (r *JSONLReader) Close() error {
+	r.reportMu.Lock()
+	r.closed = true
+	r.reportMu.Unlock()
 	return nil
 }

@@ -106,10 +106,11 @@ type GraphStats struct {
 	status MetricStatus
 
 	// Memoized active-subgraph metrics keyed by (activeSetHash|metricStates)
-	activeMetricsKey   string
-	activeBetweenness  map[string]float64
-	activeCoreNumber   map[string]int
-	activeArticulation []string
+	activeMetricsKey      string
+	activeBetweenness     map[string]float64
+	activeBetweennessRank map[string]int
+	activeCoreNumber      map[string]int
+	activeArticulation    []string
 }
 
 // metricStatus captures per-metric computation outcome for transparency.
@@ -940,6 +941,38 @@ func (s *GraphStats) BetweennessRank() map[string]int {
 	return cp
 }
 
+// ActiveBetweennessRank returns 1-based betweenness ranks computed over the
+// active subgraph when pre-populated for graphs with closed issues, or
+// delegates to BetweennessRank().
+func (s *GraphStats) ActiveBetweennessRank() map[string]int {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	if s.activeMetricsKey != "" {
+		if s.activeBetweennessRank != nil {
+			cp := make(map[string]int, len(s.activeBetweennessRank))
+			for k, v := range s.activeBetweennessRank {
+				cp[k] = v
+			}
+			s.mu.RUnlock()
+			return cp
+		}
+		if s.activeBetweenness == nil {
+			s.mu.RUnlock()
+			return nil
+		}
+		bwCopy := make(map[string]float64, len(s.activeBetweenness))
+		for k, v := range s.activeBetweenness {
+			bwCopy[k] = v
+		}
+		s.mu.RUnlock()
+		return computeFloatRanks(bwCopy)
+	}
+	s.mu.RUnlock()
+	return s.BetweennessRank()
+}
+
 func (s *GraphStats) EigenvectorRank() map[string]int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -1382,8 +1415,6 @@ type Analyzer struct {
 	issuePtrByID     map[string]*model.Issue
 	issues           []model.Issue // Analyzer-owned snapshot retained for data-hash memoization
 	childrenByParent map[string][]string
-	cascadeOnce      sync.Once
-	cascadeFrontiers map[string][]string // Immutable sorted graph dependents plus hierarchy children
 	blockerCounts    []int
 	blockerCountsMax int
 	config           *AnalysisConfig // Optional custom config, nil means use size-based defaults
@@ -1891,7 +1922,7 @@ func (a *Analyzer) activeSubgraphMetrics(stats *GraphStats) (map[string]float64,
 
 	cacheKey := activeHash + "|" + status.Betweenness.State + "|" + status.KCore.State + "|" + status.Articulation.State
 	stats.mu.RLock()
-	if stats.activeMetricsKey == cacheKey {
+	if stats.activeMetricsKey == cacheKey && (stats.activeBetweenness == nil || stats.activeBetweennessRank != nil) {
 		bwCached, coreCached, artCached := stats.activeBetweenness, stats.activeCoreNumber, stats.activeArticulation
 		stats.mu.RUnlock()
 		return bwCached, coreCached, artCached
@@ -1900,10 +1931,15 @@ func (a *Analyzer) activeSubgraphMetrics(stats *GraphStats) (map[string]float64,
 	stats.mu.RUnlock()
 
 	_, bwOut, coreOut, artOut := a.computeActiveSubgraphMetricsWithKey(activeIDs, activeHash, cfg, status)
+	var bwRank map[string]int
+	if bwOut != nil {
+		bwRank = computeFloatRanks(bwOut)
+	}
 
 	stats.mu.Lock()
 	stats.activeMetricsKey = cacheKey
 	stats.activeBetweenness = bwOut
+	stats.activeBetweennessRank = bwRank
 	stats.activeCoreNumber = coreOut
 	stats.activeArticulation = artOut
 	stats.mu.Unlock()
@@ -2410,6 +2446,13 @@ func (s *GraphStats) snapshotValue() GraphStats {
 			activeBW[k] = v
 		}
 	}
+	var activeBWRank map[string]int
+	if s.activeBetweennessRank != nil {
+		activeBWRank = make(map[string]int, len(s.activeBetweennessRank))
+		for k, v := range s.activeBetweennessRank {
+			activeBWRank[k] = v
+		}
+	}
 	var activeCore map[string]int
 	if s.activeCoreNumber != nil {
 		activeCore = make(map[string]int, len(s.activeCoreNumber))
@@ -2424,37 +2467,38 @@ func (s *GraphStats) snapshotValue() GraphStats {
 	}
 
 	return GraphStats{
-		OutDegree:          s.OutDegree,
-		InDegree:           s.InDegree,
-		TopologicalOrder:   s.TopologicalOrder,
-		Density:            s.Density,
-		NodeCount:          s.NodeCount,
-		EdgeCount:          s.EdgeCount,
-		Config:             s.Config,
-		pageRank:           s.pageRank,
-		betweenness:        s.betweenness,
-		eigenvector:        s.eigenvector,
-		hubs:               s.hubs,
-		authorities:        s.authorities,
-		criticalPathScore:  s.criticalPathScore,
-		pageRankRank:       s.pageRankRank,
-		betweennessRank:    s.betweennessRank,
-		eigenvectorRank:    s.eigenvectorRank,
-		hubsRank:           s.hubsRank,
-		authoritiesRank:    s.authoritiesRank,
-		criticalPathRank:   s.criticalPathRank,
-		inDegreeRank:       s.inDegreeRank,
-		outDegreeRank:      s.outDegreeRank,
-		coreNumber:         s.coreNumber,
-		articulation:       s.articulation,
-		slack:              s.slack,
-		cycles:             s.cycles,
-		phase2Ready:        true,
-		status:             s.status,
-		activeMetricsKey:   s.activeMetricsKey,
-		activeBetweenness:  activeBW,
-		activeCoreNumber:   activeCore,
-		activeArticulation: activeArt,
+		OutDegree:             s.OutDegree,
+		InDegree:              s.InDegree,
+		TopologicalOrder:      s.TopologicalOrder,
+		Density:               s.Density,
+		NodeCount:             s.NodeCount,
+		EdgeCount:             s.EdgeCount,
+		Config:                s.Config,
+		pageRank:              s.pageRank,
+		betweenness:           s.betweenness,
+		eigenvector:           s.eigenvector,
+		hubs:                  s.hubs,
+		authorities:           s.authorities,
+		criticalPathScore:     s.criticalPathScore,
+		pageRankRank:          s.pageRankRank,
+		betweennessRank:       s.betweennessRank,
+		eigenvectorRank:       s.eigenvectorRank,
+		hubsRank:              s.hubsRank,
+		authoritiesRank:       s.authoritiesRank,
+		criticalPathRank:      s.criticalPathRank,
+		inDegreeRank:          s.inDegreeRank,
+		outDegreeRank:         s.outDegreeRank,
+		coreNumber:            s.coreNumber,
+		articulation:          s.articulation,
+		slack:                 s.slack,
+		cycles:                s.cycles,
+		phase2Ready:           true,
+		status:                s.status,
+		activeMetricsKey:      s.activeMetricsKey,
+		activeBetweenness:     activeBW,
+		activeBetweennessRank: activeBWRank,
+		activeCoreNumber:      activeCore,
+		activeArticulation:    activeArt,
 	}
 }
 
@@ -3000,14 +3044,18 @@ func (a *Analyzer) computePhase2WithProfile(ctx context.Context, stats *GraphSta
 
 	// Pre-populate active-subgraph metrics before marking Phase 2 ready when closed issues exist.
 	var (
-		activeKey  string
-		activeBW   map[string]float64
-		activeCore map[string]int
-		activeArt  []string
+		activeKey    string
+		activeBW     map[string]float64
+		activeBWRank map[string]int
+		activeCore   map[string]int
+		activeArt    []string
 	)
 	if a.g != nil && ctx.Err() == nil {
 		if activeIDs, hasClosed, activeHash := a.ensureActiveSet(); hasClosed {
 			activeKey, activeBW, activeCore, activeArt = a.computeActiveSubgraphMetricsWithKey(activeIDs, activeHash, config, localStatus)
+			if activeBW != nil {
+				activeBWRank = computeFloatRanks(activeBW)
+			}
 		}
 	}
 
@@ -3042,6 +3090,7 @@ func (a *Analyzer) computePhase2WithProfile(ctx context.Context, stats *GraphSta
 	if activeKey != "" {
 		stats.activeMetricsKey = activeKey
 		stats.activeBetweenness = activeBW
+		stats.activeBetweennessRank = activeBWRank
 		stats.activeCoreNumber = activeCore
 		stats.activeArticulation = activeArt
 	}

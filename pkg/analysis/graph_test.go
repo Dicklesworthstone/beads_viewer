@@ -1223,6 +1223,31 @@ func TestActiveSubgraphMetrics_SyncAnalyzeAnalyzeWithConfigAndCachedAnalyzer(t *
 		if !reflect.DeepEqual(s.ActiveArticulationPoints(), pureStats.ActiveArticulationPoints()) {
 			t.Fatalf("%s: ActiveArticulationPoints = %v, want pure-open %v", label, s.ActiveArticulationPoints(), pureStats.ActiveArticulationPoints())
 		}
+
+		// ActiveBetweennessRank: CLOSED-HUB must not distort open ranks (OPEN-BRIDGE must rank #1,
+		// followed deterministically by 0-betweenness OPEN-LEAF=#2 and OPEN-ROOT=#3),
+		// whereas full-graph BetweennessRank includes CLOSED-HUB at rank #1.
+		if s.BetweennessRank()["CLOSED-HUB"] != 1 {
+			t.Fatalf("%s: expected full-graph BetweennessRank[CLOSED-HUB] == 1, got %v", label, s.BetweennessRank())
+		}
+		gotBWRank := s.ActiveBetweennessRank()
+		wantBWRank := map[string]int{"OPEN-BRIDGE": 1, "OPEN-LEAF": 2, "OPEN-ROOT": 3}
+		if _, leakedRank := gotBWRank["CLOSED-HUB"]; leakedRank {
+			t.Fatalf("%s: CLOSED-HUB leaked into ActiveBetweennessRank: %v", label, gotBWRank)
+		}
+		if !reflect.DeepEqual(gotBWRank, wantBWRank) {
+			t.Fatalf("%s: ActiveBetweennessRank = %v, want %v", label, gotBWRank, wantBWRank)
+		}
+		// Mutating returned rank map must not alias internal precomputed activeBetweennessRank.
+		gotBWRank["OPEN-BRIDGE"] = 999
+		if s.ActiveBetweennessRank()["OPEN-BRIDGE"] != 1 {
+			t.Fatalf("%s: mutating ActiveBetweennessRank caller copy corrupted cached rank map", label)
+		}
+	}
+
+	var nilStats *analysis.GraphStats
+	if nilStats.ActiveBetweennessRank() != nil {
+		t.Fatal("nil *GraphStats.ActiveBetweennessRank() must return nil")
 	}
 
 	s1 := an.Analyze()

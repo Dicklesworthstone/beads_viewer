@@ -591,7 +591,7 @@ func extractDescendantSubgraph(issues []model.Issue, rootID string) []model.Issu
 	for _, iss := range issues {
 		issueMap[iss.ID] = struct{}{}
 		for _, dep := range iss.Dependencies {
-			if dep != nil {
+			if dep != nil && (dep.Type.IsBlocking() || dep.Type == model.DepParentChild) {
 				children[dep.DependsOnID] = append(children[dep.DependsOnID], iss.ID)
 			}
 		}
@@ -1093,45 +1093,20 @@ func ComputeStaleness(history *correlation.HistoryReport, issues []model.Issue, 
 	}
 }
 
-// buildUnblocksMap computes what each issue unblocks
+// buildUnblocksMap computes what each issue unblocks in a single completion step.
 func buildUnblocksMap(ctx *TriageContext) map[string][]string {
-	unblocksMap := make(map[string][]string)
-	readiness := ctx.analyzer.Readiness()
+	unblocksMap := make(map[string][]string, len(ctx.analyzer.issueMap))
 	now := ctx.analyzer.Now()
 
-	// We only care about blocking dependencies
-	for _, issue := range ctx.analyzer.issueMap {
+	for id, issue := range ctx.analyzer.issueMap {
 		if isClosedLikeStatus(issue.Status) || issue.IsDeferredAt(now) {
 			continue
 		}
-
-		if _, ok := unblocksMap[issue.ID]; !ok {
-			unblocksMap[issue.ID] = nil
-		}
-
-		if readiness.DependencyState(issue.ID) == model.DependenciesSatisfied {
-			continue
-		}
-
-		// Get all open blockers for this issue (including parents)
-		openBlockers := ctx.getOpenBlockersInternal(issue.ID)
-
-		// If this issue is blocked by exactly ONE issue, completing that
-		// one issue will unblock this one.
-		if len(openBlockers) == 1 {
-			blockerID := openBlockers[0]
-			// One visible blocker is not proof of readiness: parked statuses,
-			// unresolved parent chains and output eligibility still apply.
-			if ctx.analyzer.isActionableAfterSingleCompletion(issue.ID, blockerID) {
-				unblocksMap[blockerID] = append(unblocksMap[blockerID], issue.ID)
-			}
-		}
-	}
-
-	// Sort for determinism
-	for _, unblocks := range unblocksMap {
-		if len(unblocks) > 1 {
-			sort.Strings(unblocks)
+		unblocks := ctx.analyzer.computeUnblocks(id)
+		if len(unblocks) == 0 {
+			unblocksMap[id] = nil
+		} else {
+			unblocksMap[id] = unblocks
 		}
 	}
 

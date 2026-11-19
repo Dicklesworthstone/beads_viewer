@@ -217,7 +217,9 @@ func LoadConfig(path string) (*Config, error) {
 	return &config, nil
 }
 
-// FindWorkspaceConfig searches for .bv/workspace.yaml starting from dir
+// FindWorkspaceConfig searches for .bv/workspace.yaml starting from dir,
+// stopping before filesystem roots, temp-directory roots (os.TempDir(), /tmp,
+// /var/tmp), and any GIT_CEILING_DIRECTORIES boundaries.
 func FindWorkspaceConfig(dir string) (string, error) {
 	if dir == "" {
 		var err error
@@ -225,6 +227,56 @@ func FindWorkspaceConfig(dir string) (string, error) {
 		if err != nil {
 			return "", err
 		}
+	}
+	if abs, err := filepath.Abs(dir); err == nil {
+		dir = abs
+	}
+	dir = filepath.Clean(dir)
+
+	tempRoots := make(map[string]bool)
+	stopDirs := make(map[string]bool)
+	addDirSet := func(dst map[string]bool, p string) {
+		if strings.TrimSpace(p) == "" {
+			return
+		}
+		clean := filepath.Clean(p)
+		dst[clean] = true
+		if abs, err := filepath.Abs(clean); err == nil {
+			dst[filepath.Clean(abs)] = true
+		}
+		if eval, err := filepath.EvalSymlinks(clean); err == nil {
+			dst[filepath.Clean(eval)] = true
+		}
+	}
+	for _, tmpRoot := range []string{os.TempDir(), "/tmp", "/var/tmp"} {
+		addDirSet(tempRoots, tmpRoot)
+		addDirSet(stopDirs, tmpRoot)
+	}
+	for _, ceiling := range filepath.SplitList(os.Getenv("GIT_CEILING_DIRECTORIES")) {
+		addDirSet(stopDirs, ceiling)
+	}
+
+	matchesSet := func(set map[string]bool, p string) bool {
+		clean := filepath.Clean(p)
+		if set[clean] {
+			return true
+		}
+		if eval, err := filepath.EvalSymlinks(clean); err == nil && set[filepath.Clean(eval)] {
+			return true
+		}
+		return false
+	}
+	isTempOrRoot := func(p string) bool {
+		clean := filepath.Clean(p)
+		return filepath.Dir(clean) == clean || matchesSet(tempRoots, clean)
+	}
+	isStopBoundary := func(p string) bool {
+		clean := filepath.Clean(p)
+		return filepath.Dir(clean) == clean || matchesSet(stopDirs, clean)
+	}
+
+	if isTempOrRoot(dir) {
+		return "", os.ErrNotExist
 	}
 
 	// Walk up the directory tree looking for .bv/workspace.yaml
@@ -235,8 +287,7 @@ func FindWorkspaceConfig(dir string) (string, error) {
 		}
 
 		parent := filepath.Dir(dir)
-		if parent == dir {
-			// Reached filesystem root
+		if parent == dir || isStopBoundary(dir) || isStopBoundary(parent) {
 			break
 		}
 		dir = parent

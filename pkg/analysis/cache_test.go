@@ -1215,3 +1215,146 @@ func TestComputeDataHashAndFingerprint_FiveNewIssueFields(t *testing.T) {
 		}
 	}
 }
+
+func TestRobotDiskCache_IgnoresNonIssueSidecarsAndFollowsRedirectedBeadsDir(t *testing.T) {
+	t.Setenv("BV_ROBOT", "1")
+	t.Setenv("BV_NO_CACHE", "")
+	cacheDir := t.TempDir()
+	t.Setenv("BV_CACHE_DIR", cacheDir)
+	t.Setenv("BEADS_DB", "")
+	t.Setenv("BEADS_DIR", "")
+
+	// Set up workspace with subdirectory + .beads/redirect -> centralStore/.beads
+	repoRoot := t.TempDir()
+	localBeads := filepath.Join(repoRoot, ".beads")
+	subDir := filepath.Join(repoRoot, "services", "worker")
+	centralBeads := filepath.Join(t.TempDir(), "central", ".beads")
+	for _, d := range []string{localBeads, subDir, centralBeads, filepath.Join(centralBeads, ".br_history")} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	redirectPath := filepath.Join(localBeads, "redirect")
+	if err := os.WriteFile(redirectPath, []byte(centralBeads+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	issuesPath := filepath.Join(centralBeads, "issues.jsonl")
+	dbPath := filepath.Join(centralBeads, "beads.db")
+	walPath := filepath.Join(centralBeads, "beads.db-wal")
+	shmPath := filepath.Join(centralBeads, "beads.db-shm")
+	feedbackPath := filepath.Join(centralBeads, "feedback.json")
+	corrFeedbackPath := filepath.Join(centralBeads, "correlation_feedback.jsonl")
+	sprintsPath := filepath.Join(centralBeads, "sprints.jsonl")
+	lockPath := filepath.Join(centralBeads, "export.lock")
+
+	for _, p := range []string{issuesPath, dbPath, walPath, shmPath, feedbackPath, corrFeedbackPath, sprintsPath, lockPath} {
+		if err := os.WriteFile(p, []byte("{}\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	base := time.Now().Add(-3 * time.Hour).UTC().Truncate(time.Second)
+	cacheCreatedAt := base.Add(time.Hour)
+	newerSidecar := cacheCreatedAt.Add(30 * time.Minute)
+
+	for _, p := range []string{localBeads, redirectPath, centralBeads, filepath.Join(centralBeads, ".br_history"), issuesPath, dbPath, walPath} {
+		if err := os.Chtimes(p, base, base); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Bump ONLY non-authority sidecars (-shm, feedback.json, correlation_feedback.jsonl, sprints.jsonl, *.lock, .br_history) AFTER cacheCreatedAt!
+	for _, sidecar := range []string{shmPath, feedbackPath, corrFeedbackPath, sprintsPath, lockPath, filepath.Join(centralBeads, ".br_history")} {
+		if err := os.Chtimes(sidecar, newerSidecar, newerSidecar); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Restore centralBeads directory mtime to base so we isolate per-entry mtime filtering.
+	if err := os.Chtimes(centralBeads, base, base); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Chdir(subDir)
+
+	issues := []model.Issue{
+		{ID: "A", Status: model.StatusOpen},
+		{ID: "B", Status: model.StatusOpen, Dependencies: []*model.Dependency{{DependsOnID: "A", Type: model.DepBlocks}}},
+	}
+	config := analysis.ConfigForSize(2, 1)
+	fullKey := analysis.ComputeDataHash(issues) + "|" + analysis.ComputeConfigHash(&config)
+
+	stats1 := analysis.NewAnalyzer(issues).AnalyzeAsyncWithConfig(context.Background(), config)
+	stats1.WaitForPhase2()
+
+	cachePath := robotCacheEntryPath(cacheDir, fullKey)
+	pinEntryCreatedAt := func(ts time.Time) []byte {
+		t.Helper()
+		raw, err := os.ReadFile(cachePath)
+		if err != nil {
+			t.Fatalf("read cache entry: %v", err)
+		}
+		var entry map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &entry); err != nil {
+			t.Fatal(err)
+		}
+		tsRaw, _ := json.Marshal(ts)
+		zeroRaw, _ := json.Marshal(int64(0))
+		entry["created_at"] = tsRaw
+		entry["compute_duration"] = zeroRaw
+		out, err := json.Marshal(entry)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(cachePath, out, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+
+	pinnedBytes := pinEntryCreatedAt(cacheCreatedAt)
+
+	// Positive observable: with newer beads.db-shm, feedback.json, correlation_feedback.jsonl,
+	// sprints.jsonl, *.lock, and .br_history, the cache entry MUST hit without rewrite!
+	stats2 := analysis.NewAnalyzer(issues).AnalyzeAsyncWithConfig(context.Background(), config)
+	stats2.WaitForPhase2()
+	afterSidecars, err := os.ReadFile(cachePath)
+	if err != nil {
+		t.Fatalf("cache entry unexpectedly removed on sidecar mtime bump: %v", err)
+	}
+	if string(afterSidecars) != string(pinnedBytes) {
+		t.Fatal("non-issue sidecars (beads.db-shm / feedback.json / sprints.jsonl / *.lock) thrashed robot disk cache")
+	}
+
+	// Planted negative control 1: bumping beads.db-wal on the redirected store MUST invalidate and rewrite the cache entry!
+	walNewer := cacheCreatedAt.Add(45 * time.Minute)
+	if err := os.Chtimes(walPath, walNewer, walNewer); err != nil {
+		t.Fatal(err)
+	}
+	stats3 := analysis.NewAnalyzer(issues).AnalyzeAsyncWithConfig(context.Background(), config)
+	stats3.WaitForPhase2()
+	afterWAL, err := os.ReadFile(cachePath)
+	if err != nil {
+		t.Fatalf("expected regenerated cache entry after beads.db-wal bump: %v", err)
+	}
+	if string(afterWAL) == string(pinnedBytes) {
+		t.Fatal("beads.db-wal mtime bump on redirected store failed to invalidate stale robot disk cache")
+	}
+
+	// Planted negative control 2: bumping issues.jsonl on the redirected store MUST also invalidate and rewrite!
+	if err := os.Chtimes(walPath, base, base); err != nil {
+		t.Fatal(err)
+	}
+	pinnedBytes2 := pinEntryCreatedAt(cacheCreatedAt)
+	jsonlNewer := cacheCreatedAt.Add(50 * time.Minute)
+	if err := os.Chtimes(issuesPath, jsonlNewer, jsonlNewer); err != nil {
+		t.Fatal(err)
+	}
+	stats4 := analysis.NewAnalyzer(issues).AnalyzeAsyncWithConfig(context.Background(), config)
+	stats4.WaitForPhase2()
+	afterJSONL, err := os.ReadFile(cachePath)
+	if err != nil {
+		t.Fatalf("expected regenerated cache entry after issues.jsonl bump: %v", err)
+	}
+	if string(afterJSONL) == string(pinnedBytes2) {
+		t.Fatal("issues.jsonl mtime bump on redirected store failed to invalidate stale robot disk cache")
+	}
+}
