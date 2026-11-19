@@ -264,16 +264,43 @@ func (m TutorialModel) View() string {
 
 	r := m.theme.Renderer
 
-	// Calculate dimensions within m.width (accounting for 2 border columns and 4 horizontal padding columns)
-	boxWidth := max(m.width-2, 16)
-	innerWidth := max(boxWidth-4, 12)
+	// Calculate dimensions within m.width (accounting for 2 border columns and horizontal padding)
+	boxWidth := 78
+	horizPad := 2
+	if m.width > 0 {
+		boxWidth = max(1, m.width-2)
+		if boxWidth <= 6 {
+			horizPad = 0
+		} else if boxWidth <= 10 {
+			horizPad = 1
+		}
+	}
+	innerWidth := max(1, boxWidth-2*horizPad)
 	vertPad := 1
 	if m.height > 0 && m.height <= 26 {
 		vertPad = 0
 	}
+	narrowSinglePaneTOC := m.tocVisible && innerWidth < 46
 	contentWidth := innerWidth
-	if m.tocVisible {
+	if m.tocVisible && !narrowSinglePaneTOC {
 		contentWidth = max(innerWidth-26, 20) // TOC sidebar (24 cols) + 2-space gap
+	}
+
+	clampWidthLines := func(s string, maxW int) string {
+		if maxW <= 0 {
+			return ""
+		}
+		suffix := "…"
+		if maxW <= 2 {
+			suffix = ""
+		}
+		raw := strings.Split(s, "\n")
+		for i, ln := range raw {
+			if lipgloss.Width(ln) > maxW {
+				raw[i] = ansi.Truncate(ln, maxW, suffix)
+			}
+		}
+		return strings.Join(raw, "\n")
 	}
 
 	// Header + separator + page title
@@ -293,39 +320,58 @@ func (m TutorialModel) View() string {
 	footer := m.renderFooter(len(pages))
 
 	wrapMeasure := r.NewStyle().Width(innerWidth)
-	headerH := lipgloss.Height(wrapMeasure.Render(headerBlock))
-	footerH := lipgloss.Height(wrapMeasure.Render(footer))
+	headerRendered := clampWidthLines(wrapMeasure.Render(headerBlock), innerWidth)
+	footerRendered := clampWidthLines(wrapMeasure.Render(footer), innerWidth)
+	headerH := lipgloss.Height(headerRendered)
+	footerH := lipgloss.Height(footerRendered)
 	borderH := 2 + 2*vertPad
-	availBody := max(1, m.height-headerH-footerH-borderH)
-
-	// Build the view
-	var b strings.Builder
-	b.WriteString(headerBlock)
-	b.WriteString("\n")
-
-	// Content area (with optional TOC)
-	if m.tocVisible {
-		toc := m.renderTOC(pages, availBody)
-		content := m.renderContent(currentPage, contentWidth, availBody)
-		// Join TOC and content horizontally
-		b.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, toc, "  ", content))
-	} else {
-		content := m.renderContent(currentPage, contentWidth, availBody)
-		b.WriteString(content)
+	availBody := 12
+	if m.height > 0 {
+		availBody = max(1, m.height-headerH-footerH-borderH)
 	}
 
-	b.WriteString("\n")
-	b.WriteString(footer)
+	var bodySection string
+	if m.tocVisible {
+		if narrowSinglePaneTOC {
+			if m.focus == focusTutorialTOC {
+				bodySection = m.renderTOCWithWidth(pages, availBody, max(1, innerWidth-2))
+			} else {
+				bodySection = m.renderContent(currentPage, innerWidth, availBody)
+			}
+		} else {
+			toc := m.renderTOCWithWidth(pages, availBody, 22)
+			content := m.renderContent(currentPage, contentWidth, availBody)
+			bodySection = lipgloss.JoinHorizontal(lipgloss.Top, toc, "  ", content)
+		}
+	} else {
+		bodySection = m.renderContent(currentPage, contentWidth, availBody)
+	}
+	bodySection = clampWidthLines(bodySection, innerWidth)
+
+	if m.height > 0 && m.height < 3 {
+		return fitBlock(headerRendered, max(1, m.width), m.height)
+	}
+
+	assembled := headerRendered + "\n" + bodySection + "\n" + footerRendered
+	if m.height > 0 {
+		maxInner := max(1, m.height-borderH)
+		allLines := strings.Split(assembled, "\n")
+		if len(allLines) > maxInner {
+			assembled = strings.Join(allLines[:maxInner], "\n")
+		}
+	}
 
 	// Wrap in modal style
 	modalStyle := r.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(m.theme.Primary).
-		Padding(vertPad, 2).
-		Width(boxWidth).
-		MaxHeight(max(m.height, 1))
+		Padding(vertPad, horizPad).
+		Width(boxWidth)
+	if m.height > 0 {
+		modalStyle = modalStyle.MaxHeight(m.height)
+	}
 
-	return modalStyle.Render(b.String())
+	return modalStyle.Render(assembled)
 }
 
 // renderHeader renders the tutorial header with title and progress bar.
@@ -504,7 +550,19 @@ func (m TutorialModel) windowContentLines(lines []string, width, availHeight int
 
 // renderTOC renders the table of contents sidebar with focus indication (bv-wdsd).
 func (m TutorialModel) renderTOC(pages []TutorialPage, availHeight int) string {
+	return m.renderTOCWithWidth(pages, availHeight, 22)
+}
+
+func (m TutorialModel) renderTOCWithWidth(pages []TutorialPage, availHeight, tocBoxWidth int) string {
 	r := m.theme.Renderer
+	if tocBoxWidth < 1 {
+		tocBoxWidth = 22
+	}
+	tocHPad := 1
+	if tocBoxWidth < 4 {
+		tocHPad = 0
+	}
+	tocInnerW := max(1, tocBoxWidth-2*tocHPad)
 
 	// Use different border style when TOC has focus
 	borderColor := m.theme.Border
@@ -515,8 +573,8 @@ func (m TutorialModel) renderTOC(pages []TutorialPage, availHeight int) string {
 	tocStyle := r.NewStyle().
 		Border(lipgloss.NormalBorder()).
 		BorderForeground(borderColor).
-		Padding(0, 1).
-		Width(22)
+		Padding(0, tocHPad).
+		Width(tocBoxWidth)
 
 	headerStyle := r.NewStyle().
 		Bold(true).
@@ -546,6 +604,7 @@ func (m TutorialModel) renderTOC(pages []TutorialPage, availHeight int) string {
 	if m.focus == focusTutorialTOC {
 		headerLine += r.NewStyle().Foreground(m.theme.Primary).Render(" ●")
 	}
+	headerLine = ansi.Truncate(headerLine, tocInnerW, "…")
 
 	anchorIdx := m.currentPage
 	if m.focus == focusTutorialTOC {
@@ -557,6 +616,7 @@ func (m TutorialModel) renderTOC(pages []TutorialPage, availHeight int) string {
 		anchorIdx = len(pages) - 1
 	}
 
+	titleMaxRunes := max(4, tocInnerW-6)
 	var tocLines []string
 	activeLineIdx := 0
 	currentSection := ""
@@ -567,7 +627,8 @@ func (m TutorialModel) renderTOC(pages []TutorialPage, availHeight int) string {
 				tocLines = append(tocLines, "")
 			}
 			currentSection = page.Section
-			tocLines = append(tocLines, sectionStyle.Render("▸ "+currentSection))
+			secLine := sectionStyle.Render("▸ " + truncateRunesHelper(currentSection, max(2, tocInnerW-2), "…"))
+			tocLines = append(tocLines, ansi.Truncate(secLine, tocInnerW, "…"))
 		}
 
 		// Determine style based on cursor position and current page
@@ -585,7 +646,7 @@ func (m TutorialModel) renderTOC(pages []TutorialPage, availHeight int) string {
 		}
 
 		// Truncate long titles (rune-safe)
-		title := truncateRunesHelper(page.Title, 14, "…")
+		title := truncateRunesHelper(page.Title, titleMaxRunes, "…")
 
 		// Viewed indicator
 		viewed := ""
@@ -596,14 +657,14 @@ func (m TutorialModel) renderTOC(pages []TutorialPage, availHeight int) string {
 		if i == anchorIdx {
 			activeLineIdx = len(tocLines)
 		}
-		tocLines = append(tocLines, style.Render(prefix+title)+viewed)
+		tocLines = append(tocLines, ansi.Truncate(style.Render(prefix+title)+viewed, tocInnerW, "…"))
 	}
 
 	if availHeight <= 0 {
 		availHeight = max(m.height-8, 6)
 	}
 	if availHeight < 4 {
-		return r.NewStyle().Width(24).MaxHeight(max(availHeight, 1)).Render(headerLine)
+		return r.NewStyle().Width(min(24, tocBoxWidth+2)).MaxHeight(max(availHeight, 1)).Render(headerLine)
 	}
 	// NormalBorder uses 2 vertical rows and headerLine uses 1 row.
 	availBody := max(availHeight-3, 1)
@@ -716,14 +777,57 @@ func (m TutorialModel) renderFooter(totalPages int) string {
 // renderEmptyState renders a message when no pages are available.
 func (m TutorialModel) renderEmptyState() string {
 	r := m.theme.Renderer
+	msg := "No tutorial pages available for this context."
+	if m.height > 0 && m.height < 3 {
+		w := 40
+		if m.width > 0 {
+			w = m.width
+		}
+		return fitBlock(msg, max(1, w), m.height)
+	}
+	boxW := 78
+	if m.width > 0 {
+		boxW = max(1, m.width-2)
+	}
+	hPad := 4
+	if boxW <= 8 {
+		hPad = 0
+	} else if boxW <= 16 {
+		hPad = 1
+	}
+	vPad := 2
+	if m.height > 0 && m.height <= 8 {
+		vPad = 0
+	}
+	innerW := max(1, boxW-2*hPad)
+	wrapped := r.NewStyle().Width(innerW).Render(msg)
+	lines := strings.Split(wrapped, "\n")
+	for i, ln := range lines {
+		if lipgloss.Width(ln) > innerW {
+			suffix := "…"
+			if innerW <= 2 {
+				suffix = ""
+			}
+			lines[i] = ansi.Truncate(ln, innerW, suffix)
+		}
+	}
+	if m.height > 0 {
+		maxInner := max(1, m.height-2-2*vPad)
+		if len(lines) > maxInner {
+			lines = lines[:maxInner]
+		}
+	}
 
 	style := r.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(m.theme.Primary).
-		Padding(2, 4).
-		Width(m.width)
+		Padding(vPad, hPad).
+		Width(boxW)
+	if m.height > 0 {
+		style = style.MaxHeight(m.height)
+	}
 
-	return style.Render("No tutorial pages available for this context.")
+	return style.Render(strings.Join(lines, "\n"))
 }
 
 // NextPage advances to the next page.

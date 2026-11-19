@@ -1317,8 +1317,14 @@ func loadHistoryForWorkDirAtRevisionCmd(
 				feedbackStore = fs
 			}
 		}
+		resolvedRev := effectiveRev
+		if resolvedRev != "" && repoPath != "" {
+			if resolved, rErr := loader.NewGitLoader(repoPath).ResolveRevision(resolvedRev); rErr == nil && strings.TrimSpace(resolved) != "" {
+				resolvedRev = strings.TrimSpace(resolved)
+			}
+		}
 		opts := correlation.CorrelatorOptions{
-			Revision: effectiveRev,
+			Revision: resolvedRev,
 			Limit:    500, // Reasonable limit for TUI performance
 		}
 
@@ -1349,12 +1355,43 @@ func loadHistoryForWorkDirAtRevisionCmd(
 // we locate the git-tracked JSONL in the same .beads/ directory instead. When no
 // JSONL can be found we fall back to the original path so the correlator's own
 // default-file logic still runs (it degrades gracefully to "no commits").
+func resolveMetadataJSONLExport(beadsDir string) string {
+	cleanDir := filepath.Clean(strings.TrimSpace(beadsDir))
+	if cleanDir == "" || cleanDir == "." {
+		return ""
+	}
+	data, err := os.ReadFile(filepath.Join(cleanDir, "metadata.json"))
+	if err != nil {
+		return ""
+	}
+	var meta struct {
+		JSONLExport string `json:"jsonl_export"`
+	}
+	if err := json.Unmarshal(data, &meta); err != nil {
+		return ""
+	}
+	exp := strings.TrimSpace(meta.JSONLExport)
+	if exp == "" || filepath.IsAbs(exp) || !strings.EqualFold(filepath.Ext(exp), ".jsonl") {
+		return ""
+	}
+	joined := filepath.Clean(filepath.Join(cleanDir, exp))
+	rel, relErr := filepath.Rel(cleanDir, joined)
+	if relErr != nil || rel == "." || rel == "" || strings.HasPrefix(rel, "..") {
+		return ""
+	}
+	return joined
+}
+
 func resolveHistoryCorrelationPath(beadsPath, repoPath string) string {
 	trimmed := strings.TrimSpace(beadsPath)
 	if trimmed == "" {
 		if repoPath != "" {
-			if jsonlPath, err := loader.FindJSONLPath(filepath.Join(repoPath, ".beads")); err == nil && jsonlPath != "" {
+			stdDir := filepath.Join(repoPath, ".beads")
+			if jsonlPath, err := loader.FindJSONLPath(stdDir); err == nil && jsonlPath != "" {
 				return jsonlPath
+			}
+			if metaJSONL := resolveMetadataJSONLExport(stdDir); metaJSONL != "" {
+				return metaJSONL
 			}
 		}
 		return ""
@@ -1367,10 +1404,17 @@ func resolveHistoryCorrelationPath(beadsPath, repoPath string) string {
 		// Already a JSONL export — the correct correlation source.
 		return candidate
 	}
-	if info, err := os.Stat(candidate); err == nil && info.IsDir() {
+	info, statErr := os.Stat(candidate)
+	isDirCandidate := (statErr == nil && info.IsDir()) ||
+		(statErr != nil && (filepath.Base(candidate) == ".beads" || filepath.Ext(candidate) == ""))
+	if isDirCandidate {
 		if jsonlPath, findErr := loader.FindJSONLPath(candidate); findErr == nil && jsonlPath != "" {
 			return jsonlPath
 		}
+		if metaJSONL := resolveMetadataJSONLExport(candidate); metaJSONL != "" {
+			return metaJSONL
+		}
+		return filepath.Join(candidate, "issues.jsonl")
 	}
 
 	// The selected source is not a JSONL (e.g. beads.db). Find the JSONL that
@@ -1379,11 +1423,18 @@ func resolveHistoryCorrelationPath(beadsPath, repoPath string) string {
 	if jsonlPath, err := loader.FindJSONLPath(beadsDir); err == nil && jsonlPath != "" {
 		return jsonlPath
 	}
+	if metaJSONL := resolveMetadataJSONLExport(beadsDir); metaJSONL != "" {
+		return metaJSONL
+	}
 	// As a secondary attempt, try the repo's standard .beads/ directory in case
 	// beadsPath used a non-standard layout.
 	if repoPath != "" {
-		if jsonlPath, err := loader.FindJSONLPath(filepath.Join(repoPath, ".beads")); err == nil && jsonlPath != "" {
+		stdDir := filepath.Join(repoPath, ".beads")
+		if jsonlPath, err := loader.FindJSONLPath(stdDir); err == nil && jsonlPath != "" {
 			return jsonlPath
+		}
+		if metaJSONL := resolveMetadataJSONLExport(stdDir); metaJSONL != "" {
+			return metaJSONL
 		}
 	}
 	// No JSONL found: preserve original behavior (correlator falls back to its
@@ -1508,20 +1559,63 @@ func loadWorkspaceHistoryAtRevisionCmd(
 				}
 				return canonDir(filepath.Join(cWork, ".beads"))
 			}
-			if !filepath.IsAbs(trimmedBeads) && cWork != "" {
-				return canonDir(filepath.Join(cWork, trimmedBeads))
+			resolved := trimmedBeads
+			if !filepath.IsAbs(resolved) && cWork != "" {
+				resolved = filepath.Join(cWork, resolved)
 			}
-			return canonDir(trimmedBeads)
+			ext := strings.ToLower(filepath.Ext(resolved))
+			if ext == ".jsonl" || ext == ".db" || ext == ".sqlite" || ext == ".sqlite3" {
+				resolved = filepath.Dir(resolved)
+			} else if info, err := os.Stat(resolved); err == nil && !info.IsDir() {
+				resolved = filepath.Dir(resolved)
+			}
+			return canonDir(resolved)
 		}
 		resolveGitRepoRoot := func(dir string) string {
 			cDir := canonDir(dir)
 			if cDir == "" {
 				return ""
 			}
-			if root, err := correlation.FindGitRoot(cDir); err == nil && root != "" {
+			probe := cDir
+			for probe != "" {
+				if _, err := os.Stat(probe); err == nil {
+					break
+				}
+				parent := filepath.Dir(probe)
+				if parent == probe {
+					return ""
+				}
+				probe = parent
+			}
+			if root, err := correlation.FindGitRoot(probe); err == nil && root != "" {
 				return canonDir(root)
 			}
-			return cDir
+			return ""
+		}
+		resolveWorkspaceCorrelationJSONL := func(effBeads, beadsDir, rPath string) string {
+			trimmed := strings.TrimSpace(beadsDir)
+			if trimmed != "" {
+				cand := trimmed
+				if !filepath.IsAbs(cand) && rPath != "" {
+					cand = filepath.Join(rPath, cand)
+				}
+				if strings.EqualFold(filepath.Ext(cand), ".jsonl") {
+					return filepath.Clean(cand)
+				}
+			}
+			if effBeads == "" && rPath != "" {
+				effBeads = canonDir(filepath.Join(rPath, ".beads"))
+			}
+			if effBeads == "" {
+				return ""
+			}
+			if jsonlPath, err := loader.FindJSONLPath(effBeads); err == nil && jsonlPath != "" {
+				return jsonlPath
+			}
+			if metaJSONL := resolveMetadataJSONLExport(effBeads); metaJSONL != "" {
+				return metaJSONL
+			}
+			return filepath.Join(effBeads, "issues.jsonl")
 		}
 		computeStoreSubtreePrefix := func(gitRoot, effBeads, corrPath string) string {
 			if gitRoot == "" {
@@ -1567,7 +1661,7 @@ func loadWorkspaceHistoryAtRevisionCmd(
 				seenSourceRepos[sourceRepo] = true
 			}
 			gRoot := resolveGitRepoRoot(rPath)
-			corrPath := resolveHistoryCorrelationPath(beadsDir, rPath)
+			corrPath := resolveWorkspaceCorrelationJSONL(effBeads, beadsDir, rPath)
 			subPrefix := computeStoreSubtreePrefix(gRoot, effBeads, corrPath)
 			targets = append(targets, wsCorrTarget{
 				label:           label,
@@ -1831,8 +1925,15 @@ func loadWorkspaceHistoryAtRevisionCmd(
 			}
 
 			targetRev := target.revision
-			if targetRev == "" {
+			if targetRev == "" && effectiveRev != "" {
 				targetRev = effectiveRev
+				if gitRoot != "" {
+					if resolved, rErr := loader.NewGitLoaderWithBeadsDir(gitRoot, target.effBeadsDir).ResolveRevision(effectiveRev); rErr == nil && strings.TrimSpace(resolved) != "" {
+						targetRev = strings.TrimSpace(resolved)
+					} else if resolved, rErr := loader.NewGitLoader(gitRoot).ResolveRevision(effectiveRev); rErr == nil && strings.TrimSpace(resolved) != "" {
+						targetRev = strings.TrimSpace(resolved)
+					}
+				}
 			}
 			correlationPath := target.correlationPath
 			var feedbackStore *correlation.FeedbackStore

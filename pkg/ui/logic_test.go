@@ -8683,3 +8683,300 @@ func TestWave19Round1AuditRemediationsR1B1ToR1B7(t *testing.T) {
 		}
 	})
 }
+
+func TestWave19Round2AuditRemediationsR2B1ToR2B3(t *testing.T) {
+	refNow := time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)
+
+	t.Run("R2_B1_sqlite_metadata_deleted_subrepo_nongit_sibling_and_date_as_of_revision", func(t *testing.T) {
+		if _, err := exec.LookPath("git"); err != nil {
+			t.Skip("git not installed")
+		}
+		monoRoot := t.TempDir()
+		nonGitDir := t.TempDir() // Outside any git repository -> resolveGitRepoRoot MUST return ""
+		dbOnlyDir := filepath.Join(monoRoot, "services", "dbonly")
+		legacyDir := filepath.Join(monoRoot, "legacy") // Never created on disk: simulates subrepo deleted before HEAD!
+		if err := os.MkdirAll(filepath.Join(dbOnlyDir, ".beads"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Join(nonGitDir, ".beads"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+
+		gitExecIn := func(dateISO string, stdin string, args ...string) string {
+			t.Helper()
+			cmd := exec.CommandContext(context.Background(), "git", args...)
+			cmd.Dir = monoRoot
+			if stdin != "" {
+				cmd.Stdin = strings.NewReader(stdin)
+			}
+			env := append(os.Environ(),
+				"GIT_AUTHOR_NAME=Tester",
+				"GIT_AUTHOR_EMAIL=tester@example.com",
+				"GIT_COMMITTER_NAME=Tester",
+				"GIT_COMMITTER_EMAIL=tester@example.com",
+			)
+			if dateISO != "" {
+				env = append(env, "GIT_AUTHOR_DATE="+dateISO, "GIT_COMMITTER_DATE="+dateISO)
+			}
+			cmd.Env = env
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("git %v failed: %v\n%s", args, err, string(out))
+			}
+			return strings.TrimSpace(string(out))
+		}
+		stageIndexContent := func(relPath, content string) {
+			t.Helper()
+			blob := gitExecIn("", content, "hash-object", "-w", "--stdin")
+			gitExecIn("", "", "update-index", "--add", "--cacheinfo", "100644,"+blob+","+relPath)
+		}
+		commitIndexAt := func(dateISO, msg string) string {
+			t.Helper()
+			gitExecIn(dateISO, "", "commit", "-m", msg)
+			return gitExecIn("", "", "rev-parse", "HEAD")
+		}
+
+		gitExecIn("", "", "init")
+
+		// Seed dbonly (SQLite-only on disk: metadata.json + beads.db on disk, custom_export.jsonl ONLY in git history!)
+		// and legacy (deleted depth-1 subrepo: legacy/.beads/issues.jsonl ONLY in git history, never on disk!).
+		if err := os.WriteFile(filepath.Join(dbOnlyDir, ".beads", "metadata.json"), []byte(`{"backend":"sqlite","database":"beads.db","jsonl_export":"custom_export.jsonl"}`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dbOnlyDir, ".beads", "beads.db"), []byte("SQLite format 3\x00"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		gitExecIn("2026-01-05T10:00:00Z", "", "add", "services/dbonly/.beads/metadata.json")
+		stageIndexContent("services/dbonly/.beads/custom_export.jsonl", `{"id":"bd-1","title":"DBOnly service","status":"open","priority":1,"issue_type":"task"}`+"\n")
+		stageIndexContent("legacy/.beads/issues.jsonl", `{"id":"bd-1","title":"Legacy depth-1 subrepo","status":"open","priority":1,"issue_type":"task"}`+"\n")
+		commitIndexAt("2026-01-05T10:00:00Z", "chore: seed dbonly and legacy stores")
+
+		// 2026-01-10: One code commit in services/dbonly/store.go and one in legacy/old.go, both mentioning colliding "bd-1".
+		stageIndexContent("services/dbonly/store.go", "package dbonly\n")
+		shaDBOnlyJan10 := commitIndexAt("2026-01-10T12:00:00Z", "feat(bd-1): dbonly persistence")
+
+		stageIndexContent("legacy/old.go", "package legacy\n")
+		shaLegacyJan10 := commitIndexAt("2026-01-10T14:00:00Z", "feat(bd-1): legacy handler")
+
+		// 2026-02-01 (AFTER 2026-01-15 as-of date!): legacy removed from HEAD index and future commit added on dbonly.
+		gitExecIn("2026-02-01T12:00:00Z", "", "update-index", "--force-remove", "legacy/.beads/issues.jsonl", "legacy/old.go")
+		stageIndexContent("services/dbonly/future.go", "package dbonly\nvar feb = true\n")
+		shaFebFuture := commitIndexAt("2026-02-01T12:00:00Z", "feat(bd-1): february future change")
+
+		// Sanity preconditions: neither custom_export.jsonl nor legacyDir exists on disk!
+		if _, err := os.Stat(filepath.Join(dbOnlyDir, ".beads", "custom_export.jsonl")); !os.IsNotExist(err) {
+			t.Fatalf("precondition failed: custom_export.jsonl should not exist on disk")
+		}
+		if _, err := os.Stat(legacyDir); !os.IsNotExist(err) {
+			t.Fatalf("precondition failed: legacyDir should not exist on disk")
+		}
+
+		// Verify resolveHistoryCorrelationPath on a non-existent deleted subrepo .beads dir AND on SQLite metadata.json dir returns a .jsonl file path (NEVER a directory):
+		ghostBeadsDir := filepath.Join(monoRoot, "ghost", ".beads")
+		if gotGhost := resolveHistoryCorrelationPath(ghostBeadsDir, filepath.Join(monoRoot, "ghost")); gotGhost != filepath.Join(ghostBeadsDir, "issues.jsonl") {
+			t.Fatalf("resolveHistoryCorrelationPath on deleted subrepo dir = %q, want %q", gotGhost, filepath.Join(ghostBeadsDir, "issues.jsonl"))
+		}
+		sqlOnlyDir := t.TempDir()
+		sqlBeads := filepath.Join(sqlOnlyDir, ".beads")
+		if err := os.MkdirAll(sqlBeads, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(sqlBeads, "metadata.json"), []byte(`{"backend":"sqlite","database":"beads.db","jsonl_export":"exported_issues.jsonl"}`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(sqlBeads, "beads.db"), []byte("SQLite format 3\x00"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if gotSQL := resolveHistoryCorrelationPath(filepath.Join(sqlBeads, "beads.db"), sqlOnlyDir); gotSQL != filepath.Join(sqlBeads, "exported_issues.jsonl") {
+			t.Fatalf("resolveHistoryCorrelationPath with metadata.json jsonl_export = %q, want %q", gotSQL, filepath.Join(sqlBeads, "exported_issues.jsonl"))
+		}
+
+		wsIssues := []model.Issue{
+			{ID: "dbonly-bd-1", Title: "DBOnly service", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, SourceRepo: "dbonly"},
+			{ID: "legacy-bd-1", Title: "Legacy depth-1 subrepo", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, SourceRepo: "legacy"},
+			{ID: "nongit-bd-9", Title: "Scratch non-git note", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, SourceRepo: "nongit"},
+		}
+		m := NewModel(copyIssues(wsIssues), nil, "", ReadinessScope{ReferenceNow: refNow})
+		t.Cleanup(m.Stop)
+		m.workDir = monoRoot
+		m.SetAsOfRevision("2026-01-15")
+		m.EnableWorkspaceMode(WorkspaceInfo{
+			Enabled:   true,
+			RepoCount: 3,
+			Repos: []WorkspaceRepoTarget{
+				{Name: "dbonly", Path: dbOnlyDir, BeadsDir: filepath.Join(dbOnlyDir, ".beads", "beads.db"), Prefix: "dbonly-"},
+				{Name: "legacy", Path: legacyDir, BeadsDir: filepath.Join(legacyDir, ".beads"), Prefix: "legacy-"},
+				{Name: "nongit", Path: nonGitDir, BeadsDir: filepath.Join(nonGitDir, ".beads"), Prefix: "nongit-"},
+			},
+		})
+		if cmd := m.startHistoryLoad(); cmd != nil {
+			if msg := cmd(); msg != nil {
+				u, _ := m.Update(msg)
+				m = u.(*Model)
+			}
+		}
+		rep := m.historyFullReport
+		if rep == nil {
+			t.Fatalf("expected history report with date SetAsOfRevision(\"2026-01-15\"), status=%q", m.statusMsg)
+		}
+
+		// Positive observables:
+		// 1. Date revision "2026-01-15" resolved to 2026-01-10 commit (including shaDBOnlyJan10 and shaLegacyJan10), excluding shaFebFuture!
+		// 2. Non-git sibling target did NOT inflate distinctRoots from 1 to 2, so file paths stay repo-root-relative ("services/dbonly/store.go" and "legacy/old.go").
+		// 3. Depth-1 "legacy" subtreePrefix ("legacy/") disambiguated colliding "bd-1" from "dbonly".
+		dbHist := rep.Histories["dbonly-bd-1"]
+		sawDBJan10, sawFebOnDB, badDBPath := false, false, false
+		for _, cc := range dbHist.Commits {
+			if cc.SHA == shaDBOnlyJan10 {
+				sawDBJan10 = true
+				for _, f := range cc.Files {
+					if f.Path != "services/dbonly/store.go" {
+						badDBPath = true
+					}
+				}
+			}
+			if cc.SHA == shaFebFuture || cc.SHA == shaLegacyJan10 {
+				sawFebOnDB = true
+			}
+		}
+		if !sawDBJan10 || sawFebOnDB || badDBPath {
+			t.Fatalf("dbonly correlation failed: sawJan10=%v sawFebOrLegacy=%v badPath=%v commits=%+v", sawDBJan10, sawFebOnDB, badDBPath, dbHist.Commits)
+		}
+
+		legHist := rep.Histories["legacy-bd-1"]
+		sawLegJan10, leakedDBOntoLeg, badLegPath := false, false, false
+		for _, cc := range legHist.Commits {
+			if cc.SHA == shaLegacyJan10 {
+				sawLegJan10 = true
+				for _, f := range cc.Files {
+					if f.Path != "legacy/old.go" {
+						badLegPath = true
+					}
+				}
+			}
+			if cc.SHA == shaDBOnlyJan10 || cc.SHA == shaFebFuture {
+				leakedDBOntoLeg = true
+			}
+		}
+		if !sawLegJan10 || leakedDBOntoLeg || badLegPath {
+			t.Fatalf("legacy depth-1 correlation failed: sawLeg=%v leaked=%v badPath=%v commits=%+v", sawLegJan10, leakedDBOntoLeg, badLegPath, legHist.Commits)
+		}
+	})
+
+	t.Run("R2_B2_narrow_40x24_toc_verbose_80x32_35_36_cass_and_ultra_tiny_10x5_bounds", func(t *testing.T) {
+		issues := []model.Issue{
+			{ID: "FIT-1", Title: "Boundary Fit Issue", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: refNow, UpdatedAt: refNow},
+		}
+
+		// 1. 40x24 Tutorial with tocVisible=true (both TOC focus and Content focus):
+		m40 := NewModel(copyIssues(issues), nil, "", ReadinessScope{ReferenceNow: refNow})
+		t.Cleanup(m40.Stop)
+		u, _ := m40.Update(tea.WindowSizeMsg{Width: 40, Height: 24})
+		m40 = u.(*Model)
+		m40.openFullTutorialFromFocus(focusList)
+		m40.tutorialModel, _ = m40.tutorialModel.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("t")}) // tocVisible=true, focus=TOC
+		tocFocusedOut := ansi.Strip(m40.View())
+		if gotW, gotH := lipgloss.Width(tocFocusedOut), lipgloss.Height(tocFocusedOut); gotW > 40 || gotH != 24 {
+			t.Fatalf("40x24 TOC-focused m.View() = %dx%d, want <=40x24:\n%s", gotW, gotH, tocFocusedOut)
+		}
+		if !strings.Contains(tocFocusedOut, "╭") || !strings.Contains(tocFocusedOut, "╰") || !strings.Contains(tocFocusedOut, "Contents") {
+			t.Fatalf("40x24 TOC-focused Tutorial clipped border or TOC:\n%s", tocFocusedOut)
+		}
+		m40.tutorialModel, _ = m40.tutorialModel.Update(tea.KeyMsg{Type: tea.KeyTab}) // tocVisible=true, focus=Content
+		contentFocusedOut := ansi.Strip(m40.View())
+		if gotW, gotH := lipgloss.Width(contentFocusedOut), lipgloss.Height(contentFocusedOut); gotW > 40 || gotH != 24 {
+			t.Fatalf("40x24 Content-focused (tocVisible=true) m.View() = %dx%d, want <=40x24:\n%s", gotW, gotH, contentFocusedOut)
+		}
+		if !strings.Contains(contentFocusedOut, "╭") || !strings.Contains(contentFocusedOut, "╰") {
+			t.Fatalf("40x24 Content-focused Tutorial clipped border:\n%s", contentFocusedOut)
+		}
+
+		// 2. 80x32, 80x35, and 80x36 CassSessionModal with 5 verbose sessions:
+		var verboseSessions []cass.ScoredResult
+		for i := 1; i <= 5; i++ {
+			verboseSessions = append(verboseSessions, cass.ScoredResult{
+				SearchResult: cass.SearchResult{
+					Agent:     fmt.Sprintf("claude-opus-%d", i),
+					Timestamp: refNow.Add(-time.Duration(i) * time.Hour),
+					Snippet:   "First verbose preview line with details\nSecond verbose preview line with details\nThird verbose preview line with details",
+				},
+				Strategy: cass.StrategyKeywords,
+				Keywords: []string{"workspace-correlation", "monorepo-subtree", "sliding-window-modal", "overflow-protection", "extra-long-keyword-token"},
+			})
+		}
+		for _, h := range []int{32, 35, 36} {
+			mCass := NewModel(copyIssues(issues), nil, "", ReadinessScope{ReferenceNow: refNow})
+			t.Cleanup(mCass.Stop)
+			u, _ = mCass.Update(tea.WindowSizeMsg{Width: 80, Height: h})
+			mCass = u.(*Model)
+			mCass.cassModal = NewCassSessionModalWithOptions("FIT-1", cass.CorrelationResult{BeadID: "FIT-1", TopSessions: verboseSessions}, mCass.theme, CassSessionModalOptions{
+				Workspace:    "/very/deep/polyrepo/workspace/directory/path/for/cass/command/wrapping/check",
+				ReferenceNow: refNow,
+			})
+			mCass.cassModal.SetSize(80, h)
+			directModal := ansi.Strip(mCass.cassModal.View())
+			if dmW, dmH := lipgloss.Width(directModal), lipgloss.Height(directModal); dmW > 80 || dmH > h || !strings.Contains(directModal, "╭") || !strings.Contains(directModal, "╰") {
+				t.Fatalf("direct CassSessionModal.View() at 80x%d = %dx%d clipped border:\n%s", h, dmW, dmH, directModal)
+			}
+			mCass.showCassModal = true
+			mCass.focused = focusCassModal
+			fullCass := ansi.Strip(mCass.View())
+			if fcW, fcH := lipgloss.Width(fullCass), lipgloss.Height(fullCass); fcW > 80 || fcH != h || !strings.Contains(fullCass, "╭") || !strings.Contains(fullCass, "╰") {
+				t.Fatalf("full m.View() CassSessionModal at 80x%d = %dx%d clipped border:\n%s", h, fcW, fcH, fullCass)
+			}
+		}
+
+		// 3. 10x5 ultra-tiny TutorialModel (normal + empty-state) and CassSessionModal:
+		tutTiny := NewTutorialModel(DefaultTheme(lipgloss.NewRenderer(os.Stdout)))
+		tutTiny.SetSize(10, 5)
+		tinyTutView := ansi.Strip(tutTiny.View())
+		if w, h := lipgloss.Width(tinyTutView), lipgloss.Height(tinyTutView); w > 10 || h > 5 {
+			t.Fatalf("10x5 TutorialModel.View() = %dx%d, want <=10x5:\n%q", w, h, tinyTutView)
+		}
+		tutTiny.pages = nil
+		tinyEmptyView := ansi.Strip(tutTiny.View())
+		if w, h := lipgloss.Width(tinyEmptyView), lipgloss.Height(tinyEmptyView); w > 10 || h > 5 {
+			t.Fatalf("10x5 TutorialModel empty state = %dx%d, want <=10x5:\n%q", w, h, tinyEmptyView)
+		}
+
+		cassTiny := NewCassSessionModalWithOptions("FIT-1", cass.CorrelationResult{BeadID: "FIT-1", TopSessions: verboseSessions}, DefaultTheme(lipgloss.NewRenderer(os.Stdout)), CassSessionModalOptions{
+			Workspace:    "/very/long/path",
+			ReferenceNow: refNow,
+		})
+		cassTiny.SetSize(10, 5)
+		tinyCassView := ansi.Strip(cassTiny.View())
+		if w, h := lipgloss.Width(tinyCassView), lipgloss.Height(tinyCassView); w > 10 || h > 5 {
+			t.Fatalf("10x5 CassSessionModal.View() = %dx%d, want <=10x5:\n%q", w, h, tinyCassView)
+		}
+	})
+
+	t.Run("R2_B3_board_H_L_and_search_n_collapse_hidden_expanded_card_so_esc_exits_cleanly", func(t *testing.T) {
+		issues := []model.Issue{
+			{ID: "B-OPEN", Title: "Match Open", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: refNow, UpdatedAt: refNow},
+			{ID: "B-CLOSED", Title: "Match Closed", Status: model.StatusClosed, Priority: 2, IssueType: model.TypeTask, CreatedAt: refNow, UpdatedAt: refNow},
+		}
+		m := NewModel(copyIssues(issues), nil, "", ReadinessScope{ReferenceNow: refNow})
+		t.Cleanup(m.Stop)
+		u, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+		m = u.(*Model)
+
+		// Enter Board ('b'), expand B-OPEN ('d'), press 'L' to jump to Closed column -> Esc must exit Board immediately (not swallowed by hidden expandedCardID!).
+		u, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("b")})
+		m = u.(*Model)
+		u, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("d")})
+		m = u.(*Model)
+		if !m.board.HasExpandedCard() {
+			t.Fatal("precondition: expected B-OPEN expanded")
+		}
+		u, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("L")})
+		m = u.(*Model)
+		if m.board.HasExpandedCard() {
+			t.Fatal("expected 'L' column jump to collapse hidden expanded card")
+		}
+		u, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+		m = u.(*Model)
+		if m.isBoardView {
+			t.Fatal("stale expandedCardID swallowed Esc after 'L' column jump")
+		}
+	})
+}

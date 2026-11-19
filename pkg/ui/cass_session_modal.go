@@ -14,6 +14,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 const clipboardCopyTimeout = 2 * time.Second
@@ -176,16 +177,30 @@ func (m CassSessionModal) Update(msg tea.Msg) (CassSessionModal, tea.Cmd) {
 func (m CassSessionModal) effectiveWidth() int {
 	modalWidth := m.width
 	if modalWidth <= 0 {
-		modalWidth = 70
+		modalWidth = 76
+		if m.termWidth <= 0 {
+			modalWidth = 70
+		}
 	}
 	if m.termWidth > 0 {
-		modalWidth = min(modalWidth, max(24, m.termWidth-4))
+		maxBox := max(1, min(m.termWidth-2, 86))
+		if m.termWidth <= 14 {
+			return maxBox
+		}
+		modalWidth = min(modalWidth, max(1, min(m.termWidth-4, maxBox)))
 	}
-	return modalWidth
+	return max(1, modalWidth)
 }
 
 // View renders the modal.
 func (m CassSessionModal) View() string {
+	if m.height > 0 && m.height < 3 {
+		maxW := 40
+		if m.termWidth > 0 {
+			maxW = m.termWidth
+		}
+		return fitBlock("📎 Related Coding Sessions", max(1, maxW), m.height)
+	}
 	r := m.theme.Renderer
 	modalWidth := m.effectiveWidth()
 
@@ -197,12 +212,21 @@ func (m CassSessionModal) View() string {
 	if m.height > 0 && m.height <= 25 {
 		vertPad = 0
 	}
-	innerWidth := max(16, modalWidth-4)
+	horizPad := 2
+	if modalWidth <= 6 {
+		horizPad = 0
+	} else if modalWidth <= 12 {
+		horizPad = 1
+	}
+	innerWidth := max(1, modalWidth-2*horizPad)
 	modalStyle := r.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(m.theme.Primary).
-		Padding(vertPad, 2).
+		Padding(vertPad, horizPad).
 		Width(modalWidth)
+	if m.height > 0 {
+		modalStyle = modalStyle.MaxHeight(max(1, m.height))
+	}
 
 	// Header style
 	headerStyle := r.NewStyle().
@@ -225,11 +249,17 @@ func (m CassSessionModal) View() string {
 		Foreground(m.theme.Subtext).
 		Italic(true)
 
+	snippetHPad := 1
+	snippetBoxW := max(1, min(max(1, innerWidth-2), max(1, modalWidth-10)))
+	if innerWidth <= 8 {
+		snippetHPad = 0
+		snippetBoxW = max(1, innerWidth-2)
+	}
 	snippetBoxStyle := r.NewStyle().
 		Border(lipgloss.NormalBorder()).
 		BorderForeground(m.theme.Border).
-		Padding(0, 1).
-		Width(max(14, modalWidth-10))
+		Padding(0, snippetHPad).
+		Width(snippetBoxW)
 
 	footerStyle := r.NewStyle().
 		Foreground(ColorFooterHint).
@@ -240,9 +270,13 @@ func (m CassSessionModal) View() string {
 
 	// Header
 	const headerTitle = "📎 Related Coding Sessions"
-	b.WriteString(headerStyle.Render(headerTitle))
-	b.WriteString("  ")
-	b.WriteString(beadIDStyle.Render(truncateRunesHelper(m.beadID, max(8, innerWidth-28), "…")))
+	if innerWidth <= 28 {
+		b.WriteString(headerStyle.Render(truncateRunesHelper(headerTitle+" "+m.beadID, innerWidth, "…")))
+	} else {
+		b.WriteString(headerStyle.Render(headerTitle))
+		b.WriteString("  ")
+		b.WriteString(beadIDStyle.Render(truncateRunesHelper(m.beadID, max(4, innerWidth-28), "…")))
+	}
 	b.WriteString("\n\n")
 
 	// Sessions
@@ -292,10 +326,10 @@ func (m CassSessionModal) View() string {
 			}
 			b.WriteString("\n")
 
-			// Match reason (clamped to a single line on constrained terminal heights)
+			// Match reason (clamped to a single line on sized constrained terminals)
 			matchReason := m.formatMatchReason(session)
-			if m.height > 0 && m.height <= 30 {
-				matchReason = truncateRunesHelper(matchReason, max(10, innerWidth-4), "…")
+			if m.termWidth > 0 && m.height > 0 && m.height < 48 {
+				matchReason = truncateRunesHelper(matchReason, max(1, innerWidth-4), "…")
 			}
 			b.WriteString("    ")
 			b.WriteString(matchReasonStyle.Render(matchReason))
@@ -307,7 +341,7 @@ func (m CassSessionModal) View() string {
 			b.WriteString("\n\n")
 		}
 
-		// Show count of off-screen sessions and CLI search command (single line when height-constrained)
+		// Show count of off-screen sessions and CLI search command (single line when sized & height-constrained)
 		if len(m.sessions) > slots {
 			extra := len(m.sessions) - slots
 			scrollArrows := ""
@@ -324,7 +358,7 @@ func (m CassSessionModal) View() string {
 				moreText += "s"
 			}
 			moreText += fmt.Sprintf(" - run: %s)", m.searchCmd)
-			if m.height > 0 && m.height <= 30 {
+			if m.termWidth > 0 && m.height > 0 && m.height < 48 {
 				moreText = truncateRunesHelper(moreText, innerWidth, "…")
 			}
 			b.WriteString(matchReasonStyle.Render(moreText))
@@ -337,10 +371,33 @@ func (m CassSessionModal) View() string {
 	if showCopied {
 		footerText = "[j/k] Navigate    ✓ Copied!              [V/Esc] Close"
 	}
-	footerText = truncateRunesHelper(footerText, innerWidth, "…")
+	if m.termWidth > 0 {
+		footerText = truncateRunesHelper(footerText, innerWidth, "…")
+	}
 	b.WriteString(footerStyle.Render(footerText))
 
-	return modalStyle.Render(b.String())
+	assembled := b.String()
+	if m.termWidth > 0 {
+		suffix := "…"
+		if innerWidth <= 2 {
+			suffix = ""
+		}
+		lines := strings.Split(assembled, "\n")
+		for i, ln := range lines {
+			if lipgloss.Width(ln) > innerWidth {
+				lines[i] = ansi.Truncate(ln, innerWidth, suffix)
+			}
+		}
+		if m.height > 0 {
+			maxInner := max(1, m.height-2-2*vertPad)
+			if len(lines) > maxInner {
+				lines = lines[:maxInner]
+			}
+		}
+		assembled = strings.Join(lines, "\n")
+	}
+
+	return modalStyle.Render(assembled)
 }
 
 // formatMatchReason creates a human-readable match reason string.
@@ -377,7 +434,10 @@ func (m CassSessionModal) formatSnippet(snippet string) string {
 			continue
 		}
 		// Truncate long lines (UTF-8 safe)
-		maxLineLen := max(10, m.effectiveWidth()-14) // Account for box padding
+		maxLineLen := max(1, m.effectiveWidth()-14)
+		if m.effectiveWidth() <= 16 {
+			maxLineLen = max(1, m.effectiveWidth()-4)
+		}
 		line = truncateRunesHelper(line, maxLineLen, "...")
 		cleaned = append(cleaned, line)
 		if len(cleaned) >= 3 {
