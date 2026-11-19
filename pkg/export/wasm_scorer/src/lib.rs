@@ -241,7 +241,7 @@ fn normalize_recency(days_since_update: f64) -> f64 {
 
 fn normalize_pagerank(pagerank: f64) -> f64 {
     if pagerank.is_finite() {
-        pagerank
+        pagerank.clamp(0.0, 1.0)
     } else {
         0.5
     }
@@ -333,5 +333,63 @@ mod tests {
         assert!((normalize_recency(-1.0) - 0.5).abs() < 1e-12);
         assert!((normalize_recency(f64::NAN) - 0.5).abs() < 1e-12);
         assert!((normalize_recency(0.0) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn pagerank_clamps_out_of_range_and_defaults_non_finite() {
+        assert!((normalize_pagerank(2.5) - 1.0).abs() < 1e-12);
+        assert!((normalize_pagerank(-0.5) - 0.0).abs() < 1e-12);
+        assert!((normalize_pagerank(0.4) - 0.4).abs() < 1e-12);
+        assert!((normalize_pagerank(f64::NAN) - 0.5).abs() < 1e-12);
+        assert!((normalize_pagerank(f64::INFINITY) - 0.5).abs() < 1e-12);
+        assert!((normalize_pagerank(f64::NEG_INFINITY) - 0.5).abs() < 1e-12);
+
+        let mut scorer = HybridScorer::new("{}");
+        let payload = serde_json::json!([
+            {
+                "id": "pr-over",
+                "text_score": 0.8,
+                "pagerank": 2.5,
+                "status": 0,
+                "priority": 1,
+                "blocker_count": 2,
+                "days_since_update": 0.0
+            },
+            {
+                "id": "pr-unit",
+                "text_score": 0.8,
+                "pagerank": 1.0,
+                "status": 0,
+                "priority": 1,
+                "blocker_count": 2,
+                "days_since_update": 0.0
+            },
+            {
+                "id": "pr-neg",
+                "text_score": 0.8,
+                "pagerank": -0.5,
+                "status": 0,
+                "priority": 1,
+                "blocker_count": 2,
+                "days_since_update": 0.0
+            },
+            {
+                "id": "pr-zero",
+                "text_score": 0.8,
+                "pagerank": 0.0,
+                "status": 0,
+                "priority": 1,
+                "blocker_count": 2,
+                "days_since_update": 0.0
+            }
+        ]);
+        let raw = scorer.score_batch(&payload.to_string());
+        let parsed: Vec<ScoredResult> = serde_json::from_str(&raw).expect("valid JSON output");
+        let by_id: std::collections::HashMap<&str, &ScoredResult> =
+            parsed.iter().map(|r| (r.id.as_str(), r)).collect();
+        assert!((by_id["pr-over"].components[0] - 1.0).abs() < 1e-12);
+        assert!((by_id["pr-over"].score - by_id["pr-unit"].score).abs() < 1e-12);
+        assert!((by_id["pr-neg"].components[0] - 0.0).abs() < 1e-12);
+        assert!((by_id["pr-neg"].score - by_id["pr-zero"].score).abs() < 1e-12);
     }
 }

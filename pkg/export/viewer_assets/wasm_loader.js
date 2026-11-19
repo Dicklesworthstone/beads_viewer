@@ -224,7 +224,9 @@ function scoreBatchHybrid(results, weights, options = {}) {
   const payload = results.map(r => ({
     id: String(r.id ?? r.issue_id ?? ''),
     text_score: toNumber(r.textScore ?? r.text_score, 0),
-    pagerank: (typeof r.pagerank === 'number' && Number.isFinite(r.pagerank)) ? r.pagerank : 0.5,
+    pagerank: (typeof r.pagerank === 'number' && Number.isFinite(r.pagerank))
+      ? Math.min(1, Math.max(0, r.pagerank))
+      : 0.5,
     status: statusToCode(resolveHybridEffectiveStatus(r, refNowMs)),
     priority: priorityToCode(r.priority),
     blocker_count: Math.max(0, toInt(r.blockerCount ?? r.impact ?? r.blocks_count ?? r.dependent_count ?? 0, 0)),

@@ -257,6 +257,152 @@
     }
   }
 
+  async function verifyScoreBatchHybridPageRankClampingParity() {
+    if (!wasmLoader || typeof wasmLoader.scoreBatchHybrid !== 'function') {
+      throw new Error('wasm_loader.js scoreBatchHybrid unavailable');
+    }
+    const nowIso = new Date().toISOString();
+    const clampRows = [
+      { id: 'pr-over', textScore: 0.8, pagerank: 2.5, status: 'open', priority: 1, blockerCount: 2, updatedAt: nowIso },
+      { id: 'pr-unit', textScore: 0.8, pagerank: 1.0, status: 'open', priority: 1, blockerCount: 2, updatedAt: nowIso },
+      { id: 'pr-mid', textScore: 0.8, pagerank: 0.4, status: 'open', priority: 1, blockerCount: 2, updatedAt: nowIso },
+      { id: 'pr-nan', textScore: 0.8, pagerank: Number.NaN, status: 'open', priority: 1, blockerCount: 2, updatedAt: nowIso },
+      { id: 'pr-neg', textScore: 0.8, pagerank: -0.5, status: 'open', priority: 1, blockerCount: 2, updatedAt: nowIso },
+      { id: 'pr-zero', textScore: 0.8, pagerank: 0.0, status: 'open', priority: 1, blockerCount: 2, updatedAt: nowIso },
+    ];
+
+    const jsScorer = new ScorerClass(Presets.default);
+    const jsRanked = jsScorer.scoreAndRank(clampRows);
+    const jsById = new Map(jsRanked.map(r => [r.id, r]));
+
+    assertClose(jsById.get('pr-over').component_scores.pagerank, 1.0, 1e-9, 'JS HybridScorer clamps pagerank 2.5 -> 1.0');
+    assertClose(jsById.get('pr-neg').component_scores.pagerank, 0.0, 1e-9, 'JS HybridScorer clamps pagerank -0.5 -> 0.0');
+    assertClose(jsById.get('pr-nan').component_scores.pagerank, 0.5, 1e-9, 'JS HybridScorer defaults NaN -> 0.5');
+    assertClose(jsById.get('pr-mid').component_scores.pagerank, 0.4, 1e-9, 'JS HybridScorer preserves in-range 0.4');
+    assertClose(jsById.get('pr-over').hybrid_score, jsById.get('pr-unit').hybrid_score, 1e-9, 'JS HybridScorer 2.5 matches 1.0 score');
+    assertClose(jsById.get('pr-neg').hybrid_score, jsById.get('pr-zero').hybrid_score, 1e-9, 'JS HybridScorer -0.5 matches 0.0 score');
+
+    // 1. Verify scoreBatchHybrid fallback parity vs HybridScorer
+    const fallbackRanked = wasmLoader.scoreBatchHybrid(clampRows, Presets.default);
+    const fbById = new Map(fallbackRanked.map(r => [r.id, r]));
+    for (const row of clampRows) {
+      assertClose(
+        fbById.get(row.id).component_scores.pagerank,
+        jsById.get(row.id).component_scores.pagerank,
+        1e-9,
+        `scoreBatchHybrid fallback pagerank component parity for ${row.id}`
+      );
+      assertClose(
+        fbById.get(row.id).hybrid_score,
+        jsById.get(row.id).hybrid_score,
+        1e-9,
+        `scoreBatchHybrid fallback hybrid_score parity for ${row.id}`
+      );
+    }
+
+    // 2. Verify wasm_loader.js:scoreBatchHybrid non-fallback WASM payload clamping (with JS fallback disabled)
+    let capturedPayload = null;
+    class PassthroughWasmScorer {
+      constructor(_cfgJson) {}
+      score_batch(payloadJson) {
+        capturedPayload = JSON.parse(payloadJson);
+        return JSON.stringify(capturedPayload.map(item => ({
+          id: item.id,
+          score: 0.4 * item.text_score + 0.2 * item.pagerank + 0.15 * 1.0 + 0.1 * 1.0 + 0.1 * 0.8 + 0.05 * 1.0,
+          components: [item.pagerank, 1.0, 1.0, 0.8, 1.0],
+        })));
+      }
+      free() {}
+    }
+
+    const savedGlobalScorer = globalThis.HybridScorer;
+    try {
+      globalThis.HybridScorer = undefined;
+      wasmLoader.__setHybridWasmCtorForTest(PassthroughWasmScorer);
+      const wasmLoaderRows = wasmLoader.scoreBatchHybrid(clampRows, Presets.default);
+      const payloadById = new Map((capturedPayload || []).map(p => [p.id, p]));
+      assertClose(payloadById.get('pr-over').pagerank, 1.0, 1e-9, 'wasm_loader clamps payload pagerank 2.5 -> 1.0');
+      assertClose(payloadById.get('pr-neg').pagerank, 0.0, 1e-9, 'wasm_loader clamps payload pagerank -0.5 -> 0.0');
+      assertClose(payloadById.get('pr-nan').pagerank, 0.5, 1e-9, 'wasm_loader defaults payload NaN -> 0.5');
+      assertClose(payloadById.get('pr-mid').pagerank, 0.4, 1e-9, 'wasm_loader preserves payload 0.4');
+
+      const wlById = new Map(wasmLoaderRows.map(r => [r.id, r]));
+      for (const row of clampRows) {
+        assertClose(
+          wlById.get(row.id).component_scores.pagerank,
+          jsById.get(row.id).component_scores.pagerank,
+          1e-9,
+          `wasm_loader non-fallback pagerank parity vs HybridScorer for ${row.id}`
+        );
+        assertClose(
+          wlById.get(row.id).hybrid_score,
+          jsById.get(row.id).hybrid_score,
+          1e-6,
+          `wasm_loader non-fallback hybrid_score parity vs HybridScorer for ${row.id}`
+        );
+      }
+    } finally {
+      wasmLoader.__setHybridWasmCtorForTest(null);
+      globalThis.HybridScorer = savedGlobalScorer;
+    }
+
+    // 3. When compiled bv_hybrid_scorer_bg.wasm is available, verify real Rust WASM binary clamping & end-to-end parity
+    if (typeof require === 'function') {
+      const fs = require('node:fs');
+      const path = require('node:path');
+      const { pathToFileURL } = require('node:url');
+      const wasmDir = process.env.BV_HYBRID_WASM_DIR || path.join(__dirname, 'wasm');
+      const wasmJsPath = path.join(wasmDir, 'bv_hybrid_scorer.js');
+      const wasmBgPath = path.join(wasmDir, 'bv_hybrid_scorer_bg.wasm');
+      if (fs.existsSync(wasmJsPath) && fs.existsSync(wasmBgPath)) {
+        const wasmMod = await import(pathToFileURL(wasmJsPath).href);
+        wasmMod.initSync({ module: fs.readFileSync(wasmBgPath) });
+        const RealWasmScorer = wasmMod.HybridScorer;
+
+        // Direct Rust WASM check (unclamped raw JSON input -> Rust normalize_pagerank clamps to [0.0, 1.0])
+        const rawDirectScorer = new RealWasmScorer(JSON.stringify(Presets.default));
+        try {
+          const rawDirectParsed = JSON.parse(rawDirectScorer.score_batch(JSON.stringify([
+            { id: 'raw-over', text_score: 0.8, pagerank: 2.5, status: 0, priority: 1, blocker_count: 2, days_since_update: 0.0 },
+            { id: 'raw-neg', text_score: 0.8, pagerank: -0.5, status: 0, priority: 1, blocker_count: 2, days_since_update: 0.0 },
+            { id: 'raw-mid', text_score: 0.8, pagerank: 0.4, status: 0, priority: 1, blocker_count: 2, days_since_update: 0.0 },
+          ])));
+          const rawDirectById = new Map(rawDirectParsed.map(r => [r.id, r]));
+          assertClose(rawDirectById.get('raw-over').components[0], 1.0, 1e-9, 'real Rust WASM clamps pagerank 2.5 -> 1.0');
+          assertClose(rawDirectById.get('raw-neg').components[0], 0.0, 1e-9, 'real Rust WASM clamps pagerank -0.5 -> 0.0');
+          assertClose(rawDirectById.get('raw-mid').components[0], 0.4, 1e-9, 'real Rust WASM preserves pagerank 0.4');
+        } finally {
+          rawDirectScorer.free();
+        }
+
+        // End-to-end scoreBatchHybrid + real Rust WASM vs JS HybridScorer
+        try {
+          globalThis.HybridScorer = undefined;
+          wasmLoader.__setHybridWasmCtorForTest(RealWasmScorer);
+          const realWasmRanked = wasmLoader.scoreBatchHybrid(clampRows, Presets.default);
+          const realById = new Map(realWasmRanked.map(r => [r.id, r]));
+          for (const row of clampRows) {
+            assertClose(
+              realById.get(row.id).component_scores.pagerank,
+              jsById.get(row.id).component_scores.pagerank,
+              1e-9,
+              `real WASM scoreBatchHybrid pagerank parity vs HybridScorer for ${row.id}`
+            );
+            assertClose(
+              realById.get(row.id).hybrid_score,
+              jsById.get(row.id).hybrid_score,
+              1e-5,
+              `real WASM scoreBatchHybrid hybrid_score parity vs HybridScorer for ${row.id}`
+            );
+          }
+        } finally {
+          wasmLoader.__setHybridWasmCtorForTest(null);
+          globalThis.HybridScorer = savedGlobalScorer;
+        }
+      }
+    }
+  }
+
   if (typeof require === 'function') {
     const test = require('node:test');
     test('HybridScorer baseline scoreAndRank', () => {
@@ -268,10 +414,14 @@
     test('HybridScorer active PageRank normalization preserves active spread and clamps closed hubs to 1.0', () => {
       verifyActivePageRankClamping();
     });
+    test('scoreBatchHybrid and HybridScorer clamp out-of-range PageRank [0.0, 1.0] with exact parity', async () => {
+      await verifyScoreBatchHybridPageRankClampingParity();
+    });
   } else {
     verifyBaselineScore();
     verifyEphemeralParityAndControls();
     verifyActivePageRankClamping();
+    verifyScoreBatchHybridPageRankClampingParity();
     console.log('HybridScorer tests passed');
   }
 })();
