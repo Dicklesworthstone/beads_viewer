@@ -1209,7 +1209,7 @@ export function computeHITSMetrics(wasmGraph) {
     return { hub: result.hubs, authority: result.authorities };
 }
 
-function computeMetrics() {
+function computeMetrics(layout = null) {
     if (!store.wasmReady || !store.wasmGraph) return;
 
     const start = performance.now();
@@ -1225,8 +1225,44 @@ function computeMetrics() {
         // Critical path heights (depth on active DAG, unaffected by closed cycles)
         store.metrics.criticalPath = activeGraph.criticalPathHeights();
 
-        // Eigenvector (influence)
-        store.metrics.eigenvector = store.wasmGraph.eigenvectorDefault();
+        // Eigenvector (influence): on DAGs, directed power iteration returns a flat
+        // uniform vector (max - min < 1e-9 when len > 1); prefer differentiated
+        // Go eigenvector values exported in issue_overview_mv / layout when present.
+        let eigScores = store.wasmGraph.eigenvectorDefault();
+        if (eigScores && eigScores.length > 1) {
+            let minEv = Infinity;
+            let maxEv = -Infinity;
+            for (let i = 0; i < eigScores.length; i++) {
+                const v = Number(eigScores[i]) || 0;
+                if (v < minEv) minEv = v;
+                if (v > maxEv) maxEv = v;
+            }
+            if (maxEv - minEv < 1e-9) {
+                const layoutEig = layout?.centralityValues?.eigenvector || layout?.centrality?.eigenvector || null;
+                const fallbackEig = new Float64Array(fullNodeCount);
+                let minFb = Infinity;
+                let maxFb = -Infinity;
+                let hasFb = false;
+                for (let i = 0; i < fullNodeCount; i++) {
+                    const id = store.wasmGraph.nodeId(i);
+                    const issue = id ? store.nodeMap.get(id) : null;
+                    const rawVal = (layoutEig && typeof layoutEig === 'object' && Object.hasOwn(layoutEig, id))
+                        ? layoutEig[id]
+                        : issue?.eigenvector;
+                    const numVal = Number(rawVal);
+                    if (rawVal !== undefined && rawVal !== null && Number.isFinite(numVal)) {
+                        fallbackEig[i] = numVal;
+                        if (numVal < minFb) minFb = numVal;
+                        if (numVal > maxFb) maxFb = numVal;
+                        hasFb = true;
+                    }
+                }
+                if (hasFb && maxFb - minFb >= 1e-9) {
+                    eigScores = fallbackEig;
+                }
+            }
+        }
+        store.metrics.eigenvector = eigScores;
 
         // K-core (cohesion) computed on active subgraph and projected to full graph indices (0 for closed)
         const projectedKCore = new Uint32Array(fullNodeCount);
@@ -1469,7 +1505,13 @@ export async function initGraph(containerId, options = {}) {
  */
 export async function loadPrecomputedLayout(issues, dependencies) {
     try {
-        const response = await fetch('data/graph_layout.json', { signal: AbortSignal.timeout(3000) });
+        const meta = typeof window !== 'undefined'
+            ? (window.BV_META || window.beadsViewer?.getMeta?.() || null)
+            : null;
+        const generatedRaw = meta?.generated_at ?? meta?.exported_at ?? meta?.created_at ?? meta?.timestamp;
+        const parsedTs = generatedRaw ? Date.parse(String(generatedRaw)) : NaN;
+        const cacheToken = Number.isFinite(parsedTs) && parsedTs > 0 ? parsedTs : Date.now();
+        const response = await fetch(`data/graph_layout.json?_t=${cacheToken}`, { signal: AbortSignal.timeout(3000) });
         if (!response.ok) return null;
         return validateLayout(await response.json(), issues, dependencies);
     } catch (e) {
@@ -1571,7 +1613,40 @@ export function loadData(issues, dependencies, layout = null) {
                 }
             }
         }
-        computeMetrics();
+        computeMetrics(layout);
+    } else if (issues.length > 0) {
+        const centrality = layout?.centralityValues;
+        const hasClosedIssues = issues.some(isResolvedIssue);
+        const prVec = new Float64Array(issues.length);
+        const bwVec = new Float64Array(issues.length);
+        const evVec = new Float64Array(issues.length);
+        const cpVec = new Float64Array(issues.length);
+        const cycleIdxList = [];
+        issues.forEach((issue, i) => {
+            const prVal = centrality?.pagerank?.[issue.id] ?? Number(issue.pagerank);
+            prVec[i] = Number.isFinite(prVal) ? prVal : 0;
+            const bwRaw = (!hasClosedIssues && centrality?.betweenness?.[issue.id] !== undefined)
+                ? centrality.betweenness[issue.id]
+                : Number(issue.betweenness);
+            bwVec[i] = (!isResolvedIssue(issue) && Number.isFinite(bwRaw)) ? bwRaw : 0;
+            const evVal = Number(issue.eigenvector);
+            evVec[i] = Number.isFinite(evVal) ? evVal : 0;
+            const cpVal = Number(issue.critical_path_depth ?? issue.critical_depth);
+            cpVec[i] = Number.isFinite(cpVal) ? cpVal : 0;
+            if (!isResolvedIssue(issue) && Boolean(issue.in_cycle)) {
+                cycleIdxList.push(i);
+            }
+        });
+        store.metrics.pagerank = prVec;
+        store.metrics.betweenness = bwVec;
+        store.metrics.eigenvector = evVec;
+        store.metrics.criticalPath = cpVec;
+        store.metrics.hasCycles = cycleIdxList.length > 0;
+        store.metrics.cycles = {
+            has_cycles: cycleIdxList.length > 0,
+            count: cycleIdxList.length > 0 ? 1 : 0,
+            cycles: cycleIdxList.length > 0 ? [cycleIdxList] : []
+        };
     }
 
     // Build label color map for galaxy view
@@ -1659,8 +1734,12 @@ function prepareGraphData(layout = null) {
     // Enrich nodes with computed data
     const activeGraph = store.activeWasmGraph || store.wasmGraph;
     nodes = nodes.map(issue => {
-        const idx = store.wasmReady ? store.wasmGraph?.nodeIdx(issue.id) : undefined;
-        const activeIdx = store.wasmReady ? activeGraph?.nodeIdx(issue.id) : undefined;
+        const idx = store.wasmReady
+            ? store.wasmGraph?.nodeIdx(issue.id)
+            : store.nodeIndexMap.get(issue.id);
+        const activeIdx = store.wasmReady
+            ? activeGraph?.nodeIdx(issue.id)
+            : store.nodeIndexMap.get(issue.id);
         const pos = layout?.positions?.[issue.id]; // Pre-computed position
         const blockerCount = issue.blocker_count
             ?? dependencies.filter(d => isBlockingDependency(d) && d.issue_id === issue.id).length;
@@ -1714,7 +1793,9 @@ function prepareGraphData(layout = null) {
     if (metrics.cycles?.cycles) {
         const cycleNodes = new Set(metrics.cycles.cycles.flat());
         nodes.forEach(node => {
-            const activeIdx = activeGraph?.nodeIdx(node.id);
+            const activeIdx = store.wasmReady
+                ? activeGraph?.nodeIdx(node.id)
+                : store.nodeIndexMap.get(node.id);
             node.inCycle = activeIdx !== undefined && cycleNodes.has(activeIdx);
         });
     }

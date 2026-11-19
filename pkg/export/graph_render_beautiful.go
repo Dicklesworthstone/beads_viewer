@@ -1332,12 +1332,28 @@ function getConnectedNodes(nodeId, depth = 2) {
 }
 
 const container = document.getElementById('graph-container');
+function buildGraphLinksForMode(blockingOnly) {
+    return DATA.links
+        .filter(l => !blockingOnly || isBlockingLinkType(l.type))
+        .map(l => ({
+            ...l,
+            source: typeof l.source === 'object' ? l.source.id : l.source,
+            target: typeof l.target === 'object' ? l.target.id : l.target,
+        }));
+}
+function setGraphLinksMode(blockingOnly) {
+    if (typeof Graph === 'undefined' || !Graph) return;
+    const cur = Graph.graphData();
+    const nodes = Array.isArray(cur?.nodes) && cur.nodes.length > 0 ? cur.nodes : JSON.parse(JSON.stringify(DATA.nodes));
+    Graph.graphData({ nodes, links: buildGraphLinksForMode(blockingOnly) });
+}
 let dagErrorTriggered = false;
 function handleDagCycleError() {
     dagErrorTriggered = true;
     const sel = document.getElementById('view-mode');
     if (sel) sel.value = 'force';
     try { Graph.dagMode(null); } catch (_) {}
+    try { setGraphLinksMode(false); } catch (_) {}
     localStorage.removeItem('bv-graph-layout');
     showToast('Cannot apply DAG layout: dependency cycle detected');
 }
@@ -1347,10 +1363,12 @@ function applyGraphDagMode(mode) {
     if (!mode || mode === 'force') {
         if (sel) sel.value = 'force';
         Graph.dagMode(null);
+        setGraphLinksMode(false);
         localStorage.setItem('bv-graph-layout', 'force');
         return true;
     }
     if (sel) sel.value = mode;
+    setGraphLinksMode(true);
     try {
         Graph.dagMode(mode);
     } catch (err) {
@@ -2082,6 +2100,7 @@ document.getElementById('btn-reset').onclick = () => {
     activePathNodes = null;
     highlightedNodes = new Set();
     Graph.dagMode(null);
+    setGraphLinksMode(false);
     Graph.nodeVal(n => getNodeSize(n));
     Graph.nodeColor(computeNodeColor);
     Graph.linkColor(computeLinkColor);

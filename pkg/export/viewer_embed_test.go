@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -900,5 +901,82 @@ func TestBundle_HybridWasmPreparedAndSkipsDotfilesInOfflineAssets(t *testing.T) 
 	}
 	if strings.Contains(swStr, ".gitignore") || strings.Contains(swStr, ".hidden") {
 		t.Fatalf("dotfiles/dotdirs must be excluded from OFFLINE_ASSETS, got:\n%s", swStr)
+	}
+}
+
+func TestAddScriptCacheBusting_StylesCSSAndHybridBuildScriptDefaultOutDir(t *testing.T) {
+	t.Setenv("SOURCE_DATE_EPOCH", "1700000000")
+	htmlIn := `<link rel="stylesheet" href="styles.css"><link rel='stylesheet' href='styles.css'><link rel="stylesheet" href="vendor/keep.css"><script src="viewer.js"></script>`
+	out := AddScriptCacheBusting(htmlIn)
+
+	// Positive observables: both double- and single-quoted styles.css hrefs receive ?v= cache-buster.
+	if strings.Contains(out, `href="styles.css"`) || strings.Contains(out, `href='styles.css'`) {
+		t.Fatalf("styles.css href was not cache-busted: %s", out)
+	}
+	if !strings.Contains(out, `href="styles.css?v=`) || !strings.Contains(out, `href='styles.css?v=`) {
+		t.Fatalf("expected styles.css?v= in both double- and single-quoted links, got: %s", out)
+	}
+	// Planted negative control: vendor stylesheets remain untouched.
+	if !strings.Contains(out, `href="vendor/keep.css"`) {
+		t.Fatalf("vendor stylesheet should remain untouched, got: %s", out)
+	}
+
+	// Verify scripts/build_hybrid_wasm.sh defaults outside pkg/ (never creating pkg/export/viewer_assets/wasm).
+	scriptPath := filepath.Clean(filepath.Join("..", "..", "scripts", "build_hybrid_wasm.sh"))
+	if _, err := os.Stat(scriptPath); err != nil {
+		t.Fatalf("stat %s: %v", scriptPath, err)
+	}
+	scriptRaw, err := os.ReadFile(scriptPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", scriptPath, err)
+	}
+	if strings.Contains(string(scriptRaw), "pkg/export/viewer_assets/wasm") {
+		t.Fatalf("build_hybrid_wasm.sh must not default to pkg/export/viewer_assets/wasm")
+	}
+
+	if runtime.GOOS != "windows" {
+		binDir := t.TempDir()
+		outLog := filepath.Join(t.TempDir(), "wasm-pack-out.txt")
+		stub := "#!/usr/bin/env bash\nfor ((i=1; i<=$#; i++)); do\n  if [[ \"${!i}\" == \"--out-dir\" ]]; then\n    next=$((i+1))\n    printf '%s' \"${!next}\" > " + fmt.Sprintf("%q", outLog) + "\n  fi\ndone\nexit 0\n"
+		if err := os.WriteFile(filepath.Join(binDir, "wasm-pack"), []byte(stub), 0o755); err != nil {
+			t.Fatalf("write wasm-pack stub: %v", err)
+		}
+		customHybridDir := filepath.Join(t.TempDir(), "hybrid-out")
+		cmd := exec.Command("bash", scriptPath)
+		cmd.Env = append(os.Environ(),
+			"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+			"BV_HYBRID_WASM_DIR="+customHybridDir,
+		)
+		if cmdOut, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("build_hybrid_wasm.sh with stub wasm-pack failed: %v (%s)", err, string(cmdOut))
+		}
+		recordedOut, err := os.ReadFile(outLog)
+		if err != nil {
+			t.Fatalf("read wasm-pack outLog: %v", err)
+		}
+		if string(recordedOut) != customHybridDir {
+			t.Fatalf("build_hybrid_wasm.sh --out-dir = %q, want %q", string(recordedOut), customHybridDir)
+		}
+
+		// Also verify default (no BV_HYBRID_WASM_DIR, no flags) targets .bv/wasm/hybrid outside pkg/export:
+		defaultCmd := exec.Command("bash", scriptPath)
+		var cleanEnv []string
+		for _, kv := range os.Environ() {
+			if !strings.HasPrefix(kv, "BV_HYBRID_WASM_DIR=") && !strings.HasPrefix(kv, "PATH=") {
+				cleanEnv = append(cleanEnv, kv)
+			}
+		}
+		cleanEnv = append(cleanEnv, "PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+		defaultCmd.Env = cleanEnv
+		if cmdOut, err := defaultCmd.CombinedOutput(); err != nil {
+			t.Fatalf("build_hybrid_wasm.sh default invocation failed: %v (%s)", err, string(cmdOut))
+		}
+		recordedDefaultOut, err := os.ReadFile(outLog)
+		if err != nil {
+			t.Fatalf("read wasm-pack default outLog: %v", err)
+		}
+		if !strings.HasSuffix(filepath.ToSlash(string(recordedDefaultOut)), "/.bv/wasm/hybrid") || strings.Contains(filepath.ToSlash(string(recordedDefaultOut)), "/pkg/export/") {
+			t.Fatalf("build_hybrid_wasm.sh default --out-dir = %q, want suffix /.bv/wasm/hybrid outside pkg/export", string(recordedDefaultOut))
+		}
 	}
 }

@@ -293,13 +293,12 @@ impl DiGraph {
         serde_wasm_bindgen::to_value(&scores).unwrap_or(JsValue::NULL)
     }
 
-    /// Compute approximate betweenness centrality using sampling.
+    /// Compute approximate betweenness centrality using deterministic pivot sampling.
     /// Returns array of scores in node index order.
     /// Error: O(1/sqrt(k)) - with k=100, ~10% error in ranking.
     #[wasm_bindgen(js_name = betweennessApprox)]
     pub fn betweenness_approx(&self, sample_size: usize) -> JsValue {
-        use crate::algorithms::betweenness::betweenness_approx;
-        let scores = betweenness_approx(self, sample_size, None);
+        let scores = self.betweenness_approx_seeded(sample_size);
         serde_wasm_bindgen::to_value(&scores).unwrap_or(JsValue::NULL)
     }
 
@@ -724,6 +723,11 @@ impl DiGraph {
     pub(crate) fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }
+
+    /// Deterministic seeded approximate betweenness backing `betweennessApprox`.
+    pub(crate) fn betweenness_approx_seeded(&self, sample_size: usize) -> Vec<f64> {
+        crate::algorithms::betweenness::betweenness_approx(self, sample_size, Some(1))
+    }
 }
 
 impl Default for DiGraph {
@@ -810,5 +814,28 @@ mod tests {
         assert_eq!(g2.edge_count(), 1);
         assert_eq!(g2.node_id(0), Some("a".to_string()));
         assert_eq!(g2.node_id(1), Some("b".to_string()));
+    }
+
+    #[test]
+    fn test_betweenness_approx_seeded_deterministic() {
+        let mut g = DiGraph::new();
+        for i in 0..40 {
+            g.add_node(&format!("n-{i}"));
+        }
+        // Build a two-cluster hourglass through bridge 19 -> 20
+        for i in 0..19 {
+            g.add_edge(i, 19);
+        }
+        g.add_edge(19, 20);
+        for i in 21..40 {
+            g.add_edge(20, i);
+        }
+
+        let first = g.betweenness_approx_seeded(10);
+        for _ in 0..10 {
+            assert_eq!(g.betweenness_approx_seeded(10), first);
+        }
+        assert!(first[19] > 0.0 && first[20] > 0.0, "bridge endpoints must receive positive approx betweenness");
+        assert_eq!(first[0], 0.0, "source leaf must have zero betweenness");
     }
 }

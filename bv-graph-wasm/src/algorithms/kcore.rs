@@ -25,8 +25,10 @@ pub fn kcore(graph: &DiGraph) -> Vec<u32> {
 
     for u in 0..n {
         for &v in graph.successors_slice(u) {
-            neighbors[u].insert(v);
-            neighbors[v].insert(u);
+            if u != v {
+                neighbors[u].insert(v);
+                neighbors[v].insert(u);
+            }
         }
     }
 
@@ -297,5 +299,33 @@ mod tests {
         // d: connected to b, c (deg 2)
         // 2-core includes all nodes
         assert!(cores.iter().all(|&c| c >= 2), "All should be in 2-core");
+    }
+
+    #[test]
+    fn test_kcore_ignores_self_loops() {
+        let mut graph = DiGraph::new();
+        let solo = graph.add_node("solo");
+        let leaf = graph.add_node("leaf");
+        let a = graph.add_node("a");
+        let b = graph.add_node("b");
+        let c = graph.add_node("c");
+
+        // Self-loops must not inflate degree or core number
+        graph.add_edge(solo, solo);
+        graph.add_edge(leaf, leaf);
+        graph.add_edge(leaf, a);
+        graph.add_edge(a, a);
+
+        // Positive control: genuine 3-clique remains 2-core
+        graph.add_edge(a, b);
+        graph.add_edge(b, c);
+        graph.add_edge(c, a);
+
+        let cores = kcore(&graph);
+        assert_eq!(cores[solo], 0, "isolated self-loop node must have k-core 0");
+        assert_eq!(cores[leaf], 1, "pendant node with self-loop must stay in 1-core");
+        assert_eq!(cores[a], 2);
+        assert_eq!(cores[b], 2);
+        assert_eq!(cores[c], 2);
     }
 }

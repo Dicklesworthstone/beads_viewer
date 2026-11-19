@@ -346,6 +346,19 @@ func computeActiveBetweennessRanks(m map[string]float64) map[string]int {
 	return ranks
 }
 
+func computeActiveScoreRanks(m map[string]float64, isActive func(string) bool) map[string]int {
+	if m == nil {
+		return nil
+	}
+	filtered := make(map[string]float64)
+	for k, v := range m {
+		if isActive(k) {
+			filtered[k] = v
+		}
+	}
+	return computeActiveBetweennessRanks(filtered)
+}
+
 func activeSubgraphStatsForIssues(issues []model.Issue, computeBetweenness, computeKCore, computeArticulation bool) *analysis.GraphStats {
 	activeSet := make(map[string]bool, len(issues))
 	for i := range issues {
@@ -450,6 +463,7 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 		inDegree = opts.Stats.InDegree
 		outDegree = opts.Stats.OutDegree
 		if hasClosedOrTombstoneIssues(opts.Issues) {
+			pageRankRank = computeActiveScoreRanks(pageRank, isActiveIssue)
 			if canReusePrepopulatedActiveStats(opts.Stats, opts.Issues, nil, true, true, true) {
 				betweenness = opts.Stats.ActiveBetweenness()
 				betweennessRank = computeActiveBetweennessRanks(betweenness)
@@ -599,6 +613,7 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 		if !isActiveIssue(iss.ID) {
 			node.Betweenness = 0
 			node.CoreNumber = 0
+			node.PageRankRank = 0
 			node.BetweennessRank = 0
 		}
 		if slackAvailable && isActiveIssue(iss.ID) {

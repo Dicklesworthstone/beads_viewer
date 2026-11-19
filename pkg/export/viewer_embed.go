@@ -490,6 +490,9 @@ func AddScriptCacheBusting(content string) string {
 		content = strings.Replace(content, oldSrcSingle, newSrcSingle, -1)
 	}
 
+	content = strings.Replace(content, `href="styles.css"`, fmt.Sprintf(`href="styles.css%s"`, cacheBuster), -1)
+	content = strings.Replace(content, `href='styles.css'`, fmt.Sprintf(`href='styles.css%s'`, cacheBuster), -1)
+
 	return content
 }
 

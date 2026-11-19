@@ -191,6 +191,28 @@
     }
   }
 
+  function verifyActivePageRankClamping() {
+    const scorer = new ScorerClass(Presets['impact-first']);
+    const nowIso = new Date().toISOString();
+    const maxActivePR = 0.08;
+    const clampActivePR = (rawPR) => Math.min(1, Math.max(0, (Number(rawPR) || 0) / maxActivePR));
+
+    const candidates = [
+      { id: 'active-top', textScore: 0.8, pagerank: clampActivePR(0.08), status: 'open', priority: 1, blockerCount: 1, updatedAt: nowIso },
+      { id: 'active-mid', textScore: 0.8, pagerank: clampActivePR(0.02), status: 'open', priority: 1, blockerCount: 1, updatedAt: nowIso },
+      { id: 'closed-mega-hub', textScore: 0.8, pagerank: clampActivePR(0.80), status: 'closed', priority: 1, blockerCount: 0, updatedAt: nowIso },
+    ];
+
+    const ranked = scorer.scoreAndRank(candidates);
+    const byId = new Map(ranked.map(r => [r.id, r]));
+    assertClose(byId.get('active-top').component_scores.pagerank, 1.0, 1e-9, 'active-top normalized PR');
+    assertClose(byId.get('active-mid').component_scores.pagerank, 0.25, 1e-9, 'active-mid normalized PR');
+    assertClose(byId.get('closed-mega-hub').component_scores.pagerank, 1.0, 1e-9, 'closed-mega-hub clamped PR <= 1.0');
+    if (ranked[0].id !== 'active-top') {
+      throw new Error(`expected active-top to rank #1 over closed-mega-hub, got ${ranked[0].id}`);
+    }
+  }
+
   if (typeof require === 'function') {
     const test = require('node:test');
     test('HybridScorer baseline scoreAndRank', () => {
@@ -199,9 +221,13 @@
     test('HybridScorer and scoreBatchHybrid downgrade open ephemeral issues to 0.2 with open 1.0 and closed 0.1 controls', () => {
       verifyEphemeralParityAndControls();
     });
+    test('HybridScorer active PageRank normalization preserves active spread and clamps closed hubs to 1.0', () => {
+      verifyActivePageRankClamping();
+    });
   } else {
     verifyBaselineScore();
     verifyEphemeralParityAndControls();
+    verifyActivePageRankClamping();
     console.log('HybridScorer tests passed');
   }
 })();

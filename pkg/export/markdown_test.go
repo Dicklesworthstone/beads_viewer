@@ -3048,3 +3048,184 @@ func TestGenerateMarkdownAndReport_ActiveSubgraphBetweennessAndKCore(t *testing.
 			byID["open-c1"]["kcore"], byID["open-c2"]["kcore"], byID["open-c3"]["kcore"])
 	}
 }
+
+func TestGenerateHTMLAndReport_IncludeActionsAndNotReadyLabelsGating(t *testing.T) {
+	now := time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
+	closedAt := now
+	boolPtr := func(v bool) *bool { return &v }
+	workDir := filepath.Join(t.TempDir(), "dir<unsafe>&quote")
+
+	originFor := func(id string) *model.IssueOrigin {
+		return &model.IssueOrigin{
+			Tracker:          "br",
+			Executable:       "/usr/local/bin/br",
+			Database:         filepath.Join(workDir, ".beads", "beads.db"),
+			TrackerDirectory: filepath.Join(workDir, ".beads"),
+			LocalID:          id,
+			WorkingDirectory: workDir,
+			SupportsClaim:    true,
+		}
+	}
+
+	issues := []model.Issue{
+		{
+			ID:        "ready-1",
+			Title:     "Claimable Ready Issue",
+			Status:    model.StatusOpen,
+			Priority:  1,
+			IssueType: model.TypeTask,
+			Labels:    []string{"backend"},
+			CreatedAt: now,
+			UpdatedAt: now,
+			Origin:    originFor("ready-1"),
+		},
+		{
+			ID:        "wip-2",
+			Title:     "Labeled Not-Ready Issue",
+			Status:    model.StatusOpen,
+			Priority:  1,
+			IssueType: model.TypeTask,
+			Labels:    []string{"  Needs-Polish  ", "frontend"},
+			CreatedAt: now,
+			UpdatedAt: now,
+			Origin:    originFor("wip-2"),
+		},
+		{
+			ID:        "done-3",
+			Title:     "Closed Issue",
+			Status:    model.StatusClosed,
+			ClosedAt:  &closedAt,
+			Priority:  2,
+			IssueType: model.TypeTask,
+			CreatedAt: now,
+			UpdatedAt: now,
+			Origin:    originFor("done-3"),
+		},
+	}
+	readiness := model.NewReadinessIndex(issues)
+
+	// 1. HTML report with IncludeActions=true + NotReadyLabels=["needs-polish"] (case-insensitive trimmed).
+	htmlEnabledBytes, err := GenerateReport(issues, issues, ReportOptions{
+		Format:            "html",
+		Title:             "HTML Actions Test",
+		GeneratedAt:       now,
+		Readiness:         readiness,
+		AuthorityComplete: true,
+		IncludeActions:    boolPtr(true),
+		NotReadyLabels:    []string{"needs-polish"},
+	})
+	if err != nil {
+		t.Fatalf("GenerateReport(html, IncludeActions=true): %v", err)
+	}
+	htmlEnabled := string(htmlEnabledBytes)
+
+	if !strings.Contains(htmlEnabled, `<section class="quick-actions">`) {
+		t.Fatalf("expected <section class=\"quick-actions\"> when IncludeActions=true, got:\n%s", htmlEnabled)
+	}
+	if strings.Count(htmlEnabled, `<details class="issue-commands"><summary>Commands</summary><pre><code>`) != 2 {
+		t.Fatalf("expected exactly 2 per-issue command blocks (for ready-1 and wip-2, never closed done-3), got:\n%s", htmlEnabled)
+	}
+	// HTML escaping safety check on shell path containing '<' and '&':
+	if strings.Contains(htmlEnabled, "dir<unsafe>&quote") {
+		t.Fatalf("expected unescaped '<' and '&' in shell commands to be HTML-escaped inside <pre><code>, got:\n%s", htmlEnabled)
+	}
+	if !strings.Contains(htmlEnabled, "dir&lt;unsafe&gt;&amp;quote") {
+		t.Fatalf("expected HTML-escaped working directory in command block, got:\n%s", htmlEnabled)
+	}
+
+	// Extract ready-1 vs wip-2 sections to verify positive claim vs planted negative NotReadyLabels withholding.
+	wipIdx := strings.Index(htmlEnabled, `<h2>📋 wip-2 Labeled Not-Ready Issue</h2>`)
+	doneIdx := strings.Index(htmlEnabled, `<h2>📋 done-3 Closed Issue</h2>`)
+	if wipIdx < 0 || doneIdx <= wipIdx {
+		t.Fatalf("missing expected HTML issue headings in:\n%s", htmlEnabled)
+	}
+	readySection := htmlEnabled[:wipIdx]
+	wipSection := htmlEnabled[wipIdx:doneIdx]
+	doneSection := htmlEnabled[doneIdx:]
+
+	if !strings.Contains(readySection, "--claim") || !strings.Contains(readySection, "&#39;show&#39;") || !strings.Contains(readySection, "&#39;ready-1&#39;") {
+		t.Fatalf("ready-1 HTML section must emit both --claim and show ready-1:\n%s", readySection)
+	}
+	if strings.Contains(wipSection, "--claim") {
+		t.Fatalf("wip-2 HTML section must withhold --claim due to NotReadyLabels:\n%s", wipSection)
+	}
+	if !strings.Contains(wipSection, "&#39;show&#39;") || !strings.Contains(wipSection, "&#39;wip-2&#39;") {
+		t.Fatalf("wip-2 HTML section must still emit show wip-2:\n%s", wipSection)
+	}
+	if strings.Contains(doneSection, "issue-commands") {
+		t.Fatalf("closed done-3 HTML section must omit issue-commands:\n%s", doneSection)
+	}
+
+	// 2. HTML report with IncludeActions=false omits Quick Actions and per-issue Commands completely.
+	htmlDisabledBytes, err := GenerateReport(issues, issues, ReportOptions{
+		Format:            "html",
+		Title:             "HTML Actions Disabled",
+		GeneratedAt:       now,
+		Readiness:         readiness,
+		AuthorityComplete: true,
+		IncludeActions:    boolPtr(false),
+	})
+	if err != nil {
+		t.Fatalf("GenerateReport(html, IncludeActions=false): %v", err)
+	}
+	htmlDisabled := string(htmlDisabledBytes)
+	if strings.Contains(htmlDisabled, "quick-actions") || strings.Contains(htmlDisabled, "issue-commands") || strings.Contains(htmlDisabled, "--claim") {
+		t.Fatalf("expected HTML report with IncludeActions=false to omit all actions/commands, got:\n%s", htmlDisabled)
+	}
+
+	// 3. Markdown and JSON formats enforce the same NotReadyLabels claimability gate (withholding claim while keeping show).
+	mdOut, err := GenerateReport(issues, issues, ReportOptions{
+		Format:            "markdown",
+		GeneratedAt:       now,
+		Readiness:         readiness,
+		AuthorityComplete: true,
+		IncludeActions:    boolPtr(true),
+		NotReadyLabels:    []string{"NEEDS-POLISH"},
+	})
+	if err != nil {
+		t.Fatalf("GenerateReport(markdown, NotReadyLabels): %v", err)
+	}
+	mdStr := string(mdOut)
+	mdWipIdx := strings.Index(mdStr, "## 📋 wip-2 Labeled Not-Ready Issue")
+	mdDoneIdx := strings.Index(mdStr, "## 📋 done-3 Closed Issue")
+	if mdWipIdx < 0 || mdDoneIdx <= mdWipIdx {
+		t.Fatalf("missing expected Markdown issue headings in:\n%s", mdStr)
+	}
+	if !strings.Contains(mdStr[:mdWipIdx], "--claim") {
+		t.Fatalf("expected ready-1 Markdown section to include --claim")
+	}
+	if strings.Contains(mdStr[mdWipIdx:mdDoneIdx], "--claim") || !strings.Contains(mdStr[mdWipIdx:mdDoneIdx], "'show'") || !strings.Contains(mdStr[mdWipIdx:mdDoneIdx], "'wip-2'") {
+		t.Fatalf("expected wip-2 Markdown section to withhold --claim while keeping show wip-2:\n%s", mdStr[mdWipIdx:mdDoneIdx])
+	}
+
+	jsonOut, err := GenerateReport(issues, issues, ReportOptions{
+		Format:            "json",
+		GeneratedAt:       now,
+		Readiness:         readiness,
+		AuthorityComplete: true,
+		IncludeActions:    boolPtr(true),
+		NotReadyLabels:    []string{"  needs-polish "},
+	})
+	if err != nil {
+		t.Fatalf("GenerateReport(json, NotReadyLabels): %v", err)
+	}
+	var parsedJSON struct {
+		Issues []struct {
+			ID      string             `json:"id"`
+			Actions model.IssueActions `json:"actions"`
+		} `json:"issues"`
+	}
+	if err := json.Unmarshal(jsonOut, &parsedJSON); err != nil {
+		t.Fatalf("Unmarshal JSON report: %v", err)
+	}
+	actionsByID := make(map[string]model.IssueActions, len(parsedJSON.Issues))
+	for _, row := range parsedJSON.Issues {
+		actionsByID[row.ID] = row.Actions
+	}
+	if actionsByID["ready-1"].Claim == nil || actionsByID["ready-1"].Show == nil {
+		t.Fatalf("ready-1 JSON actions = %+v, want both Claim and Show", actionsByID["ready-1"])
+	}
+	if actionsByID["wip-2"].Claim != nil || actionsByID["wip-2"].Show == nil {
+		t.Fatalf("wip-2 JSON actions = %+v, want Claim=nil (withheld by NotReadyLabels) and Show!=nil", actionsByID["wip-2"])
+	}
+}

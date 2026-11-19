@@ -26,6 +26,8 @@ import (
 const skipDeploymentIssueCountVerification = -1
 
 var githubActionsInitialWait = 5 * time.Second
+var githubDeploymentPollInterval = 5 * time.Second
+var cloudflareDeploymentPollInterval = 3 * time.Second
 
 // GitHubDeployConfig configures GitHub Pages deployment.
 type GitHubDeployConfig struct {
@@ -880,6 +882,8 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Setup Pages
         uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
+        with:
+          enablement: true
       - name: Upload artifact
         uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
         with:
@@ -1114,10 +1118,16 @@ func fetchDeploymentMetaJSON(client *http.Client, metaURL string, deadline time.
 	ctx, cancel := context.WithTimeout(context.Background(), reqTimeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, metaURL, nil)
+	sep := "?"
+	if strings.Contains(metaURL, "?") {
+		sep = "&"
+	}
+	reqURL := fmt.Sprintf("%s%s_t=%d", metaURL, sep, time.Now().UnixNano())
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return nil, err
 	}
+	req.Header.Set("Cache-Control", "no-cache")
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -1152,7 +1162,7 @@ func VerifyGitHubPagesDeployment(pagesURL string, expectedIssueCount int, timeou
 		output, err := fetchDeploymentMetaJSON(httpClient, metaURL, deadline)
 		if err != nil {
 			lastErr = fmt.Errorf("fetch failed: %w", err)
-			sleepDeploymentPoll(5*time.Second, deadline)
+			sleepDeploymentPoll(githubDeploymentPollInterval, deadline)
 			continue
 		}
 
@@ -1162,15 +1172,17 @@ func VerifyGitHubPagesDeployment(pagesURL string, expectedIssueCount int, timeou
 		}
 		if err := json.Unmarshal(output, &meta); err != nil {
 			lastErr = fmt.Errorf("parse failed: %w", err)
-			sleepDeploymentPoll(5*time.Second, deadline)
+			sleepDeploymentPoll(githubDeploymentPollInterval, deadline)
 			continue
 		}
 
 		// Check issue count matches expected. Zero is a valid expected
 		// count for empty exports; negative disables count comparison.
 		if expectedIssueCount >= 0 && meta.IssueCount != expectedIssueCount {
-			return fmt.Errorf("deployment verification issue count mismatch: live site shows %d issues, expected %d",
+			lastErr = fmt.Errorf("deployment verification issue count mismatch: live site shows %d issues, expected %d",
 				meta.IssueCount, expectedIssueCount)
+			sleepDeploymentPoll(githubDeploymentPollInterval, deadline)
+			continue
 		}
 
 		fmt.Printf("  ✓ Deployment verified: %d issues live\n", meta.IssueCount)
@@ -1178,6 +1190,9 @@ func VerifyGitHubPagesDeployment(pagesURL string, expectedIssueCount int, timeou
 	}
 
 	if lastErr != nil {
+		if strings.HasPrefix(lastErr.Error(), "deployment verification ") {
+			return lastErr
+		}
 		return fmt.Errorf("deployment verification failed for %s: %w", metaURL, lastErr)
 	}
 	return fmt.Errorf("deployment verification timed out for %s", metaURL)

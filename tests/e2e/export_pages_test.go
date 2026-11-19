@@ -1456,8 +1456,8 @@ func TestExportPages_CSSPresent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read index.html: %v", err)
 	}
-	if !strings.Contains(string(indexBytes), `href="styles.css"`) {
-		t.Error("index.html doesn't reference styles.css")
+	if !strings.Contains(string(indexBytes), `href="styles.css?v=`) {
+		t.Error("index.html doesn't reference cache-busted styles.css?v=...")
 	}
 }
 

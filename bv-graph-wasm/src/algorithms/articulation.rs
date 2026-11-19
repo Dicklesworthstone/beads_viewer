@@ -123,10 +123,14 @@ fn build_undirected_neighbors(graph: &DiGraph) -> Vec<Vec<usize>> {
         }
     }
 
-    // Convert to Vec<Vec> for faster iteration
+    // Convert to sorted Vec<Vec> for deterministic DFS traversal
     neighbors
         .into_iter()
-        .map(|s| s.into_iter().collect())
+        .map(|s| {
+            let mut list: Vec<usize> = s.into_iter().collect();
+            list.sort_unstable();
+            list
+        })
         .collect()
 }
 
@@ -156,6 +160,7 @@ pub fn bridges(graph: &DiGraph) -> Vec<(usize, usize)> {
         }
     }
 
+    dfs.bridges.sort_unstable();
     dfs.bridges
 }
 
@@ -382,5 +387,29 @@ mod tests {
 
         let ap = articulation_points(&graph);
         assert!(ap.is_empty());
+    }
+
+    #[test]
+    fn test_bridges_deterministic_sorted_order() {
+        for _ in 0..24 {
+            let mut graph = DiGraph::new();
+            let n0 = graph.add_node("n0");
+            let n1 = graph.add_node("n1");
+            let n2 = graph.add_node("n2");
+            let n3 = graph.add_node("n3");
+            let n4 = graph.add_node("n4");
+            let n5 = graph.add_node("n5");
+
+            // Add edges in varying order; (3,4,5) form a triangle (non-bridges)
+            graph.add_edge(n0, n3);
+            graph.add_edge(n3, n4);
+            graph.add_edge(n4, n5);
+            graph.add_edge(n5, n3);
+            graph.add_edge(n0, n1);
+            graph.add_edge(n1, n2);
+
+            let br = bridges(&graph);
+            assert_eq!(br, vec![(n0, n1), (n0, n3), (n1, n2)]);
+        }
     }
 }

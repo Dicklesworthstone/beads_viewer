@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -457,5 +458,72 @@ func TestSuggestProjectName_DotGitTruncationAndValidateProjectName(t *testing.T)
 	}
 	if err := ValidateProjectName("Invalid_Upper"); err == nil {
 		t.Fatal("expected ValidateProjectName to reject uppercase/underscore project name")
+	}
+}
+
+func TestVerifyCloudflareDeployment_PollsStaleIssueCountUntilMatchAndBustsCache(t *testing.T) {
+	t.Setenv("PATH", "")
+	origInterval := cloudflareDeploymentPollInterval
+	cloudflareDeploymentPollInterval = 15 * time.Millisecond
+	t.Cleanup(func() { cloudflareDeploymentPollInterval = origInterval })
+
+	var calls atomic.Int32
+	var missingCacheBuster atomic.Int32
+	var missingNoCacheHeader atomic.Int32
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/data/meta.json", func(w http.ResponseWriter, r *http.Request) {
+		n := calls.Add(1)
+		if strings.TrimSpace(r.URL.Query().Get("_t")) == "" {
+			missingCacheBuster.Add(1)
+		}
+		if r.Header.Get("Cache-Control") != "no-cache" {
+			missingNoCacheHeader.Add(1)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if n < 3 {
+			_, _ = w.Write([]byte(`{"issue_count": 2}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"issue_count": 7}`))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	// Positive observable: polls past stale count=2 on Polls 1..2 and succeeds on Poll 3 (count=7).
+	if err := VerifyCloudflareDeployment(server.URL, 7, 500*time.Millisecond); err != nil {
+		t.Fatalf("VerifyCloudflareDeployment should succeed once live issue_count catches up, got: %v", err)
+	}
+	if got := calls.Load(); got < 3 {
+		t.Fatalf("expected >= 3 polling requests before match, got %d", got)
+	}
+	if got := missingCacheBuster.Load(); got != 0 {
+		t.Fatalf("expected every meta.json fetch to carry ?_t=<unixNano>, missing on %d requests", got)
+	}
+	if got := missingNoCacheHeader.Load(); got != 0 {
+		t.Fatalf("expected every meta.json fetch to carry Cache-Control: no-cache, missing on %d requests", got)
+	}
+
+	// Planted negative control: when meta.IssueCount stays stale past timeout, still returns exact mismatch error.
+	var staleCalls atomic.Int32
+	staleMux := http.NewServeMux()
+	staleMux.HandleFunc("/data/meta.json", func(w http.ResponseWriter, _ *http.Request) {
+		staleCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"issue_count": 2}`))
+	})
+	staleServer := httptest.NewServer(staleMux)
+	defer staleServer.Close()
+
+	err := VerifyCloudflareDeployment(staleServer.URL, 7, 80*time.Millisecond)
+	if err == nil {
+		t.Fatal("expected VerifyCloudflareDeployment to fail when issue_count remains stale past deadline")
+	}
+	wantMsg := "deployment verification issue count mismatch: live site shows 2 issues, expected 7"
+	if err.Error() != wantMsg {
+		t.Fatalf("err = %q, want exact %q", err.Error(), wantMsg)
+	}
+	if got := staleCalls.Load(); got < 2 {
+		t.Fatalf("expected multiple polls before deadline expiration, got %d", got)
 	}
 }

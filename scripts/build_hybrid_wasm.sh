@@ -3,7 +3,8 @@ set -euo pipefail
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 WASM_SRC="$ROOT_DIR/pkg/export/wasm_scorer"
-WASM_OUT="$ROOT_DIR/pkg/export/viewer_assets/wasm"
+WASM_OUT="${BV_HYBRID_WASM_DIR:-$ROOT_DIR/.bv/wasm/hybrid}"
+OUT_DIR_SET=0
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -13,15 +14,27 @@ while [ "$#" -gt 0 ]; do
         exit 1
       fi
       WASM_OUT="$2"
+      OUT_DIR_SET=1
       shift 2
       ;;
     --out-dir=*)
       WASM_OUT="${1#--out-dir=}"
+      OUT_DIR_SET=1
       shift
       ;;
-    *)
+    -*)
       echo "unknown flag: $1" >&2
       exit 1
+      ;;
+    *)
+      if [ "$OUT_DIR_SET" -eq 0 ]; then
+        WASM_OUT="$1"
+        OUT_DIR_SET=1
+        shift
+      else
+        echo "unexpected argument: $1" >&2
+        exit 1
+      fi
       ;;
   esac
 done

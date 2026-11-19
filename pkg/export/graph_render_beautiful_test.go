@@ -96,6 +96,10 @@ func TestGenerateUltimateHTML_ClosedArticulationAndWithheldStatusGuards(t *testi
 		`if (isActiveNodeStatus(node.status) && node.is_articulation && isHighlighted)`,
 		`if (isActiveNodeStatus(node.status) && node.is_articulation) addBadge('badge-articulation', 'Cut Vertex');`,
 		`if (isNodeWithheldFromReady(n)) {`,
+		`function buildGraphLinksForMode(blockingOnly)`,
+		`filter(l => !blockingOnly || isBlockingLinkType(l.type))`,
+		`setGraphLinksMode(true);`,
+		`setGraphLinksMode(false);`,
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("generateUltimateHTML missing guard %q", want)

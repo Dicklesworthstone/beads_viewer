@@ -2439,7 +2439,17 @@ function getGraphViewData() {
   // its dependents' blocker_count to 0 here too, which getNodeColor uses to
   // derive the effective "blocked" colouring (bv-issue#143/#144).
   const mvCols = getOverviewColumnSet();
-  const extraCols = ['defer_until', 'is_template', 'pinned', 'ephemeral'].filter(c => mvCols.has(c));
+  const extraCols = [
+    'defer_until',
+    'is_template',
+    'pinned',
+    'ephemeral',
+    'pagerank',
+    'betweenness',
+    'eigenvector',
+    'critical_path_depth',
+    'in_cycle',
+  ].filter(c => mvCols.has(c));
   const extraSelect = extraCols.length > 0 ? `, ${extraCols.join(', ')}` : '';
   const issues = execQuery(`
     SELECT id, title, description, status, priority, issue_type, assignee, labels,
@@ -2462,6 +2472,11 @@ function getGraphViewData() {
     is_template: isTruthyLifecycleFlag(row.is_template),
     pinned: isTruthyLifecycleFlag(row.pinned),
     ephemeral: isTruthyLifecycleFlag(row.ephemeral),
+    pagerank: Number.isFinite(Number(row.pagerank)) ? Number(row.pagerank) : 0,
+    betweenness: Number.isFinite(Number(row.betweenness)) ? Number(row.betweenness) : 0,
+    eigenvector: Number.isFinite(Number(row.eigenvector)) ? Number(row.eigenvector) : 0,
+    critical_path_depth: Number.isFinite(Number(row.critical_path_depth)) ? Number(row.critical_path_depth) : 0,
+    in_cycle: Boolean(row.in_cycle),
     // Pre-computed active-blocker / active-dependent counts from the
     // materialized view (which excludes closed/tombstoned endpoints).
     blocker_count: row.blocker_count ?? 0,
@@ -2798,17 +2813,37 @@ function computeLexicalTextScore(row, query) {
 }
 
 /**
- * Inspect global PageRank normalization bounds across all exported issue metrics.
+ * Inspect global PageRank normalization bounds across exported issue metrics,
+ * preferring active (non-closed, non-tombstone) max PageRank so historical hubs
+ * never compress active scores toward zero (matching Go AnalyzerMetricsLoader).
  */
 function getPageRankBounds() {
   try {
-    const rows = execQuery('SELECT COUNT(*) AS count, MAX(pagerank) AS max_pr FROM issue_metrics');
+    const rows = execQuery(`
+      SELECT COUNT(*) AS count,
+             MAX(CASE WHEN LOWER(i.status) NOT IN ('closed', 'tombstone') THEN m.pagerank ELSE 0 END) AS max_active_pr,
+             MAX(m.pagerank) AS max_any_pr
+      FROM issue_metrics m
+      JOIN issues i ON i.id = m.issue_id
+    `);
     const row = rows?.[0];
     const count = Number(row?.count || 0);
-    const maxPR = Number(row?.max_pr || 0);
-    return { hasMetrics: count > 0, maxPageRank: Number.isFinite(maxPR) ? maxPR : 0 };
+    const maxActivePR = Number(row?.max_active_pr || 0);
+    const maxAnyPR = Number(row?.max_any_pr || 0);
+    const chosenMax = (Number.isFinite(maxActivePR) && maxActivePR > 0)
+      ? maxActivePR
+      : (Number.isFinite(maxAnyPR) ? maxAnyPR : 0);
+    return { hasMetrics: count > 0, maxPageRank: chosenMax > 0 ? chosenMax : 0 };
   } catch {
-    return { hasMetrics: false, maxPageRank: 0 };
+    try {
+      const rows = execQuery('SELECT COUNT(*) AS count, MAX(pagerank) AS max_pr FROM issue_metrics');
+      const row = rows?.[0];
+      const count = Number(row?.count || 0);
+      const maxPR = Number(row?.max_pr || 0);
+      return { hasMetrics: count > 0, maxPageRank: Number.isFinite(maxPR) && maxPR > 0 ? maxPR : 0 };
+    } catch {
+      return { hasMetrics: false, maxPageRank: 0 };
+    }
   }
 }
 
@@ -3330,20 +3365,42 @@ function getIssuesBySlack(limit = 10, showZeroSlack = true) {
   }
 }
 
+let LATEST_TRIAGE_DATA = null;
+
 /**
  * Get cycle information from active graph (closed/tombstone historical cycles excluded)
  */
-function getCycleInfo() {
+function getCycleInfo(triageDataOverride = LATEST_TRIAGE_DATA) {
   const activeGraph = GRAPH_STATE.activeGraph || GRAPH_STATE.graph;
   if (!GRAPH_STATE.ready || !activeGraph) {
+    let cycleIds = [];
+    try {
+      if (DB_STATE.db && getOverviewColumnSet().has('in_cycle')) {
+        cycleIds = execQuery(`
+          SELECT id FROM issue_overview_mv
+          WHERE COALESCE(in_cycle, 0) = 1
+            AND LOWER(status) NOT IN ('closed', 'tombstone')
+          ORDER BY id
+        `).map(r => r.id).filter(Boolean);
+      }
+    } catch {
+      cycleIds = [];
+    }
+    const graphHealth = triageDataOverride?.project_health?.graph
+      ?? triageDataOverride?.triage?.project_health?.graph
+      ?? null;
+    const rawHealthCount = Number(graphHealth?.cycle_count) || 0;
+    const hasCycles = Boolean(graphHealth?.has_cycles) || rawHealthCount > 0 || cycleIds.length > 0;
+    const sccComponents = cycleIds.length > 0 ? [cycleIds] : [];
+    const cycleCount = hasCycles ? Math.max(rawHealthCount, cycleIds.length > 0 ? 1 : 0) : 0;
     return {
-      hasCycles: false,
-      cycleCount: 0,
+      hasCycles,
+      cycleCount,
       truncated: false,
-      sccCount: 0,
-      nonTrivialSccCount: 0,
-      largestSccSize: 0,
-      sccComponents: [],
+      sccCount: sccComponents.length,
+      nonTrivialSccCount: sccComponents.length || (hasCycles ? 1 : 0),
+      largestSccSize: cycleIds.length,
+      sccComponents,
       suggestions: null,
     };
   }
@@ -4810,6 +4867,14 @@ function beadsApp() {
           this.bridgeEdges = getBridgeDependencies(15);
           this.topCriticalPaths = getTopCriticalPaths(5);
           this.totalCriticalPaths = this.topCriticalPaths.length;
+        } else {
+          this.topByBetweenness = getTopByBetweenness(10);
+          this.topByCriticalPath = getTopByCriticalPath(10);
+          if (!this.topByEigenvector.length) {
+            this.topByEigenvector = getTopByEigenvector(10);
+          }
+          this.cycleInfo = getCycleInfo(this.triageData);
+          this.totalCycles = this.cycleInfo?.cycleCount || 0;
         }
 
         // Handle the initial hash route or a host-rewritten clean path after
@@ -4839,6 +4904,11 @@ function beadsApp() {
           const triageResp = await fetch(`./data/triage.json?_t=${Date.now()}`);
           if (triageResp.ok) {
             this.triageData = await triageResp.json();
+            LATEST_TRIAGE_DATA = this.triageData;
+            if (!this.graphReady) {
+              this.cycleInfo = getCycleInfo(this.triageData);
+              this.totalCycles = this.cycleInfo?.cycleCount || 0;
+            }
             console.log('[Viewer] Triage data loaded:', this.triageData?.meta?.issue_count, 'issues');
           }
         } catch (triageErr) {

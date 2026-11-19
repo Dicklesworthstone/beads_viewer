@@ -53,6 +53,7 @@ type ReportOptions struct {
 	SourceKind        string
 	AsOf              string
 	AsOfCommit        string
+	NotReadyLabels    []string
 }
 
 func (opts ReportOptions) includeActions() bool {
@@ -443,16 +444,20 @@ func GenerateReport(selected, context []model.Issue, opts ReportOptions) ([]byte
 		}
 		opts.GraphIssues = reportGraphContext(selected, context)
 	}
+	reportOpts := opts
+	if !hadCallerReadiness {
+		reportOpts.AuthorityComplete = false
+	}
 	metricsAcc := newReportMetricsAccessor(opts, selected, context)
 	switch opts.Format {
 	case "markdown":
 		if opts.Template != "" {
-			return renderReportTemplate(selected, opts)
+			return renderReportTemplate(selected, reportOpts)
 		}
-		content, err := GenerateMarkdown(selected, opts.Title, opts)
+		content, err := GenerateMarkdown(selected, opts.Title, reportOpts)
 		return []byte(content), err
 	case "html":
-		content, err := GenerateHTMLReport(selected, opts.Title, opts)
+		content, err := GenerateHTMLReport(selected, opts.Title, reportOpts)
 		return []byte(content), err
 	case "json":
 		type row struct {
@@ -464,7 +469,7 @@ func GenerateReport(selected, context []model.Issue, opts ReportOptions) ([]byte
 		for _, issue := range selected {
 			var actions model.IssueActions
 			if opts.includeActions() {
-				claimable := opts.AuthorityComplete && hadCallerReadiness && opts.Readiness.Claimable(issue.ID, opts.GeneratedAt)
+				claimable := opts.AuthorityComplete && hadCallerReadiness && opts.Readiness.Claimable(issue.ID, opts.GeneratedAt) && !hasNotReadyLabel(issue.Labels, opts.NotReadyLabels)
 				actions = issue.Actions(claimable)
 			}
 			rows = append(rows, row{
@@ -1671,6 +1676,24 @@ func GenerateHTMLReport(issues []model.Issue, title string, opts ReportOptions) 
 	}
 	sb.WriteString("</tbody>\n</table>\n")
 
+	if opts.includeActions() {
+		var quickCmds []string
+		for _, iss := range issues {
+			if isClosedLikeStatus(iss.Status) {
+				continue
+			}
+			actions := iss.Actions(false)
+			if actions.Show != nil {
+				quickCmds = append(quickCmds, actions.Show.Shell)
+			}
+		}
+		if len(quickCmds) > 0 {
+			sb.WriteString("<section class=\"quick-actions\">\n<h2>Quick Actions</h2>\n<p>Inspect the current tracker before acting on this snapshot:</p>\n<pre><code>")
+			sb.WriteString(html.EscapeString(strings.Join(quickCmds, "\n") + "\n"))
+			sb.WriteString("</code></pre>\n</section>\n")
+		}
+	}
+
 	if opts.IncludeGraph {
 		sb.WriteString("<h2>Dependency Graph</h2>\n<pre class=\"mermaid\">")
 		sb.WriteString(html.EscapeString(reportMermaid(opts.GraphIssues, opts.Readiness)))
@@ -1776,6 +1799,22 @@ func GenerateHTMLReport(issues []model.Issue, title string, opts ReportOptions) 
 					html.EscapeString(c.Author),
 					html.EscapeString(c.CreatedAt.Format("2006-01-02")),
 					html.EscapeString(c.Text)))
+			}
+		}
+		if opts.includeActions() && !isClosedLikeStatus(iss.Status) {
+			claimable := opts.AuthorityComplete && opts.Readiness != nil && opts.Readiness.Claimable(iss.ID, opts.GeneratedAt) && !hasNotReadyLabel(iss.Labels, opts.NotReadyLabels)
+			actions := iss.Actions(claimable)
+			if actions.Show != nil {
+				var cmdBuf strings.Builder
+				if actions.Claim != nil {
+					cmdBuf.WriteString("# Atomically claim; the live tracker may reject a stale recommendation\n")
+					cmdBuf.WriteString(actions.Claim.Shell + "\n\n")
+				}
+				cmdBuf.WriteString("# View full details\n")
+				cmdBuf.WriteString(actions.Show.Shell + "\n")
+				sb.WriteString("<details class=\"issue-commands\"><summary>Commands</summary><pre><code>")
+				sb.WriteString(html.EscapeString(cmdBuf.String()))
+				sb.WriteString("</code></pre></details>\n")
 			}
 		}
 		sb.WriteString("</section>\n")
@@ -1955,6 +1994,24 @@ func generateQuickActions(issues []model.Issue, options ReportOptions) string {
 	return sb.String()
 }
 
+func hasNotReadyLabel(issueLabels, notReadyLabels []string) bool {
+	if len(notReadyLabels) == 0 || len(issueLabels) == 0 {
+		return false
+	}
+	for _, rawWanted := range notReadyLabels {
+		wanted := strings.ToLower(strings.TrimSpace(rawWanted))
+		if wanted == "" {
+			continue
+		}
+		for _, rawLabel := range issueLabels {
+			if strings.ToLower(strings.TrimSpace(rawLabel)) == wanted {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // generateIssueCommands creates command snippets for a single issue
 func generateIssueCommands(issue model.Issue, options ReportOptions) string {
 	if !options.includeActions() {
@@ -1967,7 +2024,7 @@ func generateIssueCommands(issue model.Issue, options ReportOptions) string {
 		return ""
 	}
 
-	claimable := options.AuthorityComplete && options.Readiness != nil && options.Readiness.Claimable(issue.ID, options.GeneratedAt)
+	claimable := options.AuthorityComplete && options.Readiness != nil && options.Readiness.Claimable(issue.ID, options.GeneratedAt) && !hasNotReadyLabel(issue.Labels, options.NotReadyLabels)
 	actions := issue.Actions(claimable)
 	if actions.Show == nil {
 		return ""

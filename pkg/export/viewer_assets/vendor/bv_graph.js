@@ -78,7 +78,7 @@ export class DiGraph {
         return ret;
     }
     /**
-     * Compute approximate betweenness centrality using sampling.
+     * Compute approximate betweenness centrality using deterministic pivot sampling.
      * Returns array of scores in node index order.
      * Error: O(1/sqrt(k)) - with k=100, ~10% error in ranking.
      * @param {number} sample_size

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -306,6 +307,7 @@ func TestWriteGitHubActionsWorkflow(t *testing.T) {
 		// a mutable tag could be moved to steal the Pages OIDC token.
 		"actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4",
 		"actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5",
+		"enablement: true",
 		"actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3",
 		"actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4",
 	}
@@ -832,5 +834,72 @@ func TestCheckGitHubActionsStatus_ParsesRunsAndTriggersFallback(t *testing.T) {
 	gitLogged, _ := os.ReadFile(gitLog)
 	if !strings.Contains(string(gitLogged), "HEAD:gh-pages") {
 		t.Fatalf("expected PushToGHPagesBranch (HEAD:gh-pages) in git log, got:\n%s", string(gitLogged))
+	}
+}
+
+func TestVerifyGitHubPagesDeployment_PollsStaleIssueCountUntilMatchAndBustsCache(t *testing.T) {
+	t.Setenv("PATH", "")
+	origInterval := githubDeploymentPollInterval
+	githubDeploymentPollInterval = 15 * time.Millisecond
+	t.Cleanup(func() { githubDeploymentPollInterval = origInterval })
+
+	var calls atomic.Int32
+	var missingCacheBuster atomic.Int32
+	var missingNoCacheHeader atomic.Int32
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/data/meta.json", func(w http.ResponseWriter, r *http.Request) {
+		n := calls.Add(1)
+		if strings.TrimSpace(r.URL.Query().Get("_t")) == "" {
+			missingCacheBuster.Add(1)
+		}
+		if r.Header.Get("Cache-Control") != "no-cache" {
+			missingNoCacheHeader.Add(1)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if n < 3 {
+			_, _ = w.Write([]byte(`{"issue_count": 1}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"issue_count": 5}`))
+	})
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	// Positive observable: polls past stale count=1 on Polls 1..2 and succeeds on Poll 3 (count=5).
+	if err := VerifyGitHubPagesDeployment(server.URL, 5, 500*time.Millisecond); err != nil {
+		t.Fatalf("VerifyGitHubPagesDeployment should succeed once live issue_count catches up, got: %v", err)
+	}
+	if got := calls.Load(); got < 3 {
+		t.Fatalf("expected >= 3 polling requests before match, got %d", got)
+	}
+	if got := missingCacheBuster.Load(); got != 0 {
+		t.Fatalf("expected every meta.json fetch to carry ?_t=<unixNano>, missing on %d requests", got)
+	}
+	if got := missingNoCacheHeader.Load(); got != 0 {
+		t.Fatalf("expected every meta.json fetch to carry Cache-Control: no-cache, missing on %d requests", got)
+	}
+
+	// Planted negative control: when meta.IssueCount stays stale past timeout, still returns exact mismatch error.
+	var staleCalls atomic.Int32
+	staleMux := http.NewServeMux()
+	staleMux.HandleFunc("/data/meta.json", func(w http.ResponseWriter, _ *http.Request) {
+		staleCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"issue_count": 1}`))
+	})
+	staleServer := httptest.NewServer(staleMux)
+	defer staleServer.Close()
+
+	err := VerifyGitHubPagesDeployment(staleServer.URL, 5, 80*time.Millisecond)
+	if err == nil {
+		t.Fatal("expected VerifyGitHubPagesDeployment to fail when issue_count remains stale past deadline")
+	}
+	wantMsg := "deployment verification issue count mismatch: live site shows 1 issues, expected 5"
+	if err.Error() != wantMsg {
+		t.Fatalf("err = %q, want exact %q", err.Error(), wantMsg)
+	}
+	if got := staleCalls.Load(); got < 2 {
+		t.Fatalf("expected multiple polls before deadline expiration, got %d", got)
 	}
 }

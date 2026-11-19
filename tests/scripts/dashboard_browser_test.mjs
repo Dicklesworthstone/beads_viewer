@@ -924,7 +924,7 @@ async function layoutSeedsJourney(page, edgeless = false) {
   await delay(300);
   await waitFor(page, fitsContainer, 'graph fits container after detail closes');
   clean(page);
-  assert.ok(records.some(r=>r.serverRequest === '/data/graph_layout.json'), 'actual layout HTTP request');
+  assert.ok(records.some(r => typeof r.serverRequest === 'string' && /^\/data\/graph_layout\.json\?_t=\d+$/.test(r.serverRequest)), 'actual cache-busted layout HTTP request');
   layoutVariant = null;
   console.log(`PASS: ${page.name} matching seeds, ${variants.length} layout cases, metrics, movement, filter and detail`);
 }
@@ -3031,6 +3031,205 @@ async function capabilitiesJourney(page) {
   assert.ok(trackCAudit.burndownLastLabel?.startsWith('Sep '), `computeBurndownData anchors maxDate to Sep 2026 reference clock instead of Nov 2026 wall-clock Date.now(): ${trackCAudit.burndownLastLabel}`);
   assert.equal(trackCAudit.burndownLabelCount, 10, 'computeBurndownData emits exact 10 daily buckets from 2026-09-01 through 2026-09-10');
 
+  // Wave 18 (bv-apal.86): Active-PR hybrid search normalization, WASM fallback metrics/cycles,
+  // SQLite DAG eigenvector preservation, kcore self-loop == 0, deterministic bridges/betweennessApprox, and styles.css?v= cache-busting.
+  const wave18BrowserAudit = await evaluate(page, `(async () => {
+    const stylesheetHref = document.querySelector('link[rel="stylesheet"]')?.getAttribute('href') || '';
+    const refTs = new Date(getReferenceNowMs()).toISOString();
+
+    // 1. Active-PR Hybrid Search Normalization (positive + planted negative controls)
+    DB_STATE.db.run(
+      "INSERT INTO issues (id, title, description, status, priority, issue_type, labels, created_at, updated_at) VALUES " +
+      "('w18-closed-pr-hub', 'zirconquartz probe item', 'zirconquartz probe', 'closed', 1, 'task', '[]', '2026-09-01T00:00:00Z', ?), " +
+      "('w18-open-pr-high', 'zirconquartz probe item', 'zirconquartz probe', 'open', 1, 'task', '[]', '2026-09-01T00:00:00Z', ?), " +
+      "('w18-open-pr-low', 'zirconquartz probe item', 'zirconquartz probe', 'open', 1, 'task', '[]', '2026-09-01T00:00:00Z', ?)",
+      [refTs, refTs, refTs]
+    );
+    DB_STATE.db.run(
+      "INSERT INTO issue_metrics (issue_id, pagerank, betweenness, eigenvector, critical_path_depth, triage_score, blocks_count, blocked_by_count) VALUES " +
+      "('w18-closed-pr-hub', 9.0, 0, 0, 0, 0.1, 0, 0), " +
+      "('w18-open-pr-high', 0.9, 0, 0, 0, 0.8, 0, 0), " +
+      "('w18-open-pr-low', 0.09, 0, 0, 0, 0.4, 0, 0)"
+    );
+    DB_STATE.db.run(
+      "INSERT INTO issue_overview_mv (id, title, description, status, priority, issue_type, labels, created_at, updated_at, dependency_state, is_actionable, pagerank, betweenness, eigenvector, critical_path_depth, triage_score, blocks_count, blocked_by_count, blocker_count, dependent_count, critical_depth, in_cycle, comment_count) VALUES " +
+      "('w18-closed-pr-hub', 'zirconquartz probe item', 'zirconquartz probe', 'closed', 1, 'task', '[]', '2026-09-01T00:00:00Z', ?, 'satisfied', 0, 9.0, 0, 0, 0, 0.1, 0, 0, 0, 0, 0, 0, 0), " +
+      "('w18-open-pr-high', 'zirconquartz probe item', 'zirconquartz probe', 'open', 1, 'task', '[]', '2026-09-01T00:00:00Z', ?, 'satisfied', 1, 0.9, 0, 0, 0, 0.8, 0, 0, 0, 0, 0, 0, 0), " +
+      "('w18-open-pr-low', 'zirconquartz probe item', 'zirconquartz probe', 'open', 1, 'task', '[]', '2026-09-01T00:00:00Z', ?, 'satisfied', 1, 0.09, 0, 0, 0, 0.4, 0, 0, 0, 0, 0, 0, 0)",
+      [refTs, refTs, refTs]
+    );
+    if (supportsFTS5()) {
+      DB_STATE.db.run("INSERT INTO issues_fts(issues_fts) VALUES('rebuild')");
+    }
+
+    let prBounds = null;
+    let hybridRows = [];
+    let fallbackCycleWithCycles = null;
+    let fallbackCycleAcyclic = null;
+    let wasmFallbackGraphAudit = null;
+    let dagEigenvectorAudit = null;
+    let wasmGraphAlgAudit = null;
+
+    const savedGraphReady = GRAPH_STATE.ready;
+    const savedBvGraphWasm = window.bvGraphWasm;
+    try {
+      prBounds = getPageRankBounds();
+      hybridRows = searchIssues('zirconquartz', { mode: 'hybrid', preset: 'impact-first', limit: 10 });
+
+      // 2. WASM Fallback Mode: getCycleInfo() when !GRAPH_STATE.ready
+      GRAPH_STATE.ready = false;
+      fallbackCycleWithCycles = getCycleInfo({ project_health: { graph: { has_cycles: true, cycle_count: 2 } } });
+      DB_STATE.db.run("UPDATE issue_overview_mv SET in_cycle = 0 WHERE id IN ('cap-auth-root', 'cap-auth-ui', 'cap-billing-a', 'cap-billing-b')");
+      try {
+        fallbackCycleAcyclic = getCycleInfo({ project_health: { graph: { has_cycles: false, cycle_count: 0 } } });
+      } finally {
+        DB_STATE.db.run("UPDATE issue_overview_mv SET in_cycle = 1 WHERE id IN ('cap-auth-root', 'cap-auth-ui', 'cap-billing-a', 'cap-billing-b')");
+      }
+      GRAPH_STATE.ready = savedGraphReady;
+
+      // 3. graph.js WASM Fallback Mode (!store.wasmReady) precomputed metrics & in_cycle
+      const m = ${app}.forceGraphModule;
+      const gd = getGraphViewData();
+      window.bvGraphWasm = undefined;
+      await m.initGraph('graph-container');
+      const fbGraphData = m.loadData(gd.issues, gd.dependencies, null);
+      const fbAuthRoot = fbGraphData.nodes.find(n => n.id === 'cap-auth-root');
+      const fbClosed = fbGraphData.nodes.find(n => n.id === 'cap-closed-prereq');
+      wasmFallbackGraphAudit = {
+        wasmReady: m.isWasmReady(),
+        hasOverviewEigenvector: gd.issues.some(i => (i.eigenvector || 0) > 0),
+        hasOverviewInCycle: gd.issues.some(i => i.in_cycle === true),
+        authRootPagerank: fbAuthRoot?.pagerank || 0,
+        authRootEigenvector: fbAuthRoot?.eigenvector || 0,
+        authRootInCycle: Boolean(fbAuthRoot?.inCycle),
+        closedInCycle: Boolean(fbClosed?.inCycle),
+      };
+
+      // Restore window.bvGraphWasm and verify DAG differentiated eigenvector preservation in graph.js
+      window.bvGraphWasm = savedBvGraphWasm;
+      await m.initGraph('graph-container');
+      const dagIssues = [
+        { id: 'dag-a', title: 'DAG Root', status: 'open', priority: 1, type: 'task', eigenvector: 0.85, pagerank: 0.5, betweenness: 0, critical_path_depth: 2, blocker_count: 0, dependent_count: 1, dependency_state: 'satisfied', is_actionable: true },
+        { id: 'dag-b', title: 'DAG Mid', status: 'open', priority: 1, type: 'task', eigenvector: 0.45, pagerank: 0.3, betweenness: 1, critical_path_depth: 1, blocker_count: 1, dependent_count: 1, dependency_state: 'unsatisfied', is_actionable: false },
+        { id: 'dag-c', title: 'DAG Leaf', status: 'open', priority: 2, type: 'task', eigenvector: 0.10, pagerank: 0.2, betweenness: 0, critical_path_depth: 0, blocker_count: 1, dependent_count: 0, dependency_state: 'unsatisfied', is_actionable: false },
+      ];
+      const dagDeps = [
+        { issue_id: 'dag-b', depends_on_id: 'dag-a', type: 'blocks' },
+        { issue_id: 'dag-c', depends_on_id: 'dag-b', type: 'blocks' },
+      ];
+      const dagLoaded = m.loadData(dagIssues, dagDeps, null);
+      const rawWasmDagEig = Array.from(m.getWasmGraph().eigenvectorDefault());
+      const preservedDagEig = Array.from(m.getMetrics().eigenvector);
+      m.setSizeMetric('eigenvector');
+      const sizeDagA = m.getNodeSize(dagLoaded.nodes.find(n => n.id === 'dag-a'));
+      const sizeDagC = m.getNodeSize(dagLoaded.nodes.find(n => n.id === 'dag-c'));
+      m.setSizeMetric('pagerank');
+
+      // Negative control: cyclic asymmetric graph where WASM eigenvector is non-flat keeps WASM scores
+      const cycDeps = [
+        { issue_id: 'dag-a', depends_on_id: 'dag-b', type: 'blocks' },
+        { issue_id: 'dag-b', depends_on_id: 'dag-a', type: 'blocks' },
+        { issue_id: 'dag-c', depends_on_id: 'dag-a', type: 'blocks' },
+      ];
+      m.loadData(dagIssues, cycDeps, null);
+      const rawWasmCycEig = Array.from(m.getWasmGraph().eigenvectorDefault());
+      const storedCycEig = Array.from(m.getMetrics().eigenvector);
+      dagEigenvectorAudit = {
+        rawWasmDagRange: Math.max(...rawWasmDagEig) - Math.min(...rawWasmDagEig),
+        preservedDagEig,
+        sizeDagA,
+        sizeDagC,
+        rawWasmCycRange: Math.max(...rawWasmCycEig) - Math.min(...rawWasmCycEig),
+        cyclicMatchesWasm: JSON.stringify(rawWasmCycEig) === JSON.stringify(storedCycEig),
+      };
+
+      // 4. WASM kcore() self-loop == 0 & deterministic bridges() / betweennessApprox()
+      const testGraph = new window.bvGraphWasm.DiGraph();
+      try {
+        const s0 = testGraph.addNode('solo');
+        const l1 = testGraph.addNode('leaf');
+        const c2 = testGraph.addNode('c2');
+        const c3 = testGraph.addNode('c3');
+        const c4 = testGraph.addNode('c4');
+        testGraph.addEdge(s0, s0); // self-loop on isolated node
+        testGraph.addEdge(l1, l1); // self-loop on pendant
+        testGraph.addEdge(l1, c2); // bridge l1 -- c2
+        testGraph.addEdge(c2, c2); // self-loop on clique node
+        testGraph.addEdge(c2, c3);
+        testGraph.addEdge(c3, c4);
+        testGraph.addEdge(c4, c2);
+        const kcores = Array.from(testGraph.kcore());
+        const bridges1 = testGraph.bridges();
+        const bridges2 = testGraph.bridges();
+        const approx1 = Array.from(testGraph.betweennessApprox(2));
+        const approx2 = Array.from(testGraph.betweennessApprox(2));
+        wasmGraphAlgAudit = {
+          kcores,
+          bridges1,
+          bridgesEqual: JSON.stringify(bridges1) === JSON.stringify(bridges2),
+          approxEqual: JSON.stringify(approx1) === JSON.stringify(approx2),
+        };
+      } finally {
+        testGraph.free();
+      }
+    } finally {
+      GRAPH_STATE.ready = savedGraphReady;
+      window.bvGraphWasm = savedBvGraphWasm;
+      DB_STATE.db.run("DELETE FROM issues WHERE id IN ('w18-closed-pr-hub', 'w18-open-pr-high', 'w18-open-pr-low')");
+      DB_STATE.db.run("DELETE FROM issue_metrics WHERE issue_id IN ('w18-closed-pr-hub', 'w18-open-pr-high', 'w18-open-pr-low')");
+      DB_STATE.db.run("DELETE FROM issue_overview_mv WHERE id IN ('w18-closed-pr-hub', 'w18-open-pr-high', 'w18-open-pr-low')");
+      if (supportsFTS5()) {
+        DB_STATE.db.run("INSERT INTO issues_fts(issues_fts) VALUES('rebuild')");
+      }
+      ${app}.forceGraphReady = false;
+      await ${app}.initForceGraphView();
+    }
+
+    return {
+      stylesheetHref,
+      prBounds,
+      hybridSummary: hybridRows.map(r => ({
+        id: r.id,
+        score: r.hybrid_score,
+        prComp: r.component_scores?.pagerank,
+        stComp: r.component_scores?.status,
+      })),
+      fallbackCycleWithCycles,
+      fallbackCycleAcyclic,
+      wasmFallbackGraphAudit,
+      dagEigenvectorAudit,
+      wasmGraphAlgAudit,
+    };
+  })()`);
+  assert.match(wave18BrowserAudit.stylesheetHref, /^styles\.css\?v=/, 'index.html cache-busts styles.css?v=...');
+  assert.ok(Math.abs(wave18BrowserAudit.prBounds.maxPageRank - 0.9) < 1e-6, `getPageRankBounds prefers active maxPageRank (0.9) over closed mega-hub (9.0): ${JSON.stringify(wave18BrowserAudit.prBounds)}`);
+  const w18HybridById = new Map(wave18BrowserAudit.hybridSummary.map(r => [r.id, r]));
+  assert.equal(w18HybridById.get('w18-open-pr-high')?.prComp, 1.0, 'top active issue receives normalized PageRank 1.0 instead of 0.1');
+  assert.ok(Math.abs((w18HybridById.get('w18-open-pr-low')?.prComp || 0) - 0.1) < 1e-6, 'lower active issue scales proportionally against active max');
+  assert.equal(w18HybridById.get('w18-closed-pr-hub')?.prComp, 1.0, 'closed mega-hub with raw PR > active max is clamped to 1.0');
+  assert.ok((w18HybridById.get('w18-open-pr-high')?.score || 0) > (w18HybridById.get('w18-open-pr-low')?.score || 0), 'high-PR open issue outranks low-PR open issue');
+  assert.ok((w18HybridById.get('w18-open-pr-high')?.score || 0) > (w18HybridById.get('w18-closed-pr-hub')?.score || 0), 'high-PR open issue outranks clamped closed mega-hub');
+  assert.equal(wave18BrowserAudit.fallbackCycleWithCycles.hasCycles, true, 'getCycleInfo WASM fallback reports active cycles');
+  assert.equal(wave18BrowserAudit.fallbackCycleWithCycles.cycleCount, 2, 'getCycleInfo WASM fallback honors triageData.project_health.graph.cycle_count');
+  assert.deepEqual(wave18BrowserAudit.fallbackCycleWithCycles.sccComponents, [['cap-auth-root', 'cap-auth-ui', 'cap-billing-a', 'cap-billing-b']], 'getCycleInfo WASM fallback lists in_cycle=1 active issues');
+  assert.equal(wave18BrowserAudit.fallbackCycleAcyclic.hasCycles, false, 'getCycleInfo WASM fallback negative control returns false when acyclic');
+  assert.equal(wave18BrowserAudit.fallbackCycleAcyclic.cycleCount, 0);
+  assert.equal(wave18BrowserAudit.wasmFallbackGraphAudit.wasmReady, false);
+  assert.equal(wave18BrowserAudit.wasmFallbackGraphAudit.hasOverviewEigenvector, true);
+  assert.equal(wave18BrowserAudit.wasmFallbackGraphAudit.hasOverviewInCycle, true);
+  assert.ok(wave18BrowserAudit.wasmFallbackGraphAudit.authRootPagerank > 0, 'graph.js WASM fallback populates node.pagerank');
+  assert.ok(wave18BrowserAudit.wasmFallbackGraphAudit.authRootEigenvector > 0, 'graph.js WASM fallback populates node.eigenvector');
+  assert.equal(wave18BrowserAudit.wasmFallbackGraphAudit.authRootInCycle, true, 'graph.js WASM fallback marks active cycle node inCycle=true');
+  assert.equal(wave18BrowserAudit.wasmFallbackGraphAudit.closedInCycle, false, 'graph.js WASM fallback keeps closed node inCycle=false');
+  assert.ok(wave18BrowserAudit.dagEigenvectorAudit.rawWasmDagRange < 1e-9, 'WASM power-iteration eigenvector on DAG is flat');
+  assert.ok(Math.abs(wave18BrowserAudit.dagEigenvectorAudit.preservedDagEig[0] - 0.85) < 1e-6 && Math.abs(wave18BrowserAudit.dagEigenvectorAudit.preservedDagEig[2] - 0.10) < 1e-6, 'graph.js preserves differentiated SQLite eigenvector on DAGs');
+  assert.ok(wave18BrowserAudit.dagEigenvectorAudit.sizeDagA > wave18BrowserAudit.dagEigenvectorAudit.sizeDagC, 'sizeMetric="eigenvector" differentiates DAG nodes');
+  assert.ok(wave18BrowserAudit.dagEigenvectorAudit.rawWasmCycRange > 1e-4 && wave18BrowserAudit.dagEigenvectorAudit.cyclicMatchesWasm, 'non-flat cyclic WASM eigenvector remains authoritative');
+  assert.deepEqual(wave18BrowserAudit.wasmGraphAlgAudit.kcores, [0, 1, 2, 2, 2], 'WASM kcore skips self-loops while preserving 2-core triangle');
+  assert.deepEqual(wave18BrowserAudit.wasmGraphAlgAudit.bridges1, [[1, 2]], 'WASM bridges returns canonical sorted bridge');
+  assert.equal(wave18BrowserAudit.wasmGraphAlgAudit.bridgesEqual, true);
+  assert.equal(wave18BrowserAudit.wasmGraphAlgAudit.approxEqual, true, 'WASM betweennessApprox is deterministic across calls');
+
   // 5. Error Modal runErrorAction(action) recovery handler ({ action }, { handler }, { url }).
   await evaluate(page, `(() => {
     window.__errorRecovered = [];
@@ -3201,6 +3400,52 @@ async function standaloneGraphJourney(page) {
   assert.equal(initialAudit.lightOn, true, 'toggleLightMode enables body.light-mode');
   assert.equal(initialAudit.lightOff, true, 'toggleLightMode restores dark mode');
   await waitFor(page, `document.getElementById('view-mode')?.value === 'force' && localStorage.getItem('bv-graph-layout') === null && !Graph.dagMode() && (document.getElementById('toast')?.textContent || '').includes('Cannot apply DAG layout: dependency cycle detected')`, 'ForceGraph onDagError recovers from cycle, resets #view-mode to force, clears localStorage, and shows toast');
+
+  // Wave 18 (bv-apal.86): Standalone HTML dagMode filters non-blocking links (related, discovered-from)
+  // so bidirectional non-blocking links never trigger false cycle errors, and active PageRankRank is 0 for closed issues.
+  const standaloneDagAndPrRankAudit = await evaluate(page, `(() => {
+    const closedNode = DATA.nodes.find(n => n.id === 'cap-closed-prereq');
+    const activeRanks = DATA.nodes.filter(n => n.status !== 'closed' && n.status !== 'tombstone').map(n => n.pagerank_rank).sort((a, b) => a - b);
+    const savedLinks = DATA.links.map(l => ({ ...l }));
+    try {
+      DATA.links = [
+        { source: 'cap-hub-leaf', target: 'cap-auth-root', type: 'blocks', critical: false },
+        { source: 'cap-auth-root', target: 'cap-auth-ui', type: 'related', critical: false },
+        { source: 'cap-auth-ui', target: 'cap-auth-root', type: 'related', critical: false },
+        { source: 'cap-billing-a', target: 'cap-billing-b', type: 'discovered-from', critical: false },
+        { source: 'cap-billing-b', target: 'cap-billing-a', type: 'discovered-from', critical: false },
+      ];
+      const tdApplied = applyGraphDagMode('td');
+      const dagModeNow = Graph.dagMode();
+      const dagLinksCount = Graph.graphData().links.length;
+      const dagHasNonBlocking = Graph.graphData().links.some(l => !isBlockingLinkType(l.type));
+      const forceApplied = applyGraphDagMode('force');
+      const forceLinksCount = Graph.graphData().links.length;
+      return {
+        closedPrRank: closedNode?.pagerank_rank,
+        activeRanks,
+        tdApplied,
+        dagErrorTriggered,
+        dagModeNow,
+        dagLinksCount,
+        dagHasNonBlocking,
+        forceApplied,
+        forceLinksCount,
+      };
+    } finally {
+      DATA.links = savedLinks;
+      applyGraphDagMode('force');
+    }
+  })()`);
+  assert.equal(standaloneDagAndPrRankAudit.closedPrRank, 0, 'closed standalone node has pagerank_rank === 0');
+  assert.deepEqual(standaloneDagAndPrRankAudit.activeRanks, [1, 2, 3, 4, 5], 'active standalone nodes receive contiguous PageRankRank 1..5');
+  assert.equal(standaloneDagAndPrRankAudit.tdApplied, true, 'applyGraphDagMode("td") succeeds when cycle is only on related/discovered-from links');
+  assert.equal(standaloneDagAndPrRankAudit.dagErrorTriggered, false, 'bidirectional related/discovered-from links never trigger onDagError');
+  assert.equal(standaloneDagAndPrRankAudit.dagModeNow, 'td');
+  assert.equal(standaloneDagAndPrRankAudit.dagLinksCount, 1, 'dagMode filters Graph.graphData().links to the 1 blocking link');
+  assert.equal(standaloneDagAndPrRankAudit.dagHasNonBlocking, false);
+  assert.equal(standaloneDagAndPrRankAudit.forceApplied, true);
+  assert.equal(standaloneDagAndPrRankAudit.forceLinksCount, 5, 'returning to force mode restores all 5 blocking + non-blocking links');
 
   // Verify unified applyFilters across status, label, priority, and search.
   const filterAudit = await evaluate(page, `(() => {

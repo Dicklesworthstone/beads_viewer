@@ -717,7 +717,7 @@ func VerifyCloudflareDeployment(deployURL string, expectedIssueCount int, timeou
 		output, err := fetchDeploymentMetaJSON(httpClient, metaURL, deadline)
 		if err != nil {
 			lastErr = fmt.Errorf("fetch failed: %w", err)
-			sleepDeploymentPoll(3*time.Second, deadline)
+			sleepDeploymentPoll(cloudflareDeploymentPollInterval, deadline)
 			continue
 		}
 
@@ -727,15 +727,17 @@ func VerifyCloudflareDeployment(deployURL string, expectedIssueCount int, timeou
 		}
 		if err := json.Unmarshal(output, &meta); err != nil {
 			lastErr = fmt.Errorf("parse failed: %w", err)
-			sleepDeploymentPoll(3*time.Second, deadline)
+			sleepDeploymentPoll(cloudflareDeploymentPollInterval, deadline)
 			continue
 		}
 
 		// Check issue count matches expected. Zero is a valid expected
 		// count for empty exports; negative disables count comparison.
 		if expectedIssueCount >= 0 && meta.IssueCount != expectedIssueCount {
-			return fmt.Errorf("deployment verification issue count mismatch: live site shows %d issues, expected %d",
+			lastErr = fmt.Errorf("deployment verification issue count mismatch: live site shows %d issues, expected %d",
 				meta.IssueCount, expectedIssueCount)
+			sleepDeploymentPoll(cloudflareDeploymentPollInterval, deadline)
+			continue
 		}
 
 		fmt.Printf("  ✓ Deployment verified: %d issues live\n", meta.IssueCount)
@@ -743,6 +745,9 @@ func VerifyCloudflareDeployment(deployURL string, expectedIssueCount int, timeou
 	}
 
 	if lastErr != nil {
+		if strings.HasPrefix(lastErr.Error(), "deployment verification ") {
+			return lastErr
+		}
 		return fmt.Errorf("deployment verification failed for %s: %w", metaURL, lastErr)
 	}
 	return fmt.Errorf("deployment verification timed out for %s", metaURL)

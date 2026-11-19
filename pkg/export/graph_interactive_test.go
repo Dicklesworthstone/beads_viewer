@@ -726,11 +726,27 @@ func TestGenerateInteractiveGraphHTML_ExternalReadinessWithheldFlagsAndClosedArt
 		t.Fatalf("open-root positive control IsActionable = false, want true")
 	}
 
-	// Active cut vertex vs closed historical cut vertex:
-	if !byID["open-cut"].IsArticulation || byID["open-cut"].Betweenness <= 0 {
-		t.Fatalf("open-cut = %+v, want IsArticulation=true and Betweenness > 0", byID["open-cut"])
+	// Active cut vertex vs closed historical cut vertex + active PageRankRank:
+	if !byID["open-cut"].IsArticulation || byID["open-cut"].Betweenness <= 0 || byID["open-cut"].PageRankRank <= 0 {
+		t.Fatalf("open-cut = %+v, want IsArticulation=true, Betweenness > 0, and active PageRankRank > 0", byID["open-cut"])
 	}
-	if byID["closed-cut"].IsArticulation || byID["closed-cut"].Betweenness != 0 || byID["closed-cut"].CoreNumber != 0 || byID["closed-cut"].BetweennessRank != 0 {
-		t.Fatalf("closed-cut = %+v, want IsArticulation=false Betweenness=0 CoreNumber=0 BetweennessRank=0", byID["closed-cut"])
+	if byID["closed-cut"].IsArticulation || byID["closed-cut"].Betweenness != 0 || byID["closed-cut"].CoreNumber != 0 || byID["closed-cut"].BetweennessRank != 0 || byID["closed-cut"].PageRankRank != 0 {
+		t.Fatalf("closed-cut = %+v, want IsArticulation=false Betweenness=0 CoreNumber=0 BetweennessRank=0 PageRankRank=0", byID["closed-cut"])
+	}
+	// Verify active PageRankRank starts at #1 among active issues without gaps from closed nodes.
+	hasRankOne := false
+	for id, node := range byID {
+		if node.Status == "closed" || node.Status == "tombstone" {
+			if node.PageRankRank != 0 {
+				t.Fatalf("resolved node %s has PageRankRank=%d, want 0", id, node.PageRankRank)
+			}
+			continue
+		}
+		if node.PageRankRank == 1 {
+			hasRankOne = true
+		}
+	}
+	if !hasRankOne {
+		t.Fatalf("expected top active issue to receive PageRankRank == 1 even when closed hubs exist")
 	}
 }
