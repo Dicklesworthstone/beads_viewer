@@ -111,20 +111,29 @@ type labelVocabulary struct {
 	learnedMappings  map[string]map[string]int
 }
 
+func cleanValidLabel(raw string) (string, bool) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" || strings.ContainsRune(trimmed, '\x00') {
+		return "", false
+	}
+	return trimmed, true
+}
+
 func buildLabelVocabulary(issues []model.Issue, learnFromExisting bool) *labelVocabulary {
 	allLabels := make(map[string]bool)
 	rawCounts := make(map[string]map[string]int)
 	for _, issue := range issues {
 		for _, label := range issue.Labels {
-			if label == "" {
+			trimmed, ok := cleanValidLabel(label)
+			if !ok {
 				continue
 			}
-			lower := strings.ToLower(label)
+			lower := strings.ToLower(trimmed)
 			allLabels[lower] = true
 			if rawCounts[lower] == nil {
 				rawCounts[lower] = make(map[string]int)
 			}
-			rawCounts[lower][label]++
+			rawCounts[lower][trimmed]++
 		}
 	}
 
@@ -159,6 +168,15 @@ func SuggestLabels(issues []model.Issue, config LabelSuggestionConfig) []Suggest
 		return nil
 	}
 
+	hasMixedRepos := false
+	firstRepo := strings.TrimSpace(issues[0].SourceRepo)
+	for i := 1; i < len(issues); i++ {
+		if strings.TrimSpace(issues[i].SourceRepo) != firstRepo {
+			hasMixedRepos = true
+			break
+		}
+	}
+
 	vocabByRepo := make(map[string]*labelVocabulary)
 	getVocab := func(sourceRepo string) *labelVocabulary {
 		repo := strings.TrimSpace(sourceRepo)
@@ -166,11 +184,10 @@ func SuggestLabels(issues []model.Issue, config LabelSuggestionConfig) []Suggest
 			return cached
 		}
 		scopeIssues := issues
-		if repo != "" {
+		if hasMixedRepos || repo != firstRepo {
 			scopeIssues = make([]model.Issue, 0, len(issues))
 			for _, iss := range issues {
-				otherRepo := strings.TrimSpace(iss.SourceRepo)
-				if otherRepo == "" || otherRepo == repo {
+				if strings.TrimSpace(iss.SourceRepo) == repo {
 					scopeIssues = append(scopeIssues, iss)
 				}
 			}
@@ -198,7 +215,9 @@ func SuggestLabels(issues []model.Issue, config LabelSuggestionConfig) []Suggest
 		// Get existing labels for this issue (case-insensitive suppression)
 		existingLabels := make(map[string]bool, len(issue.Labels))
 		for _, l := range issue.Labels {
-			existingLabels[strings.ToLower(l)] = true
+			if trimmed, ok := cleanValidLabel(l); ok {
+				existingLabels[strings.ToLower(trimmed)] = true
+			}
 		}
 
 		// Extract keywords
@@ -333,13 +352,30 @@ func learnLabelMappings(issues []model.Issue) map[string]map[string]int {
 			continue
 		}
 
+		seenLabels := make(map[string]bool, len(issue.Labels))
+		uniqueLowerLabels := make([]string, 0, len(issue.Labels))
+		for _, label := range issue.Labels {
+			trimmed, ok := cleanValidLabel(label)
+			if !ok {
+				continue
+			}
+			lower := strings.ToLower(trimmed)
+			if !seenLabels[lower] {
+				seenLabels[lower] = true
+				uniqueLowerLabels = append(uniqueLowerLabels, lower)
+			}
+		}
+		if len(uniqueLowerLabels) == 0 {
+			continue
+		}
+
 		keywords := extractKeywords(issue.Title, issue.Description)
 		for _, kw := range keywords {
 			if mappings[kw] == nil {
 				mappings[kw] = make(map[string]int)
 			}
-			for _, label := range issue.Labels {
-				mappings[kw][strings.ToLower(label)]++
+			for _, lower := range uniqueLowerLabels {
+				mappings[kw][lower]++
 			}
 		}
 	}

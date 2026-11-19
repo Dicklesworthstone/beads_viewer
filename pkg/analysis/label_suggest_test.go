@@ -1196,3 +1196,91 @@ func TestSuggestLabels_PreservesCanonicalCasingAndSourceRepoIsolation(t *testing
 		}
 	}
 }
+
+func TestSuggestLabels_SymmetricSourceRepoBlankNulRejectionAndPerIssueDedup(t *testing.T) {
+	// 1. Symmetric SourceRepo isolation ("" <-> "web" never cross-pollinate) + blank/NUL label rejection.
+	symIssues := []model.Issue{
+		{
+			ID: "WEB-SEED-1", Title: "Checkout payment gateway timeout", Status: model.StatusClosed,
+			Labels: []string{"web:Checkout", "   ", "\t\n", "bad\x00label"}, SourceRepo: "web",
+		},
+		{
+			ID: "WEB-SEED-2", Title: "Checkout payment gateway retry", Status: model.StatusClosed,
+			Labels: []string{"web:Checkout"}, SourceRepo: "web",
+		},
+		{
+			ID: "WEB-SEED-3", Title: "Checkout payment gateway webhook", Status: model.StatusClosed,
+			Labels: []string{"web:Checkout"}, SourceRepo: "web",
+		},
+		{
+			ID: "ROOT-SEED-1", Title: "Checkout payment gateway ledger", Status: model.StatusClosed,
+			Labels: []string{"root:Ledger", "", " \x00 "}, SourceRepo: "",
+		},
+		{
+			ID: "ROOT-SEED-2", Title: "Checkout payment gateway settlement", Status: model.StatusClosed,
+			Labels: []string{"root:Ledger"}, SourceRepo: "",
+		},
+		{
+			ID: "ROOT-SEED-3", Title: "Checkout payment gateway reconciliation", Status: model.StatusClosed,
+			Labels: []string{"root:Ledger"}, SourceRepo: "",
+		},
+		{ID: "ROOT-TARGET", Title: "Checkout payment gateway audit", Status: model.StatusOpen, SourceRepo: ""},
+		{ID: "WEB-TARGET", Title: "Checkout payment gateway UI", Status: model.StatusOpen, SourceRepo: "web"},
+	}
+
+	cfg := DefaultLabelSuggestionConfig()
+	cfg.BuiltinMappings = false
+	cfg.MinConfidence = 0.2
+	sugs := SuggestLabels(symIssues, cfg)
+
+	gotRoot := false
+	gotWeb := false
+	for _, s := range sugs {
+		lbl, _ := s.Metadata["suggested_label"].(string)
+		if strings.TrimSpace(lbl) == "" || strings.ContainsRune(lbl, '\x00') {
+			t.Fatalf("emitted blank or NUL label %q: %+v", lbl, s)
+		}
+		switch s.TargetBead {
+		case "ROOT-TARGET":
+			if lbl == "web:Checkout" {
+				t.Fatalf("SourceRepo=web label leaked into SourceRepo=\"\" target: %+v", s)
+			}
+			if lbl == "root:Ledger" {
+				gotRoot = true
+			}
+		case "WEB-TARGET":
+			if lbl == "root:Ledger" {
+				t.Fatalf("SourceRepo=\"\" label leaked into SourceRepo=web target: %+v", s)
+			}
+			if lbl == "web:Checkout" {
+				gotWeb = true
+			}
+		}
+	}
+	if !gotRoot || !gotWeb {
+		t.Fatalf("expected symmetric same-repo suggestions (gotRoot=%v gotWeb=%v), got %+v", gotRoot, gotWeb, sugs)
+	}
+
+	// 2. Per-issue case-insensitive deduplication in learnLabelMappings:
+	// One issue carrying ["Billing", "billing", "BILLING"] must count ONCE (0.1 + 1*0.05 = 0.15 < 0.20 -> 0 suggestions),
+	// whereas two distinct issues carrying "Billing" count TWICE (0.1 + 2*0.05 = 0.20 >= 0.20 -> suggests "Billing").
+	dedupCfg := DefaultLabelSuggestionConfig()
+	dedupCfg.BuiltinMappings = false
+	dedupCfg.MinConfidence = 0.20
+
+	singleIssueDupCase := []model.Issue{
+		{ID: "H1", Title: "Invoice settlement", Status: model.StatusClosed, Labels: []string{"Billing", "billing", "BILLING"}},
+		{ID: "TARGET", Title: "Invoice check", Status: model.StatusOpen},
+	}
+	if got := SuggestLabels(singleIssueDupCase, dedupCfg); len(got) != 0 {
+		t.Fatalf("duplicate case-variants on single issue inflated learned count past 0.20 threshold: %+v", got)
+	}
+
+	twoIssues := append(singleIssueDupCase, model.Issue{
+		ID: "H2", Title: "Invoice refund", Status: model.StatusClosed, Labels: []string{"Billing"},
+	})
+	gotTwo := SuggestLabels(twoIssues, dedupCfg)
+	if len(gotTwo) != 1 || gotTwo[0].Metadata["suggested_label"] != "Billing" {
+		t.Fatalf("expected 2 distinct issues to reach 0.20 threshold with canonical 'Billing', got %+v", gotTwo)
+	}
+}
