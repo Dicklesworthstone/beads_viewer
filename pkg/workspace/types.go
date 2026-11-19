@@ -219,7 +219,8 @@ func LoadConfig(path string) (*Config, error) {
 
 // FindWorkspaceConfig searches for .bv/workspace.yaml starting from dir,
 // stopping before filesystem roots, temp-directory roots (os.TempDir(), /tmp,
-// /var/tmp), and any GIT_CEILING_DIRECTORIES boundaries.
+// /var/tmp), and any absolute GIT_CEILING_DIRECTORIES boundaries (including
+// symlink-aware boundary crossings).
 func FindWorkspaceConfig(dir string) (string, error) {
 	if dir == "" {
 		var err error
@@ -232,65 +233,106 @@ func FindWorkspaceConfig(dir string) (string, error) {
 		dir = abs
 	}
 	dir = filepath.Clean(dir)
+	if info, err := os.Stat(dir); err == nil && !info.IsDir() {
+		dir = filepath.Clean(filepath.Dir(dir))
+	}
+
+	canonicalPath := func(p string) string {
+		clean := filepath.Clean(p)
+		if eval, err := filepath.EvalSymlinks(clean); err == nil {
+			return filepath.Clean(eval)
+		}
+		return clean
+	}
 
 	tempRoots := make(map[string]bool)
 	stopDirs := make(map[string]bool)
-	addDirSet := func(dst map[string]bool, p string) {
-		if strings.TrimSpace(p) == "" {
+	addTempRoot := func(p string) {
+		trimmed := strings.TrimSpace(p)
+		if trimmed == "" {
 			return
 		}
-		clean := filepath.Clean(p)
-		dst[clean] = true
+		clean := filepath.Clean(trimmed)
+		tempRoots[clean] = true
+		stopDirs[clean] = true
 		if abs, err := filepath.Abs(clean); err == nil {
-			dst[filepath.Clean(abs)] = true
+			absClean := filepath.Clean(abs)
+			tempRoots[absClean] = true
+			stopDirs[absClean] = true
+			realClean := canonicalPath(absClean)
+			tempRoots[realClean] = true
+			stopDirs[realClean] = true
 		}
-		if eval, err := filepath.EvalSymlinks(clean); err == nil {
-			dst[filepath.Clean(eval)] = true
-		}
+		realClean := canonicalPath(clean)
+		tempRoots[realClean] = true
+		stopDirs[realClean] = true
 	}
 	for _, tmpRoot := range []string{os.TempDir(), "/tmp", "/var/tmp"} {
-		addDirSet(tempRoots, tmpRoot)
-		addDirSet(stopDirs, tmpRoot)
+		addTempRoot(tmpRoot)
 	}
 	for _, ceiling := range filepath.SplitList(os.Getenv("GIT_CEILING_DIRECTORIES")) {
-		addDirSet(stopDirs, ceiling)
+		trimmed := strings.TrimSpace(ceiling)
+		if trimmed == "" || !filepath.IsAbs(trimmed) {
+			// Per git(1), non-absolute GIT_CEILING_DIRECTORIES entries are ignored.
+			continue
+		}
+		clean := filepath.Clean(trimmed)
+		stopDirs[clean] = true
+		stopDirs[canonicalPath(clean)] = true
 	}
 
-	matchesSet := func(set map[string]bool, p string) bool {
-		clean := filepath.Clean(p)
-		if set[clean] {
-			return true
-		}
-		if eval, err := filepath.EvalSymlinks(clean); err == nil && set[filepath.Clean(eval)] {
-			return true
-		}
-		return false
-	}
-	isTempOrRoot := func(p string) bool {
-		clean := filepath.Clean(p)
-		return filepath.Dir(clean) == clean || matchesSet(tempRoots, clean)
-	}
-	isStopBoundary := func(p string) bool {
-		clean := filepath.Clean(p)
-		return filepath.Dir(clean) == clean || matchesSet(stopDirs, clean)
+	stopBoundaryList := make([]string, 0, len(stopDirs))
+	for b := range stopDirs {
+		stopBoundaryList = append(stopBoundaryList, b)
 	}
 
-	if isTempOrRoot(dir) {
+	strictlyInside := func(path, boundary string) bool {
+		if path == boundary {
+			return false
+		}
+		if filepath.Dir(boundary) == boundary {
+			return strings.HasPrefix(path, boundary)
+		}
+		return strings.HasPrefix(path, boundary+string(filepath.Separator))
+	}
+
+	curReal := canonicalPath(dir)
+	if filepath.Dir(dir) == dir || filepath.Dir(curReal) == curReal || tempRoots[dir] || tempRoots[curReal] {
 		return "", os.ErrNotExist
 	}
 
 	// Walk up the directory tree looking for .bv/workspace.yaml
 	for {
 		candidate := filepath.Join(dir, ".bv", "workspace.yaml")
-		if _, err := os.Stat(candidate); err == nil {
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
 			return candidate, nil
 		}
 
-		parent := filepath.Dir(dir)
-		if parent == dir || isStopBoundary(dir) || isStopBoundary(parent) {
+		parent := filepath.Clean(filepath.Dir(dir))
+		if parent == dir {
+			break
+		}
+		parentReal := canonicalPath(parent)
+		if parentReal == curReal ||
+			filepath.Dir(parent) == parent ||
+			filepath.Dir(parentReal) == parentReal ||
+			stopDirs[dir] || stopDirs[curReal] ||
+			stopDirs[parent] || stopDirs[parentReal] {
+			break
+		}
+		crossed := false
+		for _, boundary := range stopBoundaryList {
+			if (strictlyInside(dir, boundary) && !strictlyInside(parent, boundary)) ||
+				(strictlyInside(curReal, boundary) && !strictlyInside(parentReal, boundary)) {
+				crossed = true
+				break
+			}
+		}
+		if crossed {
 			break
 		}
 		dir = parent
+		curReal = parentReal
 	}
 
 	return "", os.ErrNotExist

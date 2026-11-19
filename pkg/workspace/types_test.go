@@ -927,4 +927,50 @@ func TestFindWorkspaceConfig_RespectsCeilingAndTempRootBoundaries(t *testing.T) 
 	if got, err := workspace.FindWorkspaceConfig(customTmpRoot); !os.IsNotExist(err) {
 		t.Fatalf("FindWorkspaceConfig at os.TempDir() root (%s) should return os.ErrNotExist, got %q, err=%v", customTmpRoot, got, err)
 	}
+
+	// 3. Relative entries in GIT_CEILING_DIRECTORIES must be ignored per git(1), and a regular-file start path normalizes to its parent dir.
+	t.Setenv("TMPDIR", "")
+	t.Setenv("TMP", "")
+	t.Setenv("TEMP", "")
+	t.Setenv("GIT_CEILING_DIRECTORIES", strings.Join([]string{".", "services", "../relative"}, string(os.PathListSeparator)))
+	startFile := filepath.Join(workSub, "handler.go")
+	if err := os.WriteFile(startFile, []byte("package pkg\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(workSub)
+	gotFromFile, err := workspace.FindWorkspaceConfig(startFile)
+	if err != nil || filepath.Clean(gotFromFile) != filepath.Clean(wantInnerCfg) {
+		t.Fatalf("FindWorkspaceConfig(file %s) with relative GIT_CEILING_DIRECTORIES = (%q, %v), want %q", startFile, gotFromFile, err, wantInnerCfg)
+	}
+
+	// 4. Symlink escape across GIT_CEILING_DIRECTORIES and os.TempDir() must be blocked!
+	escapeOuter := t.TempDir()
+	_ = writeWS(escapeOuter)
+	escapeCeiling := filepath.Join(escapeOuter, "jailed-ceiling")
+	escapeLeaf := filepath.Join(escapeCeiling, "sub", "leaf")
+	if err := os.MkdirAll(escapeLeaf, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Symlink inside escapeOuter pointing into escapeCeiling/sub: lexical parent of escape_link is escapeOuter!
+	escapeLink := filepath.Join(escapeOuter, "escape_link")
+	if err := os.Symlink(filepath.Join(escapeCeiling, "sub"), escapeLink); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GIT_CEILING_DIRECTORIES", escapeCeiling)
+	if got, err := workspace.FindWorkspaceConfig(filepath.Join(escapeLink, "leaf")); !os.IsNotExist(err) {
+		t.Fatalf("symlink escape crossed canonical GIT_CEILING_DIRECTORIES (%s) into outer workspace: got %q, err=%v", escapeCeiling, got, err)
+	}
+
+	// Same symlink escape across os.TempDir():
+	t.Setenv("GIT_CEILING_DIRECTORIES", "")
+	tmpEscapeLink := filepath.Join(hostWithWS, "tmp_escape_link")
+	if err := os.Symlink(filepath.Join(customTmpRoot, "scratch-job"), tmpEscapeLink); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TMPDIR", customTmpRoot)
+	t.Setenv("TMP", customTmpRoot)
+	t.Setenv("TEMP", customTmpRoot)
+	if got, err := workspace.FindWorkspaceConfig(filepath.Join(tmpEscapeLink, "sub")); !os.IsNotExist(err) {
+		t.Fatalf("symlink escape crossed canonical os.TempDir() (%s) into host workspace: got %q, err=%v", customTmpRoot, got, err)
+	}
 }
