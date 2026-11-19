@@ -550,12 +550,16 @@ func TestVerifyCloudflareDeployment_RejectsEmptyObjectAndHandlesQueryFragmentURL
 	// Positive observable: subpath + `?branch=preview#top` resolves `/cf-sub/data/meta.json?branch=preview&_t=...`,
 	// retries past Poll 1 `{"issue_count": -1}` and succeeds on Poll 2 `{"issue_count": 0}`.
 	var calls atomic.Int32
+	var sawBranchQuery atomic.Int32
+	var sawCacheBuster atomic.Int32
 	subMux := http.NewServeMux()
 	subMux.HandleFunc("/cf-sub/data/meta.json", func(w http.ResponseWriter, r *http.Request) {
 		n := calls.Add(1)
-		if r.URL.Query().Get("branch") != "preview" || r.URL.Query().Get("_t") == "" {
-			http.Error(w, "missing expected query params", http.StatusBadRequest)
-			return
+		if r.URL.Query().Get("branch") == "preview" {
+			sawBranchQuery.Add(1)
+		}
+		if strings.TrimSpace(r.URL.Query().Get("_t")) != "" {
+			sawCacheBuster.Add(1)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		if n == 1 {
@@ -570,7 +574,7 @@ func TestVerifyCloudflareDeployment_RejectsEmptyObjectAndHandlesQueryFragmentURL
 	if err := VerifyCloudflareDeployment(subSrv.URL+"/cf-sub/?branch=preview#top", 0, 500*time.Millisecond); err != nil {
 		t.Fatalf("VerifyCloudflareDeployment with query+fragment failed: %v", err)
 	}
-	if calls.Load() < 2 {
-		t.Fatalf("expected >= 2 calls before valid issue_count=0, got %d", calls.Load())
+	if calls.Load() < 2 || sawBranchQuery.Load() < 2 || sawCacheBuster.Load() < 2 {
+		t.Fatalf("calls=%d sawBranchQuery=%d sawCacheBuster=%d, want >=2 each", calls.Load(), sawBranchQuery.Load(), sawCacheBuster.Load())
 	}
 }

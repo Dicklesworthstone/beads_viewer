@@ -942,7 +942,7 @@ func TestVerifyGitHubPagesDeployment_RejectsEmptyObjectAndHandlesQueryFragmentUR
 		if r.URL.Query().Get("preview") == "1" {
 			sawPreviewQuery.Add(1)
 		}
-		if r.URL.Query().Get("_t") != "" {
+		if strings.TrimSpace(r.URL.Query().Get("_t")) != "" {
 			sawCacheBuster.Add(1)
 		}
 		w.Header().Set("Content-Type", "application/json")
