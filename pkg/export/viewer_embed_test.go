@@ -980,3 +980,55 @@ func TestAddScriptCacheBusting_StylesCSSAndHybridBuildScriptDefaultOutDir(t *tes
 		}
 	}
 }
+
+func TestCopyEmbeddedAssetsWithSubtitle_ExcludesDevOnlyAssetsFromDiskAndOfflineManifest(t *testing.T) {
+	outDir := t.TempDir()
+	// Pre-populate optional wasm/ directory with both runtime WASM and dev-only wasm-pack artifacts.
+	wasmDir := filepath.Join(outDir, "wasm")
+	if err := os.MkdirAll(wasmDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll wasm: %v", err)
+	}
+	for name, body := range map[string]string{
+		"bv_hybrid_scorer.js":           "export default function init() {}",
+		"bv_hybrid_scorer_bg.wasm":      "\x00asm\x01\x00\x00\x00",
+		"bv_hybrid_scorer.d.ts":         "export class HybridScorer {}",
+		"bv_hybrid_scorer_bg.wasm.d.ts": "export const memory: WebAssembly.Memory;",
+		"package.json":                  `{"name":"bv-hybrid-scorer"}`,
+		"scorer.test.js":                "throw new Error('dev test');",
+	} {
+		if err := os.WriteFile(filepath.Join(wasmDir, name), []byte(body), 0o644); err != nil {
+			t.Fatalf("WriteFile %s: %v", name, err)
+		}
+	}
+
+	if err := CopyEmbeddedAssetsWithSubtitle(outDir, "Audit Title", "Audit Subtitle"); err != nil {
+		t.Fatalf("CopyEmbeddedAssetsWithSubtitle failed: %v", err)
+	}
+
+	// Planted negative controls: dev-only embedded files must never exist on disk after CopyEmbeddedAssetsWithSubtitle.
+	for _, devFile := range []string{"hybrid_scorer.test.js", "graph-demo.html"} {
+		if _, err := os.Stat(filepath.Join(outDir, devFile)); !os.IsNotExist(err) {
+			t.Fatalf("dev-only asset %s must not exist after CopyEmbeddedAssetsWithSubtitle (err=%v)", devFile, err)
+		}
+	}
+
+	// Positive observables: production viewer assets exist and coi-serviceworker.js binds runtime wasm, never dev-only files.
+	for _, prodFile := range []string{"index.html", "viewer.js", "graph.js", "hybrid_scorer.js", "coi-serviceworker.js"} {
+		if _, err := os.Stat(filepath.Join(outDir, prodFile)); err != nil {
+			t.Fatalf("expected production asset %s: %v", prodFile, err)
+		}
+	}
+	swBytes, err := os.ReadFile(filepath.Join(outDir, "coi-serviceworker.js"))
+	if err != nil {
+		t.Fatalf("read coi-serviceworker.js: %v", err)
+	}
+	swText := string(swBytes)
+	if !strings.Contains(swText, `"wasm/bv_hybrid_scorer.js"`) || !strings.Contains(swText, `"wasm/bv_hybrid_scorer_bg.wasm"`) {
+		t.Fatalf("expected runtime wasm files in OFFLINE_ASSETS, got:\n%s", swText)
+	}
+	for _, forbidden := range []string{"hybrid_scorer.test.js", "graph-demo.html", ".d.ts", "package.json", "scorer.test.js"} {
+		if strings.Contains(swText, forbidden) {
+			t.Fatalf("dev-only asset %q leaked into coi-serviceworker.js OFFLINE_ASSETS:\n%s", forbidden, swText)
+		}
+	}
+}

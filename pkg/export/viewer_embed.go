@@ -274,6 +274,9 @@ func (b *Bundle) CopyEmbeddedAssetsWithSubtitle(title, subtitle string) error {
 				return nil
 			}
 			if !d.IsDir() {
+				if p == "coi-serviceworker.js" || isDevOnlyAsset(p) {
+					return nil
+				}
 				if !d.Type().IsRegular() {
 					return fmt.Errorf("offline asset %s is not a regular file", p)
 				}
