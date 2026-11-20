@@ -1496,13 +1496,41 @@ func resolveMetadataPathWithinDir(beadsDir, raw string) (string, bool) {
 	return candidate, true
 }
 
-func foldDoltNomsHeadFiles(nomsDir string, latest time.Time) time.Time {
+func foldDoltNomsHeadFiles(nomsDir string, latest time.Time) (time.Time, bool) {
+	hasHead := false
 	for _, headFile := range []string{"manifest", "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv"} {
-		if hInfo, hErr := os.Stat(filepath.Join(nomsDir, headFile)); hErr == nil && !hInfo.IsDir() && hInfo.ModTime().After(latest) {
-			latest = hInfo.ModTime()
+		if hInfo, hErr := os.Stat(filepath.Join(nomsDir, headFile)); hErr == nil && !hInfo.IsDir() {
+			hasHead = true
+			if hInfo.ModTime().After(latest) {
+				latest = hInfo.ModTime()
+			}
 		}
 	}
-	return latest
+	if !hasHead {
+		if entries, err := os.ReadDir(nomsDir); err == nil {
+			checked := 0
+			for _, entry := range entries {
+				eLower := strings.ToLower(entry.Name())
+				if entry.IsDir() ||
+					eLower == "lock" ||
+					strings.HasSuffix(eLower, "-shm") ||
+					strings.HasSuffix(eLower, ".lock") ||
+					strings.HasSuffix(eLower, ".fslock") {
+					continue
+				}
+				if eInfo, sErr := os.Stat(filepath.Join(nomsDir, entry.Name())); sErr == nil && !eInfo.IsDir() {
+					if eInfo.ModTime().After(latest) {
+						latest = eInfo.ModTime()
+					}
+					checked++
+					if checked >= 64 {
+						break
+					}
+				}
+			}
+		}
+	}
+	return latest, hasHead
 }
 
 func foldBeadsDirStoreModTime(dirPath string, latest time.Time) time.Time {
@@ -1515,7 +1543,12 @@ func foldBeadsDirStoreModTime(dirPath string, latest time.Time) time.Time {
 	if evalRoot, evalErr := filepath.EvalSymlinks(dirPath); evalErr == nil {
 		if rInfo, rErr := os.Stat(evalRoot); rErr == nil && rInfo.IsDir() {
 			rootPath = evalRoot
+			info = rInfo
 		}
+	}
+	rootLower := strings.ToLower(filepath.Base(rootPath))
+	if rootLower != "noms" && rootLower != "oldgen" && info.ModTime().After(latest) {
+		latest = info.ModTime()
 	}
 	seen := 0
 	_ = filepath.WalkDir(rootPath, func(p string, d fs.DirEntry, walkErr error) error {
@@ -1527,12 +1560,16 @@ func foldBeadsDirStoreModTime(dirPath string, latest time.Time) time.Time {
 			if lower == "oldgen" {
 				return fs.SkipDir
 			}
+			if lower == "noms" {
+				latest, _ = foldDoltNomsHeadFiles(p, latest)
+				return fs.SkipDir
+			}
 			seen++
 			if seen > maxBoundedWalkEntries {
 				return fs.SkipAll
 			}
-			if lower == "noms" {
-				latest = foldDoltNomsHeadFiles(p, latest)
+			if dInfo, dErr := d.Info(); dErr == nil && dInfo.ModTime().After(latest) {
+				latest = dInfo.ModTime()
 			}
 			return nil
 		}
@@ -1552,7 +1589,9 @@ func foldBeadsDirStoreModTime(dirPath string, latest time.Time) time.Time {
 		}
 		if pInfo.IsDir() {
 			if lower == "noms" {
-				latest = foldDoltNomsHeadFiles(p, latest)
+				latest, _ = foldDoltNomsHeadFiles(p, latest)
+			} else if lower != "oldgen" && pInfo.ModTime().After(latest) {
+				latest = pInfo.ModTime()
 			}
 			return nil
 		}
