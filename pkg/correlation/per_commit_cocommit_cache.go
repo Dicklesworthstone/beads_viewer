@@ -3,7 +3,6 @@ package correlation
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -155,8 +154,8 @@ func readPerCommitCoCommitCacheLocked(f *os.File) perCommitCoCommitCacheFile {
 	if _, err := f.Seek(0, 0); err != nil {
 		return empty
 	}
-	data, err := io.ReadAll(f)
-	if err != nil || len(data) == 0 {
+	data, ok := readCacheFileBounded(f, perCommitCoCommitCacheMaxFileSize)
+	if !ok || len(data) == 0 {
 		return empty
 	}
 	var cf perCommitCoCommitCacheFile

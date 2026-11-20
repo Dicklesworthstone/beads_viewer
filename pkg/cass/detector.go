@@ -173,17 +173,13 @@ func (d *Detector) detect() Status {
 		return StatusNotInstalled
 	}
 
-	// Interpret exit code
+	// Interpret exit code: binary is confirmed present on PATH via lookPath,
+	// so any non-zero health exit indicates unhealthy/unindexed cass, never "not installed".
 	switch exitCode {
 	case 0:
 		return StatusHealthy
-	case 1:
-		return StatusNeedsIndex
-	case 3:
-		// Index missing or corrupt
-		return StatusNeedsIndex
 	default:
-		return StatusNotInstalled
+		return StatusNeedsIndex
 	}
 }
 

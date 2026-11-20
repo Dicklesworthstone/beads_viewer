@@ -50,6 +50,7 @@ type ReverseLookup struct {
 	beads            map[string]BeadHistory        // BeadID -> history
 	explicit         *ExplicitMatcher
 	feedbackRejected bool
+	rejectedPairs    map[string]map[string]bool
 
 	// ctx, when set via WithContext, bounds the git subprocesses spawned by
 	// the lookup (issue #166). nil means context.Background().
@@ -239,6 +240,16 @@ func NewReverseLookup(report *HistoryReport) *ReverseLookup {
 	if report.Stats.FeedbackApplied != nil && report.Stats.FeedbackApplied.Rejected > 0 {
 		rl.feedbackRejected = true
 	}
+	if len(report.rejectedPairs) > 0 {
+		rl.rejectedPairs = make(map[string]map[string]bool, len(report.rejectedPairs))
+		for sha, beads := range report.rejectedPairs {
+			cp := make(map[string]bool, len(beads))
+			for bid, v := range beads {
+				cp[bid] = v
+			}
+			rl.rejectedPairs[sha] = cp
+		}
+	}
 	rl.explicit = NewExplicitMatcherWithKnownIDs("", collectReportKnownBeadIDs(report))
 
 	// Build details map for quick access
@@ -261,6 +272,23 @@ func NewReverseLookupWithRepo(report *HistoryReport, repoPath string) *ReverseLo
 		rl.explicit.mu.Unlock()
 	}
 	return rl
+}
+
+func (rl *ReverseLookup) isPairRejected(commitSHA, beadID string) bool {
+	if rl == nil || len(rl.rejectedPairs) == 0 {
+		return false
+	}
+	if beads, ok := rl.rejectedPairs[commitSHA]; ok {
+		if beads[beadID] {
+			return true
+		}
+		for k, v := range beads {
+			if v && strings.EqualFold(k, beadID) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (rl *ReverseLookup) matchesUnambiguousKnownBead(beadID string) bool {
@@ -497,9 +525,12 @@ func (rl *ReverseLookup) FindOrphanCommits(opts ExtractOptions) ([]OrphanCommit,
 			correlated++
 			continue
 		}
-		if rl.explicit != nil && !rl.feedbackRejected {
+		if rl.explicit != nil && !(rl.feedbackRejected && len(rl.rejectedPairs) == 0) {
 			linked := false
 			for _, idMatch := range rl.explicit.ExtractIDsFromMessage(wc.message()) {
+				if rl.isPairRejected(wc.SHA, idMatch.ID) {
+					continue
+				}
 				if rl.matchesUnambiguousKnownBead(idMatch.ID) {
 					linked = true
 					break

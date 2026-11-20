@@ -5110,9 +5110,14 @@ func generateWorkspaceCorrelationReportWithContext(runCtx context.Context, ctx R
 }
 
 func resolveWorkspaceFeedbackStoreForBead(ctx RobotContext, workDir, beadID string) (*correlation.FeedbackStore, string, error) {
+	store, fbBeadID, _, err := resolveWorkspaceFeedbackStoreAndRepoForBead(ctx, workDir, beadID)
+	return store, fbBeadID, err
+}
+
+func resolveWorkspaceFeedbackStoreAndRepoForBead(ctx RobotContext, workDir, beadID string) (*correlation.FeedbackStore, string, string, error) {
 	if ctx.SourceKind != "workspace" || ctx.SourceAuthority == nil {
 		store, err := loadCorrelationFeedbackStore(workDir)
-		return store, beadID, err
+		return store, beadID, workDir, err
 	}
 	sources, _ := resolveWorkspaceCorrelationSources(ctx)
 	allIssues := ctx.Issues
@@ -5130,9 +5135,9 @@ func resolveWorkspaceFeedbackStoreForBead(ctx RobotContext, workDir, beadID stri
 			if strings.EqualFold(strings.TrimSpace(issue.SourceRepo), strings.TrimSpace(ws.source.SourceRepo)) {
 				store, err := loadCorrelationFeedbackStoreForBeadsPath(ws.repoRoot, ws.beadsPath)
 				if err != nil {
-					return nil, "", err
+					return nil, "", "", err
 				}
-				return store, localBeadIDForWorkspaceIssue(issue, ws.source), nil
+				return store, localBeadIDForWorkspaceIssue(issue, ws.source), ws.repoRoot, nil
 			}
 		}
 	}
@@ -5145,7 +5150,7 @@ func resolveWorkspaceFeedbackStoreForBead(ctx RobotContext, workDir, beadID stri
 		if prefix != "" && len(beadID) > len(prefix) && strings.EqualFold(beadID[:len(prefix)], prefix) {
 			store, err := loadCorrelationFeedbackStoreForBeadsPath(ws.repoRoot, ws.beadsPath)
 			if err != nil {
-				return nil, "", err
+				return nil, "", "", err
 			}
 			stripped := beadID[len(prefix):]
 			if !strings.EqualFold(stripped, beadID) {
@@ -5155,14 +5160,14 @@ func resolveWorkspaceFeedbackStoreForBead(ctx RobotContext, workDir, beadID stri
 					Revision:          workspaceSourceRevision(ctx, ws.source, ctx.AsOfCommit),
 				}); corrErr == nil {
 					if _, ok := part.Histories[beadID]; ok {
-						return store, beadID, nil
+						return store, beadID, ws.repoRoot, nil
 					}
 				}
 			}
-			return store, stripped, nil
+			return store, stripped, ws.repoRoot, nil
 		}
 	}
-	return nil, "", fmt.Errorf("workspace repository not found for bead %q", beadID)
+	return nil, "", "", fmt.Errorf("workspace repository not found for bead %q", beadID)
 }
 
 func loadWorkspaceCorrelationFeedbackStats(ctx RobotContext, workDir string) (correlation.FeedbackStats, error) {
@@ -5859,7 +5864,7 @@ func handleRobotCorrelationFeedback(ctx RobotContext, cfg phaseThreeRobotHandler
 		return fmt.Errorf("getting current directory: %w", err)
 	}
 
-	feedbackStore, fbBeadID, err := resolveWorkspaceFeedbackStoreForBead(ctx, workDir, beadID)
+	feedbackStore, fbBeadID, targetRepoDir, err := resolveWorkspaceFeedbackStoreAndRepoForBead(ctx, workDir, beadID)
 	if err != nil {
 		return err
 	}
@@ -5878,12 +5883,23 @@ func handleRobotCorrelationFeedback(ctx RobotContext, cfg phaseThreeRobotHandler
 	if err != nil {
 		return err
 	}
+	var originalConf float64
 	if targetCommit == nil {
-		fmt.Fprintf(ctx.StderrOrDefault(), "Commit %s not found in bead %s correlations\n", commitSHA, beadID)
-		return newReportedRobotHandlerExit(1)
+		if feedbackType != correlation.FeedbackConfirm {
+			fmt.Fprintf(ctx.StderrOrDefault(), "Commit %s not found in bead %s correlations\n", commitSHA, beadID)
+			return newReportedRobotHandlerExit(1)
+		}
+		resolved, resolveErr := correlation.ResolveCommitInRepo(context.Background(), targetRepoDir, commitSHA)
+		if resolveErr != nil {
+			fmt.Fprintf(ctx.StderrOrDefault(), "Commit %s not found in bead %s correlations or repository: %v\n", commitSHA, beadID, resolveErr)
+			return newReportedRobotHandlerExit(1)
+		}
+		originalConf = 0.0
+		commitSHA = resolved.SHA
+	} else {
+		originalConf = targetCommit.Confidence
+		commitSHA = targetCommit.SHA
 	}
-	originalConf := targetCommit.Confidence
-	commitSHA = targetCommit.SHA
 
 	feedbackBy := "cli"
 	if cfg.CorrelationFeedbackBy != nil && strings.TrimSpace(*cfg.CorrelationFeedbackBy) != "" {

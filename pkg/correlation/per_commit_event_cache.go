@@ -1,7 +1,6 @@
 package correlation
 
 import (
-	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -119,8 +118,8 @@ func readPerCommitEventCacheLocked(f *os.File) perCommitEventCacheFile {
 	if _, err := f.Seek(0, 0); err != nil {
 		return empty
 	}
-	data, err := io.ReadAll(f)
-	if err != nil || len(data) == 0 {
+	data, ok := readCacheFileBounded(f, perCommitEventCacheMaxFileSize)
+	if !ok || len(data) == 0 {
 		return empty
 	}
 	var cf perCommitEventCacheFile

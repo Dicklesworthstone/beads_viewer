@@ -337,7 +337,13 @@ func (nb *NetworkBuilder) addSharedCommitEdges(network *ImpactNetwork) {
 		// each membership list so a commit contributes once per distinct pair.
 		uniqueBeads := uniqueSortedStrings(beadIDs)
 		for i := 0; i < len(uniqueBeads); i++ {
+			if _, ok := network.Nodes[uniqueBeads[i]]; !ok {
+				continue
+			}
 			for j := i + 1; j < len(uniqueBeads); j++ {
+				if _, ok := network.Nodes[uniqueBeads[j]]; !ok {
+					continue
+				}
 				key := makeNetworkEdgeKey(uniqueBeads[i], uniqueBeads[j], EdgeSharedCommit)
 
 				edgeWeights[key]++
@@ -660,13 +666,17 @@ func (nb *NetworkBuilder) buildCluster(id int, beadIDs []string, network *Impact
 	sort.Strings(cluster.SharedFiles)
 
 	// Generate label from common path prefix or central bead title
-	cluster.Label = nb.generateClusterLabel(beadIDs, cluster.SharedFiles)
+	cluster.Label = nb.generateClusterLabelForCluster(cluster.CentralBead, beadIDs, cluster.SharedFiles)
 
 	return cluster
 }
 
 // generateClusterLabel creates a descriptive label for a cluster.
 func (nb *NetworkBuilder) generateClusterLabel(beadIDs []string, sharedFiles []string) string {
+	return nb.generateClusterLabelForCluster("", beadIDs, sharedFiles)
+}
+
+func (nb *NetworkBuilder) generateClusterLabelForCluster(centralBead string, beadIDs []string, sharedFiles []string) string {
 	// Try to find common path prefix from shared files
 	if len(sharedFiles) > 0 {
 		prefix := commonPathPrefix(sharedFiles)
@@ -679,9 +689,13 @@ func (nb *NetworkBuilder) generateClusterLabel(beadIDs []string, sharedFiles []s
 		}
 	}
 
-	// Fall back to first bead's title (truncated)
-	if len(beadIDs) > 0 {
-		if history, ok := nb.report.Histories[beadIDs[0]]; ok {
+	// Fall back to central bead's title (or first bead's title), truncated
+	fallbackID := centralBead
+	if fallbackID == "" && len(beadIDs) > 0 {
+		fallbackID = beadIDs[0]
+	}
+	if fallbackID != "" {
+		if history, ok := nb.report.Histories[fallbackID]; ok {
 			title := history.Title
 			if len([]rune(title)) > 30 {
 				title = string([]rune(title)[:27]) + "..."

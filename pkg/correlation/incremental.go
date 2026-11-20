@@ -1034,8 +1034,9 @@ func mergeReportsWithOptions(c *Correlator, existing *HistoryReport, beads []Bea
 	}
 
 	var feedbackApplied *FeedbackApplied
+	var rejectedPairs map[string]map[string]bool
 	if c != nil && c.feedback != nil {
-		feedbackApplied = applyFeedbackIdempotent(c.feedback, histories)
+		feedbackApplied, rejectedPairs = applyFeedbackWithRepo(c.feedback, c.ctx, c.repoPath, histories)
 	}
 
 	if opts.BeadID != "" {
@@ -1103,6 +1104,7 @@ func mergeReportsWithOptions(c *Correlator, existing *HistoryReport, beads []Bea
 		Stats:           stats,
 		Histories:       histories,
 		CommitIndex:     commitIndex,
+		rejectedPairs:   rejectedPairs,
 	}
 }
 
@@ -1135,53 +1137,7 @@ func mergeIncrementalBeadCommits(scorer *Scorer, existing, incoming []Correlated
 }
 
 func applyFeedbackIdempotent(store *FeedbackStore, histories map[string]BeadHistory) *FeedbackApplied {
-	if store == nil {
-		return nil
-	}
-	applied := &FeedbackApplied{}
-	for beadID, history := range histories {
-		if len(history.Commits) == 0 {
-			continue
-		}
-		kept := make([]CorrelatedCommit, 0, len(history.Commits))
-		changed := false
-		for _, commit := range history.Commits {
-			fb, ok := store.Get(commit.SHA, beadID)
-			if !ok {
-				kept = append(kept, commit)
-				continue
-			}
-			switch fb.Type {
-			case FeedbackReject:
-				applied.Rejected++
-				changed = true
-				continue
-			case FeedbackConfirm:
-				applied.Confirmed++
-				changed = true
-				commit.Confidence = 1.0
-				if !commit.Confirmed {
-					commit.Confirmed = true
-					commit.Reason = commit.Reason + "; confirmed by feedback (" + fb.FeedbackBy + ")"
-				}
-			case FeedbackIgnore:
-				applied.Ignored++
-			}
-			kept = append(kept, commit)
-		}
-		if !changed {
-			continue
-		}
-		history.Commits = kept
-		if len(kept) > 0 {
-			history.LastAuthor = kept[len(kept)-1].Author
-		} else if len(history.Events) > 0 {
-			history.LastAuthor = history.Events[len(history.Events)-1].Author
-		} else {
-			history.LastAuthor = ""
-		}
-		histories[beadID] = history
-	}
+	applied, _ := applyFeedbackWithRepo(store, nil, "", histories)
 	return applied
 }
 

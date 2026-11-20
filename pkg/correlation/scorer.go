@@ -19,7 +19,7 @@ type ConfidenceRange struct {
 var MethodRanges = map[CorrelationMethod]ConfidenceRange{
 	MethodCoCommitted: {
 		Method: MethodCoCommitted,
-		Min:    0.85,
+		Min:    0.80,
 		Max:    0.99,
 		Desc:   "Changed in same commit as bead update (direct causation)",
 	},
@@ -421,10 +421,10 @@ func (s *Scorer) ExtractSignals(commit CorrelatedCommit) []CorrelationSignal {
 		})
 	}
 
-	// Confidence adjustment signals
-	// If confidence is higher than base method suggests, there may be proximity signal
-	baseRange, ok := MethodRanges[commit.Method]
-	if ok && commit.Confidence > baseRange.Max*0.9 {
+	// Confidence adjustment signals: only report proximity when commit evidence
+	// actually records adjacency/proximity rather than solely high confidence.
+	reasonLower := strings.ToLower(commit.Reason)
+	if strings.Contains(reasonLower, "proxim") || strings.Contains(reasonLower, "adjacent") {
 		signals = append(signals, CorrelationSignal{
 			Type:   SignalProximity,
 			Weight: 7,

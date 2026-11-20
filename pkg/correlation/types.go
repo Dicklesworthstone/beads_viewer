@@ -222,6 +222,11 @@ type HistoryReport struct {
 	Histories       map[string]BeadHistory `json:"histories"`                   // BeadID -> BeadHistory
 	CommitIndex     CommitIndex            `json:"commit_index"`                // SHA -> []BeadID for reverse lookup
 	CausalHistory   *CausalHistory         `json:"causal_history,omitempty"`    // Full historical authority, only for an explicitly requested target
+
+	// rejectedPairs records explicit (commitSHA -> beadID) feedback rejections
+	// from FeedbackStore so ReverseLookup suppresses fallback per-pair instead of
+	// disabling explicit matching globally across unrelated commits.
+	rejectedPairs map[string]map[string]bool
 }
 
 // FilterOptions controls which beads to include in the history report

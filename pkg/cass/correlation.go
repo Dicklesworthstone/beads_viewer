@@ -728,10 +728,8 @@ func (c *Correlator) searchByTimestamp(ctx context.Context, issue *model.Issue) 
 	}
 
 	filtered := c.rankAndLimit(scored)
-	if c.cutoff != nil {
+	if c.cutoff != nil || days > 7 || rejected > 0 {
 		resp.Meta.Total = len(scored)
-	} else if days > 7 || rejected > 0 {
-		resp.Meta.Total = len(filtered)
 	}
 	return filtered, resp.Meta
 }

@@ -132,8 +132,8 @@ func TestDetector_Check_UnknownExitCode(t *testing.T) {
 	}
 
 	status := d.Check()
-	if status != StatusNotInstalled {
-		t.Errorf("Check() = %v, want StatusNotInstalled", status)
+	if status != StatusNeedsIndex {
+		t.Errorf("Check() = %v, want StatusNeedsIndex when cass binary is on PATH", status)
 	}
 }
 
