@@ -1093,12 +1093,94 @@ func TestLoadIssues_BeadsPathIsFile(t *testing.T) {
 }
 
 func TestLoadIssues_EmptyPath(t *testing.T) {
-	// This test verifies that empty path uses current directory
-	// We just verify it doesn't panic - actual behavior depends on cwd
-	_, err := loader.LoadIssues("")
-	// Error is expected since cwd likely doesn't have .beads
-	if err == nil {
-		t.Log("Empty path used current directory successfully")
+	t.Setenv("BEADS_DB", "")
+	t.Setenv("BEADS_DIR", "")
+
+	// When cwd has a valid .beads directory, LoadIssues("") loads from it.
+	validRepo := t.TempDir()
+	beadsDir := filepath.Join(validRepo, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "issues.jsonl"), []byte(`{"id":"cwd-1","title":"From CWD","status":"open","issue_type":"task"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(validRepo)
+	issues, err := loader.LoadIssues("")
+	if err != nil {
+		t.Fatalf("LoadIssues(\"\") in valid repo failed: %v", err)
+	}
+	if len(issues) != 1 || issues[0].ID != "cwd-1" {
+		t.Fatalf("LoadIssues(\"\") = %+v, want single issue cwd-1", issues)
+	}
+
+	// When cwd has no .beads directory, LoadIssues("") must return an error.
+	emptyDir := t.TempDir()
+	t.Chdir(emptyDir)
+	if _, err := loader.LoadIssues(""); err == nil {
+		t.Fatal("LoadIssues(\"\") in directory without .beads succeeded, want error")
+	}
+}
+
+func TestLoadIssues_BOMOnlyAndBOMWhitespace(t *testing.T) {
+	cases := []struct {
+		name    string
+		content []byte
+		wantIDs []string
+	}{
+		{
+			name:    "bom_only_file",
+			content: []byte{0xEF, 0xBB, 0xBF},
+			wantIDs: nil,
+		},
+		{
+			name:    "bom_whitespace_then_issue",
+			content: append([]byte{0xEF, 0xBB, 0xBF}, []byte("   \t \n{\"id\":\"bom-1\",\"title\":\"After BOM whitespace\",\"status\":\"open\",\"issue_type\":\"task\"}\n")...),
+			wantIDs: []string{"bom-1"},
+		},
+		{
+			name:    "bom_prefix_on_issue_line",
+			content: append([]byte{0xEF, 0xBB, 0xBF}, []byte("{\"id\":\"bom-2\",\"title\":\"BOM inline\",\"status\":\"open\",\"issue_type\":\"task\"}\n")...),
+			wantIDs: []string{"bom-2"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "issues.jsonl")
+			if err := os.WriteFile(path, tc.content, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			var stats loader.ParseStats
+			issues, err := loader.LoadIssuesFromFileWithOptions(path, loader.ParseOptions{Stats: &stats})
+			if err != nil {
+				t.Fatalf("LoadIssuesFromFileWithOptions: %v", err)
+			}
+			if stats.Errors != 0 {
+				t.Fatalf("unexpected parse errors %+v for %s", stats, tc.name)
+			}
+			if len(issues) != len(tc.wantIDs) {
+				t.Fatalf("got %d issues, want %d (%v)", len(issues), len(tc.wantIDs), tc.wantIDs)
+			}
+			for i, want := range tc.wantIDs {
+				if issues[i].ID != want {
+					t.Fatalf("issue[%d].ID = %q, want %q", i, issues[i].ID, want)
+				}
+			}
+		})
+	}
+
+	// Verify sprints.jsonl BOM-only and BOM+whitespace lines parse cleanly too.
+	sprintContent := append([]byte{0xEF, 0xBB, 0xBF}, []byte("   \n{\"id\":\"sp-bom\",\"name\":\"BOM Sprint\",\"start_date\":\"2026-01-01T00:00:00Z\",\"end_date\":\"2026-01-14T00:00:00Z\"}\n")...)
+	sprintPath := filepath.Join(t.TempDir(), "sprints.jsonl")
+	if err := os.WriteFile(sprintPath, sprintContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sprints, err := loader.LoadSprintsFromFile(sprintPath)
+	if err != nil {
+		t.Fatalf("LoadSprintsFromFile: %v", err)
+	}
+	if len(sprints) != 1 || sprints[0].ID != "sp-bom" {
+		t.Fatalf("LoadSprintsFromFile = %+v, want [sp-bom]", sprints)
 	}
 }
 
@@ -1537,14 +1619,14 @@ func TestLoadIssuesFromFile_DependencyTargetAliases(t *testing.T) {
 
 func TestLoadRealIssues(t *testing.T) {
 	files := []string{
-		"../../tests/testdata/srps_issues.jsonl",
-		"../../tests/testdata/cass_issues.jsonl",
+		"../../tests/testdata/real/srps.jsonl",
+		"../../tests/testdata/real/cass.jsonl",
 	}
 
 	for _, f := range files {
 		t.Run(f, func(t *testing.T) {
-			if _, err := os.Stat(f); os.IsNotExist(err) {
-				t.Skipf("Test file %s not found, skipping", f)
+			if _, err := os.Stat(f); err != nil {
+				t.Fatalf("required real-world fixture %s missing: %v", f, err)
 			}
 
 			issues, err := loader.LoadIssuesFromFile(f)

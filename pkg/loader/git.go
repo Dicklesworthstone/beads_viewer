@@ -714,7 +714,7 @@ func (g *GitLoader) resolveTarget() (gitLoaderTarget, error) {
 		return buildExplicitGitTarget(resolvedDir, PreferredJSONLNames)
 	}
 
-	if envDB := env.BeadsDB.Get(); envDB != "" {
+	if envDB := strings.TrimSpace(env.BeadsDB.Get()); envDB != "" {
 		fileNames := PreferredJSONLNames
 		if info, statErr := os.Stat(envDB); statErr == nil && !info.IsDir() {
 			if strings.HasSuffix(strings.ToLower(envDB), ".jsonl") {
@@ -730,7 +730,7 @@ func (g *GitLoader) resolveTarget() (gitLoaderTarget, error) {
 		return buildExplicitGitTarget(beadsDir, fileNames)
 	}
 
-	if envDir := env.BeadsDir.Get(); envDir != "" {
+	if envDir := strings.TrimSpace(env.BeadsDir.Get()); envDir != "" {
 		beadsDir, _, err := resolveBeadsRedirect(envDir)
 		if err != nil {
 			return gitLoaderTarget{}, fmt.Errorf("resolving BEADS_DIR %q: %w", envDir, err)

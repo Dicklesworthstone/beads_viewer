@@ -1466,15 +1466,16 @@ func parseIssuesWithOptions(r io.Reader, opts ParseOptions, usePool bool) ([]mod
 			continue
 		}
 
+		// Strip UTF-8 BOM before blank-line detection so BOM-only or
+		// BOM+whitespace first lines match datasource validation semantics.
+		if lineNum == 1 {
+			line = stripBOM(line)
+		}
+
 		// Match datasource validation semantics: blank lines containing spaces or
 		// tabs are formatting, not malformed issue records.
 		if len(bytes.TrimSpace(line)) == 0 {
 			continue
-		}
-
-		// Strip UTF-8 BOM if present on the first line
-		if lineNum == 1 {
-			line = stripBOM(line)
 		}
 
 		before := len(issues)
@@ -2104,12 +2105,12 @@ func parseChunkLines(chunk []byte, startLine int, isFirstChunk bool, opts ParseO
 			line = line[:n-1]
 		}
 
-		if len(bytes.TrimSpace(line)) == 0 {
-			continue
-		}
-
 		if isFirstChunk && lineNum == 1 {
 			line = stripBOM(line)
+		}
+
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
 		}
 
 		before := len(res.issues)

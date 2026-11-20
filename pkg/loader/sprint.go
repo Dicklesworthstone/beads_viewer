@@ -2,6 +2,7 @@ package loader
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -67,13 +68,13 @@ func ParseSprints(r io.Reader) ([]model.Sprint, error) {
 	for scanner.Scan() {
 		lineNum++
 		line := scanner.Bytes()
-		if len(line) == 0 {
-			continue
-		}
-
-		// Strip UTF-8 BOM if present on the first line.
+		// Strip UTF-8 BOM on the first line before blank-line detection so
+		// BOM-only and BOM+whitespace lines do not produce parse warnings.
 		if lineNum == 1 {
 			line = stripBOM(line)
+		}
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
 		}
 
 		var sprint model.Sprint
