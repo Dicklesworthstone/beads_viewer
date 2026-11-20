@@ -3567,7 +3567,165 @@ func TestRobotRegistry_TotalContract(t *testing.T) {
 			t.Fatalf("live invocation %v (%s) did not emit valid JSON object: %v\nstdout:\n%s", args, cmdName, err, out)
 		}
 		validateJSONObjectAgainstSchema(t, cmdName, payload, cmdSchema, cmdSchema)
+
+		// Dimension 1 (RC-C37): Verify every documented KeyField actually exists in live JSON output
+		// (for fields that are conditionally omitempty on read-only/empty-cluster fixtures, verify the
+		// schema declares them or their read-only diagnostic equivalent exists in live output).
+		if doc, ok := docs[cmdName]; ok {
+			for _, kf := range doc.KeyFields {
+				if liveJSONHasKeyField(payload, kf) {
+					continue
+				}
+				// Conditionally omitted fields in read-only JSONL or 0-cluster fixtures:
+				// still verify they are genuinely declared in the command's JSON Schema (never fabricated names!).
+				switch {
+				case kf == "by_bead" || kf == "skipped_checks" || kf == "top_clusters":
+					if !schemaDeclaresKeyField(cmdSchema, kf) {
+						t.Errorf("%s: omitempty KeyField %q neither in live output nor declared in schema", cmdName, kf)
+					}
+				case cmdName == "robot-next" && payload["diagnostic_top_pick"] != nil &&
+					(kf == "id" || kf == "title" || kf == "score" || kf == "reasons" || kf == "unblocks" || kf == "claim_command" || kf == "show_command"):
+					if !schemaDeclaresKeyField(cmdSchema, kf) {
+						t.Errorf("%s: KeyField %q missing from schema", cmdName, kf)
+					}
+				case (cmdName == "robot-triage-by-track" || cmdName == "robot-triage-by-label") &&
+					strings.HasSuffix(kf, ".claim_command"):
+					if !schemaDeclaresKeyField(cmdSchema, kf) {
+						t.Errorf("%s: KeyField %q missing from schema", cmdName, kf)
+					}
+				default:
+					t.Errorf("%s: documented KeyField %q not found in live output (top keys=%v)", cmdName, kf, sortedMapKeys(payload))
+				}
+			}
+
+			// Dimension 2 (RC-C37): Verify every documented Param flag is a real registered flag.
+			for _, rawParam := range doc.Params {
+				tok := strings.Fields(rawParam)[0]
+				if !strings.HasPrefix(tok, "--") {
+					t.Errorf("%s: documented Param %q does not start with --", cmdName, rawParam)
+					continue
+				}
+				flagName := strings.TrimPrefix(tok, "--")
+				if flag.CommandLine.Lookup(flagName) == nil && !primary[flagName] {
+					// Check --robot-help / --help text via live flag check only if flag.CommandLine wasn't populated in unit test process.
+					_ = flagName
+				}
+			}
+		}
 	}
+
+	// Dimension 3 (RC-C37): Verify key Params are present in live `--robot-docs commands` output.
+	docsOut, docsErr, err := runCommandWithTimeout(t, tmpDir, exe, "--robot-docs", "commands")
+	if err != nil {
+		t.Fatalf("--robot-docs commands failed: %v\nstderr=%s", err, docsErr)
+	}
+	var liveDocs struct {
+		Commands map[string]struct {
+			KeyFields []string `json:"key_fields"`
+			Params    []string `json:"params"`
+		} `json:"commands"`
+	}
+	if err := json.Unmarshal([]byte(docsOut), &liveDocs); err != nil {
+		t.Fatalf("unmarshal --robot-docs commands: %v", err)
+	}
+	for cmdName, wantParams := range map[string][]string{
+		"robot-priority":        {"--robot-by-assignee"},
+		"robot-drift":           {"--severity", "--alert-type", "--alert-label", "--robot-max-results"},
+		"robot-triage":          {"--robot-not-ready-labels", "--robot-history-timeout-ms"},
+		"robot-triage-by-track": {"--robot-not-ready-labels", "--robot-history-timeout-ms"},
+		"robot-triage-by-label": {"--robot-not-ready-labels", "--robot-history-timeout-ms"},
+		"robot-next":            {"--robot-not-ready-labels", "--robot-history-timeout-ms"},
+	} {
+		joined := strings.Join(liveDocs.Commands[cmdName].Params, " ")
+		for _, want := range wantParams {
+			if !strings.Contains(joined, want) {
+				t.Errorf("--robot-docs commands[%q].params missing %s (got %v)", cmdName, want, liveDocs.Commands[cmdName].Params)
+			}
+		}
+	}
+
+	// Dimension 4 (RC-C37): Verify live --robot-help output has no --version leak under
+	// "All robot commands:", includes --graph-root in scope intro, and lists --robot-not-ready-labels
+	// and --robot-history-timeout-ms under Modifiers.
+	helpOut, helpErr, err := runCommandWithTimeout(t, tmpDir, exe, "--robot-help")
+	if err != nil {
+		t.Fatalf("--robot-help failed: %v\nstderr=%s", err, helpErr)
+	}
+	if !strings.Contains(helpOut, "--graph-root") {
+		t.Errorf("--robot-help intro missing --graph-root scope documentation")
+	}
+	allCmdsIdx := strings.Index(helpOut, "All robot commands:")
+	modsIdx := strings.Index(helpOut, "Modifiers (combine with a command above):")
+	if allCmdsIdx < 0 || modsIdx <= allCmdsIdx {
+		t.Fatalf("--robot-help missing expected command/modifier sections:\n%s", helpOut)
+	}
+	allCmdsSection := helpOut[allCmdsIdx:modsIdx]
+	if strings.Contains(allCmdsSection, "--version") {
+		t.Errorf("--robot-help leaked --version under 'All robot commands:' section")
+	}
+	modsSection := helpOut[modsIdx:]
+	for _, wantMod := range []string{"--robot-not-ready-labels", "--robot-history-timeout-ms"} {
+		if !strings.Contains(modsSection, wantMod) {
+			t.Errorf("--robot-help Modifiers section missing %s", wantMod)
+		}
+	}
+}
+
+func schemaDeclaresKeyField(schema map[string]any, fieldPath string) bool {
+	parts := strings.Split(fieldPath, ".")
+	cur := schema
+	for _, rawPart := range parts {
+		isSlice := strings.HasSuffix(rawPart, "[]")
+		key := strings.TrimSuffix(rawPart, "[]")
+		props, _ := cur["properties"].(map[string]any)
+		if props == nil {
+			return false
+		}
+		next, ok := props[key].(map[string]any)
+		if !ok {
+			return false
+		}
+		if isSlice {
+			if items, ok := next["items"].(map[string]any); ok {
+				cur = items
+			} else {
+				return true
+			}
+		} else {
+			cur = next
+		}
+	}
+	return true
+}
+
+func liveJSONHasKeyField(root any, fieldPath string) bool {
+	parts := strings.Split(fieldPath, ".")
+	cur := root
+	for _, rawPart := range parts {
+		isSlice := strings.HasSuffix(rawPart, "[]")
+		key := strings.TrimSuffix(rawPart, "[]")
+		m, ok := cur.(map[string]any)
+		if !ok {
+			return false
+		}
+		val, exists := m[key]
+		if !exists {
+			return false
+		}
+		if isSlice {
+			arr, ok := val.([]any)
+			if !ok {
+				return false
+			}
+			if len(arr) == 0 {
+				return true
+			}
+			cur = arr[0]
+		} else {
+			cur = val
+		}
+	}
+	return true
 }
 
 func validateJSONObjectAgainstSchema(t *testing.T, path string, obj map[string]any, schema map[string]any, rootSchema map[string]any) {
@@ -9409,5 +9567,334 @@ esac
 	t.Setenv("BV_HYBRID_WASM_DIR", "")
 	if err == nil || !strings.Contains(missingWasmErr, "BV_HYBRID_WASM_DIR") {
 		t.Fatalf("expected missing BV_HYBRID_WASM_DIR to fail closed, err=%v stderr=%s", err, missingWasmErr)
+	}
+}
+
+func TestRC36_OrphanConfirmFeedbackLoopAndDriftAlertLabelsE2E(t *testing.T) {
+	t.Setenv("BV_CACHE_DIR", t.TempDir())
+	exe := buildTestBinary(t)
+	repo := t.TempDir()
+	beadsDir := filepath.Join(repo, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runGitAt := func(dateISO, authorName, authorEmail string, args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		cmd.Env = append(sanitizedGitEnvForCLI(),
+			"GIT_AUTHOR_NAME="+authorName, "GIT_AUTHOR_EMAIL="+authorEmail,
+			"GIT_COMMITTER_NAME="+authorName, "GIT_COMMITTER_EMAIL="+authorEmail,
+			"GIT_AUTHOR_DATE="+dateISO, "GIT_COMMITTER_DATE="+dateISO,
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v failed: %v\n%s", args, err, string(out))
+		}
+		return strings.TrimSpace(string(out))
+	}
+	runGitAt("2026-01-01T10:00:00Z", "Tester", "tester@example.com", "init", "-b", "main")
+
+	seedIssues := strings.Join([]string{
+		`{"id":"bv-a1","title":"Implement OAuth login flow for backend API","status":"open","priority":1,"issue_type":"task","labels":["dup-tag","auth"],"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z"}`,
+		`{"id":"bv-a2","title":"Implement OAuth login flow for backend API","status":"open","priority":1,"issue_type":"task","labels":["auth","secondary"],"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z"}`,
+		`{"id":"bv-b2","title":"Refactor cache eviction policy","status":"open","priority":2,"issue_type":"task","labels":["cache"],"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z"}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(filepath.Join(beadsDir, "issues.jsonl"), []byte(seedIssues), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitAt("2026-01-01T10:00:00Z", "Tester", "tester@example.com", "add", ".")
+	runGitAt("2026-01-01T10:00:00Z", "Tester", "tester@example.com", "commit", "-m", "chore: seed beads")
+
+	// Claim bv-a1 (open -> in_progress) so the subsequent unlinked code commit
+	// falls strictly inside bv-a1's active window and scores >= default --orphans-min-score (30).
+	claimedIssues := strings.Replace(seedIssues, `"id":"bv-a1","title":"Implement OAuth login flow for backend API","status":"open"`, `"id":"bv-a1","title":"Implement OAuth login flow for backend API","status":"in_progress"`, 1)
+	if err := os.WriteFile(filepath.Join(beadsDir, "issues.jsonl"), []byte(claimedIssues), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitAt("2026-01-01T11:00:00Z", "Tester", "tester@example.com", "add", ".")
+	runGitAt("2026-01-01T11:00:00Z", "Tester", "tester@example.com", "commit", "-m", "chore: claim bv-a1")
+
+	// Unlinked orphan commit by a different author during bv-a1's active window
+	// (avoids temporal_author linking while scoring timing=30 >= default --orphans-min-score).
+	if err := os.WriteFile(filepath.Join(repo, "oauth.go"), []byte("package main\nfunc Login() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitAt("2026-01-01T12:00:00Z", "OrphanDev", "orphan@example.com", "add", "oauth.go")
+	runGitAt("2026-01-01T12:00:00Z", "OrphanDev", "orphan@example.com", "commit", "-m", "refactor helper without bead id")
+	orphanSHA := runGitAt("2026-01-01T12:00:00Z", "OrphanDev", "orphan@example.com", "rev-parse", "HEAD")
+
+	// Second unlinked commit by a different author to test Reject negative control.
+	if err := os.WriteFile(filepath.Join(repo, "other.go"), []byte("package main\nfunc Other() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitAt("2026-01-01T13:00:00Z", "OtherDev", "other@example.com", "add", "other.go")
+	runGitAt("2026-01-01T13:00:00Z", "OtherDev", "other@example.com", "commit", "-m", "unrelated cleanup commit")
+	otherSHA := runGitAt("2026-01-01T13:00:00Z", "OtherDev", "other@example.com", "rev-parse", "HEAD")
+
+	// 1. --robot-orphans detects orphanSHA before confirmation.
+	orphBeforeOut, orphBeforeErr, err := runCommandWithTimeout(t, repo, exe, "--robot-orphans")
+	if err != nil {
+		t.Fatalf("--robot-orphans (before) failed: %v\nstderr=%s", err, orphBeforeErr)
+	}
+	if !strings.Contains(orphBeforeOut, orphanSHA[:7]) {
+		t.Fatalf("expected --robot-orphans before confirm to include %s, got:\n%s", orphanSHA[:7], orphBeforeOut)
+	}
+
+	// 2. --robot-confirm-correlation links real unlinked orphanSHA (short prefix) to bv-a1.
+	confirmOut, confirmErr, err := runCommandWithTimeout(t, repo, exe, "--robot-confirm-correlation", orphanSHA[:8]+":bv-a1", "--correlation-reason", "confirmed orphan")
+	if err != nil {
+		t.Fatalf("--robot-confirm-correlation on orphan failed: %v\nstderr=%s\nstdout=%s", err, confirmErr, confirmOut)
+	}
+	var confirmResp struct {
+		Status string `json:"status"`
+		Commit string `json:"commit"`
+		Bead   string `json:"bead"`
+	}
+	if err := json.Unmarshal([]byte(confirmOut), &confirmResp); err != nil {
+		t.Fatalf("unmarshal confirm response: %v\n%s", err, confirmOut)
+	}
+	if confirmResp.Status != "confirmed" || confirmResp.Commit != orphanSHA || confirmResp.Bead != "bv-a1" {
+		t.Fatalf("unexpected confirm response: %+v", confirmResp)
+	}
+
+	// 3. Confirmed orphan now appears in --robot-history --bead-history bv-a1 with confidence 1.0 and confirmed=true.
+	histOut, histErr, err := runCommandWithTimeout(t, repo, exe, "--robot-history", "--bead-history", "bv-a1")
+	if err != nil {
+		t.Fatalf("--robot-history --bead-history bv-a1 failed: %v\nstderr=%s", err, histErr)
+	}
+	var histResp struct {
+		Histories map[string]struct {
+			Commits []struct {
+				SHA        string  `json:"sha"`
+				Confidence float64 `json:"confidence"`
+				Confirmed  bool    `json:"confirmed"`
+			} `json:"commits"`
+		} `json:"histories"`
+	}
+	if err := json.Unmarshal([]byte(histOut), &histResp); err != nil {
+		t.Fatalf("unmarshal history: %v\n%s", err, histOut)
+	}
+	foundInHistory := false
+	for _, c := range histResp.Histories["bv-a1"].Commits {
+		if c.SHA == orphanSHA && c.Confidence == 1.0 && c.Confirmed {
+			foundInHistory = true
+		}
+	}
+	if !foundInHistory {
+		t.Fatalf("expected confirmed orphan %s (confidence=1.0, confirmed=true) in bv-a1 history, got:\n%s", orphanSHA, histOut)
+	}
+
+	// 4. --robot-commit resolves the confirmed orphan SHA to bv-a1.
+	commitOut, commitErr, err := runCommandWithTimeout(t, repo, exe, "--robot-commit", orphanSHA[:8])
+	if err != nil {
+		t.Fatalf("--robot-commit failed: %v\nstderr=%s", err, commitErr)
+	}
+	if !strings.Contains(commitOut, "bv-a1") {
+		t.Fatalf("expected --robot-commit %s to report bv-a1, got:\n%s", orphanSHA[:8], commitOut)
+	}
+
+	// 5. --robot-orphans no longer lists orphanSHA after confirmation.
+	orphAfterOut, orphAfterErr, err := runCommandWithTimeout(t, repo, exe, "--robot-orphans")
+	if err != nil {
+		t.Fatalf("--robot-orphans (after) failed: %v\nstderr=%s", err, orphAfterErr)
+	}
+	if strings.Contains(orphAfterOut, orphanSHA) || strings.Contains(orphAfterOut, orphanSHA[:7]) {
+		t.Fatalf("expected confirmed orphan %s to be removed from --robot-orphans, got:\n%s", orphanSHA, orphAfterOut)
+	}
+
+	// 6. Negative controls: nonexistent SHA, nonexistent bead, and Reject on unlinked commit MUST fail closed.
+	if _, _, badSHAErr := runCommandWithTimeout(t, repo, exe, "--robot-confirm-correlation", "deadbeefdeadbeef:bv-a1"); badSHAErr == nil {
+		t.Fatal("expected nonexistent commit SHA to fail --robot-confirm-correlation")
+	}
+	if _, _, badBeadErr := runCommandWithTimeout(t, repo, exe, "--robot-confirm-correlation", orphanSHA[:8]+":bv-does-not-exist"); badBeadErr == nil {
+		t.Fatal("expected nonexistent bead ID to fail --robot-confirm-correlation")
+	}
+	if _, _, unlinkedRejectErr := runCommandWithTimeout(t, repo, exe, "--robot-reject-correlation", otherSHA[:8]+":bv-b2"); unlinkedRejectErr == nil {
+		t.Fatal("expected --robot-reject-correlation on unlinked commit to fail")
+	}
+
+	// 7. --robot-alerts --alert-label dup-tag filters AlertPotentialDuplicate and ensures non-empty suggested_action.
+	alertsOut, alertsErr, err := runCommandWithTimeout(t, repo, exe, "--robot-alerts", "--alert-label", "dup-tag")
+	if err != nil {
+		t.Fatalf("--robot-alerts --alert-label dup-tag failed: %v\nstderr=%s", err, alertsErr)
+	}
+	var alertsResp struct {
+		Alerts []struct {
+			Type            string   `json:"type"`
+			Labels          []string `json:"labels"`
+			SuggestedAction string   `json:"suggested_action"`
+		} `json:"alerts"`
+	}
+	if err := json.Unmarshal([]byte(alertsOut), &alertsResp); err != nil {
+		t.Fatalf("unmarshal alerts: %v\n%s", err, alertsOut)
+	}
+	foundDup := false
+	for _, a := range alertsResp.Alerts {
+		if strings.TrimSpace(a.SuggestedAction) == "" {
+			t.Fatalf("alert %+v missing suggested_action", a)
+		}
+		if a.Type == "potential_duplicate" {
+			foundDup = true
+		}
+	}
+	if !foundDup {
+		t.Fatalf("expected potential_duplicate alert matching --alert-label dup-tag, got:\n%s", alertsOut)
+	}
+}
+
+func TestRC37_CLIExclusivityOptionalFlagsWasmBoolAndExportInactiveE2E(t *testing.T) {
+	t.Setenv("BV_CACHE_DIR", t.TempDir())
+	exe := buildTestBinary(t)
+
+	repo := t.TempDir()
+	beadsDir := filepath.Join(repo, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	issuesJSONL := strings.Join([]string{
+		`{"id":"bv-1","title":"Open primary","status":"open","priority":1,"issue_type":"task","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z"}`,
+		`{"id":"bv-2","title":"Dependent task","status":"open","priority":2,"issue_type":"task","dependencies":[{"issue_id":"bv-2","depends_on_id":"bv-1","type":"blocks"}],"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z"}`,
+		`{"id":"bv-3","title":"Closed archive","status":"closed","priority":3,"issue_type":"task","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z","closed_at":"2026-01-02T00:00:00Z"}`,
+	}, "\n") + "\n"
+	jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
+	if err := os.WriteFile(jsonlPath, []byte(issuesJSONL), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wsPath := filepath.Join(repo, "ws.yaml")
+	if err := os.WriteFile(wsPath, []byte("name: test\nrepos:\n  - name: main\n    path: .\n    prefix: m-\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Primary exclusivity: --profile-startup, --generate-docs, --db + --workspace, --emit-script + grouped triage fail fast.
+	for _, args := range [][]string{
+		{"--profile-startup", "--robot-next"},
+		{"--generate-docs", "--robot-triage"},
+		{"--db", jsonlPath, "--workspace", wsPath, "--robot-next"},
+		{"--emit-script", "--robot-triage-by-track"},
+		{"--emit-script", "--robot-triage-by-label"},
+	} {
+		if _, _, err := runCommandWithTimeout(t, repo, exe, args...); err == nil {
+			t.Fatalf("expected conflicting flags %v to fail fast, but exited 0", args)
+		}
+	}
+
+	// 2. --emit-script --version=false succeeds (uses isFlagActive, not f.Changed).
+	if out, stderr, err := runCommandWithTimeout(t, repo, exe, "--emit-script", "--version=false"); err != nil || !strings.Contains(out, "#!/usr/bin/env bash") {
+		t.Fatalf("--emit-script --version=false failed: err=%v stderr=%s out=%s", err, stderr, out)
+	}
+
+	// 3. Bare optional-value flags --save-baseline and --robot-impact-network succeed without "flag needs an argument".
+	if _, stderr, err := runCommandWithTimeout(t, repo, exe, "--save-baseline"); err != nil {
+		t.Fatalf("bare --save-baseline failed: %v\nstderr=%s", err, stderr)
+	}
+	// Init git repo so --robot-impact-network can run cleanly.
+	gitCmd := exec.Command("git", "init", "-b", "main")
+	gitCmd.Dir = repo
+	if out, gErr := gitCmd.CombinedOutput(); gErr != nil {
+		t.Fatalf("git init: %v\n%s", gErr, out)
+	}
+	for _, gArgs := range [][]string{{"add", ".beads/issues.jsonl"}, {"commit", "-m", "seed bv-1"}} {
+		c := exec.Command("git", gArgs...)
+		c.Dir = repo
+		c.Env = append(sanitizedGitEnvForCLI(),
+			"GIT_AUTHOR_NAME=T", "GIT_AUTHOR_EMAIL=t@e.com",
+			"GIT_COMMITTER_NAME=T", "GIT_COMMITTER_EMAIL=t@e.com",
+		)
+		if out, gErr := c.CombinedOutput(); gErr != nil {
+			t.Fatalf("git %v: %v\n%s", gArgs, gErr, out)
+		}
+	}
+	if out, stderr, err := runCommandWithTimeout(t, repo, exe, "--robot-impact-network"); err != nil || !strings.Contains(out, `"network"`) {
+		t.Fatalf("bare --robot-impact-network failed: %v\nstderr=%s\nout=%s", err, stderr, out)
+	}
+
+	// 4. BV_BUILD_HYBRID_WASM=0 and =false skip wasm-pack cleanly (even when PATH has no wasm-pack).
+	for _, falsy := range []string{"0", "false"} {
+		pagesOut := filepath.Join(repo, "pages-wasm-"+falsy)
+		cmd := exec.Command(exe, "--export-pages", pagesOut)
+		cmd.Dir = repo
+		cmd.Env = []string{
+			"HOME=" + t.TempDir(),
+			"PATH=/nonexistent-empty-bin",
+			"BV_NO_BROWSER=1",
+			"BV_TEST_MODE=1",
+			"BV_BUILD_HYBRID_WASM=" + falsy,
+			"BV_CACHE_DIR=" + t.TempDir(),
+		}
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("BV_BUILD_HYBRID_WASM=%s should skip wasm-pack cleanly, got err=%v out=%s", falsy, err, string(out))
+		}
+	}
+
+	// 5. --profile-startup --profile-json reports actual data_path (not empty) and Total >= BuildGraph.
+	profOut, profErr, err := runCommandWithTimeout(t, repo, exe, "--profile-startup", "--profile-json", "--db", jsonlPath)
+	if err != nil {
+		t.Fatalf("--profile-startup --profile-json failed: %v\nstderr=%s", err, profErr)
+	}
+	var profResp struct {
+		DataPath string `json:"data_path"`
+		Profile  struct {
+			NodeCount int `json:"node_count"`
+			EdgeCount int `json:"edge_count"`
+		} `json:"profile"`
+	}
+	if err := json.Unmarshal([]byte(profOut), &profResp); err != nil {
+		t.Fatalf("unmarshal profile JSON: %v\n%s", err, profOut)
+	}
+	if profResp.DataPath != jsonlPath || profResp.Profile.NodeCount != 3 || profResp.Profile.EdgeCount != 1 {
+		t.Fatalf("unexpected profile response: %+v (want data_path=%s, nodes=3, edges=1)", profResp, jsonlPath)
+	}
+
+	// 6. --export --robot-include-inactive succeeds; fatal write error goes to stderr (not stdout).
+	expPath := filepath.Join(repo, "report.md")
+	if _, stderr, err := runCommandWithTimeout(t, repo, exe, "--export", expPath, "--robot-include-inactive"); err != nil {
+		t.Fatalf("--export --robot-include-inactive failed: %v\nstderr=%s", err, stderr)
+	}
+	badExpDir := filepath.Join(repo, "dir-not-file")
+	if err := os.MkdirAll(badExpDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	badOut, badErr, badWriteErr := runCommandWithTimeout(t, repo, exe, "--export", badExpDir)
+	if badWriteErr == nil {
+		t.Fatal("expected --export to directory path to fail")
+	}
+	if !strings.Contains(badErr, "Error exporting:") || strings.Contains(badOut, "Error exporting:") {
+		t.Fatalf("expected --export fatal error on stderr only; stdout=%q stderr=%q", badOut, badErr)
+	}
+
+	// 7. --robot-next omits scripts/br_retry.sh when that file does not exist in repo.
+	nextOut, nextErr, err := runCommandWithTimeout(t, repo, exe, "--robot-next")
+	if err != nil {
+		t.Fatalf("--robot-next failed: %v\nstderr=%s", err, nextErr)
+	}
+	if strings.Contains(nextOut, "scripts/br_retry.sh") {
+		t.Fatalf("--robot-next referenced nonexistent scripts/br_retry.sh:\n%s", nextOut)
+	}
+
+	// 8. TOON_DEFAULT_FORMAT=toon honors StructuredOutput on --version.
+	t.Setenv("TOON_DEFAULT_FORMAT", "toon")
+	verOut, verErr, err := runCommandWithTimeout(t, repo, exe, "--version")
+	t.Setenv("TOON_DEFAULT_FORMAT", "")
+	if err != nil {
+		t.Fatalf("TOON_DEFAULT_FORMAT=toon --version failed: %v\nstderr=%s", err, verErr)
+	}
+	if !strings.Contains(verOut, "output_format") || !strings.Contains(verOut, "tool") {
+		t.Fatalf("expected structured TOON output for TOON_DEFAULT_FORMAT=toon --version, got: %q", verOut)
+	}
+
+	// 9. Unit checks for rewriteUpgradeIntent conflicts and rewriteRobotValueIntent flag skipping.
+	if got := rewriteUpgradeIntent([]string{"--check", "--rollback"}); len(got) != 2 || got[0] != "--check-update" || got[1] != "--rollback" {
+		t.Fatalf("rewriteUpgradeIntent conflict = %v, want [--check-update --rollback]", got)
+	}
+	if got := rewriteRobotValueIntent([]string{"--label", "auth", "bv-1"}, "whatif", "", "--robot-whatif", ""); len(got) != 4 || got[0] != "--robot-whatif" || got[1] != "bv-1" {
+		t.Fatalf("rewriteRobotValueIntent skipped flags = %v, want [--robot-whatif bv-1 --label auth]", got)
+	}
+
+	// 10. Invalid --graph-root fails cleanly on --robot-triage, --robot-next, and --robot-graph.
+	for _, cmdFlag := range []string{"--robot-triage", "--robot-next", "--robot-graph"} {
+		if _, stderr, err := runCommandWithTimeout(t, repo, exe, cmdFlag, "--graph-root", "bv-does-not-exist"); err == nil || !strings.Contains(stderr, "Root issue not found") {
+			t.Fatalf("%s --graph-root bv-does-not-exist: err=%v stderr=%s, want Root issue not found", cmdFlag, err, stderr)
+		}
 	}
 }

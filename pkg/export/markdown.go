@@ -54,6 +54,7 @@ type ReportOptions struct {
 	AsOf              string
 	AsOfCommit        string
 	NotReadyLabels    []string
+	IncludeInactive   bool
 }
 
 func (opts ReportOptions) includeActions() bool {
@@ -244,33 +245,41 @@ func newReportMetricsAccessor(opts ReportOptions, issueSlices ...[]model.Issue) 
 		return nil
 	}
 	resolvedIDs := make(map[string]bool)
-	if opts.Readiness != nil {
-		for _, id := range opts.Readiness.ResolvedIDs() {
-			resolvedIDs[id] = true
+	if !opts.IncludeInactive {
+		if opts.Readiness != nil {
+			for _, id := range opts.Readiness.ResolvedIDs() {
+				resolvedIDs[id] = true
+			}
 		}
-	}
-	for _, iss := range opts.GraphIssues {
-		if isClosedLikeStatus(iss.Status) {
-			resolvedIDs[iss.ID] = true
-		}
-	}
-	for _, slice := range issueSlices {
-		for _, iss := range slice {
+		for _, iss := range opts.GraphIssues {
 			if isClosedLikeStatus(iss.Status) {
 				resolvedIDs[iss.ID] = true
 			}
 		}
+		for _, slice := range issueSlices {
+			for _, iss := range slice {
+				if isClosedLikeStatus(iss.Status) {
+					resolvedIDs[iss.ID] = true
+				}
+			}
+		}
+	}
+	betweenness := opts.GraphStats.ActiveBetweenness()
+	kcore := opts.GraphStats.ActiveCoreNumber()
+	if opts.IncludeInactive {
+		betweenness = opts.GraphStats.Betweenness()
+		kcore = opts.GraphStats.CoreNumber()
 	}
 	slack := opts.GraphStats.Slack()
 	return &reportMetricsAccessor{
 		keys:           keys,
 		pageRank:       opts.GraphStats.PageRank(),
-		betweenness:    opts.GraphStats.ActiveBetweenness(),
+		betweenness:    betweenness,
 		eigenvector:    opts.GraphStats.Eigenvector(),
 		hubs:           opts.GraphStats.Hubs(),
 		authorities:    opts.GraphStats.Authorities(),
 		criticalPath:   opts.GraphStats.CriticalPathScore(),
-		kcore:          opts.GraphStats.ActiveCoreNumber(),
+		kcore:          kcore,
 		slack:          slack,
 		slackAvailable: len(slack) > 0 && len(opts.GraphStats.Cycles()) == 0,
 		resolvedIDs:    resolvedIDs,

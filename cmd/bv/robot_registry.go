@@ -978,8 +978,8 @@ Start here:
   --robot-docs <topic>  Long-form agent documentation
 
 Every payload carries: generated_at, data_hash, source_path, source_kind,
-as_of/as_of_commit (with --as-of), scope (with --label/--recipe/--repo, plus
-scope.unsupported for flags a command cannot honour), load_stats (when records
+as_of/as_of_commit (with --as-of), scope (with --label/--recipe/--repo/--graph-root,
+plus scope.unsupported for flags a command cannot honour), load_stats (when records
 were dropped during load).
 Issue-backed responses also carry source_authority, authority_hash, and
 scope_hash. Partial or stale sources retain exploratory output with provisional
@@ -1012,6 +1012,9 @@ readiness; source_authority.claim_safe must be true before claiming work.
 			seen[cmd.FlagName] = true
 			if cmd.IsModifier {
 				modifiers = append(modifiers, cmd)
+				continue
+			}
+			if cmd.FlagName == "version" {
 				continue
 			}
 			if err := writef("  %-28s %s\n", formatRobotFlag(cmd.FlagName), cmd.Description); err != nil {
@@ -1511,8 +1514,8 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 
 			exportIssues := ctx.Issues
 			if rootIssueID != "" {
-				sourceIssues := ctx.Issues
-				if (ctx.CandidateIDs != nil && !ctx.CandidateIDs[rootIssueID]) || !containsIssueID(sourceIssues, rootIssueID) {
+				sourceIssues := ctx.GraphRootSourceIssues()
+				if !isGraphRootInActiveScope(ctx, rootIssueID) || !containsIssueID(sourceIssues, rootIssueID) {
 					fmt.Fprintf(ctx.StderrOrDefault(), "Root issue not found: %s\n", rootIssueID)
 					return newReportedRobotHandlerExit(1)
 				}
@@ -3461,9 +3464,8 @@ func loadTriageHistoryForContext(ctx RobotContext, cfg phaseThreeRobotHandlerCon
 }
 
 func handleRobotTriage(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
-	historyReport, historyStatus := loadTriageHistoryForContext(ctx, cfg)
-
-	// bv-140: scope triage to a subgraph if --graph-root is specified
+	// bv-140: validate & scope --graph-root BEFORE spawning git history correlation
+	// so invalid roots fail fast without paying history extraction latency.
 	var rootIssueID string
 	if cfg.GraphRoot != nil && strings.TrimSpace(*cfg.GraphRoot) != "" {
 		rootIssueID = strings.TrimSpace(*cfg.GraphRoot)
@@ -3486,6 +3488,8 @@ func handleRobotTriage(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error
 		ctx.DataHash = analysis.ComputeDataHash(subgraphIssues)
 		ctx.DataHashMatchesIssues = false
 	}
+
+	historyReport, historyStatus := loadTriageHistoryForContext(ctx, cfg)
 	seedHash := ""
 	if rootIssueID == "" && ctx.DataHashMatchesIssues && len(graphIssues) == len(ctx.Issues) {
 		seedHash = ctx.DataHash
@@ -4024,8 +4028,7 @@ func loadRobotFeedbackForDir(projectDir string) (*analysis.FeedbackData, *analys
 }
 
 func handleRobotNext(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
-	historyReport, _ := loadTriageHistoryForContext(ctx, cfg)
-
+	// Validate & scope --graph-root BEFORE spawning git history correlation.
 	var rootIssueID string
 	if cfg.GraphRoot != nil && strings.TrimSpace(*cfg.GraphRoot) != "" {
 		rootIssueID = strings.TrimSpace(*cfg.GraphRoot)
@@ -4048,6 +4051,8 @@ func handleRobotNext(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
 		ctx.DataHash = analysis.ComputeDataHash(subgraphIssues)
 		ctx.DataHashMatchesIssues = false
 	}
+
+	historyReport, _ := loadTriageHistoryForContext(ctx, cfg)
 	seedHash := ""
 	if rootIssueID == "" && ctx.DataHashMatchesIssues && len(graphIssues) == len(ctx.Issues) {
 		seedHash = ctx.DataHash
@@ -4090,12 +4095,25 @@ func handleRobotNext(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
 		return nil
 	}
 
+	hasBrRetryScript := false
+	if projectDir, dirErr := ctx.ProjectDirOrDefault(); dirErr == nil && projectDir != "" {
+		if info, statErr := os.Stat(filepath.Join(projectDir, "scripts", "br_retry.sh")); statErr == nil && !info.IsDir() {
+			hasBrRetryScript = true
+		}
+	}
+	actionableHint := "Use br ready --json plus the claim gate before mutating Beads state in crowded swarms."
+	noActionableRepair := "Use br ready --json for authoritative claim candidates."
+	if hasBrRetryScript {
+		actionableHint = "Use scripts/br_retry.sh actionable --json plus the claim gate before mutating Beads state in crowded swarms."
+		noActionableRepair = "Use br ready --json or scripts/br_retry.sh actionable --json for authoritative claim candidates."
+	}
+
 	output := robotNextOutput{
 		RobotEnvelope: ctx.Envelope(),
 		Phase2Ready:   triage.Meta.Phase2Ready,
 		Status:        triage.Status,
 		UsageHints: []string{
-			"Use scripts/br_retry.sh actionable --json plus the claim gate before mutating Beads state in crowded swarms.",
+			actionableHint,
 			"No claim_command is emitted unless the item is open, unblocked, unassigned, and triage metrics are ready.",
 			"Inspect .status for skipped, timeout, or pending graph phases.",
 		},
@@ -4143,7 +4161,7 @@ func handleRobotNext(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
 			Code:     "no_actionable_recommendation",
 			Severity: "info",
 			Message:  msg,
-			Repair:   "Use br ready --json or scripts/br_retry.sh actionable --json for authoritative claim candidates.",
+			Repair:   noActionableRepair,
 		}}
 		if err := ctx.EncoderOrDefault().Encode(output); err != nil {
 			return fmt.Errorf("encoding robot-next: %w", err)
@@ -7259,8 +7277,8 @@ func handleRobotCapacity(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 	if velPerDay <= 0 {
 		velPerDay = 60.0 * 8.0
 	}
-	effectiveMinutes := serialMinutes + parallelMinutes/agents
-	estimatedDays := float64(effectiveMinutes) / velPerDay
+	effectiveMinutes := float64(serialMinutes) + float64(parallelMinutes)/float64(agents)
+	estimatedDays := effectiveMinutes / velPerDay
 	if len(openIssues) > 0 {
 		if estimatedDays < graham.GrahamMinDays {
 			estimatedDays = graham.GrahamMinDays

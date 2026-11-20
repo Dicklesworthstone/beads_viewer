@@ -360,6 +360,25 @@ var primaryStringCommandFlags = map[string]bool{
 	"debug-render":              true,
 }
 
+// optionalValueStringFlags maps string flags that may be passed bare (without
+// an explicit value) to their canonical default value. Shared between
+// isFlagActive and normalizeOptionalValueCLIFlags so bare forms never fail
+// pflag parsing with "flag needs an argument".
+var optionalValueStringFlags = map[string]string{
+	"export-graph":         "html",
+	"save-baseline":        "",
+	"robot-impact-network": "all",
+}
+
+func canonicalOptionalValueStringFlag(name string) (string, string, bool) {
+	for flagName, defaultVal := range optionalValueStringFlags {
+		if strings.EqualFold(name, flagName) {
+			return flagName, defaultVal, true
+		}
+	}
+	return "", "", false
+}
+
 func isFlagActive(flags *flag.FlagSet, name string) bool {
 	f := flags.Lookup(name)
 	if f == nil {
@@ -371,7 +390,7 @@ func isFlagActive(flags *flag.FlagSet, name string) bool {
 		v, err := flags.GetBool(name)
 		return err == nil && v
 	case "string":
-		if (name == "export-graph" || name == "save-baseline" || name == "robot-impact-network") && flags.Changed(name) {
+		if _, isOptional := optionalValueStringFlags[name]; isOptional && flags.Changed(name) {
 			return true
 		}
 		v, err := flags.GetString(name)
@@ -434,10 +453,12 @@ func normalizeOptionalValueCLIFlags(args []string) []string {
 			break
 		}
 		name, _, hasEq, _, ok := parseCLIFlagToken(arg)
-		if ok && !hasEq && strings.EqualFold(name, "export-graph") {
-			if i+1 >= len(args) || args[i+1] == "--" || strings.HasPrefix(args[i+1], "-") {
-				rewritten = append(rewritten, "--export-graph=html")
-				continue
+		if ok && !hasEq {
+			if canonical, defaultVal, isOptional := canonicalOptionalValueStringFlag(name); isOptional {
+				if i+1 >= len(args) || args[i+1] == "--" || strings.HasPrefix(args[i+1], "-") {
+					rewritten = append(rewritten, "--"+canonical+"="+defaultVal)
+					continue
+				}
 			}
 		}
 		rewritten = append(rewritten, arg)
@@ -713,21 +734,24 @@ func rewriteAgentIntentCommand(args []string) ([]string, bool) {
 // command reads naturally either way. Unrecognized tokens are passed through so
 // cobra reports genuine typos instead of silently ignoring them.
 func rewriteUpgradeIntent(rest []string) []string {
-	mode := "update"
+	var modes []string
+	seenMode := make(map[string]bool)
+	addMode := func(flagName string) {
+		if !seenMode[flagName] {
+			seenMode[flagName] = true
+			modes = append(modes, flagName)
+		}
+	}
 	yes := false
 	passthrough := make([]string, 0, len(rest))
 	for _, arg := range rest {
 		switch strings.ToLower(strings.TrimSpace(arg)) {
 		case "check", "--check", "check-update", "--check-update":
-			if mode == "update" {
-				mode = "check"
-			}
+			addMode("--check-update")
 		case "dry-run", "--dry-run", "dryrun", "--dryrun":
-			if mode == "update" {
-				mode = "dry-run"
-			}
+			addMode("--update-dry-run")
 		case "rollback", "--rollback":
-			mode = "rollback"
+			addMode("--rollback")
 		case "yes", "--yes", "-y", "force", "--force":
 			yes = true
 		default:
@@ -736,14 +760,11 @@ func rewriteUpgradeIntent(rest []string) []string {
 	}
 
 	var out []string
-	switch mode {
-	case "check":
-		out = []string{"--check-update"}
-	case "dry-run":
-		out = []string{"--update-dry-run"}
-	case "rollback":
-		out = []string{"--rollback"}
-	default:
+	if len(modes) > 0 {
+		// Emit every requested mode flag so conflicting combinations like
+		// `bv upgrade --check --rollback` fail fast via primary exclusivity.
+		out = append(out, modes...)
+	} else {
 		out = []string{"--update"}
 		if yes {
 			out = append(out, "--yes")
@@ -883,9 +904,33 @@ func rewriteRobotValueIntent(rest []string, context, boolFlag, valueFlag, defaul
 	if boolFlag != "" {
 		out = append(out, boolFlag)
 	}
-	if len(rest) > 0 && !strings.HasPrefix(rest[0], "-") {
-		out = append(out, valueFlag, rest[0])
-		rest = rest[1:]
+	// Scan past intervening general flags (including value-taking flags such as
+	// `--label backend` or `--format json`) to locate the first positional target.
+	targetIdx := -1
+	for i := 0; i < len(rest); i++ {
+		arg := rest[i]
+		if arg == "--" {
+			break
+		}
+		if !strings.HasPrefix(arg, "-") {
+			targetIdx = i
+			break
+		}
+		if arg == "--output" || arg == "-o" || arg == "--limit" {
+			i++
+			continue
+		}
+		if name, _, hasEq, _, ok := parseCLIFlagToken(arg); ok && !hasEq && flagTakesSeparateValue(name) {
+			i++
+		}
+	}
+	if targetIdx >= 0 {
+		target := rest[targetIdx]
+		remaining := make([]string, 0, len(rest)-1)
+		remaining = append(remaining, rest[:targetIdx]...)
+		remaining = append(remaining, rest[targetIdx+1:]...)
+		out = append(out, valueFlag, target)
+		rest = remaining
 	} else if defaultValue != "" {
 		out = append(out, valueFlag, defaultValue)
 	} else if valueFlag != "" && boolFlag == "" {
@@ -1964,7 +2009,9 @@ func main() {
 			return recipeLoader
 		},
 		StructuredOutput: func() bool {
-			return flag.CommandLine.Changed("format") || strings.TrimSpace(env.OutputFormat.Get()) != ""
+			return flag.CommandLine.Changed("format") ||
+				strings.TrimSpace(env.OutputFormat.Get()) != "" ||
+				strings.TrimSpace(env.ToonDefaultFormat.Get()) != ""
 		},
 	})
 	phaseTwoRobotRegistry := newRobotRegistry()
@@ -2069,21 +2116,13 @@ func main() {
 		{Name: "robot-min-confidence", FlagName: "robot-min-confidence", FlagPtr: robotMinConf, IsModifier: true, Description: "Filter robot recommendations or correlations by minimum confidence (0.0-1.0)"},
 		{Name: "robot-by-label", FlagName: "robot-by-label", FlagPtr: robotByLabel, IsModifier: true, Description: "Filter --robot-priority recommendations by label"},
 		{Name: "robot-by-assignee", FlagName: "robot-by-assignee", FlagPtr: robotByAssignee, IsModifier: true, Description: "Filter --robot-priority recommendations by assignee"},
+		{Name: "robot-not-ready-labels", FlagName: "robot-not-ready-labels", FlagPtr: robotNotReadyLabels, IsModifier: true, Description: "Comma-separated labels withheld from robot-next/triage claimable recommendations"},
+		{Name: "robot-history-timeout-ms", FlagName: "robot-history-timeout-ms", FlagPtr: robotHistoryTimeoutMs, IsModifier: true, Description: "Time budget (ms) for git history correlation in triage/next/export (0 = unbounded)"},
 		{Name: "schema-command", FlagName: "schema-command", FlagPtr: schemaCommand, IsModifier: true, Description: "Output JSON Schema for a single robot command (with --robot-schema)"},
 	} {
 		robotModifierRegistry.Register(mod)
 	}
 	rootCmd := newRootCommand(func() error {
-		if *generateDocs {
-			if err := docgen.Generate(docgen.GenerateOptions{
-				FlagSet:  flag.CommandLine,
-				Sections: docgen.DefaultFlagSections(),
-			}); err != nil {
-				return fmt.Errorf("generating docs: %w", err)
-			}
-			return nil
-		}
-
 		// Register custom bead ID patterns (--id-pattern, #188) before any
 		// correlation work runs, so every message-based ID matcher (explicit
 		// matching, orphan detection) recognizes non-default ID formats like
@@ -2106,7 +2145,7 @@ func main() {
 			for _, nonTUIFlag := range []string{
 				"version", "help", "check-update", "update", "update-dry-run", "rollback",
 				"pages", "export-pages", "preview-pages", "export", "export-md", "export-graph", "hooks-info",
-				"priority-brief", "agent-brief", "emit-script", "profile-startup", "diff-since",
+				"priority-brief", "agent-brief", "emit-script", "profile-startup", "generate-docs", "diff-since",
 				"init-drift", "save-baseline", "baseline-info", "check-drift",
 				"agents-add", "agents-update", "agents-remove", "agents-check", "agents-reset", "agents-dry-run", "agents-force",
 				"feedback-accept", "feedback-ignore", "feedback-reset", "feedback-show",
@@ -2158,7 +2197,7 @@ func main() {
 				"robot-triage", "robot-triage-by-track", "robot-triage-by-label",
 				"robot-priority", "robot-insights", "robot-forecast", "robot-capacity",
 				"emit-script", "agent-brief", "priority-brief",
-				"export-pages", "pages", "export-graph",
+				"export", "export-md", "export-pages", "pages", "export-graph",
 			}},
 			{modifier: "robot-max-results", requires: []string{
 				"robot-triage", "robot-triage-by-track", "robot-triage-by-label", "robot-next",
@@ -2287,6 +2326,8 @@ func main() {
 			{flags: []string{"export-graph"}},
 			{flags: []string{"priority-brief"}},
 			{flags: []string{"agent-brief"}},
+			{flags: []string{"profile-startup"}},
+			{flags: []string{"generate-docs"}},
 		}
 		if err := validateModifierFlags(flag.CommandLine, modifierRules); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -2318,16 +2359,26 @@ func main() {
 		}
 		if *emitScript {
 			for _, group := range primaryRobotCommandGroups {
-				if len(group.flags) > 0 && group.flags[0] == "robot-triage" {
-					continue
-				}
 				for _, name := range group.flags {
-					if f := flag.CommandLine.Lookup(name); f != nil && f.Changed {
+					if name == "robot-triage" {
+						continue
+					}
+					if isFlagActive(flag.CommandLine, name) {
 						fmt.Fprintf(os.Stderr, "Error: --emit-script cannot be combined with --%s (use standalone or with --robot-triage)\n", name)
 						os.Exit(1)
 					}
 				}
 			}
+		}
+
+		if *generateDocs {
+			if err := docgen.Generate(docgen.GenerateOptions{
+				FlagSet:  flag.CommandLine,
+				Sections: docgen.DefaultFlagSections(),
+			}); err != nil {
+				return fmt.Errorf("generating docs: %w", err)
+			}
+			return nil
 		}
 
 		if *watchExport && *asOf != "" {
@@ -2340,6 +2391,10 @@ func main() {
 		// Priority: --db flag > BEADS_DB env > BEADS_DIR env > auto-discovery.
 		if flag.CommandLine.Changed("db") && strings.TrimSpace(*dbPath) == "" {
 			fmt.Fprintln(os.Stderr, "Error: --db requires a non-empty path")
+			os.Exit(1)
+		}
+		if strings.TrimSpace(*dbPath) != "" && strings.TrimSpace(*workspaceConfig) != "" {
+			fmt.Fprintln(os.Stderr, "Error: --db and --workspace are mutually exclusive; choose a single database/file or a multi-repo workspace config.")
 			os.Exit(1)
 		}
 		if strings.TrimSpace(*dbPath) != "" {
@@ -4306,7 +4361,17 @@ func main() {
 						if ctx.SourcePath != "" {
 							lastSourcePath = ctx.SourcePath
 						}
-						paths = append(paths, lastSourcePath)
+						if lastSourcePath != "" {
+							paths = append(paths, lastSourcePath)
+						}
+						if ctx.SourceAuthority != nil {
+							for _, source := range ctx.SourceAuthority.Sources {
+								paths = append(paths, source.WatchPaths...)
+								if source.SourcePath != "" {
+									paths = append(paths, source.SourcePath)
+								}
+							}
+						}
 					}
 					wanted := make(map[string]bool, len(paths))
 					for _, path := range paths {
@@ -4709,7 +4774,11 @@ func main() {
 
 		// Handle --profile-startup
 		if *profileStartup {
-			if err := runProfileStartup(issues, loadDuration, *profileJSON, *forceFullAnalysis); err != nil {
+			profileSourcePath := robotDispatchContext.SourcePath
+			if profileSourcePath == "" {
+				profileSourcePath = beadsPath
+			}
+			if err := runProfileStartupWithSource(issues, profileSourcePath, loadDuration, *profileJSON, *forceFullAnalysis); err != nil {
 				fmt.Fprintf(os.Stderr, "Error encoding profile: %v\n", err)
 				exitCLI(1)
 			}
@@ -5661,6 +5730,7 @@ func main() {
 			options.AsOf = envelope.AsOf
 			options.AsOfCommit = envelope.AsOfCommit
 			options.NotReadyLabels = resolveNotReadyLabels(phaseThreeRobotHandlerConfig{NotReadyLabels: robotNotReadyLabels})
+			options.IncludeInactive = *robotIncludeInactive
 			content, err := export.GenerateReport(reportIssues, issuesForSearch, options)
 			if err != nil {
 				return fmt.Errorf("rendering report: %w", err)
@@ -5669,7 +5739,7 @@ func main() {
 
 			// Perform the export
 			if err := export.WriteReportFile(reportPath, content); err != nil {
-				fmt.Printf("Error exporting: %v\n", err)
+				fmt.Fprintf(os.Stderr, "Error exporting: %v\n", err)
 				exitCLI(1)
 			}
 
@@ -5684,7 +5754,7 @@ func main() {
 					fmt.Println(executor.Summary())
 				}
 				if postErr != nil {
-					fmt.Printf("Error: %v (export written to %s)\n", postErr, reportPath)
+					fmt.Fprintf(os.Stderr, "Error: %v (export written to %s)\n", postErr, reportPath)
 					exitCLI(1)
 				}
 			}
@@ -5800,6 +5870,9 @@ func main() {
 				m.SetSourceReload(func(ctx context.Context) (ui.SourceReloadResult, error) {
 					return reloadSingleRepoAutoDiscoverForUI(ctx, reloadDir, boundSource, boundSourceDegraded, reloadLabel, reloadRepo)
 				})
+				if *labelScope == "" && *repoFilter == "" {
+					m.SetBackgroundAutoPromote(true)
+				}
 				externalReloadCh, stopExternalWatchers = startExternalTUIWatchers(tuiSingleRepoSiblingWatchPaths(robotDispatchContext, beadsPath), "")
 				if externalReloadCh != nil {
 					m.DisableInternalWatcher()
@@ -6983,11 +7056,18 @@ func recipeMetricsForContext(ctx RobotContext, issues []model.Issue, r *recipe.R
 
 // runProfileStartup runs profiled startup analysis and outputs results
 func runProfileStartup(issues []model.Issue, loadDuration time.Duration, jsonOutput bool, forceFullAnalysis bool) error {
-	// Get actual beads path (respects BEADS_DIR)
-	beadsDir, _ := loader.GetBeadsDir("")
-	dataPath, _ := loader.FindJSONLPath(beadsDir)
+	return runProfileStartupWithSource(issues, "", loadDuration, jsonOutput, forceFullAnalysis)
+}
+
+func runProfileStartupWithSource(issues []model.Issue, sourcePath string, loadDuration time.Duration, jsonOutput bool, forceFullAnalysis bool) error {
+	dataPath := strings.TrimSpace(sourcePath)
 	if dataPath == "" {
-		dataPath = beadsDir // fallback
+		// Fallback when invoked without an explicit loaded source path
+		beadsDir, _ := loader.GetBeadsDir("")
+		dataPath, _ = loader.FindJSONLPath(beadsDir)
+		if dataPath == "" {
+			dataPath = beadsDir
+		}
 	}
 
 	// Time analyzer construction
@@ -6995,16 +7075,19 @@ func runProfileStartup(issues []model.Issue, loadDuration time.Duration, jsonOut
 	analyzer := analysis.NewAnalyzer(issues)
 	buildDuration := time.Since(buildStart)
 
-	// Select config
+	// Select config using blocking edge count (matching GraphStats/Analyze)
 	var config analysis.AnalysisConfig
 	if forceFullAnalysis {
 		config = analysis.FullAnalysisConfig()
 	} else {
 		nodeCount := len(issues)
-		// Estimate edge count from issues
 		edgeCount := 0
 		for _, issue := range issues {
-			edgeCount += len(issue.Dependencies)
+			for _, dep := range issue.Dependencies {
+				if dep != nil && dep.Type.IsBlocking() {
+					edgeCount++
+				}
+			}
 		}
 		config = analysis.ConfigForSize(nodeCount, edgeCount)
 	}
@@ -7012,8 +7095,9 @@ func runProfileStartup(issues []model.Issue, loadDuration time.Duration, jsonOut
 	// Run profiled analysis
 	_, profile := analyzer.AnalyzeWithProfile(config)
 
-	// Add load and build durations to profile
+	// Add build duration to profile and total so Total reflects full startup analysis
 	profile.BuildGraph = buildDuration
+	profile.Total += buildDuration
 
 	// Calculate total including load
 	totalWithLoad := loadDuration + profile.Total
@@ -7433,7 +7517,7 @@ func prepareBundleWasmAssets(bundle *export.Bundle, projectDir string, noHooks b
 	}
 
 	// 2. Explicit BV_BUILD_HYBRID_WASM: build fresh from Rust source before consulting cached .bv/wasm/hybrid.
-	if strings.TrimSpace(env.BuildHybridWasm.Get()) != "" {
+	if env.BuildHybridWasm.Bool() {
 		return maybeBuildHybridWasmAssets(bundle)
 	}
 
@@ -7484,7 +7568,7 @@ func prepareBundleWasmAssets(bundle *export.Bundle, projectDir string, noHooks b
 // embedded assets of a released binary do not carry it, so the checkout must
 // be reachable from the working directory.
 func maybeBuildHybridWasmAssets(bundle *export.Bundle) error {
-	if env.BuildHybridWasm.Get() == "" || bundle == nil {
+	if !env.BuildHybridWasm.Bool() || bundle == nil {
 		return nil
 	}
 	if bundle.HybridWasmPrepared() {
@@ -10131,13 +10215,13 @@ func robotCommandDocs() map[string]robotCommandDoc {
 		"robot-triage": {
 			Flag: "--robot-triage", Description: "Unified triage: top picks, recommendations, quick wins, blockers, project health, velocity.",
 			KeyFields:   []string{"triage.quick_ref.top_picks", "triage.recommendations", "triage.quick_wins", "triage.blockers_to_clear", "triage.project_health"},
-			Params:      []string{"--graph-root <id>", "--robot-include-inactive", "--robot-max-results <n>", "--brief"},
+			Params:      []string{"--graph-root <id>", "--robot-include-inactive", "--robot-max-results <n>", "--brief", "--robot-not-ready-labels <csv>", "--robot-history-timeout-ms <ms>"},
 			NeedsIssues: true,
 		},
 		"robot-next": {
 			Flag: "--robot-next", Description: "Single top recommendation with claim/show commands.",
 			KeyFields:   []string{"id", "title", "score", "reasons", "unblocks", "claim_command", "show_command"},
-			Params:      []string{"--graph-root <id>"},
+			Params:      []string{"--graph-root <id>", "--robot-not-ready-labels <csv>", "--robot-history-timeout-ms <ms>"},
 			NeedsIssues: true,
 		},
 		"robot-plan": {
@@ -10154,30 +10238,30 @@ func robotCommandDocs() map[string]robotCommandDoc {
 		"robot-priority": {
 			Flag: "--robot-priority", Description: "Priority misalignment detection: items whose graph importance differs from assigned priority.",
 			KeyFields:   []string{"recommendations", "summary", "filters", "field_descriptions"},
-			Params:      []string{"--robot-min-confidence 0.0-1.0", "--robot-max-results <n>", "--robot-by-label <label>", "--robot-include-inactive"},
+			Params:      []string{"--robot-min-confidence 0.0-1.0", "--robot-max-results <n>", "--robot-by-label <label>", "--robot-by-assignee <user>", "--robot-include-inactive"},
 			NeedsIssues: true,
 		},
 		"robot-triage-by-track": {
 			Flag: "--robot-triage-by-track", Description: "Triage grouped by independent parallel execution tracks.",
 			KeyFields:   []string{"triage.recommendations_by_track[].track_id", "triage.recommendations_by_track[].top_pick", "triage.recommendations_by_track[].claim_command"},
-			Params:      []string{"--graph-root <id>", "--robot-max-results <n>", "--brief", "--robot-include-inactive"},
+			Params:      []string{"--graph-root <id>", "--robot-max-results <n>", "--brief", "--robot-include-inactive", "--robot-not-ready-labels <csv>", "--robot-history-timeout-ms <ms>"},
 			NeedsIssues: true,
 		},
 		"robot-triage-by-label": {
 			Flag: "--robot-triage-by-label", Description: "Triage grouped by label for area-focused agents.",
 			KeyFields:   []string{"triage.recommendations_by_label[].label", "triage.recommendations_by_label[].top_pick", "triage.recommendations_by_label[].claim_command"},
-			Params:      []string{"--graph-root <id>", "--robot-max-results <n>", "--brief", "--robot-include-inactive"},
+			Params:      []string{"--graph-root <id>", "--robot-max-results <n>", "--brief", "--robot-include-inactive", "--robot-not-ready-labels <csv>", "--robot-history-timeout-ms <ms>"},
 			NeedsIssues: true,
 		},
 		"robot-alerts": {
 			Flag: "--robot-alerts", Description: "Stale issues, blocking cascades, priority mismatches.",
-			KeyFields:   []string{"alerts", "severity", "affected_issues"},
+			KeyFields:   []string{"alerts", "summary", "usage_hints"},
 			Params:      []string{"--severity info|warning|critical", "--alert-type <type>", "--alert-label <label>"},
 			NeedsIssues: true,
 		},
 		"robot-suggest": {
 			Flag: "--robot-suggest", Description: "Smart suggestions: potential duplicates, missing dependencies, label assignments, cycle warnings.",
-			KeyFields:   []string{"suggestions", "type", "confidence"},
+			KeyFields:   []string{"filters", "suggestions.suggestions", "suggestions.stats", "usage_hints"},
 			Params:      []string{"--suggest-type duplicate|dependency|label|cycle", "--suggest-confidence 0.0-1.0", "--suggest-bead <id>"},
 			NeedsIssues: true,
 		},
@@ -10232,7 +10316,7 @@ func robotCommandDocs() map[string]robotCommandDoc {
 		"robot-explain-correlation": {
 			Flag:        "--robot-explain-correlation <sha:bead>",
 			Description: "Explain why a commit is linked to a bead.",
-			KeyFields:   []string{"commit", "bead", "score", "reasons"},
+			KeyFields:   []string{"commit_sha", "bead_id", "confidence", "level", "method", "summary", "signals", "recommendation"},
 			NeedsIssues: true,
 			NeedsGit:    true,
 		},
@@ -10399,7 +10483,7 @@ func robotCommandDocs() map[string]robotCommandDoc {
 			Flag:          "--robot-drift",
 			Description:   "Drift detection from saved baseline.",
 			KeyFields:     []string{"has_drift", "exit_code", "summary", "alerts", "skipped_checks", "baseline"},
-			Params:        []string{"--check-drift"},
+			Params:        []string{"--check-drift", "--severity info|warning|critical", "--alert-type <type>", "--alert-label <label>", "--robot-max-results <n>"},
 			NeedsIssues:   true,
 			NeedsBaseline: true,
 		},
@@ -11232,7 +11316,7 @@ func generateRobotSchemas() RobotSchemas {
 					},
 				},
 			},
-			"required": []string{"generated_at", "output_format", "version", "format", "nodes", "edges", "explanation"},
+			"required": []string{"generated_at", "data_hash", "output_format", "version", "format", "nodes", "edges", "explanation"},
 		},
 		"robot-diff": {
 			"$schema":     "https://json-schema.org/draft/2020-12/schema",
@@ -12782,12 +12866,14 @@ func robotGroupedTriageOutputSchema(title, description, groupProperty string, gr
 		"description": description,
 		"type":        "object",
 		"properties": map[string]interface{}{
-			"generated_at": map[string]interface{}{"type": "string", "format": "date-time"},
-			"data_hash":    map[string]interface{}{"type": "string"},
-			"as_of":        map[string]interface{}{"type": "string"},
-			"as_of_commit": map[string]interface{}{"type": "string"},
-			"brief":        map[string]interface{}{"type": "boolean"},
-			"quick_ref":    map[string]interface{}{"type": "object"},
+			"generated_at":  map[string]interface{}{"type": "string", "format": "date-time"},
+			"data_hash":     map[string]interface{}{"type": "string"},
+			"output_format": map[string]interface{}{"type": "string", "enum": []string{"json", "toon"}},
+			"version":       map[string]interface{}{"type": "string"},
+			"as_of":         map[string]interface{}{"type": "string"},
+			"as_of_commit":  map[string]interface{}{"type": "string"},
+			"brief":         map[string]interface{}{"type": "boolean"},
+			"quick_ref":     map[string]interface{}{"type": "object"},
 			"recommendations": map[string]interface{}{
 				"type": "array",
 			},
@@ -12820,8 +12906,8 @@ func robotGroupedTriageOutputSchema(title, description, groupProperty string, gr
 			"usage_hints": map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
 		},
 		"oneOf": []map[string]interface{}{
-			{"required": []string{"generated_at", "data_hash", "triage", "usage_hints"}},
-			{"required": []string{"generated_at", "data_hash", "brief", "quick_ref", "recommendations"}},
+			{"required": []string{"generated_at", "data_hash", "output_format", "version", "triage", "usage_hints"}},
+			{"required": []string{"generated_at", "data_hash", "output_format", "version", "brief", "quick_ref", "recommendations"}},
 		},
 	}
 }
