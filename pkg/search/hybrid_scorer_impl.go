@@ -62,8 +62,11 @@ func (s *hybridScorer) Score(issueID string, textScore float64) (HybridScore, er
 		}, nil
 	}
 
-	// Skip normalizations for zero-weight components to save computation
-	var statusScore, priorityScore, impactScore, recencyScore float64
+	// Skip normalizations for zero-weight components consistently across all signals
+	var pageRankScore, statusScore, priorityScore, impactScore, recencyScore float64
+	if s.weights.PageRank > 0 {
+		pageRankScore = metrics.PageRank
+	}
 	if s.weights.Status > 0 {
 		statusScore = normalizeStatus(metrics.Status)
 	}
@@ -78,7 +81,7 @@ func (s *hybridScorer) Score(issueID string, textScore float64) (HybridScore, er
 	}
 
 	final := s.weights.TextRelevance*textScore +
-		s.weights.PageRank*metrics.PageRank +
+		s.weights.PageRank*pageRankScore +
 		s.weights.Status*statusScore +
 		s.weights.Impact*impactScore +
 		s.weights.Priority*priorityScore +
@@ -89,7 +92,7 @@ func (s *hybridScorer) Score(issueID string, textScore float64) (HybridScore, er
 		FinalScore: final,
 		TextScore:  textScore,
 		ComponentScores: map[string]float64{
-			"pagerank": metrics.PageRank,
+			"pagerank": pageRankScore,
 			"status":   statusScore,
 			"impact":   impactScore,
 			"priority": priorityScore,
