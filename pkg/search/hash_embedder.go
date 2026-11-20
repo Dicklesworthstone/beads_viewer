@@ -76,10 +76,6 @@ func (h *HashEmbedder) Embed(ctx context.Context, texts []string) ([][]float32, 
 	return out, nil
 }
 
-func hashEmbedInto(vec []float32, text string) {
-	hashEmbedIntoWithSeed(vec, fnvOffset64, text)
-}
-
 func hashEmbedIntoWithSeed(vec []float32, seed uint64, text string) {
 	if len(vec) == 0 {
 		return
@@ -103,10 +99,6 @@ func hashEmbedIntoWithSeed(vec []float32, seed uint64, text string) {
 	if tokenStart != -1 {
 		addHashedTokenWithSeed(vec, dim, seed, text[tokenStart:])
 	}
-}
-
-func addHashedToken(vec []float32, dim uint64, token string) {
-	addHashedTokenWithSeed(vec, dim, fnvOffset64, token)
 }
 
 func addHashedTokenWithSeed(vec []float32, dim uint64, seed uint64, token string) {
