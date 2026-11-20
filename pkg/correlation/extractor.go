@@ -184,6 +184,36 @@ func (e *Extractor) effectiveStoreDirRel() string {
 	return deriveStoreDirRel(e.beadsFiles)
 }
 
+func canonicalExtractorPath(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+	clean := filepath.Clean(trimmed)
+	if abs, err := filepath.Abs(clean); err == nil {
+		clean = filepath.Clean(abs)
+	}
+	if eval, err := filepath.EvalSymlinks(clean); err == nil {
+		return filepath.Clean(eval)
+	}
+	cur := clean
+	var suffix []string
+	for {
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return clean
+		}
+		suffix = append(suffix, filepath.Base(cur))
+		cur = parent
+		if resolved, err := filepath.EvalSymlinks(cur); err == nil {
+			for i := len(suffix) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, suffix[i])
+			}
+			return filepath.Clean(resolved)
+		}
+	}
+}
+
 func resolveExtractorBeadsPath(repoPath, beadPath string) string {
 	cleaned := filepath.Clean(beadPath)
 	if repoPath == "" {
@@ -192,6 +222,13 @@ func resolveExtractorBeadsPath(repoPath, beadPath string) string {
 	if filepath.IsAbs(cleaned) {
 		if absRepo, err := filepath.Abs(repoPath); err == nil {
 			if rel, err := filepath.Rel(absRepo, cleaned); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+				return rel
+			}
+		}
+		canonRepo := canonicalExtractorPath(repoPath)
+		canonBead := canonicalExtractorPath(cleaned)
+		if canonRepo != "" && canonBead != "" {
+			if rel, err := filepath.Rel(canonRepo, canonBead); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 				return rel
 			}
 		}
