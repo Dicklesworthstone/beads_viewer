@@ -212,12 +212,12 @@ func newOrphanDetector(report *HistoryReport, repoPath string, now time.Time) *O
 			}
 		}
 
-		// Build author -> beads mapping
+		// Build author -> beads mapping (case-insensitive email keys)
 		if history.LastAuthor != "" {
 			for _, commit := range history.Commits {
-				if commit.AuthorEmail != "" {
-					od.authorBeads[commit.AuthorEmail] = appendUnique(
-						od.authorBeads[commit.AuthorEmail], beadID)
+				if emailKey := strings.ToLower(strings.TrimSpace(commit.AuthorEmail)); emailKey != "" {
+					od.authorBeads[emailKey] = appendUnique(
+						od.authorBeads[emailKey], beadID)
 				}
 			}
 		}
@@ -478,9 +478,15 @@ func (od *OrphanDetector) checkTiming(candidate *OrphanCandidate, beadScores map
 			})
 
 			if _, ok := beadScores[beadID]; !ok {
+				status := "in_progress"
+				if od.lookup != nil {
+					if history, exists := od.lookup.beads[beadID]; exists && history.Status != "" {
+						status = history.Status
+					}
+				}
 				beadScores[beadID] = &probableBeadBuilder{
 					title:  window.Title,
-					status: "in_progress", // If we're here, it was active
+					status: status,
 				}
 			}
 			beadScores[beadID].score += weight
@@ -594,11 +600,12 @@ func (od *OrphanDetector) scoreMentionedBead(beadScores map[string]*probableBead
 
 // checkAuthor checks if author has linked commits nearby.
 func (od *OrphanDetector) checkAuthor(candidate *OrphanCandidate, beadScores map[string]*probableBeadBuilder) {
-	if candidate.AuthorEmail == "" {
+	emailKey := strings.ToLower(strings.TrimSpace(candidate.AuthorEmail))
+	if emailKey == "" {
 		return
 	}
 
-	beadIDs := od.authorBeads[candidate.AuthorEmail]
+	beadIDs := od.authorBeads[emailKey]
 	if len(beadIDs) == 0 {
 		return
 	}

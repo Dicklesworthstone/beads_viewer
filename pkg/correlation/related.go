@@ -109,17 +109,17 @@ func (hr *HistoryReport) FindRelatedWorkAt(targetID string, opts RelatedWorkOpti
 	seen := make(map[string]bool)
 	seen[targetID] = true // Don't include target in results
 
-	// 1. File Overlap Detection
-	fileOverlapCandidates := hr.findFileOverlap(targetID, targetFiles, fileLookup, opts, seen)
-	result.FileOverlap = fileOverlapCandidates
-	for _, rb := range fileOverlapCandidates {
-		seen[rb.BeadID] = true
-	}
-
-	// 2. Commit Overlap Detection
+	// 1. Commit Overlap Detection (stronger direct signal than shared files)
 	commitOverlapCandidates := hr.findCommitOverlap(targetID, targetCommits, opts, seen)
 	result.CommitOverlap = commitOverlapCandidates
 	for _, rb := range commitOverlapCandidates {
+		seen[rb.BeadID] = true
+	}
+
+	// 2. File Overlap Detection
+	fileOverlapCandidates := hr.findFileOverlap(targetID, targetFiles, fileLookup, opts, seen)
+	result.FileOverlap = fileOverlapCandidates
+	for _, rb := range fileOverlapCandidates {
 		seen[rb.BeadID] = true
 	}
 
@@ -335,10 +335,14 @@ func (hr *HistoryReport) findDependencyCluster(targetID string, opts RelatedWork
 		}
 	}
 
-	// Second hop: deps of deps
+	// Second hop: deps of deps AND reverse deps (siblings sharing a common blocker)
 	firstHop := make([]string, 0, len(cluster))
 	for id := range cluster {
 		firstHop = append(firstHop, id)
+	}
+	firstHopSet := make(map[string]bool, len(firstHop))
+	for _, id := range firstHop {
+		firstHopSet[id] = true
 	}
 
 	for _, hopID := range firstHop {
@@ -349,6 +353,20 @@ func (hr *HistoryReport) findDependencyCluster(targetID string, opts RelatedWork
 						cluster[depID] = 2
 					}
 				}
+			}
+		}
+	}
+	for beadID, deps := range opts.DependencyGraph {
+		if seen[beadID] || beadID == targetID {
+			continue
+		}
+		if _, exists := cluster[beadID]; exists {
+			continue
+		}
+		for _, depID := range deps {
+			if firstHopSet[depID] {
+				cluster[beadID] = 2
+				break
 			}
 		}
 	}

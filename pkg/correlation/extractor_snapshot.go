@@ -709,10 +709,10 @@ func parseRawDiffLines(payload []byte, sc *snapshotCommit) bool {
 		if newSHA != nullBlobSHA {
 			sc.newSHA = newSHA
 		}
-		// We only act on commits where the followed file has a current blob; a
-		// pure deletion (new == zero) carries no `+{...}` records to extract and
-		// the legacy `-p` path likewise produced no events for it.
-		return sc.newSHA != ""
+		// Keep commits where the followed file has either a current blob or a
+		// parent blob so full-file deletions (old != zero, new == zero) emit
+		// EventDeleted identically to the legacy `-p` extractor and causal history.
+		return sc.newSHA != "" || sc.oldSHA != ""
 	}
 	return false
 }
