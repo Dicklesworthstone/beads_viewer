@@ -1543,12 +1543,27 @@ func loadWorkspaceHistoryAtRevisionCmd(
 			}
 			clean := filepath.Clean(trimmed)
 			if abs, err := filepath.Abs(clean); err == nil {
-				if eval, evalErr := filepath.EvalSymlinks(abs); evalErr == nil {
-					return filepath.Clean(eval)
-				}
-				return filepath.Clean(abs)
+				clean = filepath.Clean(abs)
 			}
-			return clean
+			if eval, evalErr := filepath.EvalSymlinks(clean); evalErr == nil {
+				return filepath.Clean(eval)
+			}
+			cur := clean
+			var suffix []string
+			for {
+				parent := filepath.Dir(cur)
+				if parent == cur {
+					return clean
+				}
+				suffix = append(suffix, filepath.Base(cur))
+				cur = parent
+				if resolved, err := filepath.EvalSymlinks(cur); err == nil {
+					for i := len(suffix) - 1; i >= 0; i-- {
+						resolved = filepath.Join(resolved, suffix[i])
+					}
+					return filepath.Clean(resolved)
+				}
+			}
 		}
 		effectiveBeadsDir := func(repoWorkDir, beadsDir string) string {
 			cWork := canonDir(repoWorkDir)
@@ -1600,7 +1615,7 @@ func loadWorkspaceHistoryAtRevisionCmd(
 					cand = filepath.Join(rPath, cand)
 				}
 				if strings.EqualFold(filepath.Ext(cand), ".jsonl") {
-					return filepath.Clean(cand)
+					return canonDir(cand)
 				}
 			}
 			if effBeads == "" && rPath != "" {
@@ -1610,14 +1625,14 @@ func loadWorkspaceHistoryAtRevisionCmd(
 				return ""
 			}
 			if jsonlPath, err := loader.FindJSONLPath(effBeads); err == nil && jsonlPath != "" {
-				return jsonlPath
+				return canonDir(jsonlPath)
 			}
 			if metaJSONL := resolveMetadataJSONLExport(effBeads); metaJSONL != "" {
-				return metaJSONL
+				return canonDir(metaJSONL)
 			}
-			return filepath.Join(effBeads, "issues.jsonl")
+			return canonDir(filepath.Join(effBeads, "issues.jsonl"))
 		}
-		computeStoreSubtreePrefix := func(gitRoot, effBeads, corrPath string) string {
+		computeStoreSubtreePrefix := func(gitRoot, rPath, effBeads, corrPath string) string {
 			if gitRoot == "" {
 				return ""
 			}
@@ -1628,9 +1643,14 @@ func loadWorkspaceHistoryAtRevisionCmd(
 			if sDir == "" {
 				return ""
 			}
-			containerDir := filepath.Dir(sDir)
-			if filepath.Base(containerDir) == ".beads" {
-				containerDir = filepath.Dir(containerDir)
+			var containerDir string
+			if rPath != "" && sDir == rPath && filepath.Base(sDir) != ".beads" && filepath.Base(sDir) != "_beads" {
+				containerDir = rPath
+			} else {
+				containerDir = filepath.Dir(sDir)
+				if filepath.Base(containerDir) == ".beads" || filepath.Base(containerDir) == "_beads" {
+					containerDir = filepath.Dir(containerDir)
+				}
 			}
 			rel, err := filepath.Rel(gitRoot, containerDir)
 			if err != nil || rel == "." || rel == "" || strings.HasPrefix(rel, "..") {
@@ -1662,7 +1682,7 @@ func loadWorkspaceHistoryAtRevisionCmd(
 			}
 			gRoot := resolveGitRepoRoot(rPath)
 			corrPath := resolveWorkspaceCorrelationJSONL(effBeads, beadsDir, rPath)
-			subPrefix := computeStoreSubtreePrefix(gRoot, effBeads, corrPath)
+			subPrefix := computeStoreSubtreePrefix(gRoot, rPath, effBeads, corrPath)
 			targets = append(targets, wsCorrTarget{
 				label:           label,
 				workDir:         repoWorkDir,
