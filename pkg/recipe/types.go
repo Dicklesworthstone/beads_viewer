@@ -203,11 +203,15 @@ func (r *Recipe) Validate() error {
 		return errors.New("recipe is nil")
 	}
 	var problems []string
-	for _, s := range r.SortChain() {
-		if _, ok := canonicalSortField(s.Field); !ok {
-			problems = append(problems, fmt.Sprintf("sort.field %q is not one of %s", s.Field, strings.Join(knownSortFields(), ", ")))
+	for s := &r.Sort; s != nil; s = s.Secondary {
+		field := strings.TrimSpace(s.Field)
+		dir := strings.ToLower(strings.TrimSpace(s.Direction))
+		if field != "" {
+			if _, ok := canonicalSortField(field); !ok {
+				problems = append(problems, fmt.Sprintf("sort.field %q is not one of %s", s.Field, strings.Join(knownSortFields(), ", ")))
+			}
 		}
-		switch strings.ToLower(strings.TrimSpace(s.Direction)) {
+		switch dir {
 		case "", "asc", "desc":
 		default:
 			problems = append(problems, fmt.Sprintf("sort.direction %q must be asc or desc", s.Direction))

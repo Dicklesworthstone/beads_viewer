@@ -481,3 +481,36 @@ func TestCompleteRecipeFieldsValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestApply_NaturalOrderStrictTotalOrderOnZeroPaddedIDs(t *testing.T) {
+	r := &recipe.Recipe{
+		Name: "id-sort",
+		Sort: recipe.SortConfig{Field: "id", Direction: "asc"},
+	}
+	fwd := []model.Issue{
+		{ID: "bv-10", Status: model.StatusOpen},
+		{ID: "bv-1", Status: model.StatusOpen},
+		{ID: "bv-01", Status: model.StatusOpen},
+		{ID: "bv-001", Status: model.StatusOpen},
+		{ID: "bv-2", Status: model.StatusOpen},
+	}
+	rev := []model.Issue{
+		{ID: "bv-2", Status: model.StatusOpen},
+		{ID: "bv-001", Status: model.StatusOpen},
+		{ID: "bv-01", Status: model.StatusOpen},
+		{ID: "bv-1", Status: model.StatusOpen},
+		{ID: "bv-10", Status: model.StatusOpen},
+	}
+	now := time.Now()
+	gotFwd, err := recipe.Apply(fwd, recipe.Metrics{}, r, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotRev, err := recipe.Apply(rev, recipe.Metrics{}, r, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Strict total order: independent of input permutation, bv-001 < bv-01 < bv-1 < bv-2 < bv-10.
+	requireIDs(t, gotFwd, "bv-001", "bv-01", "bv-1", "bv-2", "bv-10")
+	requireIDs(t, gotRev, "bv-001", "bv-01", "bv-1", "bv-2", "bv-10")
+}

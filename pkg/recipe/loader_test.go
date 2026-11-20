@@ -1000,3 +1000,34 @@ func TestDecodeStrictRejectsMultiDocumentYAMLAndParsesExportIncludeActions(t *te
 		t.Fatalf("expected warning mentioning multiple YAML documents, got %v", multiLoader.Warnings())
 	}
 }
+
+func TestRC37_RecipeSymlinkSizeSortDirectionAndNaturalOrder(t *testing.T) {
+	dir := t.TempDir()
+	realRecipe := filepath.Join(dir, "real.yaml")
+	writeFile(t, realRecipe, "name: legit\ndescription: real recipe\n")
+
+	// 1. Symlink recipe file must be rejected by both LoadFile and project loader.
+	linkRecipe := filepath.Join(dir, "link.yaml")
+	if err := os.Symlink(realRecipe, linkRecipe); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if _, err := recipe.LoadFile(linkRecipe); err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("LoadFile(symlink) = %v, want symlink rejection", err)
+	}
+
+	// 2. Oversized (> 1 MiB) recipe file must be rejected.
+	hugeRecipe := filepath.Join(dir, "huge.yaml")
+	writeFile(t, hugeRecipe, "name: huge\ndescription: "+strings.Repeat("x", (1<<20)+64)+"\n")
+	if _, err := recipe.LoadFile(hugeRecipe); err == nil || !strings.Contains(err.Error(), "exceeds maximum size") {
+		t.Fatalf("LoadFile(>1MiB) = %v, want size cap rejection", err)
+	}
+
+	// 3. Invalid sort.direction with blank sort.field must be rejected by Validate().
+	badSort := recipe.Recipe{
+		Name: "bad-sort",
+		Sort: recipe.SortConfig{Direction: "bogus"},
+	}
+	if err := badSort.Validate(); err == nil || !strings.Contains(err.Error(), "sort.direction") {
+		t.Fatalf("Validate(blank field + bogus direction) = %v, want sort.direction error", err)
+	}
+}

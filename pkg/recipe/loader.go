@@ -205,10 +205,48 @@ func (l *Loader) loadBuiltin() error {
 	return nil
 }
 
+const maxRecipeFileBytes = 1 << 20 // 1 MiB cap for untrusted recipe YAML files
+
+func readRegularRecipeFile(path string) ([]byte, error) {
+	linfo, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if linfo.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("recipe file %s must not be a symlink", path)
+	}
+	if !linfo.Mode().IsRegular() {
+		return nil, fmt.Errorf("recipe file %s is not a regular file", path)
+	}
+	if linfo.Size() > maxRecipeFileBytes {
+		return nil, fmt.Errorf("recipe file %s exceeds maximum size of %d bytes", path, maxRecipeFileBytes)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	finfo, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !finfo.Mode().IsRegular() || !os.SameFile(linfo, finfo) {
+		return nil, fmt.Errorf("recipe file %s changed during open or is not a regular file", path)
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxRecipeFileBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxRecipeFileBytes {
+		return nil, fmt.Errorf("recipe file %s exceeds maximum size of %d bytes", path, maxRecipeFileBytes)
+	}
+	return data, nil
+}
+
 // loadFromFile loads a `recipes:` map from a YAML file and merges it.
 // Individual recipes that fail Validate are skipped with a warning.
 func (l *Loader) loadFromFile(path, source string) error {
-	data, err := os.ReadFile(path)
+	data, err := readRegularRecipeFile(path)
 	if err != nil {
 		return err
 	}
@@ -336,7 +374,7 @@ func IsPathArgument(arg string) bool {
 // field, defaulting to the file stem. Unknown keys and invalid values are
 // errors that name the offending field.
 func LoadFile(path string) (*Recipe, error) {
-	data, err := os.ReadFile(path)
+	data, err := readRegularRecipeFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, fmt.Errorf("recipe file not found: %s", path)

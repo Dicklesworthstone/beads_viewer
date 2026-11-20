@@ -363,7 +363,10 @@ func naturalLess(s1, s2 string) bool {
 	p1, n1, ok1 := split(s1)
 	p2, n2, ok2 := split(s2)
 	if ok1 && ok2 && p1 == p2 {
-		return n1 < n2
+		if n1 != n2 {
+			return n1 < n2
+		}
+		return s1 < s2
 	}
 	return s1 < s2
 }
