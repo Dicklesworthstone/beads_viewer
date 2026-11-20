@@ -283,7 +283,8 @@ func (l *AnalyzerMetricsLoader) computeMetricsAndHash(includeHash bool) (map[str
 			if pr > maxAnyPR {
 				maxAnyPR = pr
 			}
-			if issue.Status != model.StatusClosed && issue.Status != model.StatusTombstone && pr > maxActivePR {
+			norm := issue.Status.Normalize()
+			if norm != model.StatusClosed && !norm.IsTombstone() && pr > maxActivePR {
 				maxActivePR = pr
 			}
 		}

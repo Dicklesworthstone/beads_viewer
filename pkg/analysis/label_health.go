@@ -2338,9 +2338,9 @@ func ComputeLabelSubgraph(issues []model.Issue, label string) LabelSubgraph {
 	for coreID := range coreSet {
 		coreIssue := result.IssueMap[coreID]
 
-		// Add issues that this core issue depends on (blockers)
+		// Add issues that this core issue depends on (blocking prerequisites)
 		for _, dep := range coreIssue.Dependencies {
-			if dep == nil {
+			if dep == nil || !dep.Type.IsBlocking() {
 				continue
 			}
 			blockerID := dep.DependsOnID
@@ -2352,10 +2352,10 @@ func ComputeLabelSubgraph(issues []model.Issue, label string) LabelSubgraph {
 			}
 		}
 
-		// Add issues that depend on this core issue (blocked by it)
+		// Add issues that depend on this core issue (blocking dependents)
 		for _, iss := range issues {
 			for _, dep := range iss.Dependencies {
-				if dep != nil && dep.DependsOnID == coreID {
+				if dep != nil && dep.Type.IsBlocking() && dep.DependsOnID == coreID {
 					if _, inCore := coreSet[iss.ID]; !inCore {
 						depSet[iss.ID] = true
 						result.IssueMap[iss.ID] = iss
@@ -2528,19 +2528,21 @@ func ComputeLabelPageRank(sg LabelSubgraph) LabelPageRankResult {
 		nodeToID[n.ID()] = id
 	}
 
-	// Add edges from adjacency (blocker -> blocked)
-	for from, toList := range sg.Adjacency {
+	// Add edges in dependent -> prerequisite orientation matching Analyzer.g
+	// (sg.Adjacency stores blocker -> blocked, so reverse to blocked -> blocker
+	// so foundational blockers accumulate PageRank mass from dependents).
+	for _, from := range sg.AllIssues {
 		fromNode, ok := idToNode[from]
 		if !ok {
 			continue
 		}
-		for _, to := range toList {
+		for _, to := range sg.Adjacency[from] {
 			toNode, exists := idToNode[to]
-			if !exists {
+			if !exists || toNode == fromNode {
 				continue
 			}
-			// Edge direction: blocker -> blocked (from blocks to)
-			g.SetEdge(g.NewEdge(g.Node(fromNode), g.Node(toNode)))
+			// Edge direction: dependent -> prerequisite (to depends on from)
+			g.SetEdge(g.NewEdge(g.Node(toNode), g.Node(fromNode)))
 		}
 	}
 
@@ -2734,12 +2736,12 @@ func ComputeLabelCriticalPath(sg LabelSubgraph) LabelCriticalPathResult {
 		maxParentHeight := 0
 		var bestParent int64 = -1
 
-		// Look at incoming edges (parents/blockers)
+		// Look at incoming edges (parents/blockers) with deterministic lexicographical tie-breaking
 		to := g.To(nid)
 		for to.Next() {
 			p := to.Node()
 			if h, ok := heights[p.ID()]; ok {
-				if h > maxParentHeight {
+				if h > maxParentHeight || (h == maxParentHeight && (bestParent < 0 || nodeToID[p.ID()] < nodeToID[bestParent])) {
 					maxParentHeight = h
 					bestParent = p.ID()
 				}
@@ -2752,11 +2754,18 @@ func ComputeLabelCriticalPath(sg LabelSubgraph) LabelCriticalPathResult {
 		}
 	}
 
-	// Convert heights to string IDs and find max
+	// Convert heights to string IDs and find max deterministically in sorted ID order
 	var maxNode int64 = -1
 	maxHeight := 0
-	for nodeID, h := range heights {
-		issueID := nodeToID[nodeID]
+	for _, issueID := range sg.AllIssues {
+		nodeID, ok := idToNode[issueID]
+		if !ok {
+			continue
+		}
+		h, exists := heights[nodeID]
+		if !exists {
+			continue
+		}
 		result.AllHeights[issueID] = h
 		if h > maxHeight {
 			maxHeight = h
@@ -3302,8 +3311,13 @@ func computeHistoricalVelocityFromLabeled(labeled []model.Issue, label string, n
 	if weekday == 0 {
 		weekday = 7 // Sunday = 7
 	}
-	// Go back to Monday of current week
-	currentWeekStart := now.AddDate(0, 0, -(weekday - 1)).Truncate(24 * time.Hour)
+	// Go back to Monday of current week in UTC for timezone-independent bucketing
+	nowUTC := now.UTC()
+	weekday = int(nowUTC.Weekday())
+	if weekday == 0 {
+		weekday = 7 // Sunday = 7
+	}
+	currentWeekStart := nowUTC.AddDate(0, 0, -(weekday - 1)).Truncate(24 * time.Hour)
 
 	// Build week buckets
 	for i := 0; i < numWeeks; i++ {

@@ -172,6 +172,12 @@ type DiffSummary struct {
 
 // CompareSnapshots computes the diff between two snapshots
 func CompareSnapshots(from, to *Snapshot) *SnapshotDiff {
+	if from == nil {
+		from = &Snapshot{}
+	}
+	if to == nil {
+		to = &Snapshot{}
+	}
 	diff := &SnapshotDiff{
 		FromTimestamp:  from.Timestamp,
 		ToTimestamp:    to.Timestamp,

@@ -1546,10 +1546,9 @@ func foldBeadsDirStoreModTime(dirPath string, latest time.Time) time.Time {
 			info = rInfo
 		}
 	}
-	rootLower := strings.ToLower(filepath.Base(rootPath))
-	if rootLower != "noms" && rootLower != "oldgen" && info.ModTime().After(latest) {
-		latest = info.ModTime()
-	}
+	// Do not fold directory inode mtimes: creating/unlinking transient lock or
+	// journal files advances the containing directory mtime without mutating any
+	// issue-bearing store file. Only fold real store files and Dolt noms heads.
 	seen := 0
 	_ = filepath.WalkDir(rootPath, func(p string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -1567,9 +1566,6 @@ func foldBeadsDirStoreModTime(dirPath string, latest time.Time) time.Time {
 			seen++
 			if seen > maxBoundedWalkEntries {
 				return fs.SkipAll
-			}
-			if dInfo, dErr := d.Info(); dErr == nil && dInfo.ModTime().After(latest) {
-				latest = dInfo.ModTime()
 			}
 			return nil
 		}
@@ -1590,8 +1586,6 @@ func foldBeadsDirStoreModTime(dirPath string, latest time.Time) time.Time {
 		if pInfo.IsDir() {
 			if lower == "noms" {
 				latest, _ = foldDoltNomsHeadFiles(p, latest)
-			} else if lower != "oldgen" && pInfo.ModTime().After(latest) {
-				latest = pInfo.ModTime()
 			}
 			return nil
 		}
