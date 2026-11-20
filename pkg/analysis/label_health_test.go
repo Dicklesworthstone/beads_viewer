@@ -1141,8 +1141,9 @@ func TestComputeLabelPageRankSingleNode(t *testing.T) {
 }
 
 func TestComputeLabelPageRankChain(t *testing.T) {
-	// Chain: bv-1 blocks bv-2 blocks bv-3 (all api)
-	// In PageRank, nodes with more incoming links have higher scores
+	// Chain: bv-1 blocks bv-2 blocks bv-3 (all api).
+	// Dependent -> prerequisite edges flow mass onto foundational blockers,
+	// matching Analyzer.PageRank: bv-1 > bv-2 > bv-3.
 	issues := []model.Issue{
 		{ID: "bv-1", Labels: []string{"api"}},
 		{
@@ -1166,19 +1167,93 @@ func TestComputeLabelPageRankChain(t *testing.T) {
 	if result.IssueCount != 3 {
 		t.Errorf("Expected 3 issues, got %d", result.IssueCount)
 	}
-
-	// All three should have scores
 	if len(result.Scores) != 3 {
 		t.Errorf("Expected 3 scores, got %d", len(result.Scores))
 	}
-
-	// Top issues should be sorted by score
 	if len(result.TopIssues) != 3 {
-		t.Errorf("Expected 3 top issues, got %d", len(result.TopIssues))
+		t.Fatalf("Expected 3 top issues, got %d", len(result.TopIssues))
 	}
-	// First rank should be 1
-	if result.TopIssues[0].Rank != 1 {
-		t.Errorf("Expected first issue to have rank 1, got %d", result.TopIssues[0].Rank)
+	if result.TopIssues[0].Rank != 1 || result.TopIssues[0].ID != "bv-1" {
+		t.Fatalf("Expected foundational blocker bv-1 to be rank 1, got %+v (scores=%v)", result.TopIssues[0], result.Scores)
+	}
+	if !(result.Scores["bv-1"] > result.Scores["bv-2"] && result.Scores["bv-2"] > result.Scores["bv-3"]) {
+		t.Fatalf("Expected strict blocker dominance bv-1 > bv-2 > bv-3, got scores=%v", result.Scores)
+	}
+
+	// Verify exact agreement with full Analyzer.PageRank on single-label graph
+	fullStats := NewAnalyzer(issues).Analyze()
+	fullPR := fullStats.PageRank()
+	for _, id := range []string{"bv-1", "bv-2", "bv-3"} {
+		if diff := math.Abs(result.Scores[id] - fullPR[id]); diff > 1e-5 {
+			t.Fatalf("Label PageRank[%s]=%.8f diverges from full Analyzer.PageRank=%.8f (diff=%.8f)", id, result.Scores[id], fullPR[id], diff)
+		}
+	}
+}
+
+func TestComputeLabelSubgraph_ExcludesNonBlockingExternalNeighbors(t *testing.T) {
+	issues := []model.Issue{
+		{
+			ID:     "core-1",
+			Labels: []string{"api"},
+			Dependencies: []*model.Dependency{
+				{DependsOnID: "ext-related", Type: model.DepRelated},
+				{DependsOnID: "ext-blocker", Type: model.DepBlocks},
+			},
+		},
+		{ID: "ext-related", Labels: []string{"docs"}},
+		{ID: "ext-blocker", Labels: []string{"infra"}},
+		{
+			ID:     "ext-reverse-related",
+			Labels: []string{"ui"},
+			Dependencies: []*model.Dependency{
+				{DependsOnID: "core-1", Type: model.DepRelated},
+			},
+		},
+	}
+	sg := ComputeLabelSubgraph(issues, "api")
+	if sg.IssueCount != 2 {
+		t.Fatalf("expected only core-1 + ext-blocker (2 issues), got %d: %v", sg.IssueCount, sg.AllIssues)
+	}
+	if len(sg.DependencyIssues) != 1 || sg.DependencyIssues[0] != "ext-blocker" {
+		t.Fatalf("expected DependencyIssues=[ext-blocker], got %v", sg.DependencyIssues)
+	}
+}
+
+func TestComputeLabelCriticalPath_DeterministicTieBreak(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "a-root", Labels: []string{"api"}},
+		{ID: "a-leaf", Labels: []string{"api"}, Dependencies: []*model.Dependency{{DependsOnID: "a-root", Type: model.DepBlocks}}},
+		{ID: "b-root", Labels: []string{"api"}},
+		{ID: "b-leaf", Labels: []string{"api"}, Dependencies: []*model.Dependency{{DependsOnID: "b-root", Type: model.DepBlocks}}},
+	}
+	sg := ComputeLabelSubgraph(issues, "api")
+	first := ComputeLabelCriticalPath(sg)
+	want := []string{"a-root", "a-leaf"}
+	if len(first.Path) != 2 || first.Path[0] != want[0] || first.Path[1] != want[1] {
+		t.Fatalf("expected deterministic lexicographical tie-break path %v, got %v", want, first.Path)
+	}
+	for i := 0; i < 100; i++ {
+		got := ComputeLabelCriticalPath(sg)
+		if len(got.Path) != len(first.Path) || got.Path[0] != first.Path[0] || got.Path[1] != first.Path[1] {
+			t.Fatalf("iteration %d nondeterministic critical path: got %v want %v", i, got.Path, first.Path)
+		}
+	}
+}
+
+func TestComputeHistoricalVelocity_UTCAlignment(t *testing.T) {
+	tz := time.FixedZone("UTC+9", 9*3600)
+	nowLocal := time.Date(2026, 11, 16, 1, 0, 0, 0, tz) // Sunday 16:00 UTC -> UTC week starts Mon Nov 9
+	closed := time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)
+	issues := []model.Issue{
+		{ID: "tz-1", Status: model.StatusClosed, Labels: []string{"api"}, ClosedAt: &closed, UpdatedAt: closed},
+	}
+	hvLocal := ComputeHistoricalVelocity(issues, "api", 4, nowLocal)
+	hvUTC := ComputeHistoricalVelocity(issues, "api", 4, nowLocal.UTC())
+	if !hvLocal.WeeklyVelocity[0].WeekStart.Equal(hvUTC.WeeklyVelocity[0].WeekStart) {
+		t.Fatalf("non-UTC now produced shifted WeekStart: local=%v vs utc=%v", hvLocal.WeeklyVelocity[0].WeekStart, hvUTC.WeeklyVelocity[0].WeekStart)
+	}
+	if hvLocal.WeeklyVelocity[0].Closed != 1 || hvUTC.WeeklyVelocity[0].Closed != 1 {
+		t.Fatalf("expected closure in week 0: local=%+v utc=%+v", hvLocal.WeeklyVelocity[0], hvUTC.WeeklyVelocity[0])
 	}
 }
 

@@ -297,22 +297,27 @@ func ComputeProjectVelocity(issues []model.Issue, now time.Time, weeks int) *Vel
 	monthAgo := now.Add(-30 * 24 * time.Hour)
 
 	for _, iss := range issues {
-		if iss.Status != model.StatusClosed {
+		if !isClosedLikeStatus(iss.Status) {
 			continue
 		}
 
 		var closedAt time.Time
 		switch {
-		case iss.ClosedAt != nil:
+		case iss.ClosedAt != nil && !iss.ClosedAt.IsZero():
 			closedAt = iss.ClosedAt.UTC()
 		case !iss.UpdatedAt.IsZero():
-			// Fallback: approximate closure using updated_at when closed_at missing
+			// Fallback: approximate closure using updated_at when closed_at missing or zero
 			closedAt = iss.UpdatedAt.UTC()
 			estimated = true
 		default:
 			// Last resort: approximate with now; counts become estimated
 			closedAt = now
 			estimated = true
+		}
+
+		// Ignore future-dated closures relative to the reference clock (e.g., --as-of)
+		if closedAt.After(now) {
+			continue
 		}
 
 		// Count rolling windows
@@ -329,10 +334,12 @@ func ComputeProjectVelocity(issues []model.Issue, now time.Time, weeks int) *Vel
 		weekStart := isoWeekStart(year, week)
 		weekBuckets[weekStart]++
 
-		// Average time-to-close if created date present
+		// Average time-to-close if created date present and non-negative
 		if !iss.CreatedAt.IsZero() {
-			totalCloseDur += closedAt.Sub(iss.CreatedAt)
-			closeSamples++
+			if dur := closedAt.Sub(iss.CreatedAt); dur >= 0 {
+				totalCloseDur += dur
+				closeSamples++
+			}
 		}
 	}
 
@@ -1112,49 +1119,7 @@ func buildUnblocksMap(ctx *TriageContext) map[string][]string {
 	return unblocksMap
 }
 
-// computeCounts tallies issues by various dimensions
-// Deprecated: Use computeCountsWithContext for better performance via caching.
-func computeCounts(issues []model.Issue, analyzer *Analyzer) HealthCounts {
-	counts := HealthCounts{
-		Total:      len(issues),
-		ByStatus:   make(map[string]int),
-		ByType:     make(map[string]int),
-		ByPriority: make(map[int]int),
-	}
-
-	actionable := analyzer.getActionableIssuesAfterCompletions(nil)
-	actionableSet := make(map[string]bool, len(actionable))
-	for _, a := range actionable {
-		actionableSet[a.ID] = true
-	}
-
-	for _, issue := range issues {
-		counts.ByStatus[string(issue.Status)]++
-		counts.ByType[string(issue.IssueType)]++
-		counts.ByPriority[issue.Priority]++
-
-		if isClosedLikeStatus(issue.Status) {
-			counts.Closed++
-		} else {
-			counts.NotClosed++
-			if actionableSet[issue.ID] {
-				counts.Actionable++
-			} else {
-				counts.DependencyBlocked++
-			}
-		}
-	}
-
-	// Strict status counts (issue #165): keep Open/Blocked in lockstep with
-	// ByStatus so counts.open == by_status.open always holds.
-	counts.Open = counts.ByStatus[string(model.StatusOpen)]
-	counts.Blocked = counts.ByStatus[string(model.StatusBlocked)]
-
-	return counts
-}
-
 // computeCountsWithContext tallies issues by various dimensions using cached actionable data.
-// This is more efficient than computeCounts when called multiple times in the same triage pass.
 func computeCountsWithContext(issues []model.Issue, ctx *TriageContext) HealthCounts {
 	counts := HealthCounts{
 		Total:      len(issues),
@@ -1320,65 +1285,6 @@ func buildQuickWins(scores []ImpactScore, unblocksMap map[string][]string, limit
 	return quickWins
 }
 
-// buildBlockersToClear finds items that block the most downstream work
-// Deprecated: Use buildBlockersToClearWithContext for better performance via caching.
-func buildBlockersToClear(analyzer *Analyzer, unblocksMap map[string][]string, limit int) []BlockerItem {
-	type blocker struct {
-		id       string
-		title    string
-		unblocks []string
-	}
-
-	actionable := analyzer.getActionableIssuesAfterCompletions(nil)
-	actionableSet := make(map[string]bool, len(actionable))
-	for _, a := range actionable {
-		actionableSet[a.ID] = true
-	}
-
-	var blockers []blocker
-	for id, unblocks := range unblocksMap {
-		if len(unblocks) == 0 {
-			continue
-		}
-		issue := analyzer.getIssue(id)
-		if issue == nil || isClosedLikeStatus(issue.Status) {
-			continue
-		}
-		blockers = append(blockers, blocker{
-			id:       id,
-			title:    issue.Title,
-			unblocks: unblocks,
-		})
-	}
-
-	// Sort by unblocks count descending
-	sort.Slice(blockers, func(i, j int) bool {
-		if len(blockers[i].unblocks) != len(blockers[j].unblocks) {
-			return len(blockers[i].unblocks) > len(blockers[j].unblocks)
-		}
-		// Stable tie-breaker for deterministic robot output.
-		return blockers[i].id < blockers[j].id
-	})
-
-	result := make([]BlockerItem, 0, limit)
-	for i := 0; i < len(blockers) && i < limit; i++ {
-		b := blockers[i]
-		item := BlockerItem{
-			ID:            b.id,
-			Title:         b.title,
-			UnblocksCount: len(b.unblocks),
-			UnblocksIDs:   b.unblocks,
-			Actionable:    actionableSet[b.id],
-		}
-		if !item.Actionable {
-			item.BlockedBy = analyzer.GetOpenBlockers(b.id)
-		}
-		result = append(result, item)
-	}
-
-	return result
-}
-
 // buildBlockersToClearWithContext finds items that block the most downstream work.
 // This version uses TriageContext for cached actionable lookups and open blockers.
 func buildBlockersToClearWithContext(ctx *TriageContext, unblocksMap map[string][]string, limit int) []BlockerItem {
@@ -1517,11 +1423,6 @@ func hasAnyLabel(issueLabels, wanted []string) bool {
 		}
 	}
 	return false
-}
-
-// buildGraphHealth constructs graph health metrics from stats
-func buildGraphHealth(stats *GraphStats) GraphHealth {
-	return buildScopedGraphHealth(stats, nil)
 }
 
 // buildScopedGraphHealth constructs graph health metrics from stats, scoping

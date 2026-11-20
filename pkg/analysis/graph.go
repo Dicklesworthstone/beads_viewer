@@ -111,6 +111,14 @@ type GraphStats struct {
 	activeBetweennessRank map[string]int
 	activeCoreNumber      map[string]int
 	activeArticulation    []string
+
+	// Memoized active-subgraph DAG metrics (CriticalPath & Slack) keyed by
+	// (activeSetHash|criticalState|slackState) so closed historical chains never
+	// inflate active slack or distort active critical path rankings.
+	activeDAGKey       string
+	activeCriticalPath map[string]float64
+	activeSlack        map[string]float64
+	activeDAGHasCycle  bool
 }
 
 // metricStatus captures per-metric computation outcome for transparency.
@@ -245,17 +253,15 @@ func stateFromTiming(enabled bool, timedOut bool) string {
 }
 
 func emptyGraphMetricStatus(config AnalysisConfig) MetricStatus {
-	kcoreComputed := config.ComputeKCore || config.ComputeArticulation
-	articulationComputed := config.ComputeArticulation || config.ComputeKCore
 	return MetricStatus{
-		PageRank:     statusEntry{State: stateFromTiming(config.ComputePageRank, false)},
-		Betweenness:  statusEntry{State: stateFromTiming(config.ComputeBetweenness, false)},
+		PageRank:     statusEntry{State: stateFromTiming(config.ComputePageRank, false), Reason: config.PageRankSkipReason},
+		Betweenness:  statusEntry{State: stateFromTiming(config.ComputeBetweenness, false), Reason: betweennessReason(config, false)},
 		Eigenvector:  statusEntry{State: stateFromTiming(config.ComputeEigenvector, false)},
-		HITS:         statusEntry{State: stateFromTiming(config.ComputeHITS, false)},
+		HITS:         statusEntry{State: stateFromTiming(config.ComputeHITS, false), Reason: config.HITSSkipReason},
 		Critical:     statusEntry{State: stateFromTiming(config.ComputeCriticalPath, false)},
-		Cycles:       statusEntry{State: stateFromTiming(config.ComputeCycles, false)},
-		KCore:        statusEntry{State: stateFromTiming(kcoreComputed, false)},
-		Articulation: statusEntry{State: stateFromTiming(articulationComputed, false)},
+		Cycles:       statusEntry{State: stateFromTiming(config.ComputeCycles, false), Reason: config.CyclesSkipReason},
+		KCore:        statusEntry{State: stateFromTiming(config.ComputeKCore, false)},
+		Articulation: statusEntry{State: stateFromTiming(config.ComputeArticulation, false)},
 		Slack:        statusEntry{State: stateFromTiming(config.ComputeSlack, false)},
 	}
 }
@@ -2016,7 +2022,15 @@ func (a *Analyzer) computeActiveSubgraphMetricsWithKey(activeIDs []string, activ
 		}
 		if edgeCount > 0 && len(activeIDs) > 1 {
 			subCfg := ConfigForSize(len(activeIDs), edgeCount)
+			explicitExact := cfg.ComputeBetweenness && cfg.BetweennessMode == BetweennessExact
 			switch {
+			case explicitExact:
+				rawBW := exactBetweennessCompact(sub)
+				for subNode, val := range rawBW {
+					if subNode >= 0 && int(subNode) < len(activeIDs) {
+						bwOut[activeIDs[subNode]] = val
+					}
+				}
 			case cfg.BetweennessMode == BetweennessSkip || subCfg.BetweennessMode == BetweennessSkip || !subCfg.ComputeBetweenness:
 				// Dense/skipped tier: retain zeroed betweenness without running O(VE) Brandes.
 			case subCfg.BetweennessMode == BetweennessApproximate ||
@@ -2080,6 +2094,132 @@ func (a *Analyzer) computeActiveSubgraphMetricsWithKey(activeIDs []string, activ
 	}
 
 	return cacheKey, bwOut, coreOut, artOut
+}
+
+// activeDAGMetrics returns CriticalPathScore and Slack computed strictly over
+// the active non-closed/non-tombstoned subgraph so long historical closed
+// chains never inflate active slack or distort active critical path rankings.
+//
+// When no closed/tombstoned issues exist in the analyzer, it delegates directly
+// to stats' full-graph accessors without extra work. When Critical or Slack was
+// skipped/timed out or the active subgraph contains a cycle, the corresponding
+// boolean availability flag is false so callers never confuse missing map keys
+// with zero slack.
+func (a *Analyzer) activeDAGMetrics(stats *GraphStats) (map[string]float64, map[string]float64, bool, bool) {
+	if a == nil || stats == nil {
+		return nil, nil, false, false
+	}
+	status := stats.Status()
+	wantCP := status.Critical.State == "computed" || (status.Critical.State == "" && stats.Config.ComputeCriticalPath)
+	wantSlack := status.Slack.State == "computed" || (status.Slack.State == "" && stats.Config.ComputeSlack)
+	if !wantCP && !wantSlack {
+		return nil, nil, false, false
+	}
+	if a.g == nil {
+		cp := stats.CriticalPathScore()
+		sl := stats.Slack()
+		return cp, sl, wantCP && len(cp) > 0, wantSlack && len(sl) > 0
+	}
+
+	activeIDs, hasClosed, activeHash := a.ensureActiveSet()
+	if !hasClosed {
+		var cp, sl map[string]float64
+		if wantCP {
+			cp = stats.CriticalPathScore()
+		}
+		if wantSlack {
+			sl = stats.Slack()
+		}
+		return cp, sl, wantCP && len(cp) > 0, wantSlack && len(sl) > 0
+	}
+	if len(activeIDs) == 0 {
+		return map[string]float64{}, map[string]float64{}, false, false
+	}
+
+	cacheKey := activeHash + "|" + status.Critical.State + "|" + status.Slack.State
+	stats.mu.RLock()
+	if stats.activeDAGKey == cacheKey {
+		hasCycle := stats.activeDAGHasCycle
+		cpCached := stats.activeCriticalPath
+		slCached := stats.activeSlack
+		stats.mu.RUnlock()
+		if hasCycle {
+			return nil, nil, false, false
+		}
+		return cpCached, slCached, wantCP && cpCached != nil, wantSlack && slCached != nil
+	}
+	stats.mu.RUnlock()
+
+	_, cpOut, slOut, hasCycle := a.computeActiveDAGMetricsWithKey(activeIDs, activeHash, status, nil, nil, false)
+
+	stats.mu.Lock()
+	stats.activeDAGKey = cacheKey
+	stats.activeCriticalPath = cpOut
+	stats.activeSlack = slOut
+	stats.activeDAGHasCycle = hasCycle
+	stats.mu.Unlock()
+
+	if hasCycle {
+		return nil, nil, false, false
+	}
+	return cpOut, slOut, wantCP && cpOut != nil, wantSlack && slOut != nil
+}
+
+func (a *Analyzer) computeActiveDAGMetricsWithKey(
+	activeIDs []string,
+	activeHash string,
+	status MetricStatus,
+	activeGraph directedGraph,
+	activeSorted []graph.Node,
+	activeSortedValid bool,
+) (string, map[string]float64, map[string]float64, bool) {
+	wantCP := status.Critical.State == "computed" || status.Critical.State == ""
+	wantSlack := status.Slack.State == "computed" || status.Slack.State == ""
+	if !wantCP && !wantSlack {
+		return "", nil, nil, false
+	}
+	cacheKey := activeHash + "|" + status.Critical.State + "|" + status.Slack.State
+	if len(activeIDs) == 0 {
+		return cacheKey, map[string]float64{}, map[string]float64{}, false
+	}
+
+	if activeGraph == nil {
+		activeGraph = a.activeCycleGraph()
+	}
+	if !activeSortedValid {
+		sorted, err := topo.Sort(activeGraph)
+		if err != nil {
+			return cacheKey, nil, nil, true
+		}
+		filtered := make([]graph.Node, 0, len(sorted))
+		for _, n := range sorted {
+			id, ok := a.nodeToID[n.ID()]
+			if !ok {
+				continue
+			}
+			if iss, exists := a.issueMap[id]; exists && !isClosedLikeStatus(iss.Status) {
+				filtered = append(filtered, n)
+			}
+		}
+		activeSorted = filtered
+	}
+	if len(activeSorted) == 0 {
+		return cacheKey, map[string]float64{}, map[string]float64{}, false
+	}
+
+	var cpOut map[string]float64
+	if wantCP {
+		cpOut = a.computeHeightsOnGraph(activeGraph, activeSorted)
+	}
+	var slOut map[string]float64
+	if wantSlack {
+		activeOrderIDs := make([]string, 0, len(activeSorted))
+		for i := len(activeSorted) - 1; i >= 0; i-- {
+			activeOrderIDs = append(activeOrderIDs, a.nodeToID[activeSorted[i].ID()])
+		}
+		slOut = a.computeSlackOnGraph(activeGraph, activeOrderIDs)
+	}
+	return cacheKey, cpOut, slOut, false
 }
 
 // activeCycleGraph returns the blocking graph induced by open-like issues.
@@ -2410,16 +2550,26 @@ func (a *Analyzer) AnalyzeAsyncWithConfig(ctx context.Context, config AnalysisCo
 	// This avoids goroutine overhead when Phase 2 results aren't needed
 	// (e.g., all issues are closed, so no triage scoring required).
 	if config.AllPhase2Disabled() {
+		reasonOrDefault := func(r string) string {
+			if r != "" {
+				return r
+			}
+			return "all phase 2 disabled"
+		}
+		sharedReason := reasonOrDefault(config.PageRankSkipReason)
+		if sharedReason == "all phase 2 disabled" && config.BetweennessSkipReason != "" {
+			sharedReason = config.BetweennessSkipReason
+		}
 		stats.status = MetricStatus{
-			PageRank:     statusEntry{State: "skipped", Reason: "all phase 2 disabled"},
-			Betweenness:  statusEntry{State: "skipped", Reason: "all phase 2 disabled"},
-			Eigenvector:  statusEntry{State: "skipped", Reason: "all phase 2 disabled"},
-			HITS:         statusEntry{State: "skipped", Reason: "all phase 2 disabled"},
-			Critical:     statusEntry{State: "skipped", Reason: "all phase 2 disabled"},
-			Cycles:       statusEntry{State: "skipped", Reason: "all phase 2 disabled"},
-			KCore:        statusEntry{State: "skipped", Reason: "all phase 2 disabled"},
-			Articulation: statusEntry{State: "skipped", Reason: "all phase 2 disabled"},
-			Slack:        statusEntry{State: "skipped", Reason: "all phase 2 disabled"},
+			PageRank:     statusEntry{State: "skipped", Reason: reasonOrDefault(config.PageRankSkipReason)},
+			Betweenness:  statusEntry{State: "skipped", Reason: reasonOrDefault(config.BetweennessSkipReason)},
+			Eigenvector:  statusEntry{State: "skipped", Reason: sharedReason},
+			HITS:         statusEntry{State: "skipped", Reason: reasonOrDefault(config.HITSSkipReason)},
+			Critical:     statusEntry{State: "skipped", Reason: sharedReason},
+			Cycles:       statusEntry{State: "skipped", Reason: reasonOrDefault(config.CyclesSkipReason)},
+			KCore:        statusEntry{State: "skipped", Reason: sharedReason},
+			Articulation: statusEntry{State: "skipped", Reason: sharedReason},
+			Slack:        statusEntry{State: "skipped", Reason: sharedReason},
 		}
 		stats.phase2Ready = true
 		close(stats.phase2Done)
@@ -2465,6 +2615,20 @@ func (s *GraphStats) snapshotValue() GraphStats {
 		activeArt = make([]string, len(s.activeArticulation))
 		copy(activeArt, s.activeArticulation)
 	}
+	var activeCP map[string]float64
+	if s.activeCriticalPath != nil {
+		activeCP = make(map[string]float64, len(s.activeCriticalPath))
+		for k, v := range s.activeCriticalPath {
+			activeCP[k] = v
+		}
+	}
+	var activeSl map[string]float64
+	if s.activeSlack != nil {
+		activeSl = make(map[string]float64, len(s.activeSlack))
+		for k, v := range s.activeSlack {
+			activeSl[k] = v
+		}
+	}
 
 	return GraphStats{
 		OutDegree:             s.OutDegree,
@@ -2499,6 +2663,10 @@ func (s *GraphStats) snapshotValue() GraphStats {
 		activeBetweennessRank: activeBWRank,
 		activeCoreNumber:      activeCore,
 		activeArticulation:    activeArt,
+		activeDAGKey:          s.activeDAGKey,
+		activeCriticalPath:    activeCP,
+		activeSlack:           activeSl,
+		activeDAGHasCycle:     s.activeDAGHasCycle,
 	}
 }
 
@@ -2569,6 +2737,10 @@ func (a *Analyzer) AnalyzeWithProfile(config AnalysisConfig) (*GraphStats, *Star
 	a.computePhase2WithProfile(context.Background(), stats, config, profile)
 	profile.Phase2 = time.Since(phase2Start)
 
+	stats.mu.RLock()
+	profile.Config = stats.Config
+	stats.mu.RUnlock()
+
 	stats.phase2Ready = true
 	close(stats.phase2Done)
 
@@ -2589,6 +2761,8 @@ func (a *Analyzer) computePhase1WithProfile(stats *GraphStats, profile *StartupP
 		from := a.g.From(n.ID())
 		stats.OutDegree[id] = from.Len()
 	}
+	stats.inDegreeRank = computeIntRanks(stats.InDegree)
+	stats.outDegreeRank = computeIntRanks(stats.OutDegree)
 	profile.Degree = time.Since(degreeStart)
 
 	// Topological Sort
@@ -2959,12 +3133,28 @@ func (a *Analyzer) computePhase2WithProfile(ctx context.Context, stats *GraphSta
 	}
 
 	// Advanced graph signals: k-core, articulation points (undirected), slack (bv-85)
-	// These can be skipped for triage-only mode (bv-t1js optimization)
+	// Build the undirected adjacency once when either metric is enabled, then
+	// compute and time KCore and Articulation independently.
 	if config.ComputeKCore || config.ComputeArticulation {
-		kcoreStart := time.Now()
-		localCore, localArticulation = a.computeCoreAndArticulation()
-		profile.KCore = time.Since(kcoreStart)
-		profile.Articulation = 0 // Computed together with k-core
+		adj := newUndirectedAdjacency(a.g)
+		if config.ComputeKCore {
+			kcoreStart := time.Now()
+			rawCore := computeKCore(adj)
+			localCore = make(map[string]int, len(rawCore))
+			for id, val := range rawCore {
+				localCore[a.nodeToID[id]] = val
+			}
+			profile.KCore = time.Since(kcoreStart)
+		}
+		if config.ComputeArticulation {
+			artStart := time.Now()
+			rawArt := findArticulationPoints(adj)
+			localArticulation = make(map[string]bool, len(rawArt))
+			for id := range rawArt {
+				localArticulation[a.nodeToID[id]] = true
+			}
+			profile.Articulation = time.Since(artStart)
+		}
 	}
 
 	if config.ComputeSlack {
@@ -3010,8 +3200,8 @@ func (a *Analyzer) computePhase2WithProfile(ctx context.Context, stats *GraphSta
 	}
 
 	// record status snapshot
-	kcoreComputed := config.ComputeKCore || config.ComputeArticulation
-	articulationComputed := config.ComputeArticulation || config.ComputeKCore
+	kcoreComputed := config.ComputeKCore
+	articulationComputed := config.ComputeArticulation
 	slackComputed := config.ComputeSlack
 
 	criticalStatus := statusEntry{State: stateFromTiming(config.ComputeCriticalPath, false), Elapsed: profile.CriticalPath}
@@ -3026,7 +3216,7 @@ func (a *Analyzer) computePhase2WithProfile(ctx context.Context, stats *GraphSta
 	}
 
 	localStatus := MetricStatus{
-		PageRank: statusEntry{State: stateFromTiming(config.ComputePageRank, profile.PageRankTO), Elapsed: profile.PageRank},
+		PageRank: statusEntry{State: stateFromTiming(config.ComputePageRank, profile.PageRankTO), Reason: config.PageRankSkipReason, Elapsed: profile.PageRank},
 		Betweenness: statusEntry{
 			State:   stateFromTiming(config.ComputeBetweenness, profile.BetweennessTO),
 			Reason:  betweennessReason(config, betweennessIsApprox),
@@ -3042,13 +3232,18 @@ func (a *Analyzer) computePhase2WithProfile(ctx context.Context, stats *GraphSta
 		Slack:        slackStatus,
 	}
 
-	// Pre-populate active-subgraph metrics before marking Phase 2 ready when closed issues exist.
+	// Pre-populate active-subgraph metrics (including active CriticalPath & Slack)
+	// before marking Phase 2 ready when closed issues exist.
 	var (
-		activeKey    string
-		activeBW     map[string]float64
-		activeBWRank map[string]int
-		activeCore   map[string]int
-		activeArt    []string
+		activeKey       string
+		activeBW        map[string]float64
+		activeBWRank    map[string]int
+		activeCore      map[string]int
+		activeArt       []string
+		activeDAGKey    string
+		activeCP        map[string]float64
+		activeSl        map[string]float64
+		activeDAGCyclic bool
 	)
 	if a.g != nil && ctx.Err() == nil {
 		if activeIDs, hasClosed, activeHash := a.ensureActiveSet(); hasClosed {
@@ -3056,6 +3251,9 @@ func (a *Analyzer) computePhase2WithProfile(ctx context.Context, stats *GraphSta
 			if activeBW != nil {
 				activeBWRank = computeFloatRanks(activeBW)
 			}
+			activeDAGKey, activeCP, activeSl, activeDAGCyclic = a.computeActiveDAGMetricsWithKey(
+				activeIDs, activeHash, localStatus, activeGraph, activeSorted, activeTopoTried && !activeTopoFailed,
+			)
 		}
 	}
 
@@ -3067,6 +3265,10 @@ func (a *Analyzer) computePhase2WithProfile(ctx context.Context, stats *GraphSta
 	if ctx.Err() != nil {
 		stats.mu.Unlock()
 		return
+	}
+	stats.Config.BetweennessIsApproximate = betweennessIsApprox
+	if betweennessIsApprox && actualBetweennessSample > 0 {
+		stats.Config.BetweennessSampleSize = actualBetweennessSample
 	}
 	stats.pageRank = localPageRank
 	stats.betweenness = localBetweenness
@@ -3093,6 +3295,12 @@ func (a *Analyzer) computePhase2WithProfile(ctx context.Context, stats *GraphSta
 		stats.activeBetweennessRank = activeBWRank
 		stats.activeCoreNumber = activeCore
 		stats.activeArticulation = activeArt
+	}
+	if activeDAGKey != "" {
+		stats.activeDAGKey = activeDAGKey
+		stats.activeCriticalPath = activeCP
+		stats.activeSlack = activeSl
+		stats.activeDAGHasCycle = activeDAGCyclic
 	}
 
 	stats.status = localStatus

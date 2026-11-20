@@ -2,6 +2,7 @@ package analysis
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -219,17 +220,8 @@ func velocityMinutesPerDayForLabelWithStats(issues []model.Issue, stats *GraphSt
 	samples := 0
 
 	for _, iss := range issues {
-		if iss.Status != model.StatusClosed {
-			continue
-		}
-
-		// Robust closure time: use ClosedAt if available, else UpdatedAt
-		closedAt := iss.UpdatedAt
-		if iss.ClosedAt != nil {
-			closedAt = *iss.ClosedAt
-		}
-
-		if closedAt.Before(since) || closedAt.After(now) {
+		closedAt, ok := resolveClosureTime(&iss, now)
+		if !ok || closedAt.Before(since) {
 			continue
 		}
 		if label != "" && !hasLabel(iss.Labels, label) {
@@ -292,7 +284,7 @@ func ComputeGrahamBounds(openIssues []model.Issue, allIssues []model.Issue, stat
 		totalMinutes += w
 	}
 
-	critPath, critMinutes := LongestWeightedChain(openIssues, weights)
+	critPath, critMinutes := longestWeightedChainWithContext(openIssues, allIssues, weights)
 	if critMinutes > totalMinutes {
 		critMinutes = totalMinutes
 	}
@@ -320,7 +312,14 @@ func ComputeGrahamBounds(openIssues []model.Issue, allIssues []model.Issue, stat
 // condensation followed by reverse-topological DAG dynamic programming.
 // Acyclic diamonds run in strict O(V + E) time without exponential backtracking,
 // and disconnected cyclic components are evaluated symmetrically alongside roots.
+// Direct DepParentChild edges remain non-blocking, while blocking dependencies
+// declared on a DepParentChild ancestor are inherited by descendants to match
+// model.ReadinessIndex serial execution constraints.
 func LongestWeightedChain(openIssues []model.Issue, weights map[string]int) ([]string, int) {
+	return longestWeightedChainWithContext(openIssues, openIssues, weights)
+}
+
+func longestWeightedChainWithContext(openIssues []model.Issue, contextIssues []model.Issue, weights map[string]int) ([]string, int) {
 	if len(openIssues) == 0 {
 		return []string{}, 0
 	}
@@ -339,19 +338,69 @@ func LongestWeightedChain(openIssues []model.Issue, weights map[string]int) ([]s
 		return []string{}, 0
 	}
 
+	// Build ancestor lookup over contextIssues (falling back to openIssues) so
+	// children inherit unsatisfied open blockers declared on parent-child ancestors.
+	issueByID := make(map[string]model.Issue, len(openIssues)+len(contextIssues))
+	for _, iss := range contextIssues {
+		if iss.ID != "" {
+			issueByID[iss.ID] = iss
+		}
+	}
+	for _, iss := range openIssues {
+		if iss.ID != "" {
+			issueByID[iss.ID] = iss
+		}
+	}
+
 	dependents := make(map[string][]string, len(ids))
 	for _, iss := range openIssues {
 		if !openSet[iss.ID] {
 			continue
 		}
-		seen := make(map[string]bool)
+		seenBlocker := make(map[string]bool)
+		addBlocker := func(blockerID string) {
+			if blockerID == "" || blockerID == iss.ID || seenBlocker[blockerID] || !openSet[blockerID] {
+				return
+			}
+			seenBlocker[blockerID] = true
+			dependents[blockerID] = append(dependents[blockerID], iss.ID)
+		}
+
+		// Direct blocking dependencies
+		var parentQueue []string
 		for _, dep := range iss.Dependencies {
-			if dep == nil || !dep.Type.IsBlocking() || dep.DependsOnID == iss.ID || seen[dep.DependsOnID] {
+			if dep == nil {
 				continue
 			}
-			if openSet[dep.DependsOnID] {
-				seen[dep.DependsOnID] = true
-				dependents[dep.DependsOnID] = append(dependents[dep.DependsOnID], iss.ID)
+			if dep.Type.IsBlocking() {
+				addBlocker(dep.DependsOnID)
+			} else if dep.Type == model.DepParentChild && dep.DependsOnID != "" && dep.DependsOnID != iss.ID {
+				parentQueue = append(parentQueue, dep.DependsOnID)
+			}
+		}
+
+		// Inherited blocking dependencies from DepParentChild ancestors
+		visitedAnc := map[string]bool{iss.ID: true}
+		for len(parentQueue) > 0 {
+			ancID := parentQueue[0]
+			parentQueue = parentQueue[1:]
+			if visitedAnc[ancID] {
+				continue
+			}
+			visitedAnc[ancID] = true
+			anc, ok := issueByID[ancID]
+			if !ok {
+				continue
+			}
+			for _, dep := range anc.Dependencies {
+				if dep == nil {
+					continue
+				}
+				if dep.Type.IsBlocking() {
+					addBlocker(dep.DependsOnID)
+				} else if dep.Type == model.DepParentChild && dep.DependsOnID != "" && !visitedAnc[dep.DependsOnID] {
+					parentQueue = append(parentQueue, dep.DependsOnID)
+				}
 			}
 		}
 	}
@@ -569,8 +618,12 @@ func computeMedianEstimatedMinutes(issues []model.Issue) int {
 }
 
 func durationDays(days float64) time.Duration {
-	if days <= 0 {
+	if math.IsNaN(days) || days <= 0 {
 		return 0
+	}
+	const maxDurationDays = float64(math.MaxInt64) / float64(24*time.Hour)
+	if math.IsInf(days, 1) || days >= maxDurationDays {
+		return time.Duration(math.MaxInt64)
 	}
 	return time.Duration(days * float64(24*time.Hour))
 }

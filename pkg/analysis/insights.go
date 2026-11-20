@@ -161,18 +161,27 @@ func (a *Analyzer) GenerateScopedInsights(s *GraphStats, limit int, includeInact
 	var betweenness map[string]float64
 	var coreNum map[string]int
 	var artPts []string
+	var criticalPath map[string]float64
+	var slack map[string]float64
 	if includeInactive {
 		betweenness = filterFloatMap(s.Betweenness(), candidateOnly)
 		coreNum = filterIntMap(s.CoreNumber(), candidateOnly)
 		artPts = filterStrings(s.ArticulationPoints(), candidateOnly)
+		criticalPath = filterFloatMap(s.CriticalPathScore(), eligible)
+		slack = filterFloatMap(s.Slack(), eligible)
 	} else {
 		activeBW, activeCore, activeArt := a.activeSubgraphMetrics(s)
 		betweenness = filterFloatMap(activeBW, eligible)
 		coreNum = filterIntMap(activeCore, eligible)
 		artPts = filterStrings(activeArt, eligible)
+		activeCP, activeSl, hasCP, hasSl := a.activeDAGMetrics(s)
+		if hasCP {
+			criticalPath = filterFloatMap(activeCP, eligible)
+		}
+		if hasSl {
+			slack = filterFloatMap(activeSl, eligible)
+		}
 	}
-	criticalPath := filterFloatMap(s.CriticalPathScore(), eligible)
-	slack := filterFloatMap(s.Slack(), eligible)
 	orphans := filterStrings(findOrphans(s.OutDegree), eligible)
 
 	eigenvector := filterFloatMap(s.Eigenvector(), eligible)

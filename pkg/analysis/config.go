@@ -187,11 +187,11 @@ func ConfigForSize(nodeCount, edgeCount int) AnalysisConfig {
 		} else {
 			cfg.ComputeBetweenness = false
 			cfg.BetweennessMode = BetweennessSkip
-			cfg.BetweennessSkipReason = "graph too dense (density > 0.01)"
+			cfg.BetweennessSkipReason = "graph too dense (density >= 0.01)"
 		}
 
 	default:
-		// XL graph (>2000 nodes): use approximate betweenness with larger sample
+		// XL graph (>=2000 nodes): use approximate betweenness with larger sample
 		cfg = AnalysisConfig{
 			// Use approximate betweenness for XL graphs
 			ComputeBetweenness:    true,
@@ -203,7 +203,7 @@ func ConfigForSize(nodeCount, edgeCount int) AnalysisConfig {
 			PageRankTimeout: 200 * time.Millisecond,
 
 			ComputeCycles:    false,
-			CyclesSkipReason: "graph too large (>2000 nodes)",
+			CyclesSkipReason: "graph too large (>=2000 nodes)",
 			MaxCyclesToStore: 10,
 
 			ComputeEigenvector:  true,
@@ -318,6 +318,10 @@ func NoPhase2Config() AnalysisConfig {
 // SkippedMetrics returns a list of metrics that are configured to be skipped.
 func (c AnalysisConfig) SkippedMetrics() []SkippedMetric {
 	var skipped []SkippedMetric
+	fallbackReason := "disabled"
+	if c.AllPhase2Disabled() && c.PageRankSkipReason != "" {
+		fallbackReason = c.PageRankSkipReason
+	}
 
 	if !c.ComputeBetweenness {
 		skipped = append(skipped, SkippedMetric{
@@ -331,16 +335,46 @@ func (c AnalysisConfig) SkippedMetrics() []SkippedMetric {
 			Reason: c.PageRankSkipReason,
 		})
 	}
+	if !c.ComputeEigenvector {
+		skipped = append(skipped, SkippedMetric{
+			Name:   "Eigenvector",
+			Reason: fallbackReason,
+		})
+	}
 	if !c.ComputeHITS {
 		skipped = append(skipped, SkippedMetric{
 			Name:   "HITS",
 			Reason: c.HITSSkipReason,
 		})
 	}
+	if !c.ComputeCriticalPath {
+		skipped = append(skipped, SkippedMetric{
+			Name:   "CriticalPath",
+			Reason: fallbackReason,
+		})
+	}
 	if !c.ComputeCycles {
 		skipped = append(skipped, SkippedMetric{
 			Name:   "Cycles",
 			Reason: c.CyclesSkipReason,
+		})
+	}
+	if !c.ComputeKCore {
+		skipped = append(skipped, SkippedMetric{
+			Name:   "KCore",
+			Reason: fallbackReason,
+		})
+	}
+	if !c.ComputeArticulation {
+		skipped = append(skipped, SkippedMetric{
+			Name:   "Articulation",
+			Reason: fallbackReason,
+		})
+	}
+	if !c.ComputeSlack {
+		skipped = append(skipped, SkippedMetric{
+			Name:   "Slack",
+			Reason: fallbackReason,
 		})
 	}
 

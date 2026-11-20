@@ -240,6 +240,9 @@ func (a *Analyzer) ComputeImpactScoresFromStats(stats *GraphStats, now time.Time
 	if activeBW, _, _ := a.activeSubgraphMetrics(stats); activeBW != nil {
 		betweenness = activeBW
 	}
+	if activeCP, _, hasActiveCP, _ := a.activeDAGMetrics(stats); hasActiveCP && activeCP != nil {
+		criticalPath = activeCP
+	}
 
 	// Precomputed blocker counts (computed in NewAnalyzer for impact scoring).
 	blockerCounts := a.blockerCounts
@@ -694,7 +697,7 @@ func (a *Analyzer) generateRecommendationsFromStatsAndScores(stats *GraphStats, 
 	}
 
 	_, coreMap, artPoints := a.activeSubgraphMetrics(stats)
-	slackMap := stats.Slack()
+	_, slackMap, _, hasActiveSlack := a.activeDAGMetrics(stats)
 	artSet := make(map[string]bool, len(artPoints))
 	for _, id := range artPoints {
 		artSet[id] = true
@@ -714,12 +717,18 @@ func (a *Analyzer) generateRecommendationsFromStatsAndScores(stats *GraphStats, 
 		}
 		unblocks := a.computeUnblocks(score.IssueID)
 		iss := a.issueMap[score.IssueID]
+		slackVal := 0.0
+		hasSlack := false
+		if hasActiveSlack && slackMap != nil {
+			slackVal, hasSlack = slackMap[score.IssueID]
+		}
 		rec := generateRecommendation(
 			score,
 			len(unblocks),
 			coreMap[score.IssueID],
 			artSet[score.IssueID],
-			slackMap[score.IssueID],
+			slackVal,
+			hasSlack,
 			maxCore,
 			thresholds,
 			iss.IsParkedForStalenessAt(now),
@@ -748,7 +757,7 @@ func (a *Analyzer) generateRecommendationsFromStatsAndScores(stats *GraphStats, 
 }
 
 // generateRecommendation creates a recommendation for a single issue
-func generateRecommendation(score ImpactScore, unblocksCount int, core int, isArt bool, slack float64, maxCore int, thresholds RecommendationThresholds, isParked bool) *PriorityRecommendation {
+func generateRecommendation(score ImpactScore, unblocksCount int, core int, isArt bool, slack float64, hasSlack bool, maxCore int, thresholds RecommendationThresholds, isParked bool) *PriorityRecommendation {
 	var reasoning []string
 	var signals int
 	var signalStrength float64
@@ -834,15 +843,17 @@ func generateRecommendation(score ImpactScore, unblocksCount int, core int, isAr
 		signals++
 		signalStrength += 0.3
 	}
-	if slack == 0 {
-		reasoning = append(reasoning, "Zero slack on critical chain")
-		signals++
-		signalStrength += 0.25
-	} else if slack > 2 {
-		// Parallel-friendly; softer weight so it doesn't overshadow bottlenecks
-		reasoning = append(reasoning, "Parallel-friendly (slack available)")
-		signals++
-		signalStrength += 0.15
+	if hasSlack {
+		if slack == 0 {
+			reasoning = append(reasoning, "Zero slack on critical chain")
+			signals++
+			signalStrength += 0.25
+		} else if slack > 2 {
+			// Parallel-friendly; softer weight so it doesn't overshadow bottlenecks
+			reasoning = append(reasoning, "Parallel-friendly (slack available)")
+			signals++
+			signalStrength += 0.15
+		}
 	}
 
 	// No signals = no recommendation needed

@@ -165,19 +165,16 @@ func TestConfigForSize_DensityDoesNotOverflowIntMultiplication(t *testing.T) {
 }
 
 func TestSkippedMetrics(t *testing.T) {
-	cfg := AnalysisConfig{
-		ComputeBetweenness:    false,
-		BetweennessSkipReason: "test reason",
-		ComputePageRank:       true,
-		ComputeHITS:           true,
-		ComputeCycles:         false,
-		CyclesSkipReason:      "cycles disabled",
-	}
+	cfg := DefaultConfig()
+	cfg.ComputeBetweenness = false
+	cfg.BetweennessSkipReason = "test reason"
+	cfg.ComputeCycles = false
+	cfg.CyclesSkipReason = "cycles disabled"
 
 	skipped := cfg.SkippedMetrics()
 
 	if len(skipped) != 2 {
-		t.Errorf("Expected 2 skipped metrics, got %d", len(skipped))
+		t.Errorf("Expected 2 skipped metrics, got %d: %+v", len(skipped), skipped)
 	}
 
 	// Check betweenness is in the list
@@ -193,6 +190,31 @@ func TestSkippedMetrics(t *testing.T) {
 	if !found {
 		t.Error("Expected Betweenness in skipped metrics")
 	}
+
+	t.Run("AllNinePhase2MetricsReportedWhenDisabled", func(t *testing.T) {
+		t.Setenv(EnvSkipPhase2, "1")
+		allOff := ConfigForSize(50, 20)
+		allSkipped := allOff.SkippedMetrics()
+		if len(allSkipped) != 9 {
+			t.Fatalf("expected all 9 Phase 2 metrics reported skipped under %s=1, got %d: %+v", EnvSkipPhase2, len(allSkipped), allSkipped)
+		}
+		for _, s := range allSkipped {
+			if s.Reason != "BV_SKIP_PHASE2 set" {
+				t.Errorf("metric %s skipped reason = %q, want %q", s.Name, s.Reason, "BV_SKIP_PHASE2 set")
+			}
+		}
+	})
+
+	t.Run("BoundaryThresholdTextAccurate", func(t *testing.T) {
+		dense := ConfigForSize(500, 3000) // density ~0.012 >= 0.01
+		if dense.BetweennessSkipReason != "graph too dense (density >= 0.01)" {
+			t.Fatalf("dense BetweennessSkipReason = %q, want density >= 0.01", dense.BetweennessSkipReason)
+		}
+		xl := ConfigForSize(2000, 100)
+		if xl.CyclesSkipReason != "graph too large (>=2000 nodes)" {
+			t.Fatalf("xl CyclesSkipReason = %q, want >=2000 nodes", xl.CyclesSkipReason)
+		}
+	})
 }
 
 func TestDefaultConfig(t *testing.T) {
