@@ -371,7 +371,7 @@ func isFlagActive(flags *flag.FlagSet, name string) bool {
 		v, err := flags.GetBool(name)
 		return err == nil && v
 	case "string":
-		if (name == "export-graph" || name == "save-baseline") && flags.Changed(name) {
+		if (name == "export-graph" || name == "save-baseline" || name == "robot-impact-network") && flags.Changed(name) {
 			return true
 		}
 		v, err := flags.GetString(name)
@@ -6186,10 +6186,10 @@ func formatCycle(cycle []string) string {
 // recipe membership and label context against the current dependency authority.
 // ctx.Readiness must describe the full source, including tombstones; ctx.DataHash
 // may seed its unfiltered hash only when it describes exactly ctx.Issues.
-func recipeStatusListAllowsClosed(statuses []string) bool {
+func recipeStatusListAllowsNonClosed(statuses []string) bool {
 	for _, st := range statuses {
 		s := model.Status(strings.ToLower(strings.TrimSpace(st)))
-		if s.IsClosed() || s.IsTombstone() {
+		if !s.IsClosed() && !s.IsTombstone() {
 			return true
 		}
 	}
@@ -6275,14 +6275,15 @@ func scopeLoadedIssues(ctx RobotContext, r *recipe.Recipe) (RobotContext, error)
 		if uErr != nil {
 			unblockIssues = recipeIssues
 		}
-		excludeClosedFromUnblock := (r.Filters.Actionable != nil && *r.Filters.Actionable) ||
-			(len(r.Filters.Status) > 0 && !recipeStatusListAllowsClosed(r.Filters.Status))
-		unblockIDs := make(map[string]bool, len(unblockIssues))
-		for _, iss := range unblockIssues {
-			if excludeClosedFromUnblock && (iss.Status.IsClosed() || iss.Status.IsTombstone()) {
-				continue
+		unblockIDs := make(map[string]bool, len(nextCandidates))
+		allowsNonClosed := len(r.Filters.Status) == 0 || recipeStatusListAllowsNonClosed(r.Filters.Status)
+		if allowsNonClosed {
+			for _, iss := range unblockIssues {
+				if iss.Status.IsClosed() || iss.Status.IsTombstone() {
+					continue
+				}
+				unblockIDs[iss.ID] = true
 			}
-			unblockIDs[iss.ID] = true
 		}
 		for id := range nextCandidates {
 			unblockIDs[id] = true
