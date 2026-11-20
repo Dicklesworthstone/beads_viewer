@@ -216,6 +216,7 @@ func resolveIssueOriginWithCapabilities(sourcePath string, capabilities func(str
 	origin.WorkingDirectory = filepath.Dir(beadsDir)
 	origin.Tracker = "br"
 	resolve := func(name string) (string, error) {
+		name = strings.TrimSpace(name)
 		if name == "" {
 			return "", fmt.Errorf("empty tracker path")
 		}
