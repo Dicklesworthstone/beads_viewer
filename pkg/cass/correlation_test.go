@@ -1559,3 +1559,55 @@ func TestCorrelator_WithCutoffAndMaxSessions(t *testing.T) {
 		t.Fatalf("expected unfiltered Correlator after WithCutoff to return %d sessions, got %d", MaxSessionsReturned, len(freshAfterStrict.TopSessions))
 	}
 }
+
+func TestSearchByTimestamp_PreservesPreFilterTotalHits(t *testing.T) {
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	detector := NewDetector()
+	detector.lookPath = func(string) (string, error) { return "/usr/bin/cass", nil }
+	detector.runCommand = func(context.Context, string, ...string) (int, error) { return 0, nil }
+
+	searcher := NewSearcher(detector)
+	searcher.runCommand = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		if len(args) >= 2 && args[1] != "*" {
+			return []byte(`{"hits": [], "total_matches": 0}`), nil
+		}
+		// 5 valid recent sessions (all within 7d) + 1 far rejected session (>7d)
+		return []byte(fmt.Sprintf(`{
+			"hits": [
+				{"source_path": "/s/t1.jsonl", "line_number": 1, "title": "s1", "content": "notes", "score": 10, "created_at": %d, "workspace": "/work/proj"},
+				{"source_path": "/s/t2.jsonl", "line_number": 1, "title": "s2", "content": "notes", "score": 9, "created_at": %d, "workspace": "/work/proj"},
+				{"source_path": "/s/t3.jsonl", "line_number": 1, "title": "s3", "content": "notes", "score": 8, "created_at": %d, "workspace": "/work/proj"},
+				{"source_path": "/s/t4.jsonl", "line_number": 1, "title": "s4", "content": "notes", "score": 7, "created_at": %d, "workspace": "/work/proj"},
+				{"source_path": "/s/t5.jsonl", "line_number": 1, "title": "s5", "content": "notes", "score": 6, "created_at": %d, "workspace": "/work/proj"},
+				{"source_path": "/s/far.jsonl", "line_number": 1, "title": "far", "content": "notes", "score": 5, "created_at": %d, "workspace": "/work/proj"}
+			],
+			"total_matches": 100
+		}`,
+			now.Add(-1*time.Hour).UnixMilli(),
+			now.Add(-2*time.Hour).UnixMilli(),
+			now.Add(-3*time.Hour).UnixMilli(),
+			now.Add(-4*time.Hour).UnixMilli(),
+			now.Add(-5*time.Hour).UnixMilli(),
+			now.Add(-30*24*time.Hour).UnixMilli(),
+		)), nil
+	}
+
+	corr := NewCorrelator(searcher, nil, "/work/proj")
+	corr.now = func() time.Time { return now }
+	closedAt := now.Add(-30 * time.Minute)
+	res := corr.Correlate(context.Background(), &model.Issue{
+		ID:        "bv-ts5",
+		Title:     "To do",
+		CreatedAt: now.Add(-15 * 24 * time.Hour),
+		ClosedAt:  &closedAt,
+	})
+	if res.Strategy != StrategyTimestamp {
+		t.Fatalf("Strategy = %q, want StrategyTimestamp", res.Strategy)
+	}
+	if len(res.TopSessions) != MaxSessionsReturned {
+		t.Fatalf("len(TopSessions) = %d, want %d", len(res.TopSessions), MaxSessionsReturned)
+	}
+	if res.TotalFound != 5 {
+		t.Fatalf("TotalFound = %d, want 5 (pre-limit scored count, not capped at %d)", res.TotalFound, MaxSessionsReturned)
+	}
+}
