@@ -97,6 +97,11 @@ type Config struct {
 	SprintBlockedDays int `yaml:"sprint_blocked_days,omitempty" json:"sprint_blocked_days,omitempty"`
 	// SprintInactiveDays flags in_progress sprint items with no updates for >= N days (default: 4)
 	SprintInactiveDays int `yaml:"sprint_inactive_days,omitempty" json:"sprint_inactive_days,omitempty"`
+
+	// Explicit YAML presence flags so intentional 0 values (P0-only, unlimited alerts)
+	// are preserved instead of backfilled to defaults during Validate().
+	highImpactPriorityMaxSet bool
+	duplicateMaxAlertsSet    bool
 }
 
 // LabelConfig allows per-label threshold customization (bv-167)
@@ -202,6 +207,15 @@ func LoadConfig(projectDir string) (*Config, error) {
 				return nil, fmt.Errorf("parsing drift config: line %d: multiple YAML documents are not supported", extra.Line)
 			}
 		}
+		var rawKeys map[string]any
+		if err := yaml.Unmarshal(data, &rawKeys); err == nil {
+			if _, ok := rawKeys["high_impact_priority_max"]; ok {
+				config.highImpactPriorityMaxSet = true
+			}
+			if _, ok := rawKeys["duplicate_max_alerts"]; ok {
+				config.duplicateMaxAlertsSet = true
+			}
+		}
 	}
 
 	// Validate loaded config
@@ -274,8 +288,8 @@ func (c *Config) Validate() error {
 	if c.HighImpactUnblockMin == 0 {
 		c.HighImpactUnblockMin = defaults.HighImpactUnblockMin
 	}
-	if c.HighImpactPriorityMax == 0 && c.HighImpactUnblockMin == defaults.HighImpactUnblockMin {
-		// P0-only is a legitimate setting; only backfill when the whole block was omitted.
+	if !c.highImpactPriorityMaxSet && c.HighImpactPriorityMax == 0 && c.HighImpactUnblockMin == defaults.HighImpactUnblockMin {
+		// P0-only is a legitimate setting; only backfill when omitted from YAML and block stayed at default.
 		c.HighImpactPriorityMax = defaults.HighImpactPriorityMax
 	}
 	if c.AbandonedClaimMultiplier == 0 {
@@ -284,7 +298,7 @@ func (c *Config) Validate() error {
 	if c.DuplicateJaccardThreshold == 0 {
 		c.DuplicateJaccardThreshold = defaults.DuplicateJaccardThreshold
 	}
-	if c.DuplicateMaxAlerts == 0 {
+	if !c.duplicateMaxAlertsSet && c.DuplicateMaxAlerts == 0 {
 		c.DuplicateMaxAlerts = defaults.DuplicateMaxAlerts
 	}
 	if c.SourceDriftAlert == nil {

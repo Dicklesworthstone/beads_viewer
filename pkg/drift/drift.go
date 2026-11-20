@@ -508,13 +508,14 @@ func (c *Calculator) checkDensity(result *Result) {
 		})
 	} else if pctChange >= c.config.DensityInfoPct {
 		result.Alerts = append(result.Alerts, Alert{
-			Type:        AlertDensityGrowth,
-			Severity:    SeverityInfo,
-			Message:     fmt.Sprintf("Graph density increased by %.1f%%", pctChange),
-			BaselineVal: blDensity,
-			CurrentVal:  curDensity,
-			Delta:       delta,
-			DetectedAt:  c.nowUTC(),
+			Type:            AlertDensityGrowth,
+			Severity:        SeverityInfo,
+			SuggestedAction: "Monitor dependency growth; confirm new links represent true blocking relationships",
+			Message:         fmt.Sprintf("Graph density increased by %.1f%%", pctChange),
+			BaselineVal:     blDensity,
+			CurrentVal:      curDensity,
+			Delta:           delta,
+			DetectedAt:      c.nowUTC(),
 		})
 	}
 }
@@ -620,13 +621,14 @@ func (c *Calculator) checkActionable(result *Result) {
 			})
 		} else if pct >= c.config.ActionableIncreaseInfoPct || pct <= -c.config.ActionableIncreaseInfoPct {
 			result.Alerts = append(result.Alerts, Alert{
-				Type:        AlertActionableChange,
-				Severity:    SeverityInfo,
-				Message:     fmt.Sprintf("Actionable issues changed by %+d (%.1f%%)", delta, pct),
-				BaselineVal: float64(blAction),
-				CurrentVal:  float64(curAction),
-				Delta:       float64(delta),
-				DetectedAt:  c.nowUTC(),
+				Type:            AlertActionableChange,
+				Severity:        SeverityInfo,
+				SuggestedAction: "Review the actionable queue shift with bv --robot-triage to rebalance parallel work",
+				Message:         fmt.Sprintf("Actionable issues changed by %+d (%.1f%%)", delta, pct),
+				BaselineVal:     float64(blAction),
+				CurrentVal:      float64(curAction),
+				Delta:           float64(delta),
+				DetectedAt:      c.nowUTC(),
 			})
 		}
 	}
@@ -1255,6 +1257,28 @@ func (c *Calculator) checkPotentialDuplicate(result *Result) {
 	if len(live) < 2 {
 		return
 	}
+	labelsByID := make(map[string][]string, len(live))
+	for _, iss := range live {
+		labelsByID[iss.ID] = iss.Labels
+	}
+	mergePairLabels := func(a, b string) []string {
+		seen := make(map[string]struct{})
+		var out []string
+		for _, id := range []string{a, b} {
+			for _, lbl := range labelsByID[id] {
+				if lbl == "" {
+					continue
+				}
+				if _, ok := seen[lbl]; ok {
+					continue
+				}
+				seen[lbl] = struct{}{}
+				out = append(out, lbl)
+			}
+		}
+		sort.Strings(out)
+		return out
+	}
 	for i, suggestion := range analysis.DetectDuplicates(live, cfg) {
 		if maxAlerts > 0 && i >= maxAlerts {
 			break
@@ -1265,6 +1289,7 @@ func (c *Calculator) checkPotentialDuplicate(result *Result) {
 			Message:         suggestion.Summary,
 			IssueID:         suggestion.TargetBead,
 			RelatedIssueID:  suggestion.RelatedBead,
+			Labels:          mergePairLabels(suggestion.TargetBead, suggestion.RelatedBead),
 			DetectedAt:      c.nowUTC(),
 			Details:         []string{suggestion.Reason},
 			SuggestedAction: "Compare the two issues; close one as a duplicate or link them with a related dependency",
