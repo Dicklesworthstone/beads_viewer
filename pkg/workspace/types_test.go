@@ -974,3 +974,14 @@ func TestFindWorkspaceConfig_RespectsCeilingAndTempRootBoundaries(t *testing.T) 
 		t.Fatalf("symlink escape crossed canonical os.TempDir() (%s) into host workspace: got %q, err=%v", customTmpRoot, got, err)
 	}
 }
+
+func TestParseNamespacedID_LongestPrefixWins(t *testing.T) {
+	got := workspace.ParseNamespacedID("api-v2-123", []string{"api-", "api-v2-"})
+	if got.Namespace != "api-v2-" || got.LocalID != "123" {
+		t.Fatalf("ParseNamespacedID(\"api-v2-123\", [api-, api-v2-]) = %+v, want {Namespace:api-v2- LocalID:123}", got)
+	}
+	gotRev := workspace.ParseNamespacedID("api-v2-123", []string{"api-v2-", "api-"})
+	if gotRev != got {
+		t.Fatalf("ParseNamespacedID order-dependent: %+v vs %+v", gotRev, got)
+	}
+}

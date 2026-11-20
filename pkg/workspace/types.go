@@ -397,12 +397,16 @@ func (n NamespacedID) String() string {
 // ParseNamespacedID parses a namespaced ID into its components
 // If no known prefix matches, returns the whole ID as LocalID with empty Namespace
 func ParseNamespacedID(id string, knownPrefixes []string) NamespacedID {
+	bestPrefix := ""
 	for _, prefix := range knownPrefixes {
-		if strings.HasPrefix(id, prefix) {
-			return NamespacedID{
-				Namespace: prefix,
-				LocalID:   strings.TrimPrefix(id, prefix),
-			}
+		if prefix != "" && len(prefix) > len(bestPrefix) && strings.HasPrefix(id, prefix) {
+			bestPrefix = prefix
+		}
+	}
+	if bestPrefix != "" {
+		return NamespacedID{
+			Namespace: bestPrefix,
+			LocalID:   strings.TrimPrefix(id, bestPrefix),
 		}
 	}
 	// No known prefix found - treat as local ID
