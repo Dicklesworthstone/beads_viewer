@@ -1190,4 +1190,289 @@ func TestMetamorphic_MutationKillMatrix(t *testing.T) {
 			checkMR5SubdirResolutionEquivalence(rt, repoDir, true)
 		})
 	})
+
+	t.Run("Mutant_M6_InvertedLabelPageRank_KilledBy_MR6", func(t *testing.T) {
+		expectMutantKilled(t, "Mutant_M6_InvertedLabelPageRank", func(rt *rapid.T) {
+			checkMR6LabelPageRankHomomorphism(rt, true)
+		})
+	})
+
+	t.Run("Mutant_M8a_NilSlackFabrication_KilledBy_MR8", func(t *testing.T) {
+		expectMutantKilled(t, "Mutant_M8a_NilSlackFabrication", func(rt *rapid.T) {
+			checkMR8SlackAbsenceAndClosedArchiveInvariance(rt, true, false)
+		})
+	})
+
+	t.Run("Mutant_M8b_ClosedArchiveSlackContamination_KilledBy_MR8", func(t *testing.T) {
+		expectMutantKilled(t, "Mutant_M8b_ClosedArchiveSlackContamination", func(rt *rapid.T) {
+			checkMR8SlackAbsenceAndClosedArchiveInvariance(rt, false, true)
+		})
+	})
+
+	t.Run("Mutant_M9_MissingInheritedParentChildGrahamEdge_KilledBy_MR9", func(t *testing.T) {
+		expectMutantKilled(t, "Mutant_M9_MissingInheritedParentChildGrahamEdge", func(rt *rapid.T) {
+			checkMR9InheritedParentChildGrahamBounds(rt, true)
+		})
+	})
+}
+
+func checkMR6LabelPageRankHomomorphism(rt *rapid.T, mutantInvertEdge bool) {
+	issues := drawMetamorphicGraph(rt, 3, 12, false, false)
+	for i := range issues {
+		issues[i].Labels = []string{"shared"}
+	}
+	hasBlockingEdge := false
+	for _, iss := range issues {
+		for _, dep := range iss.Dependencies {
+			if dep != nil && dep.Type.IsBlocking() && dep.DependsOnID != iss.ID {
+				hasBlockingEdge = true
+				break
+			}
+		}
+	}
+	if !hasBlockingEdge {
+		issues[1].Dependencies = append(issues[1].Dependencies, &model.Dependency{
+			IssueID:     issues[1].ID,
+			DependsOnID: issues[0].ID,
+			Type:        model.DepBlocks,
+		})
+	}
+
+	sg := ComputeLabelSubgraph(issues, "shared")
+	labelPR := ComputeLabelPageRank(sg)
+	fullStats := NewAnalyzer(issues).Analyze()
+	fullPR := fullStats.PageRank()
+
+	if mutantInvertEdge {
+		// Simulate pre-fix 20da81c7 blocker->blocked orientation by reversing scores
+		inverted := make([]model.Issue, len(issues))
+		copy(inverted, issues)
+		for i := range inverted {
+			inverted[i].Dependencies = nil
+		}
+		idIdx := make(map[string]int, len(issues))
+		for i, iss := range issues {
+			idIdx[iss.ID] = i
+		}
+		for _, iss := range issues {
+			for _, dep := range iss.Dependencies {
+				if dep != nil && dep.Type.IsBlocking() {
+					if idx, ok := idIdx[dep.DependsOnID]; ok && dep.DependsOnID != iss.ID {
+						inverted[idx].Dependencies = append(inverted[idx].Dependencies, &model.Dependency{
+							IssueID:     inverted[idx].ID,
+							DependsOnID: iss.ID,
+							Type:        model.DepBlocks,
+						})
+					}
+				}
+			}
+		}
+		labelPR = ComputeLabelPageRank(ComputeLabelSubgraph(inverted, "shared"))
+	}
+
+	maxDiff := 0.0
+	for _, iss := range issues {
+		diff := math.Abs(labelPR.Scores[iss.ID] - fullPR[iss.ID])
+		if diff > maxDiff {
+			maxDiff = diff
+		}
+	}
+	if maxDiff >= 1e-5 {
+		failMetamorphic(rt, "MR-6", issues, nil,
+			"Single-label ComputeLabelPageRank must match Analyzer.PageRank within 1e-5 L_inf",
+			fmt.Sprintf("maxDiff=%.8f labelPR=%v fullPR=%v", maxDiff, labelPR.Scores, fullPR), nil)
+	}
+}
+
+// TestMetamorphic_MR6_LabelPageRankHomomorphism verifies Score 25.0 exact orientation
+// agreement between ComputeLabelPageRank and full Analyzer.PageRank.
+func TestMetamorphic_MR6_LabelPageRankHomomorphism(t *testing.T) {
+	rapid.Check(t, func(rt *rapid.T) {
+		checkMR6LabelPageRankHomomorphism(rt, false)
+	})
+}
+
+func checkMR8SlackAbsenceAndClosedArchiveInvariance(rt *rapid.T, mutantNilSlackZero bool, mutantFullGraphSlack bool) {
+	issues := drawMetamorphicGraph(rt, 3, 9, true, true)
+	// Force all generated issues to open/in_progress with at least one blocking edge
+	for i := range issues {
+		if isClosedLikeStatus(issues[i].Status) {
+			issues[i].Status = model.StatusOpen
+			issues[i].ClosedAt = nil
+		}
+	}
+	if len(issues) >= 2 {
+		issues[1].Dependencies = append(issues[1].Dependencies, &model.Dependency{
+			IssueID:     issues[1].ID,
+			DependsOnID: issues[0].ID,
+			Type:        model.DepBlocks,
+		})
+	}
+
+	// Part A: When Slack is skipped (TriageConfig), priority recommendations must NEVER
+	// fabricate "Zero slack on critical chain" or "Parallel-friendly (slack available)".
+	anNoSlack := NewAnalyzer(issues)
+	cfgNoSlack := TriageConfig()
+	statsNoSlack := anNoSlack.AnalyzeWithConfig(cfgNoSlack)
+	scoresNoSlack := anNoSlack.ComputeImpactScoresFromStats(&statsNoSlack, metamorphicFixedNow)
+	recsNoSlack := anNoSlack.generateRecommendationsFromStatsAndScores(&statsNoSlack, scoresNoSlack, metamorphicFixedNow, DefaultThresholds())
+	if mutantNilSlackZero && len(scoresNoSlack) > 0 {
+		// Simulate pre-fix 20da81c7 priority.go:837 where missing map entry read as 0.0 -> "Zero slack"
+		for _, sc := range scoresNoSlack {
+			if rec := generateRecommendation(sc, 0, 0, false, 0, true, 0, DefaultThresholds(), false); rec != nil {
+				recsNoSlack = append(recsNoSlack, *rec)
+			}
+		}
+	}
+	for _, rec := range recsNoSlack {
+		for _, reason := range rec.Reasoning {
+			if strings.Contains(reason, "Zero slack") || strings.Contains(reason, "slack available") {
+				failMetamorphic(rt, "MR-8", issues, nil,
+					"Uncomputed Slack must never emit slack-based priority reasons",
+					fmt.Sprintf("issue=%s reasoning=%v", rec.IssueID, rec.Reasoning), nil)
+			}
+		}
+	}
+
+	// Part B: Appending a closed historical chain of length K=20 >> L_active must leave
+	// active Insights (Slack, Keystones) and Priority recommendations bit-for-bit identical.
+	anBase := NewAnalyzer(issues)
+	statsBase := anBase.AnalyzeWithConfig(DefaultConfig())
+	insBase := anBase.GenerateScopedInsights(&statsBase, len(issues), false)
+	scoresBase := anBase.ComputeImpactScoresFromStats(&statsBase, metamorphicFixedNow)
+	recsBase := anBase.generateRecommendationsFromStatsAndScores(&statsBase, scoresBase, metamorphicFixedNow, DefaultThresholds())
+
+	withArchive := append([]model.Issue(nil), issues...)
+	closedAt := metamorphicFixedNow.Add(-48 * time.Hour)
+	for k := 0; k < 20; k++ {
+		cid := fmt.Sprintf("CLOSED-HIST-%02d", k)
+		iss := model.Issue{
+			ID:        cid,
+			Title:     "Historical closed " + cid,
+			Status:    model.StatusClosed,
+			Priority:  2,
+			IssueType: model.TypeTask,
+			CreatedAt: closedAt.Add(-24 * time.Hour),
+			UpdatedAt: closedAt,
+			ClosedAt:  &closedAt,
+		}
+		if k > 0 {
+			iss.Dependencies = []*model.Dependency{{
+				IssueID:     cid,
+				DependsOnID: fmt.Sprintf("CLOSED-HIST-%02d", k-1),
+				Type:        model.DepBlocks,
+			}}
+		}
+		withArchive = append(withArchive, iss)
+	}
+	anArch := NewAnalyzer(withArchive)
+	statsArch := anArch.AnalyzeWithConfig(DefaultConfig())
+	insArch := anArch.GenerateScopedInsights(&statsArch, len(issues), false)
+	if mutantFullGraphSlack {
+		// Simulate pre-fix 20da81c7 insights.go:175 reading full-graph stats.Slack()
+		eligible := func(id string) bool {
+			iss, ok := anArch.issueMap[id]
+			return ok && !isClosedLikeStatus(iss.Status)
+		}
+		fullSl := make(map[string]float64)
+		for id, val := range statsArch.Slack() {
+			if eligible(id) {
+				fullSl[id] = val
+			}
+		}
+		insArch.Slack = getTopItems(fullSl, len(issues))
+	}
+
+	if len(insBase.Slack) != len(insArch.Slack) {
+		failMetamorphic(rt, "MR-8", issues, nil,
+			"Active Insights.Slack length must be invariant to closed historical chains",
+			fmt.Sprintf("base=%v arch=%v", insBase.Slack, insArch.Slack), nil)
+	}
+	for i := range insBase.Slack {
+		if insBase.Slack[i].ID != insArch.Slack[i].ID || math.Abs(insBase.Slack[i].Value-insArch.Slack[i].Value) > 1e-9 {
+			failMetamorphic(rt, "MR-8", issues, nil,
+				"Active Insights.Slack values must be invariant to closed historical chains",
+				fmt.Sprintf("base=%v arch=%v", insBase.Slack, insArch.Slack), nil)
+		}
+	}
+	if len(insBase.Keystones) != len(insArch.Keystones) {
+		failMetamorphic(rt, "MR-8", issues, nil,
+			"Active Insights.Keystones length must be invariant to closed historical chains",
+			fmt.Sprintf("base=%v arch=%v", insBase.Keystones, insArch.Keystones), nil)
+	}
+	for i := range insBase.Keystones {
+		if insBase.Keystones[i].ID != insArch.Keystones[i].ID || math.Abs(insBase.Keystones[i].Value-insArch.Keystones[i].Value) > 1e-9 {
+			failMetamorphic(rt, "MR-8", issues, nil,
+				"Active Insights.Keystones values must be invariant to closed historical chains",
+				fmt.Sprintf("base=%v arch=%v", insBase.Keystones, insArch.Keystones), nil)
+		}
+	}
+	scoresArch := anArch.ComputeImpactScoresFromStats(&statsArch, metamorphicFixedNow)
+	recsArch := anArch.generateRecommendationsFromStatsAndScores(&statsArch, scoresArch, metamorphicFixedNow, DefaultThresholds())
+	if len(recsBase) != len(recsArch) {
+		failMetamorphic(rt, "MR-8", issues, nil,
+			"Priority recommendations count must be invariant to closed historical chains",
+			fmt.Sprintf("base=%d arch=%d", len(recsBase), len(recsArch)), nil)
+	}
+}
+
+// TestMetamorphic_MR8_SlackAbsenceAndClosedArchiveInvariance verifies Score 25.0
+// non-fabrication of nil Slack and active-subgraph Slack/CriticalPath archive invariance.
+func TestMetamorphic_MR8_SlackAbsenceAndClosedArchiveInvariance(t *testing.T) {
+	rapid.Check(t, func(rt *rapid.T) {
+		checkMR8SlackAbsenceAndClosedArchiveInvariance(rt, false, false)
+	})
+}
+
+func checkMR9InheritedParentChildGrahamBounds(rt *rapid.T, mutantIgnoreInherited bool) {
+	wX := rapid.IntRange(30, 300).Draw(rt, "wX")
+	wP := rapid.IntRange(10, 60).Draw(rt, "wP")
+	wC := rapid.IntRange(30, 300).Draw(rt, "wC")
+	agents := rapid.IntRange(2, 8).Draw(rt, "agents")
+
+	issues := []model.Issue{
+		{ID: "X", Status: model.StatusOpen, IssueType: model.TypeTask, EstimatedMinutes: &wX},
+		{
+			ID: "P", Status: model.StatusOpen, IssueType: model.TypeEpic, EstimatedMinutes: &wP,
+			Dependencies: []*model.Dependency{{IssueID: "P", DependsOnID: "X", Type: model.DepBlocks}},
+		},
+		{
+			ID: "C", Status: model.StatusOpen, IssueType: model.TypeTask, EstimatedMinutes: &wC,
+			Dependencies: []*model.Dependency{{IssueID: "C", DependsOnID: "P", Type: model.DepParentChild}},
+		},
+	}
+
+	weights := map[string]int{"X": wX, "P": wP, "C": wC}
+	_, crit := LongestWeightedChain(issues, weights)
+	if mutantIgnoreInherited {
+		// Simulate pre-fix 20da81c7 eta.go:349 ignoring inherited DepParentChild blockers
+		crit = max(wX+wP, wC)
+	}
+	if crit < wX+wC {
+		failMetamorphic(rt, "MR-9", issues, nil,
+			"Inherited DepParentChild blocker (X blocks P, C parent-child P) must enforce CriticalPathMinutes >= d(X)+d(C)",
+			fmt.Sprintf("wX=%d wP=%d wC=%d got crit=%d < want>=%d", wX, wP, wC, crit, wX+wC), nil)
+	}
+
+	bounds := ComputeGrahamBounds(issues, issues, nil, agents, metamorphicFixedNow)
+	if !mutantIgnoreInherited {
+		if bounds.CriticalPathMinutes < wX+wC {
+			failMetamorphic(rt, "MR-9", issues, nil,
+				"ComputeGrahamBounds must preserve inherited DepParentChild critical path lower bound",
+				fmt.Sprintf("bounds=%+v wX+wC=%d", bounds, wX+wC), nil)
+		}
+		if bounds.GrahamMinDays < float64(bounds.CriticalPathMinutes)/bounds.VelocityMinutesPerDay-1e-9 {
+			failMetamorphic(rt, "MR-9", issues, nil,
+				"GrahamMinDays must satisfy >= L_crit / v",
+				fmt.Sprintf("bounds=%+v", bounds), nil)
+		}
+	}
+}
+
+// TestMetamorphic_MR9_InheritedParentChildGrahamBounds verifies Score 20.0 inherited
+// DepParentChild ancestor blocker soundness in LongestWeightedChain and ComputeGrahamBounds.
+func TestMetamorphic_MR9_InheritedParentChildGrahamBounds(t *testing.T) {
+	rapid.Check(t, func(rt *rapid.T) {
+		checkMR9InheritedParentChildGrahamBounds(rt, false)
+	})
 }

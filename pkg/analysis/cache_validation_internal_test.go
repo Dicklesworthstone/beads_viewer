@@ -391,3 +391,50 @@ func TestRobotDiskCache_PutPrunesExpiredEntriesAndLegacyFile(t *testing.T) {
 		t.Fatalf("expired entry file should be reaped on lookup, stat err = %v", err)
 	}
 }
+
+func TestBeadsTreeModTime_IgnoresDoltSubdirLockInodeChurn(t *testing.T) {
+	beadsDir := filepath.Join(t.TempDir(), ".beads")
+	doltDBDir := filepath.Join(beadsDir, "dolt", "beads_db")
+	nomsDir := filepath.Join(doltDBDir, ".dolt", "noms")
+	if err := os.MkdirAll(nomsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	base := time.Now().Add(-3 * time.Hour).Truncate(time.Second)
+	manifestPath := filepath.Join(nomsDir, "manifest")
+	if err := os.WriteFile(manifestPath, []byte("head-v1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(manifestPath, base, base); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(doltDBDir, base, base); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(filepath.Join(beadsDir, "dolt"), base, base); err != nil {
+		t.Fatal(err)
+	}
+
+	before := beadsTreeModTime(beadsDir)
+	if !before.Equal(base) {
+		t.Fatalf("before beadsTreeModTime = %v, want %v", before, base)
+	}
+
+	// Simulate transient lock create + remove inside non-noms dolt subdir: advances subdir inode mtime.
+	lockPath := filepath.Join(doltDBDir, "transient.lock")
+	if err := os.WriteFile(lockPath, []byte("lock"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(lockPath); err != nil {
+		t.Fatal(err)
+	}
+	newerDir := base.Add(time.Hour)
+	if err := os.Chtimes(doltDBDir, newerDir, newerDir); err != nil {
+		t.Fatal(err)
+	}
+
+	after := beadsTreeModTime(beadsDir)
+	if !after.Equal(before) {
+		t.Fatalf("Dolt subdir inode churn busted beadsTreeModTime: before=%v after=%v (dir=%v)", before, after, newerDir)
+	}
+}

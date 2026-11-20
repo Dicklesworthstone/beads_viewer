@@ -1,6 +1,8 @@
 package analysis
 
 import (
+	"fmt"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -814,5 +816,147 @@ func TestETAIgnoresFutureClosures(t *testing.T) {
 	}
 	if etaLater.VelocityMinutesPerDay < 209.99 || etaLater.VelocityMinutesPerDay > 210.01 {
 		t.Fatalf("laterNow VelocityMinutesPerDay = %.4f, want 210.0", etaLater.VelocityMinutesPerDay)
+	}
+}
+
+func TestVelocityAndDurationSafety_ZeroFutureClosedAtAndNilCompareSnapshots(t *testing.T) {
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	zeroTime := time.Time{}
+	created := now.Add(-48 * time.Hour)
+	updated := now.Add(-24 * time.Hour)
+	futureClosed := now.Add(72 * time.Hour)
+	est60 := 60
+
+	issues := []model.Issue{
+		{
+			ID:               "ZERO-CLOSED",
+			Status:           model.StatusClosed,
+			CreatedAt:        created,
+			UpdatedAt:        updated,
+			ClosedAt:         &zeroTime, // non-nil zero time must fall back to UpdatedAt, never year 0001!
+			EstimatedMinutes: &est60,
+		},
+		{
+			ID:               "FUTURE-CLOSED",
+			Status:           model.StatusClosed,
+			CreatedAt:        created,
+			UpdatedAt:        updated,
+			ClosedAt:         &futureClosed, // future closure must be rejected
+			EstimatedMinutes: &est60,
+		},
+		{
+			ID:               "TOMB-1",
+			Status:           model.StatusTombstone,
+			CreatedAt:        created,
+			UpdatedAt:        updated,
+			EstimatedMinutes: &est60,
+		},
+	}
+
+	vel := ComputeProjectVelocity(issues, now, 4)
+	if vel.ClosedLast7Days != 2 || vel.ClosedLast30Days != 2 {
+		t.Fatalf("expected 2 valid closures (ZERO-CLOSED fallback + TOMB-1, excluding FUTURE-CLOSED), got 7d=%d 30d=%d", vel.ClosedLast7Days, vel.ClosedLast30Days)
+	}
+	if vel.AvgDaysToClose < 0.99 || vel.AvgDaysToClose > 1.01 {
+		t.Fatalf("non-nil zero *ClosedAt corrupted AvgDaysToClose: got %.4f want 1.0", vel.AvgDaysToClose)
+	}
+
+	// ETA velocity must also accept ZERO-CLOSED via UpdatedAt fallback and reject FUTURE-CLOSED.
+	since := now.Add(-30 * 24 * time.Hour)
+	vPerDay, samples := velocityMinutesPerDayForLabelWithStats(issues, nil, "", since, now, 60)
+	if samples != 2 || vPerDay <= 0 {
+		t.Fatalf("velocityMinutesPerDayForLabelWithStats = (%.4f, %d), want positive with 2 samples", vPerDay, samples)
+	}
+
+	// durationDays overflow & NaN/Inf guards
+	if d := durationDays(math.NaN()); d != 0 {
+		t.Fatalf("durationDays(NaN) = %v, want 0", d)
+	}
+	if d := durationDays(1e9); d != time.Duration(math.MaxInt64) {
+		t.Fatalf("durationDays(1e9) = %v, want MaxInt64 (no int64 wrap)", d)
+	}
+	if d := durationDays(math.Inf(1)); d != time.Duration(math.MaxInt64) {
+		t.Fatalf("durationDays(+Inf) = %v, want MaxInt64", d)
+	}
+
+	// CompareSnapshots nil guards
+	snap := NewSnapshotAt(issues, now, "rev")
+	if diff := CompareSnapshots(nil, nil); diff == nil || len(diff.NewIssues) != 0 {
+		t.Fatalf("CompareSnapshots(nil, nil) unexpected: %+v", diff)
+	}
+	if diff := CompareSnapshots(nil, snap); diff == nil || len(diff.NewIssues) != len(issues) {
+		t.Fatalf("CompareSnapshots(nil, snap) NewIssues=%d, want %d", len(diff.NewIssues), len(issues))
+	}
+	if diff := CompareSnapshots(snap, nil); diff == nil || len(diff.RemovedIssues) != len(issues) {
+		t.Fatalf("CompareSnapshots(snap, nil) RemovedIssues=%d, want %d", len(diff.RemovedIssues), len(issues))
+	}
+}
+
+func TestForceFullAnalysis_HonorsExactActiveBetweennessAndProfileMetrics(t *testing.T) {
+	// Construct 505 active nodes + 5 closed nodes with density >= 0.01 (ConfigForSize would skip betweenness)
+	// and prove FullAnalysisConfig() (--force-full-analysis) computes non-zero exact active betweenness.
+	const activeN = 505
+	issues := make([]model.Issue, 0, activeN+5)
+	for i := 0; i < activeN; i++ {
+		id := fmt.Sprintf("A-%03d", i)
+		iss := model.Issue{ID: id, Status: model.StatusOpen, IssueType: model.TypeTask}
+		// Connect chain plus hub edges so density > 0.01 and node A-001 has positive betweenness
+		if i > 0 {
+			iss.Dependencies = append(iss.Dependencies, &model.Dependency{
+				IssueID: id, DependsOnID: fmt.Sprintf("A-%03d", i-1), Type: model.DepBlocks,
+			})
+		}
+		// Add ~6 extra edges per node (~3000 edges / (505*504) ~= 0.0118 >= 0.01)
+		for step := 2; step <= 7 && i-step >= 0; step++ {
+			iss.Dependencies = append(iss.Dependencies, &model.Dependency{
+				IssueID: id, DependsOnID: fmt.Sprintf("A-%03d", i-step), Type: model.DepBlocks,
+			})
+		}
+		issues = append(issues, iss)
+	}
+	for c := 0; c < 5; c++ {
+		issues = append(issues, model.Issue{ID: fmt.Sprintf("C-%d", c), Status: model.StatusClosed, IssueType: model.TypeTask})
+	}
+
+	an := NewAnalyzer(issues)
+	fullCfg := FullAnalysisConfig()
+	fullCfg.ComputeCycles = false
+	fullCfg.ComputeHITS = false
+	stats := an.AnalyzeWithConfig(fullCfg)
+	activeBW, _, _ := an.activeSubgraphMetrics(&stats)
+	nonZero := 0
+	for _, v := range activeBW {
+		if v > 0 {
+			nonZero++
+		}
+	}
+	if nonZero == 0 {
+		t.Fatalf("FullAnalysisConfig() on %d dense active nodes + 5 closed returned all-zero active betweenness (silently overridden by ConfigForSize)", activeN)
+	}
+	if len(stats.ActiveBetweennessRank()) != activeN {
+		t.Fatalf("ActiveBetweennessRank len = %d, want %d", len(stats.ActiveBetweennessRank()), activeN)
+	}
+
+	// Verify AnalyzeWithProfile reports BetweennessIsApproximate=true on sparse 505-node graph,
+	// populates InDegreeRank/OutDegreeRank, and times Articulation independently.
+	sparse := make([]model.Issue, activeN)
+	for i := 0; i < activeN; i++ {
+		id := fmt.Sprintf("S-%03d", i)
+		sparse[i] = model.Issue{ID: id, Status: model.StatusOpen, IssueType: model.TypeTask}
+		if i > 0 {
+			sparse[i].Dependencies = []*model.Dependency{{IssueID: id, DependsOnID: fmt.Sprintf("S-%03d", i-1), Type: model.DepBlocks}}
+		}
+	}
+	anSparse := NewAnalyzer(sparse)
+	cfgSparse := ConfigForSize(len(sparse), len(sparse)-1)
+	pStats, profile := anSparse.AnalyzeWithProfile(cfgSparse)
+	if !profile.Config.BetweennessIsApproximate {
+		t.Fatalf("AnalyzeWithProfile reported BetweennessIsApproximate=false for mode=%s", profile.Config.BetweennessMode)
+	}
+	if len(pStats.InDegreeRank()) != activeN || len(pStats.OutDegreeRank()) != activeN {
+		t.Fatalf("computePhase1WithProfile omitted degree ranks: in=%d out=%d", len(pStats.InDegreeRank()), len(pStats.OutDegreeRank()))
+	}
+	if profile.Articulation <= 0 {
+		t.Fatalf("AnalyzeWithProfile reported Articulation=%v, want > 0 when ComputeArticulation=true", profile.Articulation)
 	}
 }

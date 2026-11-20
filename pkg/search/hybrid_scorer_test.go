@@ -169,3 +169,30 @@ func TestHybridScorerAtCapturesZeroReferenceClockOnce(t *testing.T) {
 		t.Fatal("zero reference clock was not captured at construction")
 	}
 }
+
+func TestHybridScorer_ZeroWeightPageRankConsistent(t *testing.T) {
+	cache := &stubMetricsCache{
+		metrics: map[string]IssueMetrics{
+			"A": {
+				IssueID:      "A",
+				PageRank:     0.9,
+				Status:       "open",
+				Priority:     1,
+				BlockerCount: 2,
+				UpdatedAt:    time.Now(),
+			},
+		},
+		maxBlockerCount: 4,
+	}
+	scorer := NewHybridScorer(Weights{TextRelevance: 0.5, Status: 0.5}, cache)
+	res, err := scorer.Score("A", 0.8)
+	if err != nil {
+		t.Fatalf("Score: %v", err)
+	}
+	if res.ComponentScores["pagerank"] != 0 {
+		t.Fatalf("zero-weight pagerank component = %v, want 0 (consistent with other zero-weight components)", res.ComponentScores["pagerank"])
+	}
+	if res.ComponentScores["status"] <= 0 {
+		t.Fatalf("non-zero-weight status component = %v, want > 0", res.ComponentScores["status"])
+	}
+}
