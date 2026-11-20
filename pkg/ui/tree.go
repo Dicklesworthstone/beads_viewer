@@ -11,7 +11,6 @@ import (
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/debug"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
-	"github.com/charmbracelet/bubbles/viewport"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 )
@@ -311,7 +310,6 @@ type TreeModel struct {
 	roots          []*IssueTreeNode          // Root nodes (issues with no parent)
 	flatList       []*IssueTreeNode          // Flattened visible nodes for navigation
 	cursor         int                       // Current selection index in flatList
-	viewport       viewport.Model            // For scrolling
 	theme          Theme                     // Visual styling
 	mode           TreeViewMode              // Hierarchy vs blocking
 	issueMap       map[string]*IssueTreeNode // Quick lookup by issue ID
@@ -775,8 +773,6 @@ func buildIssueTreeNodes(issues []model.Issue) ([]*IssueTreeNode, map[string]*Is
 func (t *TreeModel) SetSize(width, height int) {
 	t.width = width
 	t.height = height
-	t.viewport.Width = width
-	t.viewport.Height = height
 	t.ensureCursorVisible()
 }
 

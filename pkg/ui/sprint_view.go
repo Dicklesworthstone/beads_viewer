@@ -79,8 +79,12 @@ func (m *Model) renderSprintDashboard() string {
 	sb.WriteString(daysStyle.Render(fmt.Sprintf(" %d days", daysRemaining)))
 	sb.WriteString("\n\n")
 
-	// Compute bead stats
+	// Compute bead stats (including dependency-blocked issues via ReadinessIndex)
 	scopedIssues := m.candidateScopedIssues()
+	var sprintReadiness *model.ReadinessIndex
+	if m.analyzer != nil {
+		sprintReadiness = m.analyzer.Readiness()
+	}
 	var totalBeads, closedBeads, openBeads, blockedBeads, inProgressBeads int
 	var sprintIssues []model.Issue
 	beadIDSet := make(map[string]bool)
@@ -95,10 +99,11 @@ func (m *Model) renderSprintDashboard() string {
 				closedBeads++
 				continue
 			}
-			switch iss.Status {
-			case model.StatusBlocked:
+			isDepBlocked := sprintReadiness != nil && sprintReadiness.Blocked(iss.ID, now)
+			switch {
+			case iss.Status == model.StatusBlocked || isDepBlocked:
 				blockedBeads++
-			case model.StatusInProgress:
+			case iss.Status == model.StatusInProgress:
 				inProgressBeads++
 			}
 			openBeads++
@@ -180,10 +185,6 @@ func (m *Model) renderSprintDashboard() string {
 	// --robot-burndown reports (analysis.DetectAtRisk), so the TUI and robot agree.
 	sb.WriteString(labelStyle.Render("At Risk:"))
 	sb.WriteString("\n")
-	var sprintReadiness *model.ReadinessIndex
-	if m.analyzer != nil {
-		sprintReadiness = m.analyzer.Readiness()
-	}
 	atRisk := analysis.DetectAtRiskWithReadiness(scopedIssues, sprint, sprintReadiness, now, m.sprintAtRiskThresholds)
 	if len(atRisk) == 0 {
 		sb.WriteString(t.Renderer.NewStyle().Foreground(t.Open).Render("  ✓ No at-risk items"))
@@ -233,10 +234,26 @@ func (m *Model) renderSprintDashboard() string {
 		sb.WriteString("\n")
 	}
 
-	// Footer
-	sb.WriteString("\n")
-	sb.WriteString(t.Renderer.NewStyle().Foreground(t.Muted).Italic(true).Render(
-		"P/esc: close sprint view • j/k: switch sprint"))
+	// Window inner content for short terminals while preserving the footer hint.
+	footerLine := t.Renderer.NewStyle().Foreground(t.Muted).Italic(true).Render(
+		"P/esc: close • j/k: next/prev sprint • ctrl+d/u: scroll • Enter: jump")
+	bodyLines := strings.Split(strings.TrimRight(sb.String(), "\n"), "\n")
+	// Box chrome: border (2) + vertical padding (2) + footer gap & line (2) = 6 lines.
+	maxBodyLines := max(m.height-7, 3)
+	if len(bodyLines) > maxBodyLines {
+		maxScroll := len(bodyLines) - maxBodyLines
+		if m.sprintScroll > maxScroll {
+			m.sprintScroll = maxScroll
+		}
+		if m.sprintScroll < 0 {
+			m.sprintScroll = 0
+		}
+		end := min(m.sprintScroll+maxBodyLines, len(bodyLines))
+		bodyLines = bodyLines[m.sprintScroll:end]
+	} else {
+		m.sprintScroll = 0
+	}
+	finalContent := strings.Join(bodyLines, "\n") + "\n\n" + footerLine
 
 	// Wrap in a box
 	boxStyle := t.Renderer.NewStyle().
@@ -251,7 +268,7 @@ func (m *Model) renderSprintDashboard() string {
 		max(m.height-1, 1),
 		lipgloss.Center,
 		lipgloss.Top,
-		boxStyle.Render(sb.String()),
+		boxStyle.Render(finalContent),
 	)
 }
 
@@ -349,6 +366,7 @@ func (m *Model) handleSprintKeys(msg tea.KeyMsg) *Model {
 			for i, s := range m.sprints {
 				if s.ID == m.selectedSprint.ID && i < len(m.sprints)-1 {
 					m.selectedSprint = &m.sprints[i+1]
+					m.sprintScroll = 0
 					m.sprintViewText = m.renderSprintDashboard()
 					break
 				}
@@ -360,24 +378,31 @@ func (m *Model) handleSprintKeys(msg tea.KeyMsg) *Model {
 			for i, s := range m.sprints {
 				if s.ID == m.selectedSprint.ID && i > 0 {
 					m.selectedSprint = &m.sprints[i-1]
+					m.sprintScroll = 0
 					m.sprintViewText = m.renderSprintDashboard()
 					break
 				}
 			}
 		}
+	case "ctrl+d", "pgdown":
+		m.sprintScroll += 5
+		m.sprintViewText = m.renderSprintDashboard()
+	case "ctrl+u", "pgup":
+		m.sprintScroll = max(0, m.sprintScroll-5)
+		m.sprintViewText = m.renderSprintDashboard()
 	case "enter":
 		if m.selectedSprint == nil {
 			return m
 		}
-		scoped := m.candidateScopedIssues()
-		scopedSet := make(map[string]bool, len(scoped))
-		for _, iss := range scoped {
-			scopedSet[iss.ID] = true
+		// Match displayed sprintIssues order (scopedIssues filtered by BeadIDs)
+		beadIDSet := make(map[string]bool, len(m.selectedSprint.BeadIDs))
+		for _, id := range m.selectedSprint.BeadIDs {
+			beadIDSet[id] = true
 		}
 		var targetID string
-		for _, id := range m.selectedSprint.BeadIDs {
-			if scopedSet[id] {
-				targetID = id
+		for _, iss := range m.candidateScopedIssues() {
+			if beadIDSet[iss.ID] {
+				targetID = iss.ID
 				break
 			}
 		}

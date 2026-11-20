@@ -151,8 +151,12 @@ type UpdateModal struct {
 func NewUpdateModal(newVersion, releaseURL string, theme Theme) UpdateModal {
 	canRollback := canRollbackCheck()
 	initialFocus := 0 // Default to "Update" button
-	if strings.TrimSpace(newVersion) == "" && canRollback {
-		initialFocus = 2 // Focus "Rollback" when opened without a pending update
+	if strings.TrimSpace(newVersion) == "" {
+		if canRollback {
+			initialFocus = 2 // Focus "Rollback" when opened without a pending update
+		} else {
+			initialFocus = 1 // Focus "Cancel" when neither update nor rollback is available
+		}
 	}
 	return UpdateModal{
 		currentVersion: version.Version,
@@ -171,8 +175,12 @@ func NewUpdateModal(newVersion, releaseURL string, theme Theme) UpdateModal {
 func (m *UpdateModal) SetCanRollback(can bool) {
 	m.canRollback = can
 	if !can && m.confirmFocus > 1 {
-		m.confirmFocus = 0
-	} else if can && strings.TrimSpace(m.newVersion) == "" && m.confirmFocus == 0 {
+		if strings.TrimSpace(m.newVersion) == "" {
+			m.confirmFocus = 1
+		} else {
+			m.confirmFocus = 0
+		}
+	} else if can && strings.TrimSpace(m.newVersion) == "" && (m.confirmFocus == 0 || m.confirmFocus == 1) {
 		m.confirmFocus = 2
 	}
 }

@@ -8,6 +8,8 @@ import (
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // VelocityComparisonModel shows side-by-side velocity comparison for all labels
@@ -268,20 +270,20 @@ func (m *VelocityComparisonModel) View() string {
 		Foreground(t.Secondary).
 		Bold(true)
 
-	// Column widths
-	labelWidth := 20
+	// Column widths (scale label column down on narrow terminals so rows stay within m.width)
 	weekWidth := 5
 	avgWidth := 6
-	trendWidth := 10
+	trendWidth := 11
 	sparkWidth := 6
-
-	// Adjust label width based on available space
-	usedWidth := weekWidth*4 + avgWidth + trendWidth + sparkWidth + 10 // padding
-	if m.width-usedWidth > labelWidth {
-		labelWidth = min(m.width-usedWidth, 30)
+	usedWidth := weekWidth*4 + avgWidth + trendWidth + sparkWidth + 10 // padding + cursor prefix
+	labelWidth := 20
+	if avail := m.width - usedWidth; avail > labelWidth {
+		labelWidth = min(avail, 30)
+	} else if avail < labelWidth {
+		labelWidth = max(6, avail)
 	}
 
-	header := fmt.Sprintf("%-*s %*s %*s %*s %*s %*s %-*s %s",
+	header := fmt.Sprintf("  %-*s %*s %*s %*s %*s %*s %-*s %s",
 		labelWidth, "Label",
 		weekWidth, "W-4",
 		weekWidth, "W-3",
@@ -291,12 +293,15 @@ func (m *VelocityComparisonModel) View() string {
 		trendWidth, "Trend",
 		"Spark",
 	)
+	if lipgloss.Width(header) > m.width {
+		header = ansi.Truncate(header, m.width, "…")
+	}
 	sb.WriteString(headerStyle.Render(header))
 	sb.WriteString("\n")
 
 	// Separator
 	sepStyle := t.Renderer.NewStyle().Foreground(t.Secondary)
-	separator := strings.Repeat("─", max(min(len(header)+2, m.width-2), 0))
+	separator := strings.Repeat("─", max(min(lipgloss.Width(header)+2, m.width-2), 0))
 	sb.WriteString(sepStyle.Render(separator))
 	sb.WriteString("\n")
 
@@ -318,44 +323,51 @@ func (m *VelocityComparisonModel) View() string {
 			row := m.data[i]
 			isSelected := i == m.cursor
 
-			// Row style
+			// Row style using adaptive Theme colors (safe on both light and dark terminals)
 			rowStyle := t.Renderer.NewStyle()
 			if isSelected {
 				rowStyle = rowStyle.
 					Foreground(t.Primary).
 					Bold(true).
-					Background(ThemeBg("#333"))
+					Background(t.Highlight)
 			}
 
-			// Truncate label if needed (UTF-8 safe)
+			// Truncate label safely by display width
 			displayLabel := truncateRunesHelper(row.Label, labelWidth, "…")
+			if w := lipgloss.Width(displayLabel); w < labelWidth {
+				displayLabel += strings.Repeat(" ", labelWidth-w)
+			}
 
-			// Format trend with color
+			// Format trend with adaptive theme colors
 			trendStyle := t.Renderer.NewStyle()
 			switch row.Trend {
 			case "accelerating":
-				trendStyle = trendStyle.Foreground(ThemeFg("#00ff00"))
+				trendStyle = trendStyle.Foreground(t.Open)
 			case "decelerating":
-				trendStyle = trendStyle.Foreground(ThemeFg("#ff6666"))
+				trendStyle = trendStyle.Foreground(t.Blocked)
 			case "stable":
 				trendStyle = trendStyle.Foreground(t.Secondary)
 			case "erratic":
-				trendStyle = trendStyle.Foreground(ThemeFg("#ffaa00"))
+				trendStyle = trendStyle.Foreground(t.InProgress)
 			default:
 				trendStyle = trendStyle.Foreground(t.Secondary)
 			}
 
-			trendText := fmt.Sprintf("%s %-8s", row.TrendSymbol, row.Trend)
-			if len(trendText) > trendWidth {
-				trendText = trendText[:trendWidth]
+			// UTF-8 and display-width safe truncation (never slices multi-byte symbols like "─")
+			trendText := fmt.Sprintf("%s %s", row.TrendSymbol, row.Trend)
+			if lipgloss.Width(trendText) > trendWidth {
+				trendText = ansi.Truncate(trendText, trendWidth, "…")
+			}
+			if w := lipgloss.Width(trendText); w < trendWidth {
+				trendText += strings.Repeat(" ", trendWidth-w)
 			}
 
-			// Format sparkline with color gradient
-			sparkStyle := t.Renderer.NewStyle().Foreground(ThemeFg("#88aaff"))
+			// Format sparkline with adaptive theme accent
+			sparkStyle := t.Renderer.NewStyle().Foreground(t.Primary)
 
 			// Build row string
-			rowText := fmt.Sprintf("%-*s %*d %*d %*d %*d %*.1f ",
-				labelWidth, displayLabel,
+			rowText := fmt.Sprintf("%s %*d %*d %*d %*d %*.1f ",
+				displayLabel,
 				weekWidth, row.Weeks[0],
 				weekWidth, row.Weeks[1],
 				weekWidth, row.Weeks[2],
@@ -368,10 +380,11 @@ func (m *VelocityComparisonModel) View() string {
 				prefix = "> "
 			}
 
-			sb.WriteString(rowStyle.Render(prefix + rowText))
-			sb.WriteString(trendStyle.Render(trendText))
-			sb.WriteString(" ")
-			sb.WriteString(sparkStyle.Render(row.SparklineBar))
+			line := rowStyle.Render(prefix+rowText) + trendStyle.Render(trendText) + " " + sparkStyle.Render(row.SparklineBar)
+			if lipgloss.Width(line) > m.width {
+				line = ansi.Truncate(line, m.width, "…")
+			}
+			sb.WriteString(line)
 			sb.WriteString("\n")
 		}
 

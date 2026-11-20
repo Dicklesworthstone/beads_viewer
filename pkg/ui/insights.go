@@ -711,6 +711,9 @@ func (m *InsightsModel) rebuildHeatmapGrid() {
 		depth := critPath[pick.ID]
 		depthBucket := getDepthBucket(depth)
 		scoreBucket := int(pick.Score * float64(heatmapScoreBuckets))
+		if scoreBucket < 0 {
+			scoreBucket = 0
+		}
 		if scoreBucket >= heatmapScoreBuckets {
 			scoreBucket = heatmapScoreBuckets - 1
 		}

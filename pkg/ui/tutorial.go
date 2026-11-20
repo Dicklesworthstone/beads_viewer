@@ -148,8 +148,99 @@ func (m TutorialModel) Update(msg tea.Msg) (TutorialModel, tea.Cmd) {
 			return m.handleTOCKeys(msg), nil
 		}
 		return m.handleContentKeys(msg), nil
+
+	case tea.MouseMsg:
+		pages := m.visiblePages()
+		if m.focus == focusTutorialTOC && m.tocVisible {
+			switch msg.Button {
+			case tea.MouseButtonWheelUp:
+				if m.tocCursor > 0 {
+					m.tocCursor--
+				}
+			case tea.MouseButtonWheelDown:
+				if m.tocCursor < len(pages)-1 {
+					m.tocCursor++
+				}
+			}
+			return m, nil
+		}
+		switch msg.Button {
+		case tea.MouseButtonWheelUp:
+			m.scrollOffset -= 3
+			if m.scrollOffset < 0 {
+				m.scrollOffset = 0
+			}
+		case tea.MouseButtonWheelDown:
+			m.scrollOffset += 3
+			if maxScroll := m.maxScrollOffset(); m.scrollOffset > maxScroll {
+				m.scrollOffset = maxScroll
+			}
+		}
+		return m, nil
 	}
 	return m, nil
+}
+
+// maxScrollOffset computes the real maximum scroll offset for the active page
+// at the current modal dimensions, matching renderContent / windowContentLines.
+func (m TutorialModel) maxScrollOffset() int {
+	pages := m.visiblePages()
+	if len(pages) == 0 || m.currentPage < 0 || m.currentPage >= len(pages) {
+		return 0
+	}
+	page := pages[m.currentPage]
+	width := m.width
+	if width <= 0 {
+		width = 80
+	}
+	height := m.height
+	if height <= 0 {
+		height = 24
+	}
+	modalWidth := min(width-4, 110)
+	if modalWidth < 40 {
+		modalWidth = max(width-2, 20)
+	}
+	contentWidth := modalWidth - 6
+	if m.tocVisible && modalWidth >= 70 {
+		contentWidth = modalWidth - 28
+	}
+	if contentWidth < 20 {
+		contentWidth = 20
+	}
+	availHeight := max(height-11, 5)
+
+	var lines []string
+	if structuredPage := getStructuredPage(page.ID); structuredPage != nil {
+		renderedContent := RenderStructuredPage(*structuredPage, m.theme, contentWidth)
+		lines = strings.Split(renderedContent, "\n")
+	} else {
+		renderedContent := page.Content
+		if m.markdownRenderer != nil {
+			if rendered, err := m.markdownRenderer.Render(page.Content); err == nil {
+				renderedContent = strings.TrimSpace(rendered)
+			}
+		}
+		rawLines := strings.Split(renderedContent, "\n")
+		blankCount := 0
+		for _, line := range rawLines {
+			if strings.TrimSpace(line) == "" {
+				blankCount++
+				if blankCount <= 2 {
+					lines = append(lines, line)
+				}
+			} else {
+				blankCount = 0
+				lines = append(lines, line)
+			}
+		}
+	}
+	if len(lines) <= availHeight {
+		return 0
+	}
+	// When scrolled to the bottom, the "↑ more above" indicator uses 1 slot.
+	slots := max(availHeight-1, 1)
+	return max(0, len(lines)-slots)
 }
 
 // handleContentKeys handles keys when content area has focus (bv-wdsd).
@@ -163,8 +254,13 @@ func (m TutorialModel) handleContentKeys(msg tea.KeyMsg) TutorialModel {
 
 	// Content scrolling
 	case "j", "down":
-		m.scrollOffset++
+		if maxScroll := m.maxScrollOffset(); m.scrollOffset < maxScroll {
+			m.scrollOffset++
+		}
 	case "k", "up":
+		if maxScroll := m.maxScrollOffset(); m.scrollOffset > maxScroll {
+			m.scrollOffset = maxScroll
+		}
 		if m.scrollOffset > 0 {
 			m.scrollOffset--
 		}
@@ -176,10 +272,16 @@ func (m TutorialModel) handleContentKeys(msg tea.KeyMsg) TutorialModel {
 			visibleHeight = 5
 		}
 		m.scrollOffset += visibleHeight / 2
+		if maxScroll := m.maxScrollOffset(); m.scrollOffset > maxScroll {
+			m.scrollOffset = maxScroll
+		}
 	case "ctrl+u":
 		visibleHeight := m.height - 11
 		if visibleHeight < 5 {
 			visibleHeight = 5
+		}
+		if maxScroll := m.maxScrollOffset(); m.scrollOffset > maxScroll {
+			m.scrollOffset = maxScroll
 		}
 		m.scrollOffset -= visibleHeight / 2
 		if m.scrollOffset < 0 {
@@ -190,7 +292,7 @@ func (m TutorialModel) handleContentKeys(msg tea.KeyMsg) TutorialModel {
 	case "g", "home":
 		m.scrollOffset = 0
 	case "G", "end":
-		m.scrollOffset = 9999 // Will be clamped in View()
+		m.scrollOffset = m.maxScrollOffset()
 
 	// Jump to specific page (1-9)
 	case "1", "2", "3", "4", "5", "6", "7", "8", "9":

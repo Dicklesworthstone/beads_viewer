@@ -81,7 +81,7 @@ func (l WorkerLogLevel) String() string {
 func parseWorkerLogLevel(raw string) WorkerLogLevel {
 	value := strings.TrimSpace(strings.ToLower(raw))
 	switch value {
-	case "none", "off", "0":
+	case "", "none", "off", "0":
 		return LogLevelNone
 	case "error", "err", "1":
 		return LogLevelError
@@ -94,7 +94,7 @@ func parseWorkerLogLevel(raw string) WorkerLogLevel {
 	case "trace", "5":
 		return LogLevelTrace
 	default:
-		return LogLevelWarn
+		return LogLevelNone
 	}
 }
 
@@ -243,8 +243,9 @@ type BackgroundWorker struct {
 	errorCount int          // Consecutive error count for backoff
 
 	// Components
-	watcher *watcher.Watcher
-	msgCh   chan tea.Msg
+	watcher      *watcher.Watcher
+	msgCh        chan tea.Msg
+	sourceReload func(context.Context) (SourceReloadResult, error)
 
 	// Lifecycle
 	ctx             context.Context
@@ -269,6 +270,7 @@ type WorkerConfig struct {
 	BeadsPath      string
 	ProjectDir     string
 	SourceDegraded bool
+	SourceReload   func(context.Context) (SourceReloadResult, error)
 	DebounceDelay  time.Duration
 
 	IdleGC *IdleGCConfig
@@ -342,6 +344,7 @@ func NewBackgroundWorker(cfg WorkerConfig) (*BackgroundWorker, error) {
 		beadsPath:         cfg.BeadsPath,
 		projectDir:        cfg.ProjectDir,
 		sourceDegraded:    cfg.SourceDegraded,
+		sourceReload:      cfg.SourceReload,
 		debounceDelay:     cfg.DebounceDelay,
 		heartbeatInterval: cfg.HeartbeatInterval,
 		watchdogInterval:  cfg.WatchdogInterval,
@@ -456,7 +459,9 @@ func (w *BackgroundWorker) openTraceFile() {
 	f, err := os.OpenFile(w.tracePath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
 		w.traceMu.Unlock()
-		log.Printf("background worker: trace_open_failed path=%s error=%v", w.tracePath, err)
+		if w.logLevel != LogLevelNone {
+			log.Printf("background worker: trace_open_failed path=%s error=%v", w.tracePath, err)
+		}
 		return
 	}
 	w.traceFile = f
@@ -505,19 +510,22 @@ func (w *BackgroundWorker) logEvent(level WorkerLogLevel, event string, fields m
 	}
 	b, err := json.Marshal(payload)
 	if err != nil {
-		log.Printf("background worker: failed to marshal log event %s: %v", event, err)
+		if w.logLevel != LogLevelNone && !traceEnabled {
+			log.Printf("background worker: failed to marshal log event %s: %v", event, err)
+		}
 		return
 	}
 
-	if w.logLevel != LogLevelNone && level <= w.logLevel {
-		log.Printf("%s", b)
-	}
 	if traceEnabled {
 		w.traceMu.Lock()
 		if w.traceFile != nil {
 			_, _ = w.traceFile.Write(append(b, '\n'))
 		}
 		w.traceMu.Unlock()
+		return
+	}
+	if w.logLevel != LogLevelNone && level <= w.logLevel {
+		log.Printf("%s", b)
 	}
 }
 
@@ -1642,6 +1650,20 @@ func (w *BackgroundWorker) buildSnapshotResultContext(ctx context.Context, force
 		loadStart = time.Now()
 	}
 	loadErr := w.safeCompute("load", func() error {
+		if w.sourceReload != nil {
+			res, err := w.sourceReload(ctx)
+			if err != nil {
+				return err
+			}
+			issues = res.Issues
+			authority = res.Authority
+			authorityHash = res.AuthorityHash
+			if authority == nil {
+				authority = model.NewReadinessIndex(issues)
+			}
+			authorityComplete = !res.AuthorityIncomplete && !res.SourceDegraded
+			return nil
+		}
 		var err error
 		var loaded reloadIssueData
 		opts := loader.ParseOptions{

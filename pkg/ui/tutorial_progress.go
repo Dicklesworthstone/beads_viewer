@@ -144,15 +144,34 @@ func (m *tutorialProgressManager) Save() error {
 		return err
 	}
 
-	// Write atomically via temp file
-	tmpPath := path + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+	// Write atomically via unique same-directory temp file to avoid races
+	// between concurrent bv instances saving tutorial progress.
+	tmpFile, err := os.CreateTemp(dir, ".tutorial-progress-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmpFile.Name()
+	cleanupTmp := true
+	defer func() {
+		if cleanupTmp {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if _, err := tmpFile.Write(data); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if err := tmpFile.Chmod(0o644); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
 		return err
 	}
 	if err := os.Rename(tmpPath, path); err != nil {
-		os.Remove(tmpPath) // Clean up
 		return err
 	}
+	cleanupTmp = false
 
 	m.dirty = false
 	return nil

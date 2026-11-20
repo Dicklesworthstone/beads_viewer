@@ -391,7 +391,12 @@ func (m CassSessionModal) View() string {
 		if m.height > 0 {
 			maxInner := max(1, m.height-2-2*vertPad)
 			if len(lines) > maxInner {
-				lines = lines[:maxInner]
+				if maxInner >= 2 {
+					footerLine := lines[len(lines)-1]
+					lines = append(append([]string(nil), lines[:maxInner-1]...), footerLine)
+				} else {
+					lines = lines[len(lines)-1:]
+				}
 			}
 		}
 		assembled = strings.Join(lines, "\n")

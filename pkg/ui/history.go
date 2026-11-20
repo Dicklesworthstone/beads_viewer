@@ -122,7 +122,8 @@ type HistoryModel struct {
 
 	// Git-centric mode state (bv-tl3n)
 	viewMode            historyViewMode
-	commitList          []CommitListEntry // All commits sorted by recency
+	commitList          []CommitListEntry // Filtered commits sorted by recency
+	totalCommitCount    int               // True unfiltered unique commit count across report
 	selectedGitCommit   int               // Index into commitList
 	selectedRelatedBead int               // Index into selected commit's BeadIDs
 	gitScrollOffset     int               // For scrolling the commit list
@@ -439,19 +440,20 @@ func (h *HistoryModel) rebuildFilteredList() {
 			continue
 		}
 
-		// Apply author filter
+		// Apply author filter strictly to per-bead commits (matching Git mode)
 		if h.authorFilter != "" {
-			authorMatch := false
+			wantAuthor := strings.ToLower(h.authorFilter)
+			var matched []correlation.CorrelatedCommit
 			for _, c := range history.Commits {
-				if strings.Contains(strings.ToLower(c.Author), strings.ToLower(h.authorFilter)) ||
-					strings.Contains(strings.ToLower(c.AuthorEmail), strings.ToLower(h.authorFilter)) {
-					authorMatch = true
-					break
+				if strings.Contains(strings.ToLower(c.Author), wantAuthor) ||
+					strings.Contains(strings.ToLower(c.AuthorEmail), wantAuthor) {
+					matched = append(matched, c)
 				}
 			}
-			if !authorMatch {
+			if len(matched) == 0 {
 				continue
 			}
+			history.Commits = matched
 		}
 
 		// Apply confidence filter - keep only commits meeting threshold
@@ -1377,8 +1379,9 @@ func (h *HistoryModel) filterBeadList(query string) {
 	var filteredHistories []correlation.BeadHistory
 	var filteredIDs []string
 
-	for _, beadID := range h.beadIDs {
-		if hist, ok := h.report.Histories[beadID]; ok {
+	for i, beadID := range h.beadIDs {
+		if i < len(h.histories) {
+			hist := h.histories[i]
 			if h.beadMatchesQuery(beadID, hist, query) {
 				filteredHistories = append(filteredHistories, hist)
 				filteredIDs = append(filteredIDs, beadID)
@@ -1506,9 +1509,11 @@ func (h *HistoryModel) IsGitMode() bool {
 func (h *HistoryModel) buildCommitList() {
 	if h.report == nil {
 		h.commitList = nil
+		h.totalCommitCount = 0
 		return
 	}
 
+	unfilteredSHAs := make(map[string]struct{})
 	entryIndexBySHA := make(map[string]int)
 	beadIDsBySHA := make(map[string]map[string]struct{})
 	var entries []CommitListEntry
@@ -1516,6 +1521,7 @@ func (h *HistoryModel) buildCommitList() {
 	// Collect all commits from all bead histories
 	for beadID, hist := range h.report.Histories {
 		for _, commit := range hist.Commits {
+			unfilteredSHAs[commit.SHA] = struct{}{}
 			if h.authorFilter != "" {
 				if !strings.Contains(strings.ToLower(commit.Author), strings.ToLower(h.authorFilter)) &&
 					!strings.Contains(strings.ToLower(commit.AuthorEmail), strings.ToLower(h.authorFilter)) {
@@ -1560,6 +1566,7 @@ func (h *HistoryModel) buildCommitList() {
 		}
 	}
 
+	h.totalCommitCount = len(unfilteredSHAs)
 	for i := range entries {
 		sort.Strings(entries[i].BeadIDs)
 	}
@@ -2827,7 +2834,10 @@ func (h *HistoryModel) renderFilterLine() string {
 	// Show count based on mode
 	if h.viewMode == historyModeGit {
 		commits := h.GetFilteredCommitList()
-		totalCommits := len(h.commitList)
+		totalCommits := h.totalCommitCount
+		if totalCommits < len(h.commitList) {
+			totalCommits = len(h.commitList)
+		}
 		if len(commits) != totalCommits {
 			parts = append(parts, filterStyle.Render(fmt.Sprintf("Showing %d/%d commits", len(commits), totalCommits)))
 		} else {

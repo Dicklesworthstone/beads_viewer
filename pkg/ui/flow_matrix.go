@@ -831,7 +831,15 @@ func (m FlowMatrixModel) renderDetailPanel(width, maxHeight int) string {
 		Bold(true).
 		Render(fmt.Sprintf("← BLOCKED BY (%d)", stat.IncomingCount))
 
-	b.WriteString(fmt.Sprintf("%-*s  %s\n", halfWidth, blocksHeader, blockedByHeader))
+	padFlowCol := func(s string, colW int) string {
+		visW := lipgloss.Width(s)
+		if visW < colW {
+			return s + strings.Repeat(" ", colW-visW)
+		}
+		return s
+	}
+
+	b.WriteString(padFlowCol(blocksHeader, halfWidth) + "  " + blockedByHeader + "\n")
 
 	maxEntries := m.detailMaxEntries(maxHeight)
 	outLabels := stat.OutgoingLabels
@@ -858,7 +866,7 @@ func (m FlowMatrixModel) renderDetailPanel(width, maxHeight int) string {
 			rightStr = fmt.Sprintf("  %s %s (%d)", miniBar, inLabels[i], count)
 		}
 
-		b.WriteString(fmt.Sprintf("%-*s  %s\n", halfWidth, leftStr, rightStr))
+		b.WriteString(padFlowCol(leftStr, halfWidth) + "  " + rightStr + "\n")
 	}
 
 	if len(outLabels) > maxEntries || len(inLabels) > maxEntries {
@@ -871,7 +879,7 @@ func (m FlowMatrixModel) renderDetailPanel(width, maxHeight int) string {
 		if len(inLabels) > maxEntries {
 			rightMore = fmt.Sprintf("  +%d more", len(inLabels)-maxEntries)
 		}
-		b.WriteString(fmt.Sprintf("%-*s  %s\n", halfWidth, moreStyle.Render(leftMore), moreStyle.Render(rightMore)))
+		b.WriteString(padFlowCol(moreStyle.Render(leftMore), halfWidth) + "  " + moreStyle.Render(rightMore) + "\n")
 	}
 
 	if cascade := m.cascade.GetCascadeForLabel(stat.Label); cascade != nil && (cascade.BlockedCount > 0 || cascade.TotalImpact > 0) {

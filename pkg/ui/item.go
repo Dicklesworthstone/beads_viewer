@@ -15,6 +15,7 @@ const (
 	DiffStatusNew                        // Issue was added since comparison point
 	DiffStatusClosed                     // Issue was closed since comparison point
 	DiffStatusModified                   // Issue was modified since comparison point
+	DiffStatusReopened                   // Issue was reopened (closed -> open) since comparison point
 )
 
 // DiffBadge returns the badge string for a diff status
@@ -26,6 +27,8 @@ func (s DiffStatus) Badge() string {
 		return "✅"
 	case DiffStatusModified:
 		return "~"
+	case DiffStatusReopened:
+		return "[REOPENED]"
 	default:
 		return ""
 	}

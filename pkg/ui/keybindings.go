@@ -282,6 +282,9 @@ func GetKeyBindingDocs() []KeyBindingDoc {
 		{"U", "Self-update check", "Actions", "list"},
 		{"V", "Cass sessions", "Actions", "list,detail,board,graph,insights,tree,actionable,flow,history"},
 		{"\\", "Toggle split view", "Views", "list,detail"},
+		{"tab", "Switch split pane focus", "Split View", "list,detail"},
+		{"<", "Narrow list pane", "Split View", "list,detail"},
+		{">", "Widen list pane", "Split View", "list,detail"},
 
 		// Graph View (g)
 		{"hjkl", "Navigate graph", "Graph", "graph"},
@@ -296,7 +299,9 @@ func GetKeyBindingDocs() []KeyBindingDoc {
 		{"h", "Previous column", "Board", "board"},
 		{"l", "Next column", "Board", "board"},
 		{"H", "First column", "Board", "board"},
+		{"0", "First column", "Board", "board"},
 		{"L", "Last column", "Board", "board"},
+		{"$", "Last column", "Board", "board"},
 		{"1-4", "Jump to column 1-4", "Board", "board"},
 		{"/", "Search cards", "Board", "board"},
 		{"n", "Next search match", "Board", "board"},
@@ -347,6 +352,7 @@ func GetKeyBindingDocs() []KeyBindingDoc {
 		{">", "Narrow detail panel", "Insights", "insights"},
 
 		// History View (h)
+		{"g", "Go to top", "History", "history"},
 		{"v", "Toggle git/bead mode", "History", "history"},
 		{"/", "Search history", "History", "history"},
 		{"A", "Filter by commit author", "History", "history"},

@@ -184,17 +184,24 @@ func (m *AttentionModel) Update(msg tea.KeyMsg) (string, bool) {
 	return "", true
 }
 
-// attentionColumnWidths returns the fixed table geometry for a given width:
-// rank, label, attention, reason. The reason column absorbs the remainder
-// and never drops below 20 cells.
+// attentionColumnWidths returns the table geometry for a given width:
+// rank, label, attention, reason. Below 61 cells, columns scale proportionally
+// so rendered rows never exceed width on narrow terminals.
 func attentionColumnWidths(width int) []int {
 	headers := 4
-	sepWidth := len(" | ") * (headers - 1)
-	widths := []int{4, 18, 10, width - 4 - 18 - 10 - sepWidth}
-	if widths[3] < 20 {
-		widths[3] = 20
+	sepWidth := len(" | ") * (headers - 1) // 9
+	if width >= 61 {
+		return []int{4, 18, 10, width - 4 - 18 - 10 - sepWidth}
 	}
-	return widths
+	avail := width - sepWidth
+	if avail < 12 {
+		avail = 12
+	}
+	rankW := min(4, max(2, avail/10))
+	attnW := min(10, max(4, avail/5))
+	labelW := min(18, max(4, (avail-rankW-attnW)/2))
+	reasonW := max(4, avail-rankW-attnW-labelW)
+	return []int{rankW, labelW, attnW, reasonW}
 }
 
 // attentionReason renders the real formula components behind a score:
