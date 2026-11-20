@@ -285,34 +285,56 @@ func ParseConfig(data []byte) (Config, error) {
 
 func resolveHooksProjectDir(projectDir string) string {
 	cleanDir := filepath.Clean(projectDir)
+	if absDir, err := filepath.Abs(cleanDir); err == nil {
+		cleanDir = filepath.Clean(absDir)
+	}
 	if _, err := os.Lstat(filepath.Join(cleanDir, ".bv", "hooks.yaml")); err == nil {
 		return cleanDir
 	}
 	if info, err := os.Stat(filepath.Join(cleanDir, ".beads")); err == nil && info.IsDir() {
 		return cleanDir
 	}
+	// Never traverse above a repository's own .git boundary into an ancestor repo.
+	if _, err := os.Stat(filepath.Join(cleanDir, ".git")); err == nil {
+		return cleanDir
+	}
 
 	stopDirs := make(map[string]bool)
 	addStop := func(p string) {
-		if strings.TrimSpace(p) == "" {
+		p = strings.TrimSpace(p)
+		if p == "" || !filepath.IsAbs(p) {
 			return
 		}
-		if abs, err := filepath.Abs(p); err == nil {
-			stopDirs[filepath.Clean(abs)] = true
-		}
+		stopDirs[filepath.Clean(p)] = true
 		if eval, err := filepath.EvalSymlinks(p); err == nil {
 			stopDirs[filepath.Clean(eval)] = true
 		}
 	}
 	addStop(os.TempDir())
+	addStop("/tmp")
+	addStop("/var/tmp")
 	for _, ceiling := range filepath.SplitList(os.Getenv("GIT_CEILING_DIRECTORIES")) {
+		// Per Git's GIT_CEILING_DIRECTORIES specification, non-absolute entries are ignored.
 		addStop(ceiling)
+	}
+
+	isStopDir := func(dir string) bool {
+		if stopDirs[dir] {
+			return true
+		}
+		if eval, err := filepath.EvalSymlinks(dir); err == nil && stopDirs[filepath.Clean(eval)] {
+			return true
+		}
+		return false
 	}
 
 	curr := cleanDir
 	for {
+		if isStopDir(curr) {
+			break
+		}
 		parent := filepath.Dir(curr)
-		if parent == curr || stopDirs[curr] || stopDirs[parent] {
+		if parent == curr || isStopDir(parent) {
 			break
 		}
 		if info, err := os.Stat(filepath.Join(parent, ".beads")); err == nil && info.IsDir() {
@@ -328,6 +350,8 @@ func resolveHooksProjectDir(projectDir string) string {
 				}
 				return parent
 			}
+			// Reached enclosing repo root without .bv/hooks.yaml; do not climb past .git.
+			break
 		}
 		curr = parent
 	}

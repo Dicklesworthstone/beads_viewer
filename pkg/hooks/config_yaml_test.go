@@ -370,3 +370,50 @@ hooks:
 		t.Fatalf("expected sub-hook from explicit subDir config, got %+v", got)
 	}
 }
+
+func TestResolveHooksProjectDir_StopsAtGitBoundaryAndIgnoresRelativeCeiling(t *testing.T) {
+	outer := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(outer, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(outer, ".bv"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outerYAML := "hooks:\n  pre-export:\n    - name: outer-poison\n      command: echo outer\n"
+	if err := os.WriteFile(filepath.Join(outer, ".bv", "hooks.yaml"), []byte(outerYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Nested fresh git repo with NO .bv/hooks.yaml and NO .beads must NOT inherit outer repo's hooks.yaml!
+	nested := filepath.Join(outer, "nested-repo")
+	nestedSub := filepath.Join(nested, "src", "pkg")
+	if err := os.MkdirAll(filepath.Join(nested, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(nestedSub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, start := range []string{nested, nestedSub} {
+		l := NewLoader(WithProjectDir(start))
+		if err := l.Load(); err != nil {
+			t.Fatalf("Load(%s) failed: %v", start, err)
+		}
+		if l.HasHooks() {
+			t.Fatalf("nested git repo %s inherited outer hooks.yaml: %+v", start, l.GetHooks(PreExport))
+		}
+	}
+
+	// Relative entries in GIT_CEILING_DIRECTORIES must be ignored per git(1) spec.
+	t.Setenv("GIT_CEILING_DIRECTORIES", "relative/ceiling:.")
+	outerSub := filepath.Join(outer, "sub", "deep")
+	if err := os.MkdirAll(outerSub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lOuter := NewLoader(WithProjectDir(outerSub))
+	if err := lOuter.Load(); err != nil {
+		t.Fatalf("Load(outerSub) with relative ceiling failed: %v", err)
+	}
+	if !lOuter.HasHooks() || len(lOuter.GetHooks(PreExport)) != 1 || lOuter.GetHooks(PreExport)[0].Name != "outer-poison" {
+		t.Fatalf("relative GIT_CEILING_DIRECTORIES broke valid enclosing-repo hooks discovery: %+v", lOuter.GetHooks(PreExport))
+	}
+}
