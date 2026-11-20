@@ -3,12 +3,15 @@ package correlation
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestSnapshotMatchesLegacyPatch is a differential test: extractViaSnapshots
@@ -437,4 +440,318 @@ func BenchmarkRecordLineSetFrontier(b *testing.B) {
 		b.ReportMetric(float64(stats.hashedBytes), "hashed_B/op")
 		b.ReportMetric(float64(stats.reusedBytes), "reused_B/op")
 	})
+}
+
+func runGitMR7(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(),
+		"GIT_AUTHOR_NAME=Alice Dev",
+		"GIT_AUTHOR_EMAIL=Alice@Example.com",
+		"GIT_COMMITTER_NAME=Alice Dev",
+		"GIT_COMMITTER_EMAIL=Alice@Example.com",
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v failed: %v\n%s", args, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func TestMR7_FullDeletionParityAcrossPatchSnapshotAndCausal(t *testing.T) {
+	t.Setenv("BV_CACHE_DIR", t.TempDir())
+	for _, tc := range []struct {
+		name    string
+		padSize int
+	}{
+		{name: "small_under_64kb", padSize: 64},
+		{name: "large_over_64kb", padSize: 70 * 1024},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := t.TempDir()
+			runGitMR7(t, repo, "init", "-q")
+			beadsDir := filepath.Join(repo, ".beads")
+			if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
+			pad := strings.Repeat("x", tc.padSize)
+
+			// Commit 1: create bv-del1 + padding record
+			line1 := fmt.Sprintf(`{"id":"bv-del1","title":"Will be deleted","status":"open","description":%q}`+"\n", pad)
+			if err := os.WriteFile(jsonlPath, []byte(line1), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			runGitMR7(t, repo, "add", ".beads/issues.jsonl")
+			runGitMR7(t, repo, "commit", "-q", "-m", "create bv-del1")
+
+			// Commit 2: full-file deletion of .beads/issues.jsonl
+			runGitMR7(t, repo, "rm", "-q", ".beads/issues.jsonl")
+			runGitMR7(t, repo, "commit", "-q", "-m", "delete issues.jsonl")
+
+			// Commit 3: recreate .beads/issues.jsonl with bv-keep1
+			line3 := fmt.Sprintf(`{"id":"bv-keep1","title":"Recreated","status":"open","description":%q}`+"\n", pad)
+			if err := os.WriteFile(jsonlPath, []byte(line3), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			runGitMR7(t, repo, "add", ".beads/issues.jsonl")
+			runGitMR7(t, repo, "commit", "-q", "-m", "recreate issues.jsonl")
+
+			e := NewExtractor(repo, ".beads/issues.jsonl")
+			opts := ExtractOptions{Limit: 50}
+			patchEvents, err := e.extractViaGitLogPatch(opts)
+			if err != nil {
+				t.Fatalf("extractViaGitLogPatch: %v", err)
+			}
+			snapEvents, err := e.extractViaSnapshots(opts)
+			if err != nil {
+				t.Fatalf("extractViaSnapshots: %v", err)
+			}
+			if len(patchEvents) != len(snapEvents) {
+				t.Fatalf("event count mismatch: patch=%d snap=%d\npatch=%+v\nsnap=%+v", len(patchEvents), len(snapEvents), patchEvents, snapEvents)
+			}
+			foundDeleted := false
+			for i := range patchEvents {
+				p, s := patchEvents[i], snapEvents[i]
+				if p.BeadID != s.BeadID || p.EventType != s.EventType || p.CommitSHA != s.CommitSHA {
+					t.Fatalf("event[%d] diverged: patch=%+v snap=%+v", i, p, s)
+				}
+				if s.BeadID == "bv-del1" && s.EventType == EventDeleted {
+					foundDeleted = true
+				}
+			}
+			if !foundDeleted {
+				t.Fatalf("expected EventDeleted for bv-del1 across full-file deletion commit, got %+v", snapEvents)
+			}
+
+			// Verify extractCausalHistory also observes the deletion commit for bv-del1.
+			causal, err := e.extractCausalHistory("bv-del1", ExtractOptions{Limit: 50})
+			if err != nil {
+				t.Fatalf("extractCausalHistory: %v", err)
+			}
+			sawVanish := false
+			for _, obs := range causal.Observations {
+				if obs.Before.Issue != nil && obs.After.Issue == nil {
+					sawVanish = true
+				}
+			}
+			if !sawVanish {
+				t.Fatalf("extractCausalHistory dropped full-file deletion observation for bv-del1: %+v", causal.Observations)
+			}
+		})
+	}
+}
+
+func TestRC36_OrphanConfirmFeedbackAndPerPairRejectionAndEdgeFixes(t *testing.T) {
+	t.Setenv("BV_CACHE_DIR", t.TempDir())
+	repo := t.TempDir()
+	runGitMR7(t, repo, "init", "-q")
+	beadsDir := filepath.Join(repo, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
+	if err := os.WriteFile(jsonlPath, []byte(`{"id":"bv-a1","title":"Bead A1","status":"open"}`+"\n"+`{"id":"bv-b2","title":"Bead B2","status":"open"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitMR7(t, repo, "add", ".beads/issues.jsonl")
+	runGitMR7(t, repo, "commit", "-q", "-m", "seed beads")
+
+	// Unlinked orphan code commit
+	if err := os.WriteFile(filepath.Join(repo, "orphan.go"), []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitMR7(t, repo, "add", "orphan.go")
+	runGitMR7(t, repo, "commit", "-q", "-m", "refactor helper without bead id")
+	orphanSHA := runGitMR7(t, repo, "rev-parse", "HEAD")
+
+	// Commit mentioning bv-b2 explicitly
+	if err := os.WriteFile(filepath.Join(repo, "b2.go"), []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitMR7(t, repo, "add", "b2.go")
+	runGitMR7(t, repo, "commit", "-q", "-m", "implement bv-b2 feature")
+	b2SHA := runGitMR7(t, repo, "rev-parse", "HEAD")
+
+	// Commit mentioning bv-a1 explicitly (which we will reject to test per-pair rejection isolation)
+	if err := os.WriteFile(filepath.Join(repo, "a1.go"), []byte("package main\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitMR7(t, repo, "add", "a1.go")
+	runGitMR7(t, repo, "commit", "-q", "-m", "false match bv-a1")
+	a1SHA := runGitMR7(t, repo, "rev-parse", "HEAD")
+
+	beads := []BeadInfo{
+		{ID: "bv-a1", Title: "Bead A1", Status: "open"},
+		{ID: "bv-b2", Title: "Bead B2", Status: "open"},
+	}
+
+	// Verify ResolveCommitInRepo resolves real orphan commit and rejects bogus SHA
+	resolved, err := ResolveCommitInRepo(context.Background(), repo, orphanSHA[:8])
+	if err != nil || resolved.SHA != orphanSHA || len(resolved.Files) != 1 || resolved.Files[0].Path != "orphan.go" {
+		t.Fatalf("ResolveCommitInRepo(%s) = %+v, err=%v", orphanSHA[:8], resolved, err)
+	}
+	if _, err := ResolveCommitInRepo(context.Background(), repo, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"); err == nil {
+		t.Fatal("ResolveCommitInRepo accepted nonexistent commit SHA")
+	}
+
+	// Confirm orphanSHA -> bv-a1 and reject a1SHA -> bv-a1
+	fbStore := NewFeedbackStore(beadsDir)
+	if err := fbStore.Confirm(orphanSHA, "bv-a1", "tester", 0.0, "linked orphan"); err != nil {
+		t.Fatal(err)
+	}
+	if err := fbStore.Reject(a1SHA, "bv-a1", "tester", 0.85, "false positive"); err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := NewCorrelator(repo, ".beads/issues.jsonl").WithFeedbackStore(fbStore).GenerateReport(beads, CorrelatorOptions{Limit: 50})
+	if err != nil {
+		t.Fatalf("GenerateReport: %v", err)
+	}
+
+	// orphanSHA must now appear in bv-a1 history (Confidence 1.0, Confirmed true) and CommitIndex
+	foundConfirmed := false
+	for _, c := range report.Histories["bv-a1"].Commits {
+		if c.SHA == orphanSHA && c.Confirmed && c.Confidence == 1.0 {
+			foundConfirmed = true
+		}
+		if c.SHA == a1SHA {
+			t.Fatalf("rejected commit %s still present in bv-a1 history", a1SHA)
+		}
+	}
+	if !foundConfirmed {
+		t.Fatalf("confirmed orphan %s not synthesized into bv-a1 commits: %+v", orphanSHA, report.Histories["bv-a1"].Commits)
+	}
+	if len(report.CommitIndex[orphanSHA]) != 1 || report.CommitIndex[orphanSHA][0] != "bv-a1" {
+		t.Fatalf("CommitIndex[%s] = %v, want [bv-a1]", orphanSHA, report.CommitIndex[orphanSHA])
+	}
+
+	// ReverseLookup: orphanSHA is no longer orphan; a1SHA IS orphan (rejected); b2SHA is NOT orphan (per-pair isolation!)
+	// Even if we delete b2SHA from CommitIndex to force explicit fallback, rejecting (a1SHA, bv-a1) must NOT disable explicit fallback for b2SHA!
+	delete(report.CommitIndex, b2SHA)
+	rl := NewReverseLookupWithRepo(report, repo)
+	orphans, _, err := rl.FindOrphanCommits(ExtractOptions{Limit: 50})
+	if err != nil {
+		t.Fatalf("FindOrphanCommits: %v", err)
+	}
+	orphanSet := make(map[string]bool, len(orphans))
+	for _, o := range orphans {
+		orphanSet[o.SHA] = true
+	}
+	if orphanSet[orphanSHA] {
+		t.Fatalf("confirmed orphan %s still flagged as orphan", orphanSHA)
+	}
+	if !orphanSet[a1SHA] {
+		t.Fatalf("rejected commit %s should appear as orphan", a1SHA)
+	}
+	if orphanSet[b2SHA] {
+		t.Fatalf("rejecting (a1SHA, bv-a1) globally disabled explicit fallback for unrelated commit %s", b2SHA)
+	}
+
+	// Verify OrphanDetector.checkTiming reports actual closed status & case-insensitive email match
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	closedStart := now.Add(-4 * time.Hour)
+	closedEnd := now.Add(-1 * time.Hour)
+	odReport := &HistoryReport{
+		Histories: map[string]BeadHistory{
+			"bv-closed": {
+				BeadID:     "bv-closed",
+				Title:      "Closed Bead",
+				Status:     "closed",
+				LastAuthor: "Alice",
+				Milestones: BeadMilestones{
+					Claimed: &BeadEvent{Timestamp: closedStart},
+					Closed:  &BeadEvent{Timestamp: closedEnd},
+				},
+				Commits: []CorrelatedCommit{
+					{SHA: "1111111", Author: "Alice", AuthorEmail: "Alice@Example.COM", Timestamp: closedStart.Add(time.Minute)},
+				},
+			},
+		},
+		CommitIndex: CommitIndex{"1111111": {"bv-closed"}},
+	}
+	od := NewOrphanDetector(odReport, "")
+	cand, err := od.analyzeOrphan(OrphanCommit{
+		SHA:         "2222222",
+		Message:     "follow-up work",
+		Author:      "alice",
+		AuthorEmail: "alice@example.com", // lowercase vs stored Alice@Example.COM
+		Timestamp:   closedStart.Add(30 * time.Minute),
+		Files:       []string{"main.go"},
+	})
+	if err != nil {
+		t.Fatalf("analyzeOrphan: %v", err)
+	}
+	if len(cand.ProbableBeads) != 1 || cand.ProbableBeads[0].BeadStatus != "closed" {
+		t.Fatalf("expected closed ProbableBead status (not hardcoded in_progress), got %+v", cand.ProbableBeads)
+	}
+	sawAuthorSignal := false
+	for _, sig := range cand.Signals {
+		if sig.Signal == SignalOrphanAuthor {
+			sawAuthorSignal = true
+		}
+	}
+	if !sawAuthorSignal {
+		t.Fatalf("expected case-insensitive author match signal, got %+v", cand.Signals)
+	}
+
+	// Verify related.go runs commit_overlap before file_overlap and discovers sibling blockers
+	relReport := &HistoryReport{
+		Histories: map[string]BeadHistory{
+			"T": {BeadID: "T", Status: "open", Commits: []CorrelatedCommit{{SHA: "shared1", Files: []FileChange{{Path: "a.go"}}}}},
+			"S": {BeadID: "S", Status: "open", Commits: []CorrelatedCommit{{SHA: "shared1", Files: []FileChange{{Path: "a.go"}}}}},
+			"P": {BeadID: "P", Status: "open"},
+			"B": {BeadID: "B", Status: "open"},
+		},
+		CommitIndex: CommitIndex{"shared1": {"T", "S"}},
+	}
+	relOpts := DefaultRelatedWorkOptions()
+	relOpts.DependencyGraph = map[string][]string{
+		"T": {"P"},
+		"B": {"P"}, // B is a sibling of T sharing blocker P!
+	}
+	rel := relReport.FindRelatedWork("T", relOpts)
+	if len(rel.CommitOverlap) != 1 || rel.CommitOverlap[0].BeadID != "S" {
+		t.Fatalf("expected S in CommitOverlap before FileOverlap, got commit=%+v file=%+v", rel.CommitOverlap, rel.FileOverlap)
+	}
+	foundSibling := false
+	for _, d := range rel.DependencyCluster {
+		if d.BeadID == "B" {
+			foundSibling = true
+		}
+	}
+	if !foundSibling {
+		t.Fatalf("expected shared-blocker sibling B in DependencyCluster, got %+v", rel.DependencyCluster)
+	}
+
+	// Verify scorer.go MethodCoCommitted min 0.80 and no fabricated SignalProximity
+	scorer := NewScorer()
+	if !scorer.ValidateConfidence(MethodCoCommitted, 0.80) {
+		t.Fatal("ValidateConfidence(MethodCoCommitted, 0.80) = false, want true")
+	}
+	expl := scorer.BuildExplanation(CorrelatedCommit{
+		SHA:        "abc1234",
+		Method:     MethodCoCommitted,
+		Confidence: 0.95,
+		Reason:     "co-committed with bead update",
+	}, "bv-a1")
+	for _, sig := range expl.Signals {
+		if sig.Type == SignalProximity {
+			t.Fatalf("fabricated SignalProximity without adjacency evidence: %+v", expl.Signals)
+		}
+	}
+
+	// Verify bounded cache file reader rejects oversized file without OOM
+	tmpFile, err := os.CreateTemp(t.TempDir(), "oversize-cache-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tmpFile.Close()
+	if _, err := tmpFile.Write([]byte(`{"version":1}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := readCacheFileBounded(tmpFile, 4); ok {
+		t.Fatal("readCacheFileBounded accepted file exceeding maxBytes")
+	}
 }

@@ -3301,3 +3301,104 @@ func TestCheckCycles_GatedOnMatchesScope(t *testing.T) {
 		t.Fatalf("expected critical AlertNewCycle when sameScope == true, got %+v", posRes.Alerts)
 	}
 }
+
+func TestRC36_DriftP0ConfigDuplicateLabelsAndInfoSuggestedActions(t *testing.T) {
+	// 1. Explicit high_impact_priority_max: 0 (P0-only) and duplicate_max_alerts: 0 (unlimited) preserved in LoadConfig.
+	projectDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(projectDir, ".bv"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	yamlCfg := "high_impact_priority_max: 0\nduplicate_max_alerts: 0\n"
+	if err := os.WriteFile(ConfigPath(projectDir), []byte(yamlCfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadConfig(projectDir)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if loaded.HighImpactPriorityMax != 0 {
+		t.Fatalf("HighImpactPriorityMax = %d, want 0 (explicit P0-only overwritten)", loaded.HighImpactPriorityMax)
+	}
+	if loaded.DuplicateMaxAlerts != 0 {
+		t.Fatalf("DuplicateMaxAlerts = %d, want 0 (explicit unlimited overwritten)", loaded.DuplicateMaxAlerts)
+	}
+
+	// Verify P0-only config fires AlertHighImpactUnblock for P0 dependent and ignores P1-only dependents.
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	issuesP1Only := []model.Issue{
+		{ID: "ROOT-P1", Title: "Root", Status: model.StatusOpen, Priority: 2, UpdatedAt: now},
+		{ID: "D1", Title: "D1", Status: model.StatusOpen, Priority: 1, UpdatedAt: now, Dependencies: []*model.Dependency{{IssueID: "D1", DependsOnID: "ROOT-P1", Type: model.DepBlocks}}},
+		{ID: "D2", Title: "D2", Status: model.StatusOpen, Priority: 1, UpdatedAt: now, Dependencies: []*model.Dependency{{IssueID: "D2", DependsOnID: "ROOT-P1", Type: model.DepBlocks}}},
+		{ID: "D3", Title: "D3", Status: model.StatusOpen, Priority: 1, UpdatedAt: now, Dependencies: []*model.Dependency{{IssueID: "D3", DependsOnID: "ROOT-P1", Type: model.DepBlocks}}},
+	}
+	calcP1 := NewCalculator(&baseline.Baseline{Version: 1}, &baseline.Baseline{Version: 1}, loaded)
+	calcP1.SetNow(now)
+	calcP1.SetIssues(issuesP1Only)
+	if got := alertsOfType(calcP1.Calculate(), AlertHighImpactUnblock); len(got) != 0 {
+		t.Fatalf("P0-only config should ignore P1-only unblock cascade, got %+v", got)
+	}
+	issuesP1Only[1].Priority = 0
+	calcP0 := NewCalculator(&baseline.Baseline{Version: 1}, &baseline.Baseline{Version: 1}, loaded)
+	calcP0.SetNow(now)
+	calcP0.SetIssues(issuesP1Only)
+	if got := alertsOfType(calcP0.Calculate(), AlertHighImpactUnblock); len(got) != 1 {
+		t.Fatalf("P0-only config should fire 1 AlertHighImpactUnblock when a P0 is unblocked, got %+v", got)
+	}
+
+	// 2. AlertPotentialDuplicate populates deduplicated sorted Labels union across both issues (for --alert-label).
+	dupIssues := []model.Issue{
+		{ID: "DUP-A", Title: "Fix OAuth token refresh race condition in mobile client", Status: model.StatusOpen, Labels: []string{"auth", "mobile"}, UpdatedAt: now},
+		{ID: "DUP-B", Title: "Fix OAuth token refresh race condition in mobile client", Status: model.StatusOpen, Labels: []string{"mobile", "security"}, UpdatedAt: now},
+	}
+	dupCalc := NewCalculator(&baseline.Baseline{Version: 1}, &baseline.Baseline{Version: 1}, loaded)
+	dupCalc.SetNow(now)
+	dupCalc.SetIssues(dupIssues)
+	dupAlerts := alertsOfType(dupCalc.Calculate(), AlertPotentialDuplicate)
+	if len(dupAlerts) != 1 {
+		t.Fatalf("expected 1 AlertPotentialDuplicate, got %d", len(dupAlerts))
+	}
+	wantLabels := []string{"auth", "mobile", "security"}
+	if strings.Join(dupAlerts[0].Labels, ",") != strings.Join(wantLabels, ",") {
+		t.Fatalf("AlertPotentialDuplicate.Labels = %v, want %v", dupAlerts[0].Labels, wantLabels)
+	}
+	if dupAlerts[0].SuggestedAction == "" {
+		t.Fatalf("AlertPotentialDuplicate missing SuggestedAction")
+	}
+
+	// 3. Info-level AlertDensityGrowth and AlertActionableChange emit non-empty SuggestedAction.
+	bl := &baseline.Baseline{
+		Version: baseline.CurrentVersion,
+		Stats: baseline.GraphStats{
+			NodeCount:       10,
+			EdgeCount:       10,
+			Density:         0.10,
+			ActionableCount: 10,
+		},
+	}
+	cur := &baseline.Baseline{
+		Version: baseline.CurrentVersion,
+		Stats: baseline.GraphStats{
+			NodeCount:       10,
+			EdgeCount:       13,
+			Density:         0.125, // +25% >= DensityInfoPct(20) and < DensityWarningPct(50)
+			ActionableCount: 13,    // +30% >= ActionableIncreaseInfoPct(20)
+		},
+	}
+	infoRes := NewCalculator(bl, cur, DefaultConfig()).Calculate()
+	seenDensityInfo := false
+	seenActionInfo := false
+	for _, a := range infoRes.Alerts {
+		if a.SuggestedAction == "" {
+			t.Fatalf("alert %s (%s) emitted empty SuggestedAction", a.Type, a.Severity)
+		}
+		if a.Type == AlertDensityGrowth && a.Severity == SeverityInfo {
+			seenDensityInfo = true
+		}
+		if a.Type == AlertActionableChange && a.Severity == SeverityInfo {
+			seenActionInfo = true
+		}
+	}
+	if !seenDensityInfo || !seenActionInfo {
+		t.Fatalf("expected both Info density_growth (%v) and Info actionable_change (%v), got %+v", seenDensityInfo, seenActionInfo, infoRes.Alerts)
+	}
+}
