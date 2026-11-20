@@ -4,6 +4,7 @@
 package datasource
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -148,6 +149,12 @@ func DiscoverSources(opts DiscoveryOptions) ([]DataSource, error) {
 		}
 	}
 
+	if resolved, err := loader.ResolveBeadsDir(beadsDir); err != nil {
+		return nil, err
+	} else if resolved != "" {
+		beadsDir = resolved
+	}
+
 	if opts.Verbose {
 		opts.Logger(fmt.Sprintf("Discovering sources in: %s", beadsDir))
 	}
@@ -278,38 +285,70 @@ func discoverSQLiteSources(beadsDir string, opts DiscoveryOptions) ([]DataSource
 	}
 	var sources []DataSource
 
-	// Look for beads.db
-	dbPath := filepath.Join(beadsDir, "beads.db")
-	info, err := os.Stat(dbPath)
-	if os.IsNotExist(err) {
-		return sources, nil
-	}
-	if err != nil {
-		return nil, fmt.Errorf("stat SQLite source %s: %w", dbPath, err)
-	}
-
-	// A committed transaction can advance the WAL without checkpointing the
-	// main database. Compare the effective SQLite freshness with JSONL exports,
-	// resolving symlinks first because SQLite creates -wal next to the target.
-	modTime := info.ModTime()
-	walPath := sqliteWALPath(dbPath)
-	walInfo, walErr := os.Stat(walPath)
-	if walErr == nil {
-		if walInfo.ModTime().After(modTime) {
-			modTime = walInfo.ModTime()
+	// Check metadata.json "database" field first (if it names a custom SQLite file),
+	// then standard beads.db, deduplicating paths.
+	var candidates []string
+	seen := make(map[string]bool)
+	addCandidate := func(p string) {
+		clean := filepath.Clean(p)
+		if !seen[clean] {
+			seen[clean] = true
+			candidates = append(candidates, clean)
 		}
-	} else if !os.IsNotExist(walErr) {
-		return nil, fmt.Errorf("stat SQLite WAL source %s: %w", walPath, walErr)
 	}
-	sources = append(sources, DataSource{
-		Type:     SourceTypeSQLite,
-		Path:     dbPath,
-		Priority: PrioritySQLite,
-		ModTime:  modTime,
-		Size:     info.Size(),
-	})
-	if opts.Verbose {
-		opts.Logger(fmt.Sprintf("Found SQLite: %s (mod=%s)", dbPath, modTime.Format(time.RFC3339)))
+	if rawMeta, err := os.ReadFile(filepath.Join(beadsDir, "metadata.json")); err == nil {
+		var meta struct {
+			Database string `json:"database"`
+		}
+		if json.Unmarshal(rawMeta, &meta) == nil {
+			if dbName := strings.TrimSpace(meta.Database); dbName != "" {
+				metaPath := dbName
+				if !filepath.IsAbs(metaPath) {
+					metaPath = filepath.Join(beadsDir, metaPath)
+				}
+				if info, statErr := os.Stat(metaPath); statErr == nil && !info.IsDir() {
+					addCandidate(metaPath)
+				}
+			}
+		}
+	}
+	addCandidate(filepath.Join(beadsDir, "beads.db"))
+
+	for _, dbPath := range candidates {
+		info, err := os.Stat(dbPath)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("stat SQLite source %s: %w", dbPath, err)
+		}
+		if info.IsDir() {
+			continue
+		}
+
+		// A committed transaction can advance the WAL without checkpointing the
+		// main database. Compare the effective SQLite freshness with JSONL exports,
+		// resolving symlinks first because SQLite creates -wal next to the target.
+		modTime := info.ModTime()
+		walPath := sqliteWALPath(dbPath)
+		walInfo, walErr := os.Stat(walPath)
+		if walErr == nil {
+			if walInfo.ModTime().After(modTime) {
+				modTime = walInfo.ModTime()
+			}
+		} else if !os.IsNotExist(walErr) {
+			return nil, fmt.Errorf("stat SQLite WAL source %s: %w", walPath, walErr)
+		}
+		sources = append(sources, DataSource{
+			Type:     SourceTypeSQLite,
+			Path:     dbPath,
+			Priority: PrioritySQLite,
+			ModTime:  modTime,
+			Size:     info.Size(),
+		})
+		if opts.Verbose {
+			opts.Logger(fmt.Sprintf("Found SQLite: %s (mod=%s)", dbPath, modTime.Format(time.RFC3339)))
+		}
 	}
 
 	return sources, nil

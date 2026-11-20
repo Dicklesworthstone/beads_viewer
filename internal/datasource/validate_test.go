@@ -121,14 +121,21 @@ func TestValidateJSONL_SkipsBDMetadataTypeLines(t *testing.T) {
 			wantIssueCount: 2,
 		},
 		{
-			name: "only bd metadata lines have zero parse errors and zero issues",
+			name: "only bd metadata lines rejected as non-issue source (matches fusedLoadJSONL)",
 			content: strings.Join([]string{
 				`{"_type":"memory","key":"k"}`,
 				`{"_type":"sprint","name":"Sprint 1"}`,
 			}, "\n") + "\n",
-			maxErrorRate:   0.0,
-			wantErr:        false,
-			wantIssueCount: 0,
+			maxErrorRate: 0.0,
+			wantErr:      true,
+		},
+		{
+			name: "explicit null required fields rejected (matches fusedLoadJSONL)",
+			content: strings.Join([]string{
+				`{"id":null,"title":null,"status":null}`,
+			}, "\n") + "\n",
+			maxErrorRate: 0.0,
+			wantErr:      true,
 		},
 		{
 			name: "malformed json containing _type is still counted as error",
@@ -310,5 +317,69 @@ func TestValidateSQLite_ExcludesTombstonesInReadOnlySnapshot(t *testing.T) {
 				t.Fatalf("incorrect tombstone accounting: %+v", report)
 			}
 		})
+	}
+}
+
+func TestRC37_DiscoverAndLoadFollowRedirectAndMetadataDatabase(t *testing.T) {
+	// 1. .beads/redirect followed by BOTH DiscoverSources and LoadIssuesFromDir.
+	outer := t.TempDir()
+	realBeads := filepath.Join(outer, "shared", ".beads")
+	if err := os.MkdirAll(realBeads, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(realBeads, "issues.jsonl"), []byte(`{"id":"RED-1","title":"Via Redirect","status":"open","issue_type":"task"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	worktree := filepath.Join(outer, "wt")
+	wtBeads := filepath.Join(worktree, ".beads")
+	if err := os.MkdirAll(wtBeads, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wtBeads, "redirect"), []byte("../../shared/.beads\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	sources, err := DiscoverSources(DiscoveryOptions{BeadsDir: wtBeads, SkipWorktreeSources: true, ValidateAfterDiscovery: true})
+	if err != nil {
+		t.Fatalf("DiscoverSources(redirect) failed: %v", err)
+	}
+	if len(sources) == 0 || filepath.Clean(sources[0].Path) != filepath.Clean(filepath.Join(realBeads, "issues.jsonl")) {
+		t.Fatalf("DiscoverSources(redirect) = %+v, want %s", sources, filepath.Join(realBeads, "issues.jsonl"))
+	}
+	loaded, err := LoadIssuesFromDir(wtBeads)
+	if err != nil || len(loaded.Issues) != 1 || loaded.Issues[0].ID != "RED-1" {
+		t.Fatalf("LoadIssuesFromDir(redirect) = (%+v, %v), want [RED-1]", loaded.Issues, err)
+	}
+
+	// 2. metadata.json custom "database" field discovered by discoverSQLiteSources.
+	customDir := filepath.Join(outer, "custom-db", ".beads")
+	if err := os.MkdirAll(customDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	customDBPath := filepath.Join(customDir, "tracker.sqlite")
+	db, err := sql.Open("sqlite", customDBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`CREATE TABLE issues (id TEXT PRIMARY KEY, title TEXT, status TEXT, issue_type TEXT DEFAULT 'task');
+		INSERT INTO issues (id, title, status) VALUES ('CUST-1', 'Custom DB Issue', 'open');`)
+	_ = db.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(customDir, "metadata.json"), []byte(`{"database":"tracker.sqlite","backend":"sqlite"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	customSources, err := DiscoverSources(DiscoveryOptions{BeadsDir: customDir, SkipWorktreeSources: true, ValidateAfterDiscovery: true})
+	if err != nil {
+		t.Fatalf("DiscoverSources(custom metadata db) failed: %v", err)
+	}
+	if len(customSources) != 1 || customSources[0].Type != SourceTypeSQLite || filepath.Clean(customSources[0].Path) != filepath.Clean(customDBPath) {
+		t.Fatalf("DiscoverSources(custom metadata db) = %+v, want SQLite %s", customSources, customDBPath)
+	}
+	customLoaded, err := LoadIssuesFromDir(customDir)
+	if err != nil || len(customLoaded.Issues) != 1 || customLoaded.Issues[0].ID != "CUST-1" {
+		t.Fatalf("LoadIssuesFromDir(custom metadata db) = (%+v, %v), want [CUST-1]", customLoaded.Issues, err)
 	}
 }

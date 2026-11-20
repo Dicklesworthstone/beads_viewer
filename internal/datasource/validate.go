@@ -453,14 +453,19 @@ type defaultProbe struct {
 	Status json.RawMessage `json:"status"`
 }
 
+func isNonNullJSONValue(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) > 0 && !bytes.Equal(trimmed, []byte("null"))
+}
+
 func (p *defaultProbe) has(field string) bool {
 	switch field {
 	case "id":
-		return len(p.ID) > 0
+		return isNonNullJSONValue(p.ID)
 	case "title":
-		return len(p.Title) > 0
+		return isNonNullJSONValue(p.Title)
 	case "status":
-		return len(p.Status) > 0
+		return isNonNullJSONValue(p.Status)
 	default:
 		return false
 	}
@@ -473,8 +478,8 @@ func (p *defaultProbe) has(field string) bool {
 type rawProbe map[string]json.RawMessage
 
 func (p rawProbe) has(field string) bool {
-	_, ok := p[field]
-	return ok
+	raw, ok := p[field]
+	return ok && isNonNullJSONValue(raw)
 }
 
 // isDefaultRequiredFields reports whether fields is exactly the default
@@ -559,6 +564,7 @@ func validateJSONL(source *DataSource, opts ValidationOptions) error {
 	lineNum := 0
 	validLines := 0
 	errorLines := 0
+	skippedMetadataLines := 0
 	oversizedLines := 0
 
 	for {
@@ -638,6 +644,7 @@ func validateJSONL(source *DataSource, opts ValidationOptions) error {
 			}
 			if err := json.Unmarshal(line, &typeProbe); err == nil && json.Valid(line) {
 				if typeProbe.Type != "" && typeProbe.Type != "issue" {
+					skippedMetadataLines++
 					continue
 				}
 			}
@@ -698,6 +705,11 @@ func validateJSONL(source *DataSource, opts ValidationOptions) error {
 			}
 			return fmt.Errorf("too many errors: %.1f%% (max %.1f%%)", errorRate*100, opts.MaxJSONLErrorRate*100)
 		}
+	}
+	// Match fusedLoadJSONL: reject non-empty files containing only non-issue _type
+	// metadata or error records (0 valid issues), while allowing empty/whitespace files.
+	if validLines == 0 && errorLines+skippedMetadataLines > 0 {
+		return fmt.Errorf("no issue records (%d non-issue/error lines, 0 valid issues)", errorLines+skippedMetadataLines)
 	}
 
 	if opts.CountIssues {

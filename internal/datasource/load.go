@@ -242,6 +242,11 @@ func loadLegacyJSONLWithSilence(beadsDir string, silent bool) (LoadResult, error
 // This is useful when the caller already knows the .beads path.
 func LoadIssuesFromDir(beadsDir string) (result LoadResult, err error) {
 	defer func() { result.bindOrigins(err) }()
+	if resolved, rErr := loader.ResolveBeadsDir(beadsDir); rErr != nil {
+		return LoadResult{}, rErr
+	} else if resolved != "" {
+		beadsDir = resolved
+	}
 	// bd/Dolt workspaces (#189): see LoadIssues.
 	if loader.IsBDWorkspace(beadsDir) {
 		return loadBDWorkspace(beadsDir, false)
