@@ -1401,22 +1401,16 @@ func applyFeedbackWithRepo(store *FeedbackStore, ctx context.Context, repoPath s
 			if seenByBead[fb.BeadID][fb.CommitSHA] {
 				continue
 			}
-			var synth CorrelatedCommit
-			if repoPath != "" {
-				resolved, err := ResolveCommitInRepo(ctx, repoPath, fb.CommitSHA)
-				if err != nil {
-					continue
-				}
-				synth = resolved
-			} else {
-				synth = CorrelatedCommit{
-					SHA:        fb.CommitSHA,
-					ShortSHA:   shortSHA(fb.CommitSHA),
-					Method:     MethodExplicitID,
-					Confidence: 1.0,
-					Confirmed:  true,
-				}
+			if strings.TrimSpace(repoPath) == "" {
+				continue
 			}
+			resolved, err := ResolveCommitInRepo(ctx, repoPath, fb.CommitSHA)
+			if err != nil {
+				continue
+			}
+			synth := resolved
+			synth.BeadID = fb.BeadID
+			synth.Methods = []string{string(MethodExplicitID)}
 			reason := "confirmed by feedback (" + fb.FeedbackBy + ")"
 			if strings.TrimSpace(fb.Reason) != "" {
 				reason += ": " + strings.TrimSpace(fb.Reason)

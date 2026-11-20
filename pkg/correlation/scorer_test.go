@@ -14,11 +14,12 @@ func TestValidateConfidence(t *testing.T) {
 		confidence float64
 		want       bool
 	}{
-		// CoCommitted: 0.85-0.99
+		// CoCommitted: 0.80-0.99 (matches CoCommitExtractor.calculateConfidence min 0.95 - 0.10 - 0.05 = 0.80)
 		{MethodCoCommitted, 0.90, true},
 		{MethodCoCommitted, 0.85, true},
+		{MethodCoCommitted, 0.80, true},
 		{MethodCoCommitted, 0.99, true},
-		{MethodCoCommitted, 0.84, false},
+		{MethodCoCommitted, 0.79, false},
 		{MethodCoCommitted, 1.00, false},
 
 		// ExplicitID: 0.70-0.99

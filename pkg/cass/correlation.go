@@ -439,11 +439,6 @@ func (c *Correlator) searchByIssueIDs(ctx context.Context, issue *model.Issue, n
 	return c.rankAndLimit(merged), totalFound, stop
 }
 
-// searchByID searches for the bead ID literally in sessions.
-func (c *Correlator) searchByID(ctx context.Context, beadID string) ([]ScoredResult, SearchMeta) {
-	return c.searchByIDInWorkspace(ctx, beadID, c.workspace)
-}
-
 func splitASCIIAlnumSubtokens(s string) []string {
 	var tokens []string
 	start := -1

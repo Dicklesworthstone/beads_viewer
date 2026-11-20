@@ -491,6 +491,9 @@ func TestMR7_FullDeletionParityAcrossPatchSnapshotAndCausal(t *testing.T) {
 			runGitMR7(t, repo, "commit", "-q", "-m", "delete issues.jsonl")
 
 			// Commit 3: recreate .beads/issues.jsonl with bv-keep1
+			if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+				t.Fatal(err)
+			}
 			line3 := fmt.Sprintf(`{"id":"bv-keep1","title":"Recreated","status":"open","description":%q}`+"\n", pad)
 			if err := os.WriteFile(jsonlPath, []byte(line3), 0o644); err != nil {
 				t.Fatal(err)
