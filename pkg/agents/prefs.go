@@ -92,6 +92,9 @@ func projectHash(workDir string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil && resolved != "" {
+		abs = resolved
+	}
 	hash := sha256.Sum256([]byte(abs))
 	return hex.EncodeToString(hash[:8]), nil
 }

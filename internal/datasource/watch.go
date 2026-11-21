@@ -199,6 +199,23 @@ func matchEventToSource(source DataSource, watchedTargets []string, cleanEvent s
 		if cleanEvent == prevPrimary || (source.Type == SourceTypeSQLite && cleanEvent == prevPrimary+"-wal") {
 			return op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename|fsnotify.Remove) != 0
 		}
+		// On macOS/BSD kqueue, atomically replacing a symlink via symlink(target, tmp)
+		// + rename(tmp, link) may emit CREATE for tmp before rename completes and no
+		// event for link itself. When source.Path is a symlink and an entry is
+		// created/renamed/removed in its directory, let the trailing-edge debouncer
+		// re-resolve the symlink target after the rename settles.
+		isSymlink := resolvedMain != cleanOrig && resolvedMain != absOrig
+		if (resolvedMain != prevPrimary || isSymlink) && op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename|fsnotify.Remove) != 0 {
+			eventDir := filepath.Clean(filepath.Dir(cleanEvent))
+			origDir := filepath.Clean(filepath.Dir(cleanOrig))
+			absDir := filepath.Clean(filepath.Dir(absOrig))
+			if eventDir == origDir || eventDir == absDir {
+				return true
+			}
+			if evalDir, err := filepath.EvalSymlinks(origDir); err == nil && filepath.Clean(evalDir) == eventDir {
+				return true
+			}
+		}
 	}
 	return false
 }
@@ -366,10 +383,37 @@ func (sw *SourceWatcher) fireDebouncedSource(sourcePath, eventName string, seq u
 
 // run is the main event loop for the watcher
 func (sw *SourceWatcher) run() {
+	// On macOS/BSD kqueue, atomically replacing an existing symlink via
+	// symlink(target, tmp) + rename(tmp, link) can complete before fsnotify scans
+	// the directory, emitting zero events because the entry name is unchanged.
+	// Periodically re-check symlink targets (no-op when no sources are symlinks).
+	symlinkCheckTicker := time.NewTicker(100 * time.Millisecond)
+	defer symlinkCheckTicker.Stop()
+
 	for {
 		select {
 		case <-sw.done:
 			return
+
+		case <-symlinkCheckTicker.C:
+			sw.mu.Lock()
+			if sw.stopped {
+				sw.mu.Unlock()
+				return
+			}
+			for i := range sw.sources {
+				src := sw.sources[i]
+				watched := sw.sourceWatches[src.Path]
+				if len(watched) == 0 {
+					continue
+				}
+				resolvedNow := filepath.Clean(resolveSourceTargetPath(src.Path))
+				if resolvedNow != "" && resolvedNow != watched[0] {
+					sw.syncSourceWatchesLocked(src)
+					sw.scheduleDebouncedLocked(src, src.Path)
+				}
+			}
+			sw.mu.Unlock()
 
 		case event, ok := <-sw.watcher.Events:
 			if !ok {

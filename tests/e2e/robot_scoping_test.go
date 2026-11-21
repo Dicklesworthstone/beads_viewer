@@ -30,6 +30,9 @@ func TestRobotActionRoutesLiveTrackers(t *testing.T) {
 		bv = control // Explicit old-binary negative control against this same fixture.
 	}
 	root := t.TempDir()
+	if resolved, err := filepath.EvalSymlinks(root); err == nil {
+		root = resolved
+	}
 	cleanEnv := func(dir string) []string {
 		var environment []string
 		for _, item := range os.Environ() {

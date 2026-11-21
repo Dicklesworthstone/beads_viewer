@@ -4759,13 +4759,24 @@ type workspaceSharedGitMeta struct {
 	storeDirsByRoot map[string][]string
 }
 
+func canonicalWorkspacePath(p string) string {
+	clean := filepath.Clean(p)
+	if resolved, err := filepath.EvalSymlinks(clean); err == nil && resolved != "" {
+		return filepath.Clean(resolved)
+	}
+	if resolvedDir, err := filepath.EvalSymlinks(filepath.Dir(clean)); err == nil && resolvedDir != "" {
+		return filepath.Clean(filepath.Join(resolvedDir, filepath.Base(clean)))
+	}
+	return clean
+}
+
 func workspaceSourceIdentityKey(ws workspaceCorrelationSource) string {
-	return filepath.Clean(ws.repoRoot) + "|" + filepath.Clean(ws.beadsPath) + "|" + strings.ToLower(strings.TrimSpace(ws.source.SourceRepo))
+	return canonicalWorkspacePath(ws.repoRoot) + "|" + canonicalWorkspacePath(ws.beadsPath) + "|" + strings.ToLower(strings.TrimSpace(ws.source.SourceRepo))
 }
 
 func storeDirRelForWorkspaceSource(ws workspaceCorrelationSource) string {
-	cleanRoot := filepath.Clean(ws.repoRoot)
-	storeDir := filepath.Clean(filepath.Dir(ws.beadsPath))
+	cleanRoot := canonicalWorkspacePath(ws.repoRoot)
+	storeDir := canonicalWorkspacePath(filepath.Dir(ws.beadsPath))
 	rel, err := filepath.Rel(cleanRoot, storeDir)
 	if err != nil || rel == "." || rel == "" || strings.HasPrefix(rel, "..") {
 		return ""
@@ -4774,8 +4785,8 @@ func storeDirRelForWorkspaceSource(ws workspaceCorrelationSource) string {
 }
 
 func storeSubtreePrefixForWorkspaceSource(ws workspaceCorrelationSource) string {
-	cleanRoot := filepath.Clean(ws.repoRoot)
-	storeDir := filepath.Clean(filepath.Dir(ws.beadsPath))
+	cleanRoot := canonicalWorkspacePath(ws.repoRoot)
+	storeDir := canonicalWorkspacePath(filepath.Dir(ws.beadsPath))
 	containerDir := filepath.Dir(storeDir)
 	if filepath.Base(containerDir) == ".beads" {
 		containerDir = filepath.Dir(containerDir)

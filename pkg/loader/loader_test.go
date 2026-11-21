@@ -86,13 +86,18 @@ func TestIssueOriginsStyledTrackerCapabilities(t *testing.T) {
 			issues := []model.Issue{{ID: "local-1", Title: "Readable analysis"}}
 			loader.AttachIssueOrigins(issues, filepath.Join(beadsDir, "issues.jsonl"), true)
 			actions := issues[0].Actions(true)
+			wantRoot := root
+			if resolved, err := filepath.EvalSymlinks(root); err == nil && resolved != "" {
+				wantRoot = resolved
+			}
 			if tc.wantRoute {
-				if actions.Show == nil || (actions.Claim != nil) != tc.wantClaim || actions.WorkingDirectory != root {
+				if actions.Show == nil || (actions.Claim != nil) != tc.wantClaim || actions.WorkingDirectory != wantRoot {
 					t.Fatalf("styled supported flags lost exact source route: %+v", actions)
 				}
-				database := filepath.Join(beadsDir, "beads.db")
-				wantArgv := []string{"env", "BEADS_DIR=" + beadsDir, "BEADS_DB=" + database, "BD_DB=" + database,
-					executable, "--db", database, "--no-auto-import", "--no-auto-flush", "show", "--json", "--", "local-1"}
+				wantBeadsDir := filepath.Join(wantRoot, ".beads")
+				wantDatabase := filepath.Join(wantBeadsDir, "beads.db")
+				wantArgv := []string{"env", "BEADS_DIR=" + wantBeadsDir, "BEADS_DB=" + wantDatabase, "BD_DB=" + wantDatabase,
+					executable, "--db", wantDatabase, "--no-auto-import", "--no-auto-flush", "show", "--json", "--", "local-1"}
 				if !reflect.DeepEqual(actions.Show.Argv, wantArgv) {
 					t.Fatalf("styled help changed exact inspection route: got %q, want %q", actions.Show.Argv, wantArgv)
 				}
@@ -535,9 +540,13 @@ cat "$BV_TEST_EXPORT_PAYLOAD" > "$3"
 			if err := os.WriteFile(filepath.Join(binDir, "bd"), []byte(script), 0o700); err != nil {
 				t.Fatal(err)
 			}
+			expectedRoot := root
+			if resolved, err := filepath.EvalSymlinks(root); err == nil && resolved != "" {
+				expectedRoot = resolved
+			}
 			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 			t.Setenv("BV_TEST_EXPECTED_BEADS", beadsDir)
-			t.Setenv("BV_TEST_EXPECTED_ROOT", root)
+			t.Setenv("BV_TEST_EXPECTED_ROOT", expectedRoot)
 			t.Setenv("BV_TEST_EXPORT_PAYLOAD", payloadPath)
 			t.Setenv("BEADS_DIR", filepath.Join(root, "wrong-beads"))
 			t.Setenv("BEADS_DB", filepath.Join(root, "wrong-database"))

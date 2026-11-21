@@ -24,7 +24,11 @@ func TestRobotCycleSuggestionRepairsImportedTracker(t *testing.T) {
 	if err != nil {
 		t.Skip("cycle repair proof requires installed br; synthetic route tests are not a substitute")
 	}
-	dir := filepath.Join(t.TempDir(), "legacy cycle ' tracker")
+	tempRoot := t.TempDir()
+	if resolved, err := filepath.EvalSymlinks(tempRoot); err == nil {
+		tempRoot = resolved
+	}
+	dir := filepath.Join(tempRoot, "legacy cycle ' tracker")
 	var environment []string
 	for _, item := range os.Environ() {
 		key := strings.SplitN(item, "=", 2)[0]
@@ -168,6 +172,9 @@ func TestRobotSuggestionsExecuteOnlyVerifiedTracker(t *testing.T) {
 		bv = control
 	}
 	root := t.TempDir()
+	if resolved, err := filepath.EvalSymlinks(root); err == nil {
+		root = resolved
+	}
 	var environment []string
 	for _, item := range os.Environ() {
 		key := strings.SplitN(item, "=", 2)[0]

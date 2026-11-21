@@ -1571,7 +1571,11 @@ func TestOpenInEditorWithArguments(t *testing.T) {
 	if !strings.Contains(m.statusMsg, "Opened in") {
 		t.Fatalf("expected 'Opened in' message, got %q", m.statusMsg)
 	}
-	assertTestGUIEditorArgs(t, capture, []string{beadsFile})
+	wantBeadsFile := beadsFile
+	if resolved, err := filepath.EvalSymlinks(beadsFile); err == nil && resolved != "" {
+		wantBeadsFile = resolved
+	}
+	assertTestGUIEditorArgs(t, capture, []string{wantBeadsFile})
 
 	// Also test terminal editor detection with arguments (e.g., "vim -u NONE")
 	// Now dispatches via TUI suspend (bv-134); with no issue selected, returns error
@@ -1850,7 +1854,11 @@ func TestOpenInEditorMissingAndGUI(t *testing.T) {
 	if m.statusIsError || !strings.Contains(m.statusMsg, "Opened in") {
 		t.Fatalf("expected success opening editor, got %q", m.statusMsg)
 	}
-	assertTestGUIEditorArgs(t, capture, []string{beadsFile})
+	wantBeadsFile := beadsFile
+	if resolved, err := filepath.EvalSymlinks(beadsFile); err == nil && resolved != "" {
+		wantBeadsFile = resolved
+	}
+	assertTestGUIEditorArgs(t, capture, []string{wantBeadsFile})
 }
 
 func TestExportToMarkdownCreatesFile(t *testing.T) {

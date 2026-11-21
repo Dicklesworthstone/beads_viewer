@@ -5272,8 +5272,12 @@ func TestWave13Round1AuditRemediations(t *testing.T) {
 		m.SetWorkDir(realProjDir)
 		m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
 
-		if gotPath, guiErr := m.guiEditorPath(); guiErr != nil || gotPath != jsonlPath {
-			t.Fatalf("initial guiEditorPath() = (%q, %v), want (%q, nil)", gotPath, guiErr, jsonlPath)
+		wantJSONLPath := jsonlPath
+		if resolved, err := filepath.EvalSymlinks(jsonlPath); err == nil && resolved != "" {
+			wantJSONLPath = resolved
+		}
+		if gotPath, guiErr := m.guiEditorPath(); guiErr != nil || gotPath != wantJSONLPath {
+			t.Fatalf("initial guiEditorPath() = (%q, %v), want (%q, nil)", gotPath, guiErr, wantJSONLPath)
 		}
 
 		// 1) Reload switches .jsonl -> .db with SourceDegraded=true: guiEditorPath() must immediately reject .db,
@@ -5322,8 +5326,8 @@ func TestWave13Round1AuditRemediations(t *testing.T) {
 		if m.beadsPath != jsonlPath || m.sourceDegraded || m.authorityIncomplete {
 			t.Fatalf("after .db->.jsonl reload: beadsPath=%q degraded=%v incomplete=%v", m.beadsPath, m.sourceDegraded, m.authorityIncomplete)
 		}
-		if gotPath, guiErr := m.guiEditorPath(); guiErr != nil || gotPath != jsonlPath {
-			t.Fatalf("after .db->.jsonl reload, guiEditorPath() = (%q, %v), want (%q, nil)", gotPath, guiErr, jsonlPath)
+		if gotPath, guiErr := m.guiEditorPath(); guiErr != nil || gotPath != wantJSONLPath {
+			t.Fatalf("after .db->.jsonl reload, guiEditorPath() = (%q, %v), want (%q, nil)", gotPath, guiErr, wantJSONLPath)
 		}
 		if m.backgroundWorker != nil {
 			t.Fatalf("expected sourceReload != nil NOT to auto-promote to JSONL-only BackgroundWorker; status=%q", m.statusMsg)
