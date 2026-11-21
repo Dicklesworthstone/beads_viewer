@@ -352,7 +352,7 @@ func GetKeyBindingDocs() []KeyBindingDoc {
 		{">", "Narrow detail panel", "Insights", "insights"},
 
 		// History View (h)
-		{"g", "Go to top", "History", "history"},
+		{"g", "Jump to graph view", "History", "history"},
 		{"v", "Toggle git/bead mode", "History", "history"},
 		{"/", "Search history", "History", "history"},
 		{"A", "Filter by commit author", "History", "history"},

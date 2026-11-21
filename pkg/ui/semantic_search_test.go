@@ -211,12 +211,19 @@ func TestSemanticSearchFilterEmptyTerm(t *testing.T) {
 	ss := NewSemanticSearch()
 
 	targets := []string{"fix bug", "add feature", "update docs"}
-	ranks := ss.Filter("", targets)
 
-	// Empty term returns default filter results
-	// DefaultFilter with empty term returns empty slice (no matches)
-	// This is the expected behavior - empty search shows all without ranking
-	_ = ranks // Result depends on DefaultFilter behavior
+	// Empty or whitespace-only term preserves existing sort order across all targets (indices 0..len-1).
+	for _, term := range []string{"", "   "} {
+		got := ss.Filter(term, targets)
+		if len(got) != len(targets) {
+			t.Fatalf("Filter(%q, targets) returned %d ranks, want %d", term, len(got), len(targets))
+		}
+		for i := range targets {
+			if got[i].Index != i {
+				t.Fatalf("Filter(%q, targets)[%d].Index = %d, want %d", term, i, got[i].Index, i)
+			}
+		}
+	}
 }
 
 func TestSemanticSearchFilterNotReady(t *testing.T) {

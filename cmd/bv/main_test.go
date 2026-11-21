@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"runtime"
 	"sort"
 	"strconv"
@@ -3593,19 +3594,122 @@ func TestRobotRegistry_TotalContract(t *testing.T) {
 				}
 			}
 
-			// Dimension 2 (RC-C37): Verify every documented Param flag is a real registered flag.
-			for _, rawParam := range doc.Params {
-				tok := strings.Fields(rawParam)[0]
-				if !strings.HasPrefix(tok, "--") {
-					t.Errorf("%s: documented Param %q does not start with --", cmdName, rawParam)
-					continue
-				}
-				flagName := strings.TrimPrefix(tok, "--")
-				if flag.CommandLine.Lookup(flagName) == nil && !primary[flagName] {
-					// Check --robot-help / --help text via live flag check only if flag.CommandLine wasn't populated in unit test process.
-					_ = flagName
+			// Dimension 2 (RC-C37): Verify every documented Param flag is a real registered
+			// flag in live `--help` and is permitted by cliModifierFlagRules(true) for cmdName.
+			// Checked via verifyRobotDocParamsAgainstLiveFlags below.
+		}
+	}
+
+	// Dimension 2 & Exhaustive Flag Classification (RC-C37):
+	// Parse EVERY real registered flag from live `exe --help` and enforce:
+	// (a) Every doc.Params entry across all 46 commands is a real registered flag AND
+	//     when governed by cliModifierFlagRules(true), cmdName (or its group peer) is allowed;
+	// (b) Every flag in cliPrimaryRobotCommandGroups() & cliModifierFlagRules(true) exists in --help;
+	// (c) Every registered primary robot command is classified in cliPrimaryRobotCommandGroups();
+	// (d) Every live --help flag is classified (primary command, modifier rule, or global option).
+	cliHelpOut, cliHelpErr, _ := runCommandWithTimeout(t, tmpDir, exe, "--help")
+	helpText := cliHelpOut + "\n" + cliHelpErr
+	registeredFlags := make(map[string]bool)
+	longFlagRe := regexp.MustCompile(`^  (?:-[A-Za-z0-9], |    )--([a-z0-9][a-z0-9-]*)`)
+	for _, line := range strings.Split(helpText, "\n") {
+		if m := longFlagRe.FindStringSubmatch(line); len(m) == 2 {
+			registeredFlags[m[1]] = true
+		}
+	}
+	if len(registeredFlags) < 80 {
+		t.Fatalf("expected >=80 registered flags parsed from live --help, got %d\n%s", len(registeredFlags), helpText)
+	}
+
+	modRules := cliModifierFlagRules(true)
+	modRuleMap := make(map[string]map[string]bool, len(modRules))
+	for _, r := range modRules {
+		if !registeredFlags[r.modifier] {
+			t.Errorf("cliModifierFlagRules references unregistered flag --%s", r.modifier)
+		}
+		req := make(map[string]bool, len(r.requires))
+		for _, p := range r.requires {
+			req[p] = true
+		}
+		modRuleMap[r.modifier] = req
+	}
+
+	primaryGroups := cliPrimaryRobotCommandGroups()
+	classifiedPrimary := make(map[string]bool)
+	peerGroup := make(map[string][]string)
+	for _, g := range primaryGroups {
+		for _, f := range g.flags {
+			if !registeredFlags[f] {
+				t.Errorf("cliPrimaryRobotCommandGroups references unregistered flag --%s", f)
+			}
+			classifiedPrimary[f] = true
+			peerGroup[f] = g.flags
+		}
+	}
+	for cmdName := range primary {
+		if !classifiedPrimary[cmdName] {
+			t.Errorf("registered robot command --%s is missing from cliPrimaryRobotCommandGroups()", cmdName)
+		}
+	}
+
+	validateDocParam := func(cmdName, rawParam string) error {
+		tok := strings.Fields(rawParam)[0]
+		if !strings.HasPrefix(tok, "--") {
+			return fmt.Errorf("%s: documented Param %q does not start with --", cmdName, rawParam)
+		}
+		flagName := strings.TrimPrefix(tok, "--")
+		if eq := strings.IndexByte(flagName, '='); eq >= 0 {
+			flagName = flagName[:eq]
+		}
+		if !registeredFlags[flagName] {
+			return fmt.Errorf("%s: documented Param --%s is not a registered CLI flag in --help", cmdName, flagName)
+		}
+		if req, governed := modRuleMap[flagName]; governed {
+			allowed := req[cmdName]
+			if !allowed {
+				for _, peer := range peerGroup[cmdName] {
+					if req[peer] {
+						allowed = true
+						break
+					}
 				}
 			}
+			if !allowed {
+				var allowedList []string
+				for k := range req {
+					allowedList = append(allowedList, k)
+				}
+				sort.Strings(allowedList)
+				return fmt.Errorf("%s: documented Param --%s is rejected by cliModifierFlagRules for %s (requires one of %v)", cmdName, flagName, cmdName, allowedList)
+			}
+		}
+		return nil
+	}
+
+	for cmdName, doc := range docs {
+		for _, rawParam := range doc.Params {
+			if err := validateDocParam(cmdName, rawParam); err != nil {
+				t.Error(err)
+			}
+		}
+	}
+	// Planted negative controls proving Dimension 2 validator is non-vacuous:
+	if err := validateDocParam("robot-triage", "--bogus-nonexistent-flag"); err == nil {
+		t.Fatal("planted negative control failed: validateDocParam accepted --bogus-nonexistent-flag")
+	}
+	if err := validateDocParam("robot-next", "--graph-format"); err == nil {
+		t.Fatal("planted negative control failed: validateDocParam accepted --graph-format on robot-next")
+	}
+
+	// Exhaustive flag classification: every flag in --help must be in primaryGroups, modRules, or knownGlobalFlags.
+	knownGlobalFlags := map[string]bool{
+		"as-of": true, "background-mode": true, "cpu-profile": true, "db": true, "emit-script": true, "force-full-analysis": true,
+		"format": true, "help": true, "id-pattern": true, "label": true, "no-background-mode": true, "no-cache": true,
+		"no-hooks": true, "no-live-reload": true, "no-saved-config": true, "profile-startup": true,
+		"recipe": true, "repo": true, "stats": true, "theme": true, "workspace": true, "yes": true,
+	}
+	for flagName := range registeredFlags {
+		if !classifiedPrimary[flagName] && modRuleMap[flagName] == nil && !knownGlobalFlags[flagName] {
+			t.Errorf("registered CLI flag --%s is unclassified (missing from primaryRobotCommandGroups, modifierRules, and knownGlobalFlags)", flagName)
 		}
 	}
 

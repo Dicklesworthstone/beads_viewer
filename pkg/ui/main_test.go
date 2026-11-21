@@ -16,6 +16,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/muesli/termenv"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/cass"
@@ -1139,17 +1140,30 @@ func TestRC38_DisplayWidthUTF8ThemeModalsBoardCacheAndUnifiedHelp(t *testing.T) 
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 60, Height: 14})
 	m = updated.(*Model)
 
-	// 1. VelocityComparison UTF-8 safety across widths & RenderDebugView("velocity")
-	for _, w := range []int{40, 60, 80, 120} {
-		out := m.RenderDebugView("velocity", w, 24)
-		if strings.HasPrefix(out, "Unknown view:") {
-			t.Fatalf("RenderDebugView(\"velocity\") unsupported: %q", out)
-		}
-		if !utf8.ValidString(out) {
-			t.Fatalf("RenderDebugView(\"velocity\", %d, 24) emitted invalid UTF-8", w)
-		}
-		if strings.Contains(out, "─ stabl") && !strings.Contains(out, "─ stable") {
-			t.Fatalf("VelocityComparison truncated UTF-8 '─ stable' into '─ stabl' at width %d:\n%s", w, ansi.Strip(out))
+	// 1. All 13 RenderDebugView views at (60x14, 80x24, 100x30, 140x40) with TrueColor
+	// must emit valid UTF-8, fit within W display cells on every line, and preserve '─ stable'.
+	prevProfile := lipgloss.ColorProfile()
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	t.Cleanup(func() { lipgloss.SetColorProfile(prevProfile) })
+	allDebugViews := []string{"list", "triage", "insights", "board", "history", "graph", "tree", "actionable", "sprint", "flow", "attention", "labels", "velocity"}
+	for _, dim := range [][2]int{{60, 14}, {80, 24}, {100, 30}, {140, 40}} {
+		w, h := dim[0], dim[1]
+		for _, viewName := range allDebugViews {
+			out := m.RenderDebugView(viewName, w, h)
+			if strings.HasPrefix(out, "Unknown view:") {
+				t.Fatalf("RenderDebugView(%q) unsupported: %q", viewName, out)
+			}
+			if !utf8.ValidString(out) {
+				t.Fatalf("RenderDebugView(%q, %d, %d) emitted invalid UTF-8", viewName, w, h)
+			}
+			for lineIdx, line := range strings.Split(out, "\n") {
+				if lineW := ansi.StringWidth(line); lineW > w {
+					t.Fatalf("RenderDebugView(%q, %d, %d) line %d overflowed width: %d > %d (%q)", viewName, w, h, lineIdx+1, lineW, w, ansi.Strip(line))
+				}
+			}
+			if viewName == "velocity" && strings.Contains(out, "─ stabl") && !strings.Contains(out, "─ stable") {
+				t.Fatalf("VelocityComparison truncated UTF-8 '─ stable' into '─ stabl' at %dx%d:\n%s", w, h, ansi.Strip(out))
+			}
 		}
 	}
 

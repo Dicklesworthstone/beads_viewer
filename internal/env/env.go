@@ -268,7 +268,7 @@ var (
 
 	SemanticModel = register(Var{
 		Name:        "BV_SEMANTIC_MODEL",
-		Description: "Model name for a future non-hash provider; ignored by `hash`.",
+		Description: "Model identifier folded into the `hash` embedder's FNV-1a token seed and search index cache filename (and reserved for future non-hash providers).",
 		Default:     "(empty)",
 	})
 
@@ -340,8 +340,8 @@ var (
 
 	WorkerLogLevel = register(Var{
 		Name:        "BV_WORKER_LOG_LEVEL",
-		Description: "Log level for the background snapshot worker.",
-		Default:     "(default)",
+		Description: "Log level for the background snapshot worker (`none`, `error`, `warn`, `info`, `debug`).",
+		Default:     "`none`",
 	})
 
 	WorkerMetrics = register(Var{

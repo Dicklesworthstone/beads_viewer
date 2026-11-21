@@ -2712,28 +2712,36 @@ func (h *HistoryModel) renderHeader() string {
 			Render("[/] search  [h] close")
 	}
 
-	// Combine title line with spacing
-	titleLineSpacerWidth := h.width - lipgloss.Width(title) - lipgloss.Width(rightContent)
+	// Combine title line with spacing and clamp all header rows to h.width so
+	// lipgloss.JoinVertical never widens the entire view past narrow widths (e.g. 60 cols).
+	maxW := h.width
+	if maxW < 1 {
+		maxW = 1
+	}
+	clampLine := func(s string) string {
+		if ansi.StringWidth(s) > maxW {
+			return ansi.Truncate(s, maxW, "…")
+		}
+		return s
+	}
+	titleLineSpacerWidth := maxW - lipgloss.Width(title) - lipgloss.Width(rightContent)
 	if titleLineSpacerWidth < 1 {
 		titleLineSpacerWidth = 1
 	}
 	titleLineSpacer := strings.Repeat(" ", titleLineSpacerWidth)
-	titleLine := lipgloss.JoinHorizontal(lipgloss.Top, title, titleLineSpacer, rightContent)
+	titleLine := clampLine(lipgloss.JoinHorizontal(lipgloss.Top, title, titleLineSpacer, rightContent))
 
 	// Build stats line (bv-y5sx)
-	statsLine := h.renderStatsLine()
+	statsLine := clampLine(h.renderStatsLine())
 
 	// Build filter status line (bv-y5sx)
-	filterLine := h.renderFilterLine()
+	filterLine := clampLine(h.renderFilterLine())
 
 	// Add separator line
-	separatorWidth := h.width
-	if separatorWidth < 1 {
-		separatorWidth = 1
-	}
+	separatorWidth := maxW
 	separator := t.Renderer.NewStyle().
 		Foreground(t.Muted).
-		Width(h.width).
+		Width(maxW).
 		Render(strings.Repeat("─", separatorWidth))
 
 	return lipgloss.JoinVertical(lipgloss.Left, titleLine, statsLine, filterLine, separator)
