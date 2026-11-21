@@ -3731,14 +3731,14 @@ func TestComputeBlockageCascadeAndAttention_DeduplicationScopeAndBlockImpact(t *
 		t.Fatalf("unscoped TotalBlocked = %d, want 4", unscopedCascade.TotalBlocked)
 	}
 
-	// Verify ComputeLabelAttentionScoresWithScope enforces BlockedCount == int(BlockImpact)
-	// and excludes closed dependents (DOWN-CLOSED) + out-of-scope labels (legacy/legacy-ui).
+	// Verify ComputeLabelAttentionScoresWithScope excludes closed dependents (DOWN-CLOSED)
+	// and out-of-scope labels (legacy/legacy-ui), and reports distinct BlockedCount (<= BlockImpact).
 	attn := ComputeLabelAttentionScoresWithScope(issues, cfg, now, readiness, candidates)
 	byLabel := make(map[string]LabelAttentionScore, len(attn.Labels))
 	for _, s := range attn.Labels {
 		byLabel[s.Label] = s
-		if s.BlockedCount != int(s.BlockImpact) {
-			t.Fatalf("label %q BlockedCount=%d != int(BlockImpact)=%d", s.Label, s.BlockedCount, int(s.BlockImpact))
+		if s.BlockedCount > int(s.BlockImpact) {
+			t.Fatalf("label %q BlockedCount=%d > int(BlockImpact)=%d", s.Label, s.BlockedCount, int(s.BlockImpact))
 		}
 	}
 	if _, leaked := byLabel["legacy"]; leaked {
@@ -3750,6 +3750,35 @@ func TestComputeBlockageCascadeAndAttention_DeduplicationScopeAndBlockImpact(t *
 	}
 	if byLabel["web"].BlockedCount != 0 || byLabel["web"].BlockImpact != 0.0 {
 		t.Fatalf("leaf label 'web' BlockedCount=%d BlockImpact=%f, want 0 / 0.0", byLabel["web"].BlockedCount, byLabel["web"].BlockImpact)
+	}
+
+	// Regression: two issues in the same label blocking ONE downstream issue must report
+	// BlockImpact == 2.0 (edges) and BlockedCount == 1 (distinct downstream blocked issues).
+	multiIssues := []model.Issue{
+		{ID: "M-1", Title: "Blocker 1", Status: model.StatusOpen, Labels: []string{"multi"}, UpdatedAt: now},
+		{ID: "M-2", Title: "Blocker 2", Status: model.StatusOpen, Labels: []string{"multi"}, UpdatedAt: now},
+		{
+			ID:        "M-DOWN",
+			Title:     "Single downstream",
+			Status:    model.StatusOpen,
+			Labels:    []string{"downstream"},
+			UpdatedAt: now,
+			Dependencies: []*model.Dependency{
+				{IssueID: "M-DOWN", DependsOnID: "M-1", Type: model.DepBlocks},
+				{IssueID: "M-DOWN", DependsOnID: "M-2", Type: model.DepBlocks},
+			},
+		},
+	}
+	multiAttn := ComputeLabelAttentionScores(multiIssues, cfg, now)
+	var multiScore *LabelAttentionScore
+	for i := range multiAttn.Labels {
+		if multiAttn.Labels[i].Label == "multi" {
+			multiScore = &multiAttn.Labels[i]
+			break
+		}
+	}
+	if multiScore == nil || multiScore.BlockImpact != 2.0 || multiScore.BlockedCount != 1 {
+		t.Fatalf("label 'multi' got %+v, want BlockImpact=2.0 BlockedCount=1", multiScore)
 	}
 }
 

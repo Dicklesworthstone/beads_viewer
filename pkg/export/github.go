@@ -9,6 +9,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -1140,8 +1141,12 @@ func buildDeploymentMetaURL(rawDeployURL string) (*url.URL, error) {
 }
 
 func fetchDeploymentMetaJSON(client *http.Client, baseMetaURL *url.URL, deadline time.Time) ([]byte, error) {
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return nil, context.DeadlineExceeded
+	}
 	reqTimeout := 10 * time.Second
-	if remaining := time.Until(deadline); remaining > 0 && remaining < reqTimeout {
+	if remaining < reqTimeout {
 		reqTimeout = remaining
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), reqTimeout)
@@ -1194,7 +1199,9 @@ func VerifyGitHubPagesDeployment(pagesURL string, expectedIssueCount int, timeou
 	for time.Now().Before(deadline) {
 		output, err := fetchDeploymentMetaJSON(httpClient, baseMetaURL, deadline)
 		if err != nil {
-			lastErr = fmt.Errorf("fetch failed: %w", err)
+			if lastErr == nil || !errors.Is(err, context.DeadlineExceeded) {
+				lastErr = fmt.Errorf("fetch failed: %w", err)
+			}
 			sleepDeploymentPoll(githubDeploymentPollInterval, deadline)
 			continue
 		}

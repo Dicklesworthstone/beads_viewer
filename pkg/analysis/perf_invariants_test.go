@@ -194,7 +194,7 @@ func TestComputeProjectVelocity_BucketsAndEstimated(t *testing.T) {
 			CreatedAt: created2DaysBefore(updated4),
 			UpdatedAt: updated4},
 
-		// Missing closed_at and updated_at -> fallback to now, mark Estimated.
+		// Missing both closed_at and updated_at -> rejected (never fabricated as closed at now).
 		{ID: "c5", Title: "closed5 (no timestamps)", Status: model.StatusClosed, IssueType: model.TypeTask, Priority: 2,
 			CreatedAt: created2DaysBefore(now)},
 	}
@@ -204,11 +204,11 @@ func TestComputeProjectVelocity_BucketsAndEstimated(t *testing.T) {
 		t.Fatal("expected velocity, got nil")
 	}
 
-	if v.ClosedLast7Days != 4 {
-		t.Fatalf("ClosedLast7Days: expected 4, got %d", v.ClosedLast7Days)
+	if v.ClosedLast7Days != 3 {
+		t.Fatalf("ClosedLast7Days: expected 3, got %d", v.ClosedLast7Days)
 	}
-	if v.ClosedLast30Days != 5 {
-		t.Fatalf("ClosedLast30Days: expected 5, got %d", v.ClosedLast30Days)
+	if v.ClosedLast30Days != 4 {
+		t.Fatalf("ClosedLast30Days: expected 4, got %d", v.ClosedLast30Days)
 	}
 	if !v.Estimated {
 		t.Fatal("expected Estimated=true due to missing closed_at timestamps")
@@ -216,7 +216,7 @@ func TestComputeProjectVelocity_BucketsAndEstimated(t *testing.T) {
 
 	// Weekly buckets: Monday starts for ISO weeks containing now.
 	wantWeeks := []VelocityWeek{
-		{WeekStart: time.Date(2025, 12, 15, 0, 0, 0, 0, time.UTC), Closed: 4},
+		{WeekStart: time.Date(2025, 12, 15, 0, 0, 0, 0, time.UTC), Closed: 3},
 		{WeekStart: time.Date(2025, 12, 8, 0, 0, 0, 0, time.UTC), Closed: 1},
 		{WeekStart: time.Date(2025, 12, 1, 0, 0, 0, 0, time.UTC), Closed: 0},
 	}

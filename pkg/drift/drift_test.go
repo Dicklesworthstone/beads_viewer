@@ -2868,14 +2868,11 @@ func TestLoadConfig_SourceDriftMaxAlertsZeroUnlimitedOn15DriftedIssues(t *testin
 		t.Fatalf("expected all 15 alerts when source_drift_max_alerts: 0, got %d", len(got))
 	}
 
-	// Verify negative SourceDriftMaxAlerts normalizes back to default 10 in Validate().
+	// Verify negative SourceDriftMaxAlerts is rejected by Validate().
 	negCfg := DefaultConfig()
 	negCfg.SourceDriftMaxAlerts = -5
-	if err := negCfg.Validate(); err != nil {
-		t.Fatalf("Validate with negative SourceDriftMaxAlerts: %v", err)
-	}
-	if negCfg.SourceDriftMaxAlerts != 10 {
-		t.Fatalf("expected negative SourceDriftMaxAlerts to normalize to 10, got %d", negCfg.SourceDriftMaxAlerts)
+	if err := negCfg.Validate(); err == nil {
+		t.Fatalf("expected Validate to reject negative SourceDriftMaxAlerts (-5), got nil")
 	}
 
 	// Verify source_drift_alert: false disables AlertSourceInconsistency.
@@ -3321,6 +3318,38 @@ func TestRC36_DriftP0ConfigDuplicateLabelsAndInfoSuggestedActions(t *testing.T) 
 	}
 	if loaded.DuplicateMaxAlerts != 0 {
 		t.Fatalf("DuplicateMaxAlerts = %d, want 0 (explicit unlimited overwritten)", loaded.DuplicateMaxAlerts)
+	}
+
+	// Negative source_drift_max_alerts must return a validation error instead of silently resetting.
+	negDir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(negDir, ".bv"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(ConfigPath(negDir), []byte("source_drift_max_alerts: -1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(negDir); err == nil {
+		t.Fatalf("expected LoadConfig to reject negative source_drift_max_alerts: -1")
+	}
+
+	// duplicate_max_alerts: 0 (unlimited) must emit all 28 pairs for 8 identical-title open issues (not capped at 20).
+	dupNow := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	eightDups := make([]model.Issue, 8)
+	for i := range eightDups {
+		eightDups[i] = model.Issue{
+			ID:        fmt.Sprintf("DUP-%02d", i+1),
+			Title:     "Identical OAuth callback token validation regression",
+			Status:    model.StatusOpen,
+			Priority:  2,
+			Labels:    []string{"auth"},
+			UpdatedAt: dupNow,
+		}
+	}
+	calcUnlim := NewCalculator(&baseline.Baseline{Version: 1}, &baseline.Baseline{Version: 1}, loaded)
+	calcUnlim.SetNow(dupNow)
+	calcUnlim.SetIssues(eightDups)
+	if got := alertsOfType(calcUnlim.Calculate(), AlertPotentialDuplicate); len(got) != 28 {
+		t.Fatalf("duplicate_max_alerts: 0 emitted %d AlertPotentialDuplicate alerts for 8 identical issues, want 28 (unlimited)", len(got))
 	}
 
 	// Verify P0-only config fires AlertHighImpactUnblock for P0 dependent and ignores P1-only dependents.

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -486,11 +487,34 @@ func TestMR7_FullDeletionParityAcrossPatchSnapshotAndCausal(t *testing.T) {
 			runGitMR7(t, repo, "add", ".beads/issues.jsonl")
 			runGitMR7(t, repo, "commit", "-q", "-m", "create bv-del1")
 
-			// Commit 2: full-file deletion of .beads/issues.jsonl
+			// Commit 2: claim bv-del1 (open -> in_progress)
+			lineClaim := fmt.Sprintf(`{"id":"bv-del1","title":"Will be deleted","status":"in_progress","description":%q}`+"\n", pad)
+			if err := os.WriteFile(jsonlPath, []byte(lineClaim), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			runGitMR7(t, repo, "add", ".beads/issues.jsonl")
+			runGitMR7(t, repo, "commit", "-q", "-m", "claim bv-del1")
+
+			// Commit 3: close bv-del1 (in_progress -> closed)
+			lineClose := fmt.Sprintf(`{"id":"bv-del1","title":"Will be deleted","status":"closed","description":%q}`+"\n", pad)
+			if err := os.WriteFile(jsonlPath, []byte(lineClose), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			runGitMR7(t, repo, "add", ".beads/issues.jsonl")
+			runGitMR7(t, repo, "commit", "-q", "-m", "close bv-del1")
+
+			// Commit 4: reopen bv-del1 (closed -> open)
+			if err := os.WriteFile(jsonlPath, []byte(line1), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			runGitMR7(t, repo, "add", ".beads/issues.jsonl")
+			runGitMR7(t, repo, "commit", "-q", "-m", "reopen bv-del1")
+
+			// Commit 5: full-file deletion of .beads/issues.jsonl
 			runGitMR7(t, repo, "rm", "-q", ".beads/issues.jsonl")
 			runGitMR7(t, repo, "commit", "-q", "-m", "delete issues.jsonl")
 
-			// Commit 3: recreate .beads/issues.jsonl with bv-keep1
+			// Commit 6: recreate .beads/issues.jsonl with bv-keep1
 			if err := os.MkdirAll(beadsDir, 0o755); err != nil {
 				t.Fatal(err)
 			}
@@ -511,21 +535,27 @@ func TestMR7_FullDeletionParityAcrossPatchSnapshotAndCausal(t *testing.T) {
 			if err != nil {
 				t.Fatalf("extractViaSnapshots: %v", err)
 			}
-			if len(patchEvents) != len(snapEvents) {
-				t.Fatalf("event count mismatch: patch=%d snap=%d\npatch=%+v\nsnap=%+v", len(patchEvents), len(snapEvents), patchEvents, snapEvents)
+			patchJSON, err := json.Marshal(patchEvents)
+			if err != nil {
+				t.Fatalf("marshal patchEvents: %v", err)
 			}
-			foundDeleted := false
-			for i := range patchEvents {
-				p, s := patchEvents[i], snapEvents[i]
-				if p.BeadID != s.BeadID || p.EventType != s.EventType || p.CommitSHA != s.CommitSHA {
-					t.Fatalf("event[%d] diverged: patch=%+v snap=%+v", i, p, s)
-				}
-				if s.BeadID == "bv-del1" && s.EventType == EventDeleted {
-					foundDeleted = true
+			snapJSON, err := json.Marshal(snapEvents)
+			if err != nil {
+				t.Fatalf("marshal snapEvents: %v", err)
+			}
+			if string(patchJSON) != string(snapJSON) {
+				t.Fatalf("MR-7 byte-identical []BeadEvent mismatch (padSize=%d):\npatch=%s\nsnap=%s", tc.padSize, patchJSON, snapJSON)
+			}
+			seenTypes := map[EventType]bool{}
+			for _, ev := range snapEvents {
+				if ev.BeadID == "bv-del1" {
+					seenTypes[ev.EventType] = true
 				}
 			}
-			if !foundDeleted {
-				t.Fatalf("expected EventDeleted for bv-del1 across full-file deletion commit, got %+v", snapEvents)
+			for _, wantType := range []EventType{EventCreated, EventClaimed, EventClosed, EventReopened, EventDeleted} {
+				if !seenTypes[wantType] {
+					t.Fatalf("missing expected lifecycle event %q for bv-del1; got %+v", wantType, snapEvents)
+				}
 			}
 
 			// Verify extractCausalHistory also observes the deletion commit for bv-del1.

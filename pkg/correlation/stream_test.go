@@ -35,7 +35,7 @@ func TestNewStreamExtractorPrefersCanonicalBeadsJSONL(t *testing.T) {
 	writeHistorySelectionFiles(t, repoPath)
 
 	s := NewStreamExtractor(repoPath)
-	if got, want := s.primaryBeadsFile(), ".beads/beads.jsonl"; got != want {
+	if got, want := s.primaryBeadsFile(), ".beads/issues.jsonl"; got != want {
 		t.Fatalf("primaryBeadsFile = %s, want %s", got, want)
 	}
 }

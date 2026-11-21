@@ -1,8 +1,11 @@
 package export
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -576,5 +579,68 @@ func TestVerifyCloudflareDeployment_RejectsEmptyObjectAndHandlesQueryFragmentURL
 	}
 	if calls.Load() < 2 || sawBranchQuery.Load() < 2 || sawCacheBuster.Load() < 2 {
 		t.Fatalf("calls=%d sawBranchQuery=%d sawCacheBuster=%d, want >=2 each", calls.Load(), sawBranchQuery.Load(), sawCacheBuster.Load())
+	}
+}
+
+func TestFetchDeploymentMetaJSON_ExpiredDeadlineAndSemanticErrorPreservation(t *testing.T) {
+	origCF := cloudflareDeploymentPollInterval
+	origGH := githubDeploymentPollInterval
+	cloudflareDeploymentPollInterval = 15 * time.Millisecond
+	githubDeploymentPollInterval = 15 * time.Millisecond
+	t.Cleanup(func() {
+		cloudflareDeploymentPollInterval = origCF
+		githubDeploymentPollInterval = origGH
+	})
+
+	// 1. Expired deadline must short-circuit immediately without issuing an HTTP request.
+	var hitCount atomic.Int32
+	expiredSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hitCount.Add(1)
+		_, _ = w.Write([]byte(`{"issue_count": 1}`))
+	}))
+	defer expiredSrv.Close()
+	parsedURL, err := url.Parse(expiredSrv.URL + "/data/meta.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fetchDeploymentMetaJSON(&http.Client{Timeout: 10 * time.Second}, parsedURL, time.Now().Add(-time.Millisecond)); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expired deadline err = %v, want context.DeadlineExceeded", err)
+	}
+	if hitCount.Load() != 0 {
+		t.Fatalf("expired deadline still issued %d HTTP request(s)", hitCount.Load())
+	}
+
+	// 2. When poll 1 observes stale issue_count and poll 2 stalls past the caller deadline,
+	// both VerifyCloudflareDeployment and VerifyGitHubPagesDeployment must preserve the
+	// semantic issue_count mismatch error instead of clobbering it with context deadline exceeded.
+	for _, tc := range []struct {
+		name   string
+		verify func(string, int, time.Duration) error
+	}{
+		{name: "cloudflare", verify: VerifyCloudflareDeployment},
+		{name: "github", verify: VerifyGitHubPagesDeployment},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var n atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if n.Add(1) == 1 {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(`{"issue_count": 2}`))
+					return
+				}
+				// Stall poll 2 until client cancels on deadline.
+				select {
+				case <-r.Context().Done():
+				case <-time.After(500 * time.Millisecond):
+				}
+			}))
+			defer srv.Close()
+
+			err := tc.verify(srv.URL, 7, 60*time.Millisecond)
+			want := "deployment verification issue count mismatch: live site shows 2 issues, expected 7"
+			if err == nil || err.Error() != want {
+				t.Fatalf("%s err = %v, want exact %q (must not be clobbered by deadline exceeded)", tc.name, err, want)
+			}
+		})
 	}
 }

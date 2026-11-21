@@ -306,7 +306,7 @@ func (c *Config) Validate() error {
 		c.SourceDriftAlert = &defaultAlert
 	}
 	if c.SourceDriftMaxAlerts < 0 {
-		c.SourceDriftMaxAlerts = defaults.SourceDriftMaxAlerts
+		return fmt.Errorf("source_drift_max_alerts must be non-negative (0 = no cap)")
 	}
 	if c.PriorityMismatchMinConfidence == 0 {
 		c.PriorityMismatchMinConfidence = defaults.PriorityMismatchMinConfidence

@@ -253,16 +253,29 @@ func stateFromTiming(enabled bool, timedOut bool) string {
 }
 
 func emptyGraphMetricStatus(config AnalysisConfig) MetricStatus {
+	sharedSkip := ""
+	if !config.ComputePageRank && config.PageRankSkipReason != "" {
+		sharedSkip = config.PageRankSkipReason
+	}
+	skipReason := func(enabled bool, specific string) string {
+		if specific != "" {
+			return specific
+		}
+		if !enabled {
+			return sharedSkip
+		}
+		return ""
+	}
 	return MetricStatus{
-		PageRank:     statusEntry{State: stateFromTiming(config.ComputePageRank, false), Reason: config.PageRankSkipReason},
+		PageRank:     statusEntry{State: stateFromTiming(config.ComputePageRank, false), Reason: skipReason(config.ComputePageRank, config.PageRankSkipReason)},
 		Betweenness:  statusEntry{State: stateFromTiming(config.ComputeBetweenness, false), Reason: betweennessReason(config, false)},
-		Eigenvector:  statusEntry{State: stateFromTiming(config.ComputeEigenvector, false)},
-		HITS:         statusEntry{State: stateFromTiming(config.ComputeHITS, false), Reason: config.HITSSkipReason},
-		Critical:     statusEntry{State: stateFromTiming(config.ComputeCriticalPath, false)},
-		Cycles:       statusEntry{State: stateFromTiming(config.ComputeCycles, false), Reason: config.CyclesSkipReason},
-		KCore:        statusEntry{State: stateFromTiming(config.ComputeKCore, false)},
-		Articulation: statusEntry{State: stateFromTiming(config.ComputeArticulation, false)},
-		Slack:        statusEntry{State: stateFromTiming(config.ComputeSlack, false)},
+		Eigenvector:  statusEntry{State: stateFromTiming(config.ComputeEigenvector, false), Reason: skipReason(config.ComputeEigenvector, "")},
+		HITS:         statusEntry{State: stateFromTiming(config.ComputeHITS, false), Reason: skipReason(config.ComputeHITS, config.HITSSkipReason)},
+		Critical:     statusEntry{State: stateFromTiming(config.ComputeCriticalPath, false), Reason: skipReason(config.ComputeCriticalPath, "")},
+		Cycles:       statusEntry{State: stateFromTiming(config.ComputeCycles, false), Reason: skipReason(config.ComputeCycles, config.CyclesSkipReason)},
+		KCore:        statusEntry{State: stateFromTiming(config.ComputeKCore, false), Reason: skipReason(config.ComputeKCore, "")},
+		Articulation: statusEntry{State: stateFromTiming(config.ComputeArticulation, false), Reason: skipReason(config.ComputeArticulation, "")},
+		Slack:        statusEntry{State: stateFromTiming(config.ComputeSlack, false), Reason: skipReason(config.ComputeSlack, "")},
 	}
 }
 

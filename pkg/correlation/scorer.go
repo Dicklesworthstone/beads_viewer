@@ -472,15 +472,6 @@ func (s *Scorer) buildRecommendation(confidence float64, _ int) string {
 	}
 }
 
-// ExplainMultiple generates explanations for all commits related to a bead
-func (s *Scorer) ExplainMultiple(commits []CorrelatedCommit, beadID string) []CorrelationExplanation {
-	explanations := make([]CorrelationExplanation, len(commits))
-	for i, commit := range commits {
-		explanations[i] = s.BuildExplanation(commit, beadID)
-	}
-	return explanations
-}
-
 // minInt returns the minimum of two ints
 func minInt(a, b int) int {
 	if a < b {

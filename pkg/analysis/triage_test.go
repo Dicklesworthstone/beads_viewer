@@ -3223,26 +3223,52 @@ func TestComputeStalenessAndAbandonedClaim_SkipParkedBeads(t *testing.T) {
 		}
 	}
 
-	withExpiredDefer := append(parkedOnly, model.Issue{
-		ID:         "UNPARKED-CLAIM",
-		Status:     model.StatusInProgress,
-		DeferUntil: &past,
-		UpdatedAt:  ancient,
-		CreatedAt:  ancient,
-	})
+	withExpiredDefer := append(parkedOnly,
+		model.Issue{
+			ID:         "UNPARKED-CLAIM",
+			Status:     model.StatusInProgress,
+			Assignee:   "alice",
+			DeferUntil: &past,
+			UpdatedAt:  ancient,
+			CreatedAt:  ancient,
+		},
+		model.Issue{
+			ID:        "UNASSIGNED-IP",
+			Status:    model.StatusInProgress,
+			Assignee:  "",
+			UpdatedAt: ancient,
+			CreatedAt: ancient,
+		},
+	)
 	stActive := ComputeStaleness(nil, withExpiredDefer, now)
-	if stActive.StaleCount != 1 || stActive.StalestIssueID != "UNPARKED-CLAIM" {
-		t.Fatalf("expected UNPARKED-CLAIM to be stale once DeferUntil expired, got %+v", stActive)
+	if stActive.StaleCount != 2 {
+		t.Fatalf("expected StaleCount=2 for UNPARKED-CLAIM + UNASSIGNED-IP, got %+v", stActive)
 	}
 	activeAlerts := buildTriageAlerts(nil, withExpiredDefer, nil, stActive, nil, now)
 	foundAbandoned := false
 	for _, a := range activeAlerts {
-		if a.Type == "abandoned_claim" && len(a.IssueIDs) == 1 && a.IssueIDs[0] == "UNPARKED-CLAIM" {
+		if a.Type == "abandoned_claim" {
+			if len(a.IssueIDs) != 1 || a.IssueIDs[0] != "UNPARKED-CLAIM" {
+				t.Fatalf("expected abandoned_claim solely for assigned UNPARKED-CLAIM (excluding UNASSIGNED-IP), got %+v", a)
+			}
 			foundAbandoned = true
 		}
 	}
 	if !foundAbandoned {
 		t.Fatalf("expected abandoned_claim alert solely for UNPARKED-CLAIM, got %+v", activeAlerts)
+	}
+
+	// Regression (RC-C35): ComputeProjectVelocity must reject non-nil zero *ClosedAt with zero UpdatedAt,
+	// and must not leak Estimated=true when a nil-ClosedAt issue has a future UpdatedAt (> now).
+	zeroClosed := time.Time{}
+	validClosed := now.Add(-2 * 24 * time.Hour)
+	vel := ComputeProjectVelocity([]model.Issue{
+		{ID: "V-VALID", Status: model.StatusClosed, ClosedAt: &validClosed},
+		{ID: "V-ZERO", Status: model.StatusClosed, ClosedAt: &zeroClosed},
+		{ID: "V-FUTURE-UPD", Status: model.StatusClosed, ClosedAt: nil, UpdatedAt: now.Add(48 * time.Hour)},
+	}, now, 8)
+	if vel.ClosedLast7Days != 1 || vel.ClosedLast30Days != 1 || vel.Estimated {
+		t.Fatalf("ComputeProjectVelocity = %+v, want ClosedLast7=1 ClosedLast30=1 Estimated=false", vel)
 	}
 }
 

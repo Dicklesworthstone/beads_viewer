@@ -301,23 +301,14 @@ func ComputeProjectVelocity(issues []model.Issue, now time.Time, weeks int) *Vel
 			continue
 		}
 
-		var closedAt time.Time
-		switch {
-		case iss.ClosedAt != nil && !iss.ClosedAt.IsZero():
-			closedAt = iss.ClosedAt.UTC()
-		case !iss.UpdatedAt.IsZero():
-			// Fallback: approximate closure using updated_at when closed_at missing or zero
-			closedAt = iss.UpdatedAt.UTC()
-			estimated = true
-		default:
-			// Last resort: approximate with now; counts become estimated
-			closedAt = now
-			estimated = true
-		}
-
-		// Ignore future-dated closures relative to the reference clock (e.g., --as-of)
-		if closedAt.After(now) {
+		closedAt, ok := resolveClosureTime(&iss, now)
+		if !ok {
 			continue
+		}
+		closedAt = closedAt.UTC()
+		if iss.ClosedAt == nil || iss.ClosedAt.IsZero() {
+			// Fallback used updated_at because closed_at was missing or zero.
+			estimated = true
 		}
 
 		// Count rolling windows
@@ -1001,7 +992,7 @@ func buildTriageAlerts(analyzer *Analyzer, candidateIssues []model.Issue, stats 
 
 	var abandoned []string
 	for _, iss := range candidateIssues {
-		if iss.Status != model.StatusInProgress || iss.UpdatedAt.IsZero() || iss.IsParkedForStalenessAt(now) {
+		if iss.Status != model.StatusInProgress || strings.TrimSpace(iss.Assignee) == "" || iss.UpdatedAt.IsZero() || iss.IsParkedForStalenessAt(now) {
 			continue
 		}
 		days := int(now.Sub(iss.UpdatedAt).Hours() / 24)

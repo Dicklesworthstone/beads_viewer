@@ -182,22 +182,6 @@ func Timer(m *TimingMetric) func() {
 	}
 }
 
-// TimerWithCallback returns a function that records elapsed time
-// and also calls the provided callback with the duration.
-func TimerWithCallback(m *TimingMetric, cb func(time.Duration)) func() {
-	if !enabled.Load() || m == nil {
-		return func() {}
-	}
-	start := time.Now()
-	return func() {
-		d := time.Since(start)
-		m.Record(d)
-		if cb != nil {
-			cb(d)
-		}
-	}
-}
-
 // Global timing metrics for various operations.
 // Every metric registered here has an active producer in pkg/loader or pkg/analysis.
 var (

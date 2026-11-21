@@ -1380,21 +1380,3 @@ func (m *ExplicitMatcher) MatchWalkedCommitsFiltered(commits []walkedCommit, bea
 	}
 	return matches
 }
-
-// FindAllExplicitMatches finds explicit references for all known bead IDs.
-func (m *ExplicitMatcher) FindAllExplicitMatches(beadIDs []string, opts ExtractOptions) (map[string][]ExplicitMatch, error) {
-	results := make(map[string][]ExplicitMatch)
-
-	for _, beadID := range beadIDs {
-		matches, err := m.FindCommitsForBead(beadID, opts)
-		if err != nil {
-			// Non-fatal: continue with other beads
-			continue
-		}
-		if len(matches) > 0 {
-			results[beadID] = matches
-		}
-	}
-
-	return results, nil
-}

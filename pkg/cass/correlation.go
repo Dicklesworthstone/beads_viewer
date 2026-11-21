@@ -723,6 +723,10 @@ func (c *Correlator) searchByTimestamp(ctx context.Context, issue *model.Issue) 
 	}
 
 	filtered := c.rankAndLimit(scored)
+	// Strategy 3 runs a wildcard "*" query across the workspace; when cutoff,
+	// days > 7, or proximity rejections narrow the candidate pool, preserve the
+	// pre-rankAndLimit count of scored sessions (len(scored), which can exceed
+	// MaxSessionsReturned) without leaking the inflated wildcard total_matches.
 	if c.cutoff != nil || days > 7 || rejected > 0 {
 		resp.Meta.Total = len(scored)
 	}

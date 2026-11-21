@@ -2895,9 +2895,11 @@ func ComputeLabelAttentionScoresWithScope(issues []model.Issue, cfg LabelHealthC
 		return result
 	}
 
-	// Build issue map and pre-index reverse active blocking edges once across context issues
+	// Build issue map and pre-index reverse active blocking edges and distinct
+	// downstream blocked issues once across context issues.
 	issueMap := make(map[string]model.Issue, len(issues))
 	activeDependentEdges := make(map[string]int, len(issues))
+	activeDependentIssues := make(map[string][]string, len(issues))
 	for _, iss := range issues {
 		issueMap[iss.ID] = iss
 		if isClosedLikeStatus(iss.Status) {
@@ -2906,6 +2908,7 @@ func ComputeLabelAttentionScoresWithScope(issues []model.Issue, cfg LabelHealthC
 		for _, dep := range iss.Dependencies {
 			if dep != nil && dep.DependsOnID != iss.ID && dep.Type.IsBlocking() {
 				activeDependentEdges[dep.DependsOnID]++
+				activeDependentIssues[dep.DependsOnID] = append(activeDependentIssues[dep.DependsOnID], iss.ID)
 			}
 		}
 	}
@@ -2913,7 +2916,7 @@ func ComputeLabelAttentionScoresWithScope(issues []model.Issue, cfg LabelHealthC
 	// Compute attention for each candidate label while preserving downstream block impact across all context issues
 	var scores []LabelAttentionScore
 	for _, label := range labels.Labels {
-		score := computeLabelAttention(label, scopedIssues, issues, issueMap, activeDependentEdges, cfg, now, candidateIDs)
+		score := computeLabelAttention(label, scopedIssues, issues, issueMap, activeDependentEdges, activeDependentIssues, cfg, now, candidateIDs)
 		scores = append(scores, score)
 	}
 
@@ -2986,7 +2989,7 @@ func ComputeLabelAttentionScoresWithScope(issues []model.Issue, cfg LabelHealthC
 }
 
 // computeLabelAttention calculates attention score for a single label
-func computeLabelAttention(label string, scopedIssues []model.Issue, allIssues []model.Issue, issueMap map[string]model.Issue, activeDependentEdges map[string]int, cfg LabelHealthConfig, now time.Time, candidateIDs map[string]bool) LabelAttentionScore {
+func computeLabelAttention(label string, scopedIssues []model.Issue, allIssues []model.Issue, issueMap map[string]model.Issue, activeDependentEdges map[string]int, activeDependentIssues map[string][]string, cfg LabelHealthConfig, now time.Time, candidateIDs map[string]bool) LabelAttentionScore {
 	score := LabelAttentionScore{
 		Label: label,
 	}
@@ -3033,15 +3036,20 @@ func computeLabelAttention(label string, scopedIssues []model.Issue, allIssues [
 		score.StalenessFactor = 0.0
 	}
 
-	// Compute block impact (how many active issues across context are blocked by open issues in this label)
+	// Compute block impact (outgoing blocking edges) and distinct downstream blocked issues
+	// blocked by open issues in this label.
 	blockImpact := 0
+	distinctBlocked := make(map[string]struct{})
 	for _, iss := range labeledIssues {
 		if !isClosedLikeStatus(iss.Status) {
 			blockImpact += activeDependentEdges[iss.ID]
+			for _, depID := range activeDependentIssues[iss.ID] {
+				distinctBlocked[depID] = struct{}{}
+			}
 		}
 	}
 	score.BlockImpact = float64(blockImpact)
-	score.BlockedCount = blockImpact
+	score.BlockedCount = len(distinctBlocked)
 
 	// Compute velocity factor
 	velocity := ComputeVelocityMetrics(labeledIssues, now)

@@ -4,6 +4,7 @@ package drift
 
 import (
 	"fmt"
+	"math"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -1241,6 +1242,9 @@ func (c *Calculator) checkPotentialDuplicate(result *Result) {
 	maxAlerts := c.config.DuplicateMaxAlerts
 	if maxAlerts > 0 {
 		cfg.MaxSuggestions = maxAlerts
+	} else {
+		// duplicate_max_alerts: 0 explicitly disables the cap (unlimited duplicate alerts).
+		cfg.MaxSuggestions = math.MaxInt
 	}
 	// Closed, tombstoned, and template issues cannot be consolidated any more;
 	// pairing them only buries live duplicates under history or boilerplate.

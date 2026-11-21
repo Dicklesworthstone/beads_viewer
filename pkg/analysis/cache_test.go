@@ -1746,6 +1746,22 @@ func TestRobotDiskCache_MetadataDotDirectoryAndDoltNoms600TableFiles(t *testing.
 		t.Fatal("writing LOCK / .fslock / oldgen inside noms/ falsely invalidated robot disk cache")
 	}
 
+	// Positive observable (RC-C35): creating and deleting a temp lock file inside
+	// .beads/dolt/<db>/ (non-noms parent subdir) changes that directory's inode mtime
+	// and MUST NOT invalidate the robot disk cache!
+	parentLock := filepath.Join(filepath.Dir(filepath.Dir(nomsDir)), "tmp.lock")
+	if err := os.WriteFile(parentLock, []byte("transient"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(parentLock); err != nil {
+		t.Fatal(err)
+	}
+	s = analysis.NewAnalyzer(issues).AnalyzeAsyncWithConfig(context.Background(), config)
+	s.WaitForPhase2()
+	if got, err := os.ReadFile(cachePath); err != nil || string(got) != string(pinnedDolt) {
+		t.Fatal("creating/removing temp lock inside .beads/dolt/<db>/ falsely invalidated robot disk cache")
+	}
+
 	// Planted negative control: reset noms/ directory mtime to base, then mutate ONLY
 	// vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv in-place (advancing its mtime without changing directory mtime).
 	// Even with 600 lexicographically-earlier table files (0000..0599), eager head folding MUST invalidate!

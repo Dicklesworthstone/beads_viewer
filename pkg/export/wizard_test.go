@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -659,5 +660,61 @@ func TestWizard_MultiRepoSavedConfigPreservation(t *testing.T) {
 	if !wizAResume.isUpdate || res.DeployTarget != "local" || wizAResume.config.Title != "Alpha Pages" {
 		t.Fatalf("wizAResume failed to restore Repo A config: isUpdate=%v res=%+v cfg=%+v",
 			wizAResume.isUpdate, res, wizAResume.config)
+	}
+}
+
+func TestWizardOfferPreview_NoFDLeakAcrossRepeatedCycles(t *testing.T) {
+	t.Setenv("TERM", "dumb")
+	bundleDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bundleDir, "index.html"), []byte("<!doctype html><html><body>preview</body></html>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	resolvedBundle, err := filepath.EvalSymlinks(bundleDir)
+	if err != nil {
+		resolvedBundle = filepath.Clean(bundleDir)
+	}
+
+	countOpenBundleFDs := func() (total int, bundleRefs int) {
+		entries, err := os.ReadDir("/proc/self/fd")
+		if err != nil {
+			return -1, -1
+		}
+		total = len(entries)
+		for _, e := range entries {
+			if target, err := os.Readlink(filepath.Join("/proc/self/fd", e.Name())); err == nil {
+				if target == bundleDir || target == resolvedBundle || strings.HasPrefix(target, resolvedBundle+string(os.PathSeparator)) {
+					bundleRefs++
+				}
+			}
+		}
+		return total, bundleRefs
+	}
+
+	// Run 8 real Wizard.OfferPreview() cycles (alternating Continue -> "deploy" and Cancel -> "cancel")
+	// exercising wizard.go:940-944 validatePreviewBundle + previewDir.Close() and server shutdown.
+	// If _ = previewDir.Close() at wizard.go:944 is removed, bundleRefs grows to 8 and fails loudly!
+	for i := 0; i < 8; i++ {
+		w := NewWizard(t.TempDir())
+		w.bundlePath = bundleDir
+		wantAction := "deploy"
+		resp := "y\ny\n"
+		if i%2 == 1 {
+			wantAction = "cancel"
+			resp = "y\nn\n"
+		}
+		w.input = &wizardInputReader{data: []byte(resp)}
+		action, err := w.OfferPreview()
+		if err != nil {
+			t.Fatalf("cycle %d: OfferPreview() error = %v", i, err)
+		}
+		if action != wantAction {
+			t.Fatalf("cycle %d: OfferPreview() action = %q, want %q", i, action, wantAction)
+		}
+	}
+
+	if runtime.GOOS == "linux" {
+		if _, bundleRefs := countOpenBundleFDs(); bundleRefs != 0 {
+			t.Fatalf("OfferPreview leaked %d open file descriptor(s) pointing to bundleDir %q after 8 cycles", bundleRefs, bundleDir)
+		}
 	}
 }

@@ -10,8 +10,8 @@ import (
 )
 
 var defaultBeadsFiles = []string{
-	".beads/beads.jsonl",
 	".beads/issues.jsonl",
+	".beads/beads.jsonl",
 	".beads/beads.base.jsonl",
 }
 

@@ -9,6 +9,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -720,7 +721,9 @@ func VerifyCloudflareDeployment(deployURL string, expectedIssueCount int, timeou
 	for time.Now().Before(deadline) {
 		output, err := fetchDeploymentMetaJSON(httpClient, baseMetaURL, deadline)
 		if err != nil {
-			lastErr = fmt.Errorf("fetch failed: %w", err)
+			if lastErr == nil || !errors.Is(err, context.DeadlineExceeded) {
+				lastErr = fmt.Errorf("fetch failed: %w", err)
+			}
 			sleepDeploymentPoll(cloudflareDeploymentPollInterval, deadline)
 			continue
 		}

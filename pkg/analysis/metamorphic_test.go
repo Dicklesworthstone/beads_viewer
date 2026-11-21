@@ -1414,6 +1414,15 @@ func checkMR8SlackAbsenceAndClosedArchiveInvariance(rt *rapid.T, mutantNilSlackZ
 			"Priority recommendations count must be invariant to closed historical chains",
 			fmt.Sprintf("base=%d arch=%d", len(recsBase), len(recsArch)), nil)
 	}
+	for i := range recsBase {
+		rb, ra := recsBase[i], recsArch[i]
+		if rb.IssueID != ra.IssueID || rb.CurrentPriority != ra.CurrentPriority || rb.SuggestedPriority != ra.SuggestedPriority ||
+			rb.Direction != ra.Direction || math.Abs(rb.Confidence-ra.Confidence) > 1e-4 || strings.Join(rb.Reasoning, "|") != strings.Join(ra.Reasoning, "|") {
+			failMetamorphic(rt, "MR-8", issues, nil,
+				"Priority recommendations must match element-by-element before and after appending closed archive",
+				fmt.Sprintf("idx=%d base=%+v arch=%+v", i, rb, ra), nil)
+		}
+	}
 }
 
 // TestMetamorphic_MR8_SlackAbsenceAndClosedArchiveInvariance verifies Score 25.0
