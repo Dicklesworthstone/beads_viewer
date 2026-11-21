@@ -68,6 +68,7 @@ func createCoreTables(tx *sql.Tx) error {
 			estimated_minutes INTEGER,
 			created_by TEXT,
 			close_reason TEXT,
+			source_repo TEXT,
 			is_template INTEGER NOT NULL DEFAULT 0,
 			pinned INTEGER NOT NULL DEFAULT 0,
 			ephemeral INTEGER NOT NULL DEFAULT 0
@@ -159,6 +160,7 @@ func createIndexes(tx *sql.Tx) error {
 		`CREATE INDEX IF NOT EXISTS idx_issues_priority ON issues(priority, status)`,
 		`CREATE INDEX IF NOT EXISTS idx_issues_updated ON issues(updated_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_issues_type_status ON issues(issue_type, status)`,
+		`CREATE INDEX IF NOT EXISTS idx_issues_source_repo ON issues(source_repo)`,
 
 		// Dependencies indexes
 		`CREATE INDEX IF NOT EXISTS idx_deps_issue ON dependencies(issue_id)`,
@@ -219,6 +221,7 @@ func CreateFTSIndex(db *sql.DB) error {
 			design,
 			acceptance_criteria,
 			external_ref,
+			source_repo,
 			content='issues',
 			content_rowid='rowid',
 			tokenize='porter unicode61'
@@ -277,6 +280,7 @@ func CreateMaterializedViews(db *sql.DB) error {
 			i.estimated_minutes,
 			i.created_by,
 			i.close_reason,
+			i.source_repo,
 			i.is_template,
 			i.pinned,
 			i.ephemeral,
@@ -367,6 +371,7 @@ func CreateMaterializedViews(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS idx_mv_priority ON issue_overview_mv(priority)`,
 		`CREATE INDEX IF NOT EXISTS idx_mv_score ON issue_overview_mv(triage_score DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_mv_actionable ON issue_overview_mv(is_actionable)`,
+		`CREATE INDEX IF NOT EXISTS idx_mv_source_repo ON issue_overview_mv(source_repo)`,
 	}
 
 	for _, sql := range mvIndexes {

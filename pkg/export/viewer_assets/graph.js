@@ -272,6 +272,8 @@ class GraphStore {
             hits: null,           // { hub: Float32Array, authority: Float32Array }
             slack: null,          // Float32Array of slack values
             articulationPoints: null, // Set of node IDs (cut vertices)
+            bridges: null,        // Set of "a-b" / "b-a" Tarjan bridge cut-edge keys on active subgraph
+            cycleBreakSuggestions: null, // Resolved [{ from, to, edgeKey, cyclesBroken }]
             cycles: null
         };
 
@@ -1329,6 +1331,7 @@ function computeMetrics(layout = null) {
                 store.metrics.slack = activeGraph.slack();
             } catch (e) {
                 console.warn('[bv-graph] Slack computation skipped:', e);
+                store.metrics.slack = null;
             }
         } else {
             store.metrics.slack = null;
@@ -1349,14 +1352,70 @@ function computeMetrics(layout = null) {
                 }
             } catch (e) {
                 console.warn('[bv-graph] Articulation points computation skipped:', e);
+                store.metrics.articulationPoints = new Set();
             }
         } else {
             store.metrics.articulationPoints = new Set();
         }
 
+        // Tarjan bridge cut-edges on active subgraph (single-link bottlenecks)
+        if (typeof activeGraph.bridges === 'function') {
+            try {
+                const rawBridges = activeGraph.bridges();
+                const bridgeKeys = new Set();
+                if (Array.isArray(rawBridges)) {
+                    for (const pair of rawBridges) {
+                        if (!Array.isArray(pair) || pair.length < 2) continue;
+                        const idA = activeGraph.nodeId(pair[0]);
+                        const idB = activeGraph.nodeId(pair[1]);
+                        if (idA && idB) {
+                            bridgeKeys.add(`${idA}-${idB}`);
+                            bridgeKeys.add(`${idB}-${idA}`);
+                        }
+                    }
+                }
+                store.metrics.bridges = bridgeKeys;
+            } catch (e) {
+                console.warn('[bv-graph] Bridges computation skipped:', e);
+                store.metrics.bridges = new Set();
+            }
+        } else {
+            store.metrics.bridges = new Set();
+        }
+
         // Cycles (enumerated on active graph so closed historical cycles are ignored)
         const cycleResult = activeGraph.enumerateCycles(100);
         store.metrics.cycles = cycleResult;
+
+        // Cycle-break edge recommendations (active subgraph only)
+        if (hasCycles && typeof activeGraph.cycleBreakSuggestions === 'function') {
+            try {
+                const rawBreak = activeGraph.cycleBreakSuggestions(10, 100);
+                const list = rawBreak?.suggestions || rawBreak?.top_suggestions || [];
+                const resolved = [];
+                if (Array.isArray(list)) {
+                    for (const item of list) {
+                        if (!item) continue;
+                        const from = item.from_id || (typeof item.from === 'number' ? activeGraph.nodeId(item.from) : item.from);
+                        const to = item.to_id || (typeof item.to === 'number' ? activeGraph.nodeId(item.to) : item.to);
+                        if (from && to) {
+                            resolved.push({
+                                from: String(from),
+                                to: String(to),
+                                edgeKey: `${from}-${to}`,
+                                cyclesBroken: Number(item.cycles_broken ?? item.cyclesBroken ?? 1) || 1
+                            });
+                        }
+                    }
+                }
+                store.metrics.cycleBreakSuggestions = resolved;
+            } catch (e) {
+                console.warn('[bv-graph] Cycle break suggestions skipped:', e);
+                store.metrics.cycleBreakSuggestions = [];
+            }
+        } else {
+            store.metrics.cycleBreakSuggestions = [];
+        }
 
         const elapsed = performance.now() - start;
         console.log(`[bv-graph] Metrics computed in ${elapsed.toFixed(1)}ms`);
@@ -1978,16 +2037,20 @@ function prepareGraphData(layout = null) {
     // Build node set for link filtering
     const nodeIds = new Set(nodes.map(n => n.id));
 
-    // Filter links (include renderable non-blocking edges visually; mark blocking flag)
+    // Filter links (include renderable non-blocking edges visually; mark blocking & bridge flags)
     let links = dependencies
         .filter(isRenderableDependency)
         .filter(d => nodeIds.has(d.issue_id) && nodeIds.has(d.depends_on_id))
-        .map(d => ({
-            source: d.issue_id,
-            target: d.depends_on_id,
-            type: d.type || 'blocks',
-            blocking: isBlockingDependency(d)
-        }));
+        .map(d => {
+            const blocking = isBlockingDependency(d);
+            return {
+                source: d.issue_id,
+                target: d.depends_on_id,
+                type: d.type || 'blocks',
+                blocking,
+                isBridge: blocking && Boolean(metrics.bridges?.has(`${d.issue_id}-${d.depends_on_id}`))
+            };
+        });
 
     // Enrich nodes with computed data
     const activeGraph = store.activeWasmGraph || store.wasmGraph;
@@ -2013,6 +2076,7 @@ function prepareGraphData(layout = null) {
             type: issue.type || 'task',
             labels: issue.labels || [],
             assignee: issue.assignee,
+            sourceRepo: issue.source_repo || '',
             createdAt: issue.created_at,
             updatedAt: issue.updated_at,
 
@@ -2215,6 +2279,19 @@ function drawNode(node, ctx, globalScale) {
     ctx.lineWidth = isSelected ? 3 : isHovered ? 2 : 1;
     ctx.stroke();
 
+    // Articulation-point (cut-vertex) halo ring on active subgraph
+    if (node.isArticulationPoint) {
+        ctx.save();
+        ctx.shadowBlur = 0;
+        ctx.beginPath();
+        ctx.arc(node.x, node.y, size + Math.max(2.5, 3 / globalScale), 0, Math.PI * 2);
+        ctx.strokeStyle = THEME.accent.orange || '#FFB86C';
+        ctx.lineWidth = Math.max(1.2, 1.5 / globalScale);
+        ctx.setLineDash([3 / globalScale, 2 / globalScale]);
+        ctx.stroke();
+        ctx.restore();
+    }
+
     // Priority indicator (flame for P0/P1)
     if (node.priority <= 1 && globalScale > 0.4) {
         // Keep emoji ~12px on screen
@@ -2315,6 +2392,11 @@ function getLinkColor(link) {
         }
     }
 
+    // Cycle navigator recommended cut edge stands out in bright gold
+    if (cycleNavigatorState.active && cycleNavigatorState.suggestedBreakEdgeKey === linkId) {
+        return THEME.accent.gold;
+    }
+
     // Highlighted links
     if (store.highlightedLinks.has(linkId)) return THEME.link.highlighted;
 
@@ -2329,6 +2411,11 @@ function getLinkColor(link) {
     // Cross-label edges in galaxy view (bv-qpt0)
     if (labelClusterState.active && isCrossLabelEdge(link)) {
         return THEME.accent.pink; // Distinct color for cross-label dependencies
+    }
+
+    // Tarjan bridge cut-edges (single-link bottlenecks on active subgraph)
+    if (link.isBridge && !store.heatmapMode) {
+        return (THEME.accent.orange || '#FFB86C') + 'cc';
     }
 
     // Heatmap mode: color links by topological hop slack of connected nodes (acyclic DAGs only)
@@ -2400,6 +2487,11 @@ function getLinkWidth(link, globalScale) {
     const tgtId = targetNode?.id || link.target;
     const linkId = `${srcId}-${tgtId}`;
 
+    // Cycle navigator recommended break edge gets extra emphasis (blocking edges only)
+    if (link.blocking !== false && cycleNavigatorState.active && cycleNavigatorState.suggestedBreakEdgeKey === linkId) {
+        return Math.max(4, 4 / globalScale);
+    }
+
     // Highlighted links (what-if, critical path, etc.) get thick width
     if (store.highlightedLinks.has(linkId)) {
         return Math.max(3, 3 / globalScale);
@@ -2408,6 +2500,11 @@ function getLinkWidth(link, globalScale) {
     // Gold connected subgraph links get medium-thick width
     if (store.connectedNodes.size > 0 && store.connectedNodes.has(srcId) && store.connectedNodes.has(tgtId)) {
         return Math.max(2.5, 3 / globalScale);
+    }
+
+    // Tarjan bridge cut-edges get medium emphasis
+    if (link.isBridge) {
+        return Math.max(2, 2.2 / globalScale);
     }
 
     // Critical path edges
@@ -2451,12 +2548,18 @@ function drawLink(link, ctx, globalScale) {
     const opacity = getLinkOpacity(link);
     const width = getLinkWidth(link, globalScale);
 
+    const linkId = `${start.id || start}-${end.id || end}`;
+    const isSuggestedCycleBreak = link.blocking !== false && cycleNavigatorState.active && cycleNavigatorState.suggestedBreakEdgeKey === linkId;
     ctx.save();
     ctx.globalAlpha = opacity;
     ctx.strokeStyle = color;
     ctx.lineWidth = width;
-    if (link.blocking === false) {
+    if (isSuggestedCycleBreak) {
+        ctx.setLineDash([6 / globalScale, 3 / globalScale]);
+    } else if (link.blocking === false) {
         ctx.setLineDash([4 / globalScale, 4 / globalScale]);
+    } else if (link.isBridge) {
+        ctx.setLineDash([6 / globalScale, 3 / globalScale]);
     }
 
     // Curved link
@@ -2688,7 +2791,9 @@ export function performWhatIf(nodeInput) {
         return null;
     }
 
-    // Animate the cascade
+    // Clear competing overlays and animate the cascade
+    resetCycleNavigator();
+    resetCriticalPath();
     resetDependencyCone({ refresh: false });
     animateWhatIfCascade([node], result);
 
@@ -2744,6 +2849,8 @@ export function performBatchWhatIf(nodesInput) {
         return null;
     }
 
+    resetCycleNavigator();
+    resetCriticalPath();
     resetDependencyCone({ refresh: false });
     animateWhatIfCascade(uniqueNodes, result);
     return result;
@@ -3342,8 +3449,8 @@ export function highlightDependencyPath(node) {
         if (idx === undefined) return;
         // Get all nodes that block this one (upstream) and all blocked by it (downstream),
         // normalized to string IDs excluding self to match the JS BFS fallback.
-        const rawBlockers = Array.from(store.wasmGraph.reachableFrom(idx));
-        const rawDependents = Array.from(store.wasmGraph.reachableTo(idx));
+        const rawBlockers = Array.from(store.wasmGraph.reachableFrom(idx) || []);
+        const rawDependents = Array.from(store.wasmGraph.reachableTo(idx) || []);
         blockers = rawBlockers
             .map(i => store.wasmGraph.nodeId(i))
             .filter(id => id && id !== node.id);
@@ -3451,7 +3558,9 @@ const cycleNavigatorState = {
     cycles: [],           // Array of cycles (each cycle is array of node IDs)
     currentIndex: 0,
     highlightedCycleNodes: new Set(),
-    highlightedCycleEdges: new Set()
+    highlightedCycleEdges: new Set(),
+    suggestedBreakEdgeKey: null,
+    suggestedBreakEdge: null
 };
 
 /**
@@ -3527,6 +3636,17 @@ export function highlightCycle(index, zoom = false) {
         }
     }
 
+    // Match top cycle-break recommendation to an edge in this highlighted cycle
+    cycleNavigatorState.suggestedBreakEdgeKey = null;
+    cycleNavigatorState.suggestedBreakEdge = null;
+    for (const suggestion of (store.metrics.cycleBreakSuggestions || [])) {
+        if (cycleNavigatorState.highlightedCycleEdges.has(suggestion.edgeKey)) {
+            cycleNavigatorState.suggestedBreakEdgeKey = suggestion.edgeKey;
+            cycleNavigatorState.suggestedBreakEdge = suggestion;
+            break;
+        }
+    }
+
     // Mark nodes with cycle state for enhanced visual
     const graphData = store.graph?.graphData();
     if (graphData) {
@@ -3546,13 +3666,15 @@ export function highlightCycle(index, zoom = false) {
         currentIndex: index,
         cycleCount: cycleNavigatorState.cycles.length,
         cycle: cycle,
-        cyclePath: formatCyclePath(cycle)
+        cyclePath: formatCyclePath(cycle),
+        suggestedBreakEdge: cycleNavigatorState.suggestedBreakEdge
     });
 
     return {
         index,
         cycle,
-        path: formatCyclePath(cycle)
+        path: formatCyclePath(cycle),
+        suggestedBreakEdge: cycleNavigatorState.suggestedBreakEdge
     };
 }
 
@@ -3626,6 +3748,8 @@ export function resetCycleNavigator() {
     cycleNavigatorState.currentIndex = 0;
     cycleNavigatorState.highlightedCycleNodes.clear();
     cycleNavigatorState.highlightedCycleEdges.clear();
+    cycleNavigatorState.suggestedBreakEdgeKey = null;
+    cycleNavigatorState.suggestedBreakEdge = null;
 
     // Clear cycle highlight state from nodes
     const graphData = store.graph?.graphData();
@@ -3649,6 +3773,8 @@ export function toggleCycleNavigator() {
     if (cycleNavigatorState.active && cycleNavigatorState.highlightedCycleNodes.size > 0) {
         resetCycleNavigator();
     } else {
+        resetWhatIf();
+        resetCriticalPath();
         resetDependencyCone({ refresh: false });
         initCycleNavigator();
         if (cycleNavigatorState.cycles.length > 0) {
@@ -4252,7 +4378,7 @@ function isGraphShortcutScopeActive(e) {
         if (appData.view && appData.view !== 'graph') {
             return false;
         }
-        if (appData.selectedIssue || appData.showKeyboardHelp || appData.globalError || appData.showTriageModal || appData.showDiagnostics) {
+        if (appData.selectedIssue || appData.showKeyboardHelp || appData.globalError || appData.showTriageModal || appData.showDiagnostics || appData.graphContextMenu?.open) {
             return false;
         }
     }

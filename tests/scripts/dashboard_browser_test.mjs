@@ -3311,6 +3311,64 @@ async function capabilitiesJourney(page) {
   assert.deepEqual(wave18BrowserAudit.wasmGraphAlgAudit.approxZero, [0, 0, 0, 0, 0], 'WASM betweennessApprox(0) returns finite zeros instead of NaN');
   assert.equal(wave18BrowserAudit.wasmGraphAlgAudit.approxZeroAllFinite, true);
 
+  // 4b. Wave 23 Graph UX: single-repo #filter-repo-select hiding (verified on #/issues), right-click context menu + Escape isolation, What-If HUD + Cycle Navigator mutual exclusion + break-edge HUD, and Tarjan bridges.
+  const issuesRepoAudit = await evaluate(page, `({
+    view: ${app}.view,
+    repoSelectVisible: (${visible})(document.querySelector('#filter-repo-select')),
+    reposLen: (${app}.filterOptions?.repos || []).length,
+  })`);
+  assert.equal(issuesRepoAudit.view, 'issues', 'verify #filter-repo-select hiding while on #/issues');
+  assert.equal(issuesRepoAudit.repoSelectVisible, false, 'single-repo export hides #filter-repo-select in Issues view');
+  assert.equal(issuesRepoAudit.reposLen, 0, 'single-repo export has 0 multi-repo options');
+
+  await click(page, 'a[href="#/graph"]');
+  await waitFor(page, `${app}.view === 'graph' && window.location.hash === '#/graph' && ${app}.forceGraphReady && !${app}.forceGraphLoading && !!document.querySelector('#graph-container canvas')`, 'graph view ready for Wave 23 checks');
+  const wave23GraphAudit = await evaluate(page, `(() => {
+    const graphData = ${app}.forceGraphModule.getGraph().graphData();
+    const hubLeaf = graphData.nodes.find(n => n.id === 'cap-hub-leaf');
+    const authRoot = graphData.nodes.find(n => n.id === 'cap-auth-root');
+    const bridgeCount = graphData.links.filter(l => l.isBridge).length;
+    return {
+      hasHubLeaf: Boolean(hubLeaf),
+      hasAuthRoot: Boolean(authRoot),
+      bridgeCount,
+      listenersBound: Boolean(${app}._graphListenersBound),
+    };
+  })()`);
+  assert.equal(wave23GraphAudit.hasHubLeaf && wave23GraphAudit.hasAuthRoot, true, 'graph nodes loaded');
+  assert.ok(wave23GraphAudit.bridgeCount >= 1, `expected >=1 Tarjan bridge cut-edge on capabilities graph (cap-hub-leaf -> cap-auth-root), got ${wave23GraphAudit.bridgeCount}`);
+  assert.equal(wave23GraphAudit.listenersBound, true, 'graph document listeners guarded by _graphListenersBound');
+
+  // Toggle Cycle Navigator -> #graph-cycle-hud shows cycle counter AND recommended break edge!
+  await evaluate(page, `${app}.forceGraphModule.toggleCycleNavigator()`);
+  await waitFor(page, `${app}.cycleNavigatorActive && Boolean(${app}.currentCycleBreakEdge?.from) && (${visible})(document.querySelector('#graph-cycle-hud'))`, 'Cycle Navigator HUD shows recommended break edge');
+  const breakEdge = await evaluate(page, `JSON.parse(JSON.stringify(${app}.currentCycleBreakEdge))`);
+  assert.ok(breakEdge.from && breakEdge.to, `recommended cycle break edge populated: ${JSON.stringify(breakEdge)}`);
+
+  // Dispatch bv-graph:nodeContextMenu while Cycle Navigator is active -> Escape closes ONLY the context menu, keeping Cycle Navigator intact!
+  await evaluate(page, `(() => {
+    const node = ${app}.forceGraphModule.getGraph().graphData().nodes.find(n => n.id === 'cap-auth-root');
+    document.dispatchEvent(new CustomEvent('bv-graph:nodeContextMenu', { detail: { node, x: 99999, y: 99999 } }));
+  })()`);
+  await waitFor(page, `${app}.graphContextMenu.open && (${visible})(document.querySelector('#graph-context-menu'))`, 'right-click context menu opens');
+  const menuPos = await evaluate(page, `({ x: ${app}.graphContextMenu.x, y: ${app}.graphContextMenu.y, w: window.innerWidth, h: window.innerHeight })`);
+  assert.ok(menuPos.x >= 8 && menuPos.x < menuPos.w && menuPos.y >= 8 && menuPos.y < menuPos.h, `context menu clamped inside viewport: ${JSON.stringify(menuPos)}`);
+  await key(page, 'Escape');
+  await waitFor(page, `!${app}.graphContextMenu.open`, 'Escape closes context menu');
+  assert.equal(await evaluate(page, `${app}.cycleNavigatorActive`), true, 'Escape on context menu does not leak to tear down Cycle Navigator');
+
+  // Re-open context menu -> click What-If Close -> clears Cycle Navigator & activates #graph-whatif-hud with synced graphWhatIfBatchIds!
+  await evaluate(page, `(() => {
+    const node = ${app}.forceGraphModule.getGraph().graphData().nodes.find(n => n.id === 'cap-auth-root');
+    document.dispatchEvent(new CustomEvent('bv-graph:nodeContextMenu', { detail: { node, x: 200, y: 200 } }));
+  })()`);
+  await waitFor(page, `${app}.graphContextMenu.open && (${visible})(document.querySelector('#graph-context-menu'))`, 'right-click context menu reopens');
+  await click(page, '#graph-context-menu button span', 'What-If Close');
+  await waitFor(page, `!${app}.graphContextMenu.open && ${app}.graphWhatIfActive && !${app}.cycleNavigatorActive && (${visible})(document.querySelector('#graph-whatif-hud'))`, 'What-If HUD opens from context menu and clears competing Cycle Navigator');
+  assert.deepEqual(await evaluate(page, `[...${app}.graphWhatIfBatchIds]`), ['cap-auth-root'], 'graphWhatIfBatchIds stays synced with active What-If');
+  await click(page, '#graph-whatif-hud button', 'Reset');
+  await waitFor(page, `!${app}.graphWhatIfActive && ${app}.graphWhatIfBatchIds.length === 0`, 'What-If HUD Reset clears active simulation and batch queue');
+
   // 5. Error Modal runErrorAction(action) recovery handler ({ action }, { handler }, { url }).
   await evaluate(page, `(() => {
     window.__errorRecovered = [];

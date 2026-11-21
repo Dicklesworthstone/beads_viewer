@@ -1442,6 +1442,21 @@ function getOverviewColumnSet() {
   }
 }
 
+function hasSourceRepoColumn() {
+  return getOverviewColumnSet().has('source_repo');
+}
+
+function getFtsColumnSet() {
+  if (!supportsFTS5()) return new Set();
+  try {
+    return new Set(
+      execQuery('PRAGMA table_info(issues_fts)').map(r => String(r.name || '').toLowerCase())
+    );
+  } catch {
+    return new Set();
+  }
+}
+
 function getOverviewWithheldGuardSQL() {
   const cols = getOverviewColumnSet();
   let guard = '';
@@ -2127,6 +2142,12 @@ function buildFilterClauses(filters = {}, tableAlias = '') {
     params.push(filters.assignee);
   }
 
+  // Source repo filter (multi-repo workspace exports)
+  if (filters.repo && hasSourceRepoColumn()) {
+    clauses.push(`${col('source_repo')} = ?`);
+    params.push(filters.repo);
+  }
+
   // Readiness comes from the full-source export snapshot, not visible edges.
   if (filters.hasBlockers === true || filters.hasBlockers === 'true') {
     clauses.push(`(${col('dependency_state')} <> 'satisfied' OR ${col('status')} = 'blocked')`);
@@ -2197,6 +2218,7 @@ function buildFilterClauses(filters = {}, tableAlias = '') {
       `COALESCE(${col('design')}, '')`,
       `COALESCE(${col('acceptance_criteria')}, '')`,
       `COALESCE(${col('external_ref')}, '')`,
+      ...(hasSourceRepoColumn() ? [`COALESCE(${col('source_repo')}, '')`] : []),
     ];
     for (const part of searchParts) {
       const nfcPattern = `%${escapeLikePattern(part)}%`;
@@ -2272,12 +2294,16 @@ function countIssues(filters = {}) {
  * Get unique values for filter dropdowns
  */
 	function getFilterOptions() {
+	  const repos = hasSourceRepoColumn()
+	    ? execQuery(`SELECT DISTINCT source_repo FROM issue_overview_mv WHERE source_repo IS NOT NULL AND source_repo <> '' ORDER BY source_repo`).map(r => r.source_repo)
+	    : [];
 	  return {
 	    statuses: execQuery(`SELECT DISTINCT status FROM issue_overview_mv ORDER BY status`).map(r => r.status),
 	    types: execQuery(`SELECT DISTINCT issue_type FROM issue_overview_mv ORDER BY issue_type`).map(r => r.issue_type),
 	    priorities: execQuery(`SELECT DISTINCT priority FROM issue_overview_mv ORDER BY priority`).map(r => r.priority),
 	    assignees: execQuery(`SELECT DISTINCT assignee FROM issue_overview_mv WHERE assignee IS NOT NULL AND assignee <> '' ORDER BY assignee`).map(r => r.assignee),
 	    labels: getUniqueLabels(),
+	    repos,
 	  };
 	}
 
@@ -2449,6 +2475,7 @@ function getGraphViewData() {
     'eigenvector',
     'critical_path_depth',
     'in_cycle',
+    'source_repo',
   ].filter(c => mvCols.has(c));
   const extraSelect = extraCols.length > 0 ? `, ${extraCols.join(', ')}` : '';
   const issues = execQuery(`
@@ -2464,6 +2491,7 @@ function getGraphViewData() {
     priority: row.priority ?? 2,
     type: row.issue_type || 'task',
     assignee: row.assignee || '',
+    source_repo: row.source_repo || '',
     labels: parseLabelsJSON(row.labels),
     created_at: row.created_at,
     updated_at: row.updated_at,
@@ -2496,8 +2524,13 @@ function getGraphViewData() {
 /**
  * Full-text search using FTS5 (if available)
  */
-const BM25_WEIGHTS = '3.0, 2.0, 1.0, 1.5, 0.5, 0.8, 0.8, 0.8, 1.0'; // id, title, description, labels, assignee, notes, design, acceptance_criteria, external_ref
-const BM25_EXPR = `bm25(issues_fts, ${BM25_WEIGHTS})`;
+const BM25_WEIGHTS_LEGACY = '3.0, 2.0, 1.0, 1.5, 0.5, 0.8, 0.8, 0.8, 1.0'; // 9 cols
+const BM25_WEIGHTS = '3.0, 2.0, 1.0, 1.5, 0.5, 0.8, 0.8, 0.8, 1.0, 0.8'; // id, title, description, labels, assignee, notes, design, acceptance_criteria, external_ref, source_repo
+function getBM25Expr() {
+  const ftsCols = getFtsColumnSet();
+  const weights = ftsCols.has('source_repo') ? BM25_WEIGHTS : BM25_WEIGHTS_LEGACY;
+  return `bm25(issues_fts, ${weights})`;
+}
 
 function isLikelyIssueID(term) {
   return /^[A-Za-z]+-[A-Za-z0-9]+$/.test((term || '').trim());
@@ -2599,34 +2632,35 @@ function searchIssues(term, options = {}) {
 
   const ftsQuery = buildFtsMatchQuery(term);
   const { clauses, params } = buildFilterClauses(searchFilters, 'i');
-  const baseSQL = `
-      SELECT i.*,
-             snippet(issues_fts, -1, '<mark>', '</mark>', '...', 32) as snippet,
-             ${BM25_EXPR} as bm25_score
-      FROM issues_fts
-      JOIN issue_overview_mv i ON issues_fts.id = i.id
-      WHERE issues_fts MATCH ?
-    `;
-  let sql = baseSQL;
-  const queryParams = [ftsQuery];
-  if (clauses.length > 0) {
-    sql += ` AND ${clauses.join(' AND ')}`;
-    queryParams.push(...params);
-  }
-
-  let fetchLimit = limit;
-  const minCandidates = isShortQuery(term) ? HYBRID_CANDIDATE_MIN_SHORT : HYBRID_CANDIDATE_MIN;
-  if (mode === 'hybrid') {
-    fetchLimit = Math.max(limit * 2, offset + limit, minCandidates);
-  }
-  const fetchOffset = mode === 'hybrid' ? 0 : offset;
-  sql += ` ORDER BY ${BM25_EXPR} LIMIT ? OFFSET ?`;
-  queryParams.push(fetchLimit, fetchOffset);
 
   const UNBOUNDED_SUBSTRING_POOL_LIMIT = 1000000;
   let rows = [];
   let usedFTS = false;
   if (supportsFTS5() && ftsQuery) {
+    const bm25Expr = getBM25Expr();
+    let sql = `
+      SELECT i.*,
+             snippet(issues_fts, -1, '<mark>', '</mark>', '...', 32) as snippet,
+             ${bm25Expr} as bm25_score
+      FROM issues_fts
+      JOIN issue_overview_mv i ON issues_fts.id = i.id
+      WHERE issues_fts MATCH ?
+    `;
+    const queryParams = [ftsQuery];
+    if (clauses.length > 0) {
+      sql += ` AND ${clauses.join(' AND ')}`;
+      queryParams.push(...params);
+    }
+
+    let fetchLimit = limit;
+    const minCandidates = isShortQuery(term) ? HYBRID_CANDIDATE_MIN_SHORT : HYBRID_CANDIDATE_MIN;
+    if (mode === 'hybrid') {
+      fetchLimit = Math.max(limit * 2, offset + limit, minCandidates);
+    }
+    const fetchOffset = mode === 'hybrid' ? 0 : offset;
+    sql += ` ORDER BY ${bm25Expr} LIMIT ? OFFSET ?`;
+    queryParams.push(fetchLimit, fetchOffset);
+
     try {
       rows = execQuery(sql, queryParams);
       usedFTS = true;
@@ -2759,7 +2793,7 @@ function computeLexicalTextScore(row, query) {
   const assignee = normalizeSearchText(row.assignee).toLowerCase();
   const description = normalizeSearchText(row.description).toLowerCase();
   const extraText = normalizeSearchText(
-    [row.notes, row.design, row.acceptance_criteria, row.external_ref]
+    [row.notes, row.design, row.acceptance_criteria, row.external_ref, row.source_repo]
       .filter(Boolean)
       .join(' ')
   ).toLowerCase();
@@ -3939,6 +3973,10 @@ function filtersToURL(filters = {}, sort = 'priority', searchQuery = '', searchM
     params.set('assignee', filters.assignee);
   }
 
+  if (filters.repo) {
+    params.set('repo', filters.repo);
+  }
+
   if (filters.hasBlockers === true || filters.hasBlockers === 'true') {
     params.set('blocked', 'true');
   } else if (filters.hasBlockers === false || filters.hasBlockers === 'false') {
@@ -4015,6 +4053,11 @@ function filtersFromURL() {
   const assigneeParam = params.get('assignee');
   if (assigneeParam) {
     filters.assignee = assigneeParam;
+  }
+
+  const repoParam = params.get('repo');
+  if (repoParam) {
+    filters.repo = repoParam;
   }
 
   const blockedParam = params.get('blocked');
@@ -4579,6 +4622,7 @@ function beadsApp() {
       priorities: [],
       assignees: [],
       labels: [],
+      repos: [],
     },
 
     // Filters (supports multi-select arrays)
@@ -4588,6 +4632,7 @@ function beadsApp() {
       priority: [],    // Array for multi-select
       labels: [],      // Array for multi-select
       assignee: '',    // Single select
+      repo: '',        // Multi-repo workspace filter (empty = all)
       hasBlockers: null, // true/false/null
       isBlocking: null,  // true/false/null
       criticalPath: false, // Filter to critical path issues
@@ -4632,7 +4677,15 @@ function beadsApp() {
     forceGraphLoading: false,
     forceGraphError: null,
     forceGraphModule: null,
+    _graphListenersBound: false,
     graphDetailNode: null, // Currently selected node for detail pane
+    graphContextMenu: { open: false, x: 0, y: 0, node: null },
+    graphWhatIfActive: false,
+    graphWhatIfNodes: [],
+    graphWhatIfDirectUnblocks: 0,
+    graphWhatIfTransitiveUnblocks: 0,
+    graphWhatIfUnblockedIds: [],
+    graphWhatIfBatchIds: [],
 
     // Graph loading stages: 'init' | 'loading-data' | 'computing-metrics' | 'simulating' | null
     graphLoadingStage: null,
@@ -4653,6 +4706,7 @@ function beadsApp() {
     currentCycleIdx: 0,
     totalCycles: 0,
     currentCyclePath: '',
+    currentCycleBreakEdge: null,
 
     // Critical path highlighting & [1/N] kCriticalPaths stepper
     showCriticalPath: false,
@@ -4732,6 +4786,9 @@ function beadsApp() {
           if (this.graphDetailNode) {
             this.graphDetailNode = null;
           }
+          if (this.graphContextMenu?.open) {
+            this.graphContextMenu = { open: false, x: 0, y: 0, node: null };
+          }
           if (oldView === 'graph') {
             this.forceGraphModule?.hideTooltip?.();
           }
@@ -4760,11 +4817,14 @@ function beadsApp() {
         }
       });
 
-      // Close coarse-pointer / click-opened .metric-tooltip cards when clicking outside
+      // Close coarse-pointer / click-opened .metric-tooltip cards and graph context menu when clicking outside
       document.addEventListener('click', (e) => {
         if (!e.target?.closest?.('.metric-tooltip-trigger')) {
           document.querySelectorAll('.metric-tooltip.tooltip-visible').forEach(el => el.classList.remove('tooltip-visible'));
           document.querySelectorAll('.metric-tooltip-trigger.tooltip-open').forEach(el => el.classList.remove('tooltip-open'));
+        }
+        if (this.graphContextMenu?.open && !e.target?.closest?.('#graph-context-menu')) {
+          this.graphContextMenu = { open: false, x: 0, y: 0, node: null };
         }
       });
 
@@ -4789,6 +4849,15 @@ function beadsApp() {
           this.toasts = this.toasts.filter(t => t.id !== validToast.id);
         }, 5000);
       });
+
+      // Capture-phase Escape closes the graph node context menu without leaking to graph.js or detail pane
+      window.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && this.graphContextMenu?.open) {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+          this.graphContextMenu = { open: false, x: 0, y: 0, node: null };
+        }
+      }, true);
 
       // Listen for keyboard shortcuts (vim-style navigation)
       window.addEventListener('keydown', (e) => {
@@ -4942,11 +5011,13 @@ function beadsApp() {
         this.currentCycleIdx = e.detail?.currentIndex ?? 0;
         this.totalCycles = e.detail?.cycleCount ?? (this.cycleInfo?.cycleCount || 0);
         this.currentCyclePath = e.detail?.cyclePath || '';
+        this.currentCycleBreakEdge = e.detail?.suggestedBreakEdge || null;
       });
       document.addEventListener('bv-graph:cycleNavigatorReset', () => {
         this.cycleNavigatorActive = false;
         this.currentCycleIdx = 0;
         this.currentCyclePath = '';
+        this.currentCycleBreakEdge = null;
       });
       document.addEventListener('bv-graph:criticalPathChange', (e) => {
         this.criticalPathNavActive = Boolean(e.detail?.active ?? true);
@@ -4988,6 +5059,7 @@ function beadsApp() {
           priority: [],
           labels: [],
           assignee: '',
+          repo: '',
           hasBlockers: null,
           isBlocking: null,
           criticalPath: false,
@@ -5235,6 +5307,7 @@ function beadsApp() {
             priority: [],
             labels: [],
             assignee: '',
+            repo: '',
             hasBlockers: null,
             isBlocking: null,
             criticalPath: false,
@@ -5357,8 +5430,11 @@ function beadsApp() {
         if (!this.forceGraphReady) {
           await this.forceGraphModule.initGraph('graph-container');
           this.forceGraphReady = true;
+        }
 
-          // Register event listeners once (inside forceGraphReady check to avoid duplicates)
+        if (!this._graphListenersBound) {
+          this._graphListenersBound = true;
+          // Register event listeners once (guarded independently of forceGraphReady so retries never duplicate)
           // Events are dispatched on document, so listen there
           const handleGraphNodeDetail = (e) => {
             const node = e.detail?.node;
@@ -5369,8 +5445,24 @@ function beadsApp() {
               setTimeout(() => this.resizeForceGraph(), 350);
             }
           };
-          document.addEventListener('bv-graph:nodeClick', handleGraphNodeDetail);
+          document.addEventListener('bv-graph:nodeClick', (e) => {
+            if (this.graphContextMenu?.open) {
+              this.graphContextMenu = { open: false, x: 0, y: 0, node: null };
+            }
+            handleGraphNodeDetail(e);
+          });
           document.addEventListener('bv-graph:nodeSelect', handleGraphNodeDetail);
+          document.addEventListener('bv-graph:nodeContextMenu', (e) => {
+            const node = e.detail?.node;
+            if (!node) return;
+            const rawX = Number(e.detail?.x ?? e.detail?.event?.clientX ?? 16);
+            const rawY = Number(e.detail?.y ?? e.detail?.event?.clientY ?? 16);
+            const menuWidth = 224;
+            const menuHeight = 232;
+            const clampedX = Math.max(8, Math.min(rawX, (window.innerWidth || 1024) - menuWidth - 8));
+            const clampedY = Math.max(8, Math.min(rawY, (window.innerHeight || 768) - menuHeight - 8));
+            this.graphContextMenu = { open: true, x: clampedX, y: clampedY, node };
+          });
           document.addEventListener('bv-graph:selectionChange', (e) => {
             if (e.detail?.node) {
               if (this.graphDetailNode?.id !== e.detail.node.id) {
@@ -5383,8 +5475,50 @@ function beadsApp() {
           });
           document.addEventListener('bv-graph:backgroundClick', () => {
             this.graphDetailNode = null;
+            if (this.graphContextMenu?.open) {
+              this.graphContextMenu = { open: false, x: 0, y: 0, node: null };
+            }
             // Resize graph after detail pane closes
             setTimeout(() => this.resizeForceGraph(), 250);
+          });
+
+          // Sync What-If cascade state for Graph HUD
+          document.addEventListener('bv-graph:whatIfStart', (e) => {
+            const nodes = Array.isArray(e.detail?.nodes) && e.detail.nodes.length > 0
+              ? e.detail.nodes
+              : (e.detail?.node ? [e.detail.node] : []);
+            const result = e.detail?.result || {};
+            const direct = Number(result.direct_unblocks ?? (result.unblocked_ids?.length || 0)) || 0;
+            const transitive = Number(result.transitive_unblocks ?? direct) || direct;
+            const nodeIds = nodes.map(n => n?.id || String(n)).filter(Boolean);
+            this.graphWhatIfActive = nodeIds.length > 0;
+            this.graphWhatIfNodes = nodeIds;
+            this.graphWhatIfBatchIds = [...nodeIds];
+            this.graphWhatIfDirectUnblocks = direct;
+            this.graphWhatIfTransitiveUnblocks = transitive;
+            this.graphWhatIfUnblockedIds = [];
+          });
+          document.addEventListener('bv-graph:whatIfComplete', (e) => {
+            const nodes = Array.isArray(e.detail?.nodes) && e.detail.nodes.length > 0
+              ? e.detail.nodes
+              : (e.detail?.node ? [e.detail.node] : []);
+            if (nodes.length > 0) {
+              const nodeIds = nodes.map(n => n?.id || String(n)).filter(Boolean);
+              this.graphWhatIfActive = nodeIds.length > 0;
+              this.graphWhatIfNodes = nodeIds;
+              this.graphWhatIfBatchIds = [...nodeIds];
+            }
+            this.graphWhatIfDirectUnblocks = Number(e.detail?.directUnblocks ?? this.graphWhatIfDirectUnblocks) || 0;
+            this.graphWhatIfTransitiveUnblocks = Number(e.detail?.transitiveUnblocks ?? this.graphWhatIfTransitiveUnblocks) || 0;
+            this.graphWhatIfUnblockedIds = Array.isArray(e.detail?.unblockedIds) ? e.detail.unblockedIds : [];
+          });
+          document.addEventListener('bv-graph:whatIfReset', () => {
+            this.graphWhatIfActive = false;
+            this.graphWhatIfNodes = [];
+            this.graphWhatIfBatchIds = [];
+            this.graphWhatIfDirectUnblocks = 0;
+            this.graphWhatIfTransitiveUnblocks = 0;
+            this.graphWhatIfUnblockedIds = [];
           });
 
           // Sync heatmap state when toggled via keyboard shortcut
@@ -5638,6 +5772,7 @@ function beadsApp() {
         priority: normalizeArr(overrides.priority),
         labels: Array.isArray(overrides.labels) ? [...overrides.labels] : normalizeArr(overrides.labels),
         assignee: overrides.assignee || '',
+        repo: overrides.repo || '',
         hasBlockers: overrides.hasBlockers === true || overrides.hasBlockers === false ? overrides.hasBlockers : null,
         isBlocking: overrides.isBlocking === true ? true : null,
         criticalPath: Boolean(overrides.criticalPath),
@@ -5677,6 +5812,7 @@ function beadsApp() {
         priority: [],
         labels: [],
         assignee: '',
+        repo: '',
         hasBlockers: null,
         isBlocking: null,
         criticalPath: false,
@@ -5699,6 +5835,7 @@ function beadsApp() {
              this.filters.priority?.length > 0 ||
              this.filters.labels?.length > 0 ||
              this.filters.assignee ||
+             this.filters.repo ||
              this.filters.hasBlockers !== null ||
              this.filters.isBlocking !== null ||
              Boolean(this.filters.criticalPath) ||
@@ -6608,6 +6745,87 @@ function beadsApp() {
 
     resetGraphDependencyCone() {
       this.forceGraphModule?.resetDependencyCone?.();
+    },
+
+    setRepoFilter(repo) {
+      const next = String(repo || '').trim();
+      this.filters.repo = this.filters.repo === next ? '' : next;
+      this.selectedIssue = null;
+      this.graphDetailNode = null;
+      this.page = 1;
+      if (this.view !== 'issues' || window.location.hash.startsWith('#/issue/')) {
+        navigateToIssues(this.filters, this.sort, this.searchQuery, this.searchMode, this.searchPreset);
+      } else {
+        this.loadIssues();
+      }
+    },
+
+    closeGraphContextMenu() {
+      this.graphContextMenu = { open: false, x: 0, y: 0, node: null };
+    },
+
+    isNodeInWhatIfBatch(nodeId) {
+      return Boolean(nodeId) && this.graphWhatIfBatchIds.includes(nodeId);
+    },
+
+    async runGraphWhatIf(nodeId) {
+      if (!nodeId) return false;
+      this.closeGraphContextMenu();
+      const ready = await this.initForceGraph();
+      if (!ready) return false;
+      const result = this.forceGraphModule?.performWhatIf?.(nodeId);
+      return Boolean(result);
+    },
+
+    async toggleGraphWhatIfBatch(nodeId) {
+      if (!nodeId) return;
+      this.closeGraphContextMenu();
+      const idx = this.graphWhatIfBatchIds.indexOf(nodeId);
+      if (idx === -1) {
+        this.graphWhatIfBatchIds = [...this.graphWhatIfBatchIds, nodeId];
+      } else {
+        this.graphWhatIfBatchIds = this.graphWhatIfBatchIds.filter(id => id !== nodeId);
+      }
+      if (this.graphWhatIfBatchIds.length === 0) {
+        if (this.graphWhatIfActive) {
+          this.forceGraphModule?.resetWhatIf?.();
+        }
+        return;
+      }
+      if (this.graphWhatIfActive || this.graphWhatIfBatchIds.length >= 2) {
+        await this.runGraphWhatIfBatch();
+      }
+    },
+
+    async runGraphWhatIfBatch() {
+      const batchIds = [...this.graphWhatIfBatchIds];
+      if (batchIds.length === 0) return false;
+      this.closeGraphContextMenu();
+      const ready = await this.initForceGraph();
+      if (!ready) return false;
+      const res = batchIds.length === 1
+        ? this.forceGraphModule?.performWhatIf?.(batchIds[0])
+        : this.forceGraphModule?.performBatchWhatIf?.(batchIds);
+      return Boolean(res);
+    },
+
+    resetGraphWhatIf() {
+      this.graphWhatIfBatchIds = [];
+      this.forceGraphModule?.resetWhatIf?.();
+    },
+
+    async copyGraphNodeId(nodeId) {
+      this.closeGraphContextMenu();
+      const text = String(nodeId || '').trim();
+      if (!text) return false;
+      try {
+        await navigator.clipboard.writeText(text);
+        showToast(`Copied ${text}`, 'info');
+        return true;
+      } catch {
+        showToast(text, 'info');
+        return false;
+      }
     },
 
     toggleMobileTooltip(event) {

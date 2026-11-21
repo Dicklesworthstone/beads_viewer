@@ -1757,3 +1757,59 @@ func TestExport_EphemeralRoundTripAndLayoutActiveBetweenness(t *testing.T) {
 		t.Fatalf("layout.Centrality.Betweenness[closed-hub] = %v, want > 0 (exported topology centrality preserved)", layout.Centrality)
 	}
 }
+
+func TestSQLiteExportSourceRepoColumnAndFTS(t *testing.T) {
+	now := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+	issues := []*model.Issue{
+		{
+			ID: "api-1", Title: "API Auth", Status: model.StatusOpen, Priority: 1,
+			IssueType: model.TypeTask, SourceRepo: "api", CreatedAt: now, UpdatedAt: now,
+		},
+		{
+			ID: "web-1", Title: "Web Dashboard", Status: model.StatusOpen, Priority: 2,
+			IssueType: model.TypeFeature, SourceRepo: "web", CreatedAt: now, UpdatedAt: now,
+		},
+		{
+			ID: "local-1", Title: "Local Single Repo", Status: model.StatusOpen, Priority: 2,
+			IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now,
+		},
+	}
+
+	outDir := t.TempDir()
+	exp := NewSQLiteExporter(issues, nil, nil, nil)
+	if err := exp.Export(outDir); err != nil {
+		t.Fatalf("Export failed: %v", err)
+	}
+
+	db, err := sql.Open("sqlite", filepath.Join(outDir, "beads.sqlite3"))
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer db.Close()
+
+	// Verify source_repo persisted in issues and issue_overview_mv (NULL when empty).
+	var repoAPI, repoWeb string
+	var repoLocal sql.NullString
+	if err := db.QueryRow(`SELECT source_repo FROM issues WHERE id = 'api-1'`).Scan(&repoAPI); err != nil || repoAPI != "api" {
+		t.Fatalf("issues.source_repo(api-1) = %q (err=%v), want api", repoAPI, err)
+	}
+	if err := db.QueryRow(`SELECT source_repo FROM issue_overview_mv WHERE id = 'web-1'`).Scan(&repoWeb); err != nil || repoWeb != "web" {
+		t.Fatalf("issue_overview_mv.source_repo(web-1) = %q (err=%v), want web", repoWeb, err)
+	}
+	if err := db.QueryRow(`SELECT source_repo FROM issue_overview_mv WHERE id = 'local-1'`).Scan(&repoLocal); err != nil || repoLocal.Valid {
+		t.Fatalf("issue_overview_mv.source_repo(local-1) = %+v (err=%v), want NULL", repoLocal, err)
+	}
+
+	// Verify source_repo is indexed in issues_fts and compatible with 10-column bm25().
+	var matchedID string
+	var bm25Score float64
+	if err := db.QueryRow(`
+		SELECT i.id, bm25(issues_fts, 3.0, 2.0, 1.0, 1.5, 0.5, 0.8, 0.8, 0.8, 1.0, 0.8)
+		FROM issues_fts
+		JOIN issue_overview_mv i ON issues_fts.id = i.id
+		WHERE issues_fts MATCH '"web"*'
+		LIMIT 1
+	`).Scan(&matchedID, &bm25Score); err != nil || matchedID != "web-1" {
+		t.Fatalf("FTS5 10-col bm25 match for web: id=%q score=%v err=%v", matchedID, bm25Score, err)
+	}
+}

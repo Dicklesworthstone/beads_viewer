@@ -268,8 +268,8 @@ func (e *SQLiteExporter) insertIssues(db *sql.DB) error {
 	defer tx.Rollback()
 
 	stmt, err := tx.Prepare(`
-		INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type, assignee, labels, created_at, updated_at, closed_at, due_date, defer_until, external_ref, estimated_minutes, created_by, close_reason, is_template, pinned, ephemeral)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO issues (id, title, description, design, acceptance_criteria, notes, status, priority, issue_type, assignee, labels, created_at, updated_at, closed_at, due_date, defer_until, external_ref, estimated_minutes, created_by, close_reason, source_repo, is_template, pinned, ephemeral)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
@@ -318,6 +318,11 @@ func (e *SQLiteExporter) insertIssues(db *sql.DB) error {
 			s := issue.CloseReason
 			closeReason = &s
 		}
+		var sourceRepo *string
+		if issue.SourceRepo != "" {
+			s := issue.SourceRepo
+			sourceRepo = &s
+		}
 
 		_, err := stmt.Exec(
 			issue.ID,
@@ -340,6 +345,7 @@ func (e *SQLiteExporter) insertIssues(db *sql.DB) error {
 			estimatedMinutes,
 			createdBy,
 			closeReason,
+			sourceRepo,
 			boolToInt(issue.IsTemplate),
 			boolToInt(issue.Pinned),
 			boolToInt(issue.Ephemeral),
