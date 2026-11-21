@@ -163,6 +163,7 @@ func main() {
 					t.Fatalf("build capability fixture: %v\n%s", err, out)
 				}
 				t.Setenv("PATH", filepath.Dir(executable)+string(os.PathListSeparator)+os.Getenv("PATH"))
+				older := time.Now().Add(-5 * time.Second)
 				for _, name := range []string{"first.db", "second.db"} {
 					dbPath := filepath.Join(filepath.Dir(source), name)
 					fixtureDB, err := sql.Open("sqlite", dbPath)
@@ -174,6 +175,13 @@ func main() {
 						t.Fatal(err)
 					}
 					if err := fixtureDB.Close(); err != nil {
+						t.Fatal(err)
+					}
+					// Keep the stub metadata databases older than issues.jsonl so smart
+					// SQLite discovery (which honors metadata.json "database") continues
+					// to select the fresher JSONL fixture while routing mutation actions
+					// to first.db / second.db.
+					if err := os.Chtimes(dbPath, older, older); err != nil {
 						t.Fatal(err)
 					}
 				}

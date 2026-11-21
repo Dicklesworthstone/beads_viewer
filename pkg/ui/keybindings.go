@@ -229,8 +229,8 @@ func GetKeyBindingDocs() []KeyBindingDoc {
 		// gg is a 200 ms combo; only the board and tree implement it. In the
 		// list a single g opens the graph view.
 		{"gg", "Go to start", "Navigation", "board,tree"},
-		{"ctrl+d", "Page down", "Navigation", "list,detail,board,graph,insights,tree,actionable,history,flow,attention,label,velocity"},
-		{"ctrl+u", "Page up", "Navigation", "list,detail,board,graph,insights,tree,actionable,history,flow,attention,label,velocity"},
+		{"ctrl+d", "Page down", "Navigation", "list,detail,board,graph,insights,tree,actionable,history,flow,attention,label,velocity,sprint"},
+		{"ctrl+u", "Page up", "Navigation", "list,detail,board,graph,insights,tree,actionable,history,flow,attention,label,velocity,sprint"},
 		{"enter", "Open details", "Navigation", "list,detail,board,graph,insights,actionable,history"},
 		{"esc", "Back/close (list: clear filters)", "Navigation", "all"},
 		{"q", "Quit / close view", "Navigation", "all"},
@@ -299,9 +299,9 @@ func GetKeyBindingDocs() []KeyBindingDoc {
 		{"h", "Previous column", "Board", "board"},
 		{"l", "Next column", "Board", "board"},
 		{"H", "First column", "Board", "board"},
-		{"0", "First column", "Board", "board"},
+		{"0", "First item in column", "Board", "board"},
 		{"L", "Last column", "Board", "board"},
-		{"$", "Last column", "Board", "board"},
+		{"$", "Last item in column", "Board", "board"},
 		{"1-4", "Jump to column 1-4", "Board", "board"},
 		{"/", "Search cards", "Board", "board"},
 		{"n", "Next search match", "Board", "board"},

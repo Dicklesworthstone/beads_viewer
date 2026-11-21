@@ -44,7 +44,7 @@
 | `BV_TUI_AUTOCLOSE_MS` | Quit the TUI automatically after this many milliseconds (for automated tests). | (unset) |
 | `BV_UPDATE_USE_TOKEN` | Allow update checks and `--update` to send ambient `GITHUB_TOKEN` / `GH_TOKEN` only to the exact HTTPS origins api.github.com and github.com with `1`/`true`/`yes`/`on`; `0`/`false`/`no`/`off` denies it. Cross-origin redirects receive no token. Nonempty values override `updates.use_token` in user config (case-insensitive, trimmed); invalid values deny token use, and empty values preserve config. | (never sent) |
 | `BV_WATCHDOG_INTERVAL_S` | Background worker watchdog interval (seconds). | `10` |
-| `BV_WORKER_LOG_LEVEL` | Log level for the background snapshot worker (`none`, `error`, `warn`, `info`, `debug`). | `none` |
+| `BV_WORKER_LOG_LEVEL` | Log level for the background snapshot worker (`none`, `error`, `warn`, `info`, `debug`, `trace`). | `none` |
 | `BV_WORKER_METRICS` | Truthy value: the background worker records its own metrics. | (off) |
 | `BV_WORKER_TRACE` | Path to a trace file the background worker appends to. | (off) |
 | `SOURCE_DATE_EPOCH` | Unix epoch timestamp (seconds) pinning robot report timestamps and running timeout-raced metrics to deterministic completion. | (unset) |

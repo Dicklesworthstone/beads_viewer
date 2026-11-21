@@ -7704,9 +7704,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 
 			case focusSprint:
-				// Sprint uses P/esc/j/k/enter — no conflicts with view-toggles.
+				// Sprint uses P/esc/j/k/ctrl+d/ctrl+u/pgdown/pgup/enter — no conflicts with view-toggles.
 				switch keyStr {
-				case "P", "esc", "j", "k", "up", "down", "enter":
+				case "P", "esc", "j", "k", "up", "down", "ctrl+d", "ctrl+u", "pgdown", "pgup", "enter":
 					m = m.handleSprintKeys(msg)
 					viewToggleHandled = true
 				}

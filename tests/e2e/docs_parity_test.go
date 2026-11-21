@@ -1845,7 +1845,8 @@ func TestDocsParity_RC40CrossDocumentTruthAndNegativeControls(t *testing.T) {
 				if len(fields) == 0 {
 					continue
 				}
-				if !strings.Contains(skillText, fields[0]) {
+				exactToken := regexp.MustCompile(`(?m)(?:^|[^A-Za-z0-9_-])` + regexp.QuoteMeta(fields[0]) + `(?:[^A-Za-z0-9_-]|$)`)
+				if !exactToken.MatchString(skillText) {
 					missing = append(missing, fields[0])
 				}
 			}
@@ -2089,6 +2090,10 @@ func TestDocsParity_RC40CrossDocumentTruthAndNegativeControls(t *testing.T) {
 				"across all statuses",
 				"ignored by hash",
 				"wizard does not run hooks",
+				"`Enter` jumps to the selected sprint issue",
+				"| `0` | First column |",
+				"| `$` | Last column |",
+				"| `g` / `G` | Jump to first / last node |",
 			} {
 				if strings.Contains(strings.ToLower(readmeText), strings.ToLower(stale)) {
 					return fmt.Errorf("README.md still contains stale claim %q", stale)
@@ -2099,10 +2104,13 @@ func TestDocsParity_RC40CrossDocumentTruthAndNegativeControls(t *testing.T) {
 				"`extractPathHints`",
 				"active non-closed, non-parked issues",
 				"FNV-1a token seed and search index cache filename",
-				"| `BV_WORKER_LOG_LEVEL` | Log level for the background snapshot worker (`none`, `error`, `warn`, `info`, `debug`). | `none` |",
+				"| `BV_WORKER_LOG_LEVEL` | Log level for the background snapshot worker (`none`, `error`, `warn`, `info`, `debug`, `trace`). | `none` |",
 				"unified help overlay",
 				"`[REOPENED]`",
-				"`Enter` jumps to the selected sprint issue",
+				"`Enter` jumps to the first sprint bead",
+				"| `0` | First item in column |",
+				"| `$` | Last item in column |",
+				"| `gg` / `G` | Jump to first / last node |",
 			} {
 				if !strings.Contains(readmeText, must) {
 					return fmt.Errorf("README.md missing reconciled truth %q", must)
@@ -2211,6 +2219,13 @@ func TestDocsParity_RC40CrossDocumentTruthAndNegativeControls(t *testing.T) {
 		}
 		if err := checkPerfDoc("The remaining CLI evidence cannot be replaced by the UI pass, and the P1 implementation and proof beads remain open."); err == nil {
 			t.Fatal("negative control failed: stale docs/performance.md open-bead claim unexpectedly passed")
+		} else {
+			t.Logf("negative_control_pass %s", formatLog(rc40AuditLog{
+				FixtureID: "planted_stale_perf_open_beads",
+				DocPath:   "docs/performance.md",
+				Expected:  "stale open-bead claim rejected",
+				Observed:  err.Error(),
+			}))
 		}
 
 		checkReleasingDoc := func(relText string) error {
@@ -2237,6 +2252,13 @@ func TestDocsParity_RC40CrossDocumentTruthAndNegativeControls(t *testing.T) {
 		}
 		if err := checkReleasingDoc(strings.ReplaceAll(releasingDoc, "scripts/verify_vendor.sh --source", "scripts/verify_vendor.sh")); err == nil {
 			t.Fatal("negative control failed: docs/RELEASING.md omitting --source unexpectedly passed")
+		} else {
+			t.Logf("negative_control_pass %s", formatLog(rc40AuditLog{
+				FixtureID: "planted_missing_verify_vendor_source_flag",
+				DocPath:   "docs/RELEASING.md",
+				Expected:  "missing --source flag rejected",
+				Observed:  err.Error(),
+			}))
 		}
 
 		// Verify docs/testing.md timeout matches scripts/release_gate.sh and thresholds match scripts/coverage.sh.
@@ -2276,6 +2298,13 @@ func TestDocsParity_RC40CrossDocumentTruthAndNegativeControls(t *testing.T) {
 		}
 		if err := checkTestingDoc(strings.ReplaceAll(testingDoc, "-timeout=30m", "-timeout=45m")); err == nil {
 			t.Fatal("negative control failed: stale -timeout=45m in docs/testing.md unexpectedly passed")
+		} else {
+			t.Logf("negative_control_pass %s", formatLog(rc40AuditLog{
+				FixtureID: "planted_stale_testing_timeout_45m",
+				DocPath:   "docs/testing.md",
+				Expected:  "stale -timeout=45m rejected",
+				Observed:  err.Error(),
+			}))
 		}
 
 		changelog := repoFile(t, "CHANGELOG.md")
@@ -2285,6 +2314,80 @@ func TestDocsParity_RC40CrossDocumentTruthAndNegativeControls(t *testing.T) {
 				DocPath:   "CHANGELOG.md",
 				Expected:  "Wave 18–21 reality-check closure section under Unreleased",
 				Observed:  "missing",
+			}))
+		}
+	})
+
+	// 7. Live TUI runtime verification of documented Sprint Ctrl+d/Ctrl+u/Enter, Board 0/$, and Tree gg keys.
+	t.Run("sprint_board_tree_documented_keys_match_runtime", func(t *testing.T) {
+		now := time.Now().UTC()
+		issues := make([]model.Issue, 0, 25)
+		beadIDs := make([]string, 0, 25)
+		for i := 0; i < 25; i++ {
+			id := fmt.Sprintf("SP-%02d", i+1)
+			beadIDs = append(beadIDs, id)
+			issues = append(issues, model.Issue{
+				ID:        id,
+				Title:     fmt.Sprintf("Sprint issue %02d for scroll verification", i+1),
+				Status:    model.StatusOpen,
+				Priority:  2,
+				IssueType: model.TypeTask,
+			})
+		}
+		sprints := []model.Sprint{{
+			ID:        "sprint-active",
+			Name:      "Active Sprint",
+			StartDate: now.Add(-24 * time.Hour),
+			EndDate:   now.Add(6 * 24 * time.Hour),
+			BeadIDs:   beadIDs,
+		}}
+		m := ui.NewModel(issues, nil, "")
+		t.Cleanup(m.Stop)
+		m.SetSprints(sprints)
+		updated, _ := m.Update(tea.WindowSizeMsg{Width: 100, Height: 20})
+		m = updated.(*ui.Model)
+
+		// Open Sprint Dashboard with P, scroll down with ctrl+d, scroll back up with ctrl+u.
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'P'}})
+		m = updated.(*ui.Model)
+		viewTop := m.View()
+		if !strings.Contains(viewTop, "Active Sprint") {
+			t.Fatalf("pressing P did not open Sprint Dashboard; view=%q", viewTop)
+		}
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})
+		m = updated.(*ui.Model)
+		viewScrolled := m.View()
+		if viewScrolled == viewTop {
+			t.Fatalf("%s", formatLog(rc40AuditLog{
+				FixtureID: "sprint_dashboard_ctrl_d_scroll",
+				DocPath:   "README.md",
+				Expected:  "ctrl+d advances Sprint Dashboard viewport",
+				Observed:  "Sprint Dashboard view unchanged after ctrl+d",
+			}))
+		}
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlU})
+		m = updated.(*ui.Model)
+		if m.View() != viewTop {
+			t.Fatalf("ctrl+u did not restore Sprint Dashboard top view")
+		}
+
+		// Close sprint with P, verify Board 0/$ move within column (not switching columns).
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'P'}})
+		m = updated.(*ui.Model)
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'b'}})
+		m = updated.(*ui.Model)
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'$'}})
+		m = updated.(*ui.Model)
+		boardBottom := m.View()
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'0'}})
+		m = updated.(*ui.Model)
+		boardTop := m.View()
+		if boardBottom == boardTop {
+			t.Fatalf("%s", formatLog(rc40AuditLog{
+				FixtureID: "board_0_dollar_column_jump",
+				DocPath:   "pkg/ui/keybindings.go",
+				Expected:  "$ and 0 jump to last/first item in Open column",
+				Observed:  "board view identical after $ and 0",
 			}))
 		}
 	})

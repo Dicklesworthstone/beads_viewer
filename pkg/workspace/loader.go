@@ -591,6 +591,9 @@ func (l *AggregateLoader) loadSingleRepo(ctx context.Context, repo RepoConfig, k
 		}
 		result.SourcePath = sourcePath
 		result.WatchPaths = append(result.WatchPaths, sourcePath)
+		if result.SourceKind == string(datasource.SourceTypeSQLite) && sourcePath != "" {
+			result.WatchPaths = append(result.WatchPaths, sourcePath+"-wal")
+		}
 	}
 
 	// Resolve local references before filtering tombstones: a deleted local ID

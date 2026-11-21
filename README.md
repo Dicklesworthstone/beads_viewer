@@ -1760,7 +1760,7 @@ The tree construction uses a **parent-child only** filter with intelligent root 
 |-----|--------|
 | **Movement** | |
 | `j` / `k` / `↓` / `↑` | Move cursor down / up |
-| `g` / `G` | Jump to first / last node |
+| `gg` / `G` | Jump to first / last node |
 | `Ctrl+D` / `Ctrl+U` | Page down / up (half viewport) |
 | **Expand/Collapse** | |
 | `Enter` / `Space` | Toggle expand/collapse on current node |
@@ -2758,7 +2758,7 @@ When cass is available, press `V` in History to open the separate session modal 
 
 ## 📅 Sprint Dashboard: Burndown & Progress Tracking
 
-The **Sprint Dashboard** (`pkg/ui/sprint_view.go`) shows sprint progress, a simple burndown chart, at-risk items, and sprint beads, driven by `.beads/sprints.jsonl`. Historical scope changes are available through `--robot-burndown`, not this dashboard. Press `P` from the list or detail view to open it on the sprint active today (the status line says so when no sprints are defined); `j`/`k` step between sprints, `Ctrl+d`/`Ctrl+u` scroll, `Enter` jumps to the selected sprint issue, and `P`, `Esc`, or `q` close it.
+The **Sprint Dashboard** (`pkg/ui/sprint_view.go`) shows sprint progress, a simple burndown chart, at-risk items, and sprint beads, driven by `.beads/sprints.jsonl`. Historical scope changes are available through `--robot-burndown`, not this dashboard. Press `P` from the list or detail view to open it on the sprint active today (the status line says so when no sprints are defined); `j`/`k` step between sprints, `Ctrl+d`/`Ctrl+u` scroll, `Enter` jumps to the first sprint bead, and `P`, `Esc`, or `q` close it.
 
 ### Dashboard Layout
 
@@ -4281,7 +4281,7 @@ bv has a comprehensive built-in help system:
 | **list,detail,board,graph,insights,tree,actionable,history,flow,attention,label,velocity** | `G` | Go to end |
 |  | `home` | Go to start |
 | **board,tree** | `gg` | Go to start |
-| **list,detail,board,graph,insights,tree,actionable,history,flow,attention,label,velocity** | `ctrl+d` | Page down |
+| **list,detail,board,graph,insights,tree,actionable,history,flow,attention,label,velocity,sprint** | `ctrl+d` | Page down |
 |  | `ctrl+u` | Page up |
 | **list,detail,board,graph,insights,actionable,history** | `enter` | Open details |
 | **all** | `esc` | Back/close (list: clear filters) |
@@ -4341,9 +4341,9 @@ bv has a comprehensive built-in help system:
 | **board** | `h` | Previous column |
 |  | `l` | Next column |
 |  | `H` | First column |
-|  | `0` | First column |
+|  | `0` | First item in column |
 |  | `L` | Last column |
-|  | `$` | Last column |
+|  | `$` | Last item in column |
 |  | `1-4` | Jump to column 1-4 |
 |  | `/` | Search cards |
 |  | `n` | Next search match |
@@ -4477,7 +4477,7 @@ bv has a comprehensive built-in help system:
 | `BV_TUI_AUTOCLOSE_MS` | Quit the TUI automatically after this many milliseconds (for automated tests). | (unset) |
 | `BV_UPDATE_USE_TOKEN` | Allow update checks and `--update` to send ambient `GITHUB_TOKEN` / `GH_TOKEN` only to the exact HTTPS origins api.github.com and github.com with `1`/`true`/`yes`/`on`; `0`/`false`/`no`/`off` denies it. Cross-origin redirects receive no token. Nonempty values override `updates.use_token` in user config (case-insensitive, trimmed); invalid values deny token use, and empty values preserve config. | (never sent) |
 | `BV_WATCHDOG_INTERVAL_S` | Background worker watchdog interval (seconds). | `10` |
-| `BV_WORKER_LOG_LEVEL` | Log level for the background snapshot worker (`none`, `error`, `warn`, `info`, `debug`). | `none` |
+| `BV_WORKER_LOG_LEVEL` | Log level for the background snapshot worker (`none`, `error`, `warn`, `info`, `debug`, `trace`). | `none` |
 | `BV_WORKER_METRICS` | Truthy value: the background worker records its own metrics. | (off) |
 | `BV_WORKER_TRACE` | Path to a trace file the background worker appends to. | (off) |
 | `SOURCE_DATE_EPOCH` | Unix epoch timestamp (seconds) pinning robot report timestamps and running timeout-raced metrics to deterministic completion. | (unset) |

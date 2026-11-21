@@ -340,7 +340,7 @@ var (
 
 	WorkerLogLevel = register(Var{
 		Name:        "BV_WORKER_LOG_LEVEL",
-		Description: "Log level for the background snapshot worker (`none`, `error`, `warn`, `info`, `debug`).",
+		Description: "Log level for the background snapshot worker (`none`, `error`, `warn`, `info`, `debug`, `trace`).",
 		Default:     "`none`",
 	})
 

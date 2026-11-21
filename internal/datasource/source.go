@@ -298,16 +298,20 @@ func discoverSQLiteSources(beadsDir string, opts DiscoveryOptions) ([]DataSource
 	}
 	if rawMeta, err := os.ReadFile(filepath.Join(beadsDir, "metadata.json")); err == nil {
 		var meta struct {
+			Backend  string `json:"backend"`
 			Database string `json:"database"`
 		}
 		if json.Unmarshal(rawMeta, &meta) == nil {
-			if dbName := strings.TrimSpace(meta.Database); dbName != "" {
-				metaPath := dbName
-				if !filepath.IsAbs(metaPath) {
-					metaPath = filepath.Join(beadsDir, metaPath)
-				}
-				if info, statErr := os.Stat(metaPath); statErr == nil && !info.IsDir() {
-					addCandidate(metaPath)
+			backend := strings.ToLower(strings.TrimSpace(meta.Backend))
+			if backend == "" || backend == "sqlite" {
+				if dbName := strings.TrimSpace(meta.Database); dbName != "" {
+					metaPath := dbName
+					if !filepath.IsAbs(metaPath) {
+						metaPath = filepath.Join(beadsDir, metaPath)
+					}
+					if info, statErr := os.Stat(metaPath); statErr == nil && !info.IsDir() {
+						addCandidate(metaPath)
+					}
 				}
 			}
 		}
