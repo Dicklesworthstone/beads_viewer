@@ -517,4 +517,35 @@ func TestWave22_Pass2MetadataJSONHardening(t *testing.T) {
 			t.Fatal("ResolveMetadataPathWithinDir accepted symlink escaping beadsDir")
 		}
 	}
+
+	// 4. Canonical absolute path inside a symlinked beadsDir (e.g., macOS /var -> /private/var) must be accepted
+	//    AND discoverSQLiteSources must deduplicate canonical metadata.json beads.db against symlinked beads.db.
+	realProj := filepath.Join(outer, "real-proj", ".beads")
+	if err := os.MkdirAll(realProj, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	insideDB := filepath.Join(realProj, "beads.db")
+	createTestSQLiteDB(t, insideDB)
+	symProjLink := filepath.Join(outer, "sym-proj")
+	if err := os.Symlink(filepath.Join(outer, "real-proj"), symProjLink); err == nil {
+		canonInside, err := filepath.EvalSymlinks(insideDB)
+		if err != nil {
+			t.Fatal(err)
+		}
+		symBeadsDir := filepath.Join(symProjLink, ".beads")
+		if got, ok := ResolveMetadataPathWithinDir(symBeadsDir, canonInside); !ok || got == "" {
+			t.Fatalf("ResolveMetadataPathWithinDir rejected canonical absolute path %q inside symlinked beadsDir", canonInside)
+		}
+		metaJSON := `{"backend":"sqlite","database":"` + filepath.ToSlash(canonInside) + `"}`
+		if err := os.WriteFile(filepath.Join(realProj, "metadata.json"), []byte(metaJSON), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		sources, err := discoverSQLiteSources(symBeadsDir, DiscoveryOptions{BeadsDir: symBeadsDir})
+		if err != nil {
+			t.Fatalf("discoverSQLiteSources on symlinked beadsDir: %v", err)
+		}
+		if len(sources) != 1 {
+			t.Fatalf("discoverSQLiteSources returned %d duplicate SQLite sources for symlinked beads.db: %+v", len(sources), sources)
+		}
+	}
 }

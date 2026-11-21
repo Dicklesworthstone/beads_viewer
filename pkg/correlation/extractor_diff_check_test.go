@@ -959,13 +959,10 @@ func TestWave22_Pass2ShortSHARejectIncrementalWindowAndMergeRejectedPairs(t *tes
 	runGitMR7(t, repo, "commit", "-m", "chore: second orphan commit")
 	secondSHA := strings.TrimSpace(runGitMR7(t, repo, "rev-parse", "HEAD"))
 
-	// 1. Short-SHA Reject(firstSHA[:8], "bv-s1") must filter out full-SHA firstSHA in Pass 1
-	//    AND block full-SHA Confirm(firstSHA, "bv-s1") in Pass 2 AND record fullSHA in rejectedPairs.
+	// 1. Short-SHA Reject(firstSHA[:8], "bv-s1") alone filters out full-SHA firstSHA in Pass 1
+	//    and records resolved full SHA in rejectedPairs for ReverseLookup.
 	store := NewFeedbackStore(beadsDir)
 	if err := store.Reject(firstSHA[:8], "bv-s1", "tester", 0.95, "short-sha reject"); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Confirm(firstSHA, "bv-s1", "tester", 0.95, "full-sha confirm should be blocked"); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Confirm(secondSHA, "bv-s1", "tester", 0.0, "future confirm"); err != nil {
@@ -974,32 +971,90 @@ func TestWave22_Pass2ShortSHARejectIncrementalWindowAndMergeRejectedPairs(t *tes
 
 	beads := []BeadInfo{{ID: "bv-s1", Title: "S1", Status: "open"}}
 	c := NewCorrelator(repo, ".beads/issues.jsonl").WithFeedbackStore(store)
-	rep, err := c.GenerateReport(beads, CorrelatorOptions{Limit: 50})
+	repRejectOnly, err := c.GenerateReport(beads, CorrelatorOptions{Limit: 50})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, cc := range rep.Histories["bv-s1"].Commits {
+	for _, cc := range repRejectOnly.Histories["bv-s1"].Commits {
 		if cc.SHA == firstSHA {
 			t.Fatalf("short-SHA rejection failed to exclude full-SHA commit %s", firstSHA)
 		}
 	}
-	if !rep.rejectedPairs[firstSHA]["bv-s1"] {
-		t.Fatalf("expected resolved full SHA %s in rejectedPairs, got %+v", firstSHA, rep.rejectedPairs)
+	if !repRejectOnly.rejectedPairs[firstSHA]["bv-s1"] {
+		t.Fatalf("expected resolved full SHA %s in rejectedPairs, got %+v", firstSHA, repRejectOnly.rejectedPairs)
 	}
 
-	// 2. IncrementalCorrelator mergeIncremental honors opts.Revision (--as-of) when applying feedback.
-	inc := NewIncrementalCorrelator(repo, ".beads/issues.jsonl").WithFeedbackStore(store)
-	repInc, err := inc.GenerateReport(beads, CorrelatorOptions{Limit: 50, Revision: firstSHA})
+	// 2. Last-write-wins across short/full SHAs: a newer full-SHA Confirm overrides an older
+	//    short-SHA Reject (clearing rejectedPairs for that pair), and short-SHA Ignore increments Ignored.
+	time.Sleep(2 * time.Millisecond)
+	if err := store.Confirm(firstSHA, "bv-s1", "tester", 0.95, "newer full-sha confirm wins"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Ignore(secondSHA[:8], "bv-s1", "tester", 0.5, "short-sha ignore"); err != nil {
+		t.Fatal(err)
+	}
+	repOverride, err := c.GenerateReport(beads, CorrelatorOptions{Limit: 50})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, cc := range repInc.Histories["bv-s1"].Commits {
-		if cc.SHA == secondSHA {
-			t.Fatalf("IncrementalCorrelator leaked post-Revision confirmed commit %s", secondSHA)
+	foundFirstConfirmed := false
+	for _, cc := range repOverride.Histories["bv-s1"].Commits {
+		if cc.SHA == firstSHA && cc.Confirmed {
+			foundFirstConfirmed = true
 		}
 	}
+	if !foundFirstConfirmed {
+		t.Fatalf("newer full-SHA Confirm failed to override older short-SHA Reject: %+v", repOverride.Histories["bv-s1"].Commits)
+	}
+	if repOverride.rejectedPairs[firstSHA]["bv-s1"] {
+		t.Fatalf("overridden short-SHA Reject remained in rejectedPairs: %+v", repOverride.rejectedPairs)
+	}
+	if repOverride.Stats.FeedbackApplied == nil || repOverride.Stats.FeedbackApplied.Confirmed < 1 {
+		t.Fatalf("expected Confirmed >= 1 after override, got %+v", repOverride.Stats.FeedbackApplied)
+	}
 
-	// 3. MergeRejectedPairs with qualify != nil records ONLY qualified ID (no unprefixed sibling poison).
+	// Short-SHA Ignore on an existing commit must resolve to full SHA and increment Ignored.
+	storeIgnore := NewFeedbackStore(t.TempDir())
+	if err := storeIgnore.Ignore(firstSHA[:8], "bv-s1", "tester", 0.9, "short-sha ignore"); err != nil {
+		t.Fatal(err)
+	}
+	cIgn := NewCorrelator(repo, ".beads/issues.jsonl").WithFeedbackStore(storeIgnore)
+	repIgn, err := cIgn.GenerateReport(beads, CorrelatorOptions{Limit: 50})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repIgn.Stats.FeedbackApplied == nil || repIgn.Stats.FeedbackApplied.Ignored != 1 {
+		t.Fatalf("short-SHA Ignore did not resolve and increment Ignored: %+v", repIgn.Stats.FeedbackApplied)
+	}
+
+	// 3. Direct mergeReportsWithOptions call (exercising incremental.go:1039) honors opts.Revision
+	//    when applying feedback AND preserves Confirmed count when re-merging a short-SHA confirm.
+	storeMerge := NewFeedbackStore(t.TempDir())
+	if err := storeMerge.Confirm(firstSHA[:8], "bv-s1", "tester", 0.95, "short-sha confirm existing"); err != nil {
+		t.Fatal(err)
+	}
+	if err := storeMerge.Confirm(secondSHA, "bv-s1", "tester", 0.0, "post-revision orphan"); err != nil {
+		t.Fatal(err)
+	}
+	cMerge := NewCorrelator(repo, ".beads/issues.jsonl").WithFeedbackStore(storeMerge)
+	existing, err := cMerge.GenerateReport(beads, CorrelatorOptions{Limit: 50, Revision: firstSHA})
+	if err != nil {
+		t.Fatal(err)
+	}
+	merged := mergeReportsWithOptions(cMerge, existing, beads, nil, nil, firstSHA, CorrelatorOptions{Limit: 50, Revision: firstSHA})
+	if merged == nil {
+		t.Fatal("mergeReportsWithOptions returned nil")
+	}
+	for _, cc := range merged.Histories["bv-s1"].Commits {
+		if cc.SHA == secondSHA {
+			t.Fatalf("mergeReportsWithOptions leaked post-Revision confirmed commit %s", secondSHA)
+		}
+	}
+	if merged.Stats.FeedbackApplied == nil || merged.Stats.FeedbackApplied.Confirmed != 1 {
+		t.Fatalf("mergeReportsWithOptions dropped Confirmed count on short-SHA re-merge: %+v", merged.Stats.FeedbackApplied)
+	}
+
+	// 4. MergeRejectedPairs with qualify != nil records ONLY qualified ID (no unprefixed sibling poison).
 	rootRep := &HistoryReport{}
 	subRep := &HistoryReport{
 		rejectedPairs: map[string]map[string]bool{
@@ -1012,5 +1067,29 @@ func TestWave22_Pass2ShortSHARejectIncrementalWindowAndMergeRejectedPairs(t *tes
 	}
 	if rootRep.rejectedPairs[firstSHA]["bv-1"] {
 		t.Fatalf("MergeRejectedPairs poisoned unprefixed sibling ID bv-1: %+v", rootRep.rejectedPairs)
+	}
+
+	// 5. Pass 4 #1 & #2: Uppercase 40-char SHA reject canonicalizes cleanly AND FeedbackStore.Fingerprint()
+	//    changes whenever FeedbackAt advances (preventing stale cache hits under last-write-wins).
+	storeUpper := NewFeedbackStore(t.TempDir())
+	if err := storeUpper.Reject(strings.ToUpper(firstSHA), "bv-s1", "tester", 0.9, "uppercase reject"); err != nil {
+		t.Fatal(err)
+	}
+	fpBefore := storeUpper.Fingerprint()
+	repUpper, err := NewCorrelator(repo, ".beads/issues.jsonl").WithFeedbackStore(storeUpper).GenerateReport(beads, CorrelatorOptions{Limit: 50})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, cc := range repUpper.Histories["bv-s1"].Commits {
+		if cc.SHA == firstSHA {
+			t.Fatalf("uppercase 40-char Reject failed to exclude %s", firstSHA)
+		}
+	}
+	time.Sleep(2 * time.Millisecond)
+	if err := storeUpper.Reject(strings.ToUpper(firstSHA), "bv-s1", "tester", 0.9, "newer uppercase reject"); err != nil {
+		t.Fatal(err)
+	}
+	if fpAfter := storeUpper.Fingerprint(); fpAfter == fpBefore {
+		t.Fatalf("FeedbackStore.Fingerprint() did not change when FeedbackAt advanced: %q", fpAfter)
 	}
 }

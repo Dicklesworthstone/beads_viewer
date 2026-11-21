@@ -335,20 +335,22 @@ func ResolveMetadataPathWithinDir(beadsDir, target string) (string, bool) {
 	if err != nil {
 		return "", false
 	}
-	rel, err := filepath.Rel(baseAbs, candAbs)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+	isWithin := func(base, p string) bool {
+		rel, relErr := filepath.Rel(base, p)
+		return relErr == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+	}
+	// Accept paths lexically inside beadsDir (or its canonical symlink target for
+	// absolute paths such as macOS /private/var vs /var).
+	if !isWithin(baseAbs, candAbs) && (!filepath.IsAbs(target) || !isWithin(baseCanon, candAbs)) {
 		return "", false
 	}
-	info, statErr := os.Stat(candAbs)
-	if statErr != nil || !info.Mode().IsRegular() {
-		return "", false
-	}
+	// Resolve symlinks and enforce canonical containment BEFORE stat'ing the file.
 	candCanon, err := filepath.EvalSymlinks(candAbs)
-	if err != nil || candCanon == "" {
+	if err != nil || candCanon == "" || !isWithin(baseCanon, candCanon) {
 		return "", false
 	}
-	relCanon, err := filepath.Rel(baseCanon, candCanon)
-	if err != nil || relCanon == ".." || strings.HasPrefix(relCanon, ".."+string(filepath.Separator)) {
+	info, statErr := os.Stat(candCanon)
+	if statErr != nil || !info.Mode().IsRegular() {
 		return "", false
 	}
 	return candAbs, true
@@ -368,8 +370,13 @@ func discoverSQLiteSources(beadsDir string, opts DiscoveryOptions) ([]DataSource
 	seen := make(map[string]bool)
 	addCandidate := func(p string) {
 		clean := filepath.Clean(p)
-		if !seen[clean] {
+		key := clean
+		if resolved, err := filepath.EvalSymlinks(clean); err == nil && resolved != "" {
+			key = filepath.Clean(resolved)
+		}
+		if !seen[clean] && !seen[key] {
 			seen[clean] = true
+			seen[key] = true
 			candidates = append(candidates, clean)
 		}
 	}

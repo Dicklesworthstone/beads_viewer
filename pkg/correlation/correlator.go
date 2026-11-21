@@ -1356,30 +1356,104 @@ func applyFeedbackWithRepoAndOptions(store *FeedbackStore, ctx context.Context, 
 			gitRoot = found
 		}
 	}
-	resolveShortCommitSHA := func(sha string) string {
-		if strings.TrimSpace(gitRoot) == "" || validateGitRefArg(sha) != nil {
+	isHexSHA40 := func(s string) bool {
+		if len(s) != 40 {
+			return false
+		}
+		for i := 0; i < len(s); i++ {
+			c := s[i]
+			if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+				return false
+			}
+		}
+		return true
+	}
+	resolveCommitRef := func(sha string) string {
+		trimmed := strings.TrimSpace(sha)
+		if strings.TrimSpace(gitRoot) == "" || validateGitRefArg(trimmed) != nil {
 			return ""
 		}
-		cmd := gitCommand(ctx, "rev-parse", "--verify", "--quiet", "--end-of-options", sha+"^{commit}")
+		cmd := gitCommand(ctx, "rev-parse", "--verify", "--quiet", "--end-of-options", trimmed+"^{commit}")
 		cmd.Dir = gitRoot
 		out, err := cmd.Output()
 		if err != nil {
 			return ""
 		}
-		return strings.TrimSpace(string(out))
+		return strings.ToLower(strings.TrimSpace(string(out)))
 	}
 
-	// Record every stored rejection first (resolving short-SHA rejections to full
-	// 40-char SHAs when repoPath is available) so short-SHA rejections block Pass 1
-	// existing commits, Pass 2 full-SHA confirmations, and ReverseLookup equally.
+	feedbackTypeRank := func(ft FeedbackType) int {
+		switch ft {
+		case FeedbackReject:
+			return 3
+		case FeedbackConfirm:
+			return 2
+		case FeedbackIgnore:
+			return 1
+		default:
+			return 0
+		}
+	}
+	type canonicalFeedback struct {
+		fb      CorrelationFeedback
+		isShort bool
+		rawSHAs []string
+	}
+	// Canonicalize all feedback entries (normalizing whitespace, uppercase 40-char hex SHAs,
+	// short SHAs, and symbolic/long refs) so last-write-wins (latest FeedbackAt) works
+	// consistently across all SHA spellings for Reject, Confirm, and Ignore alike.
+	effectiveByPair := make(map[string]map[string]*canonicalFeedback)
 	for _, fb := range allFeedback {
-		if fb.Type != FeedbackReject {
+		rawSHA := strings.TrimSpace(fb.CommitSHA)
+		if rawSHA == "" || fb.BeadID == "" {
 			continue
 		}
-		recordReject(fb.CommitSHA, fb.BeadID)
-		if len(fb.CommitSHA) < 40 {
-			if fullSHA := resolveShortCommitSHA(fb.CommitSHA); fullSHA != "" {
-				recordReject(fullSHA, fb.BeadID)
+		isShort := len(rawSHA) < 40
+		canonicalSHA := rawSHA
+		if isHexSHA40(rawSHA) {
+			canonicalSHA = strings.ToLower(rawSHA)
+		} else if fullSHA := resolveCommitRef(rawSHA); fullSHA != "" {
+			canonicalSHA = fullSHA
+		}
+		if effectiveByPair[canonicalSHA] == nil {
+			effectiveByPair[canonicalSHA] = make(map[string]*canonicalFeedback)
+		}
+		prev, exists := effectiveByPair[canonicalSHA][fb.BeadID]
+		if !exists {
+			effectiveByPair[canonicalSHA][fb.BeadID] = &canonicalFeedback{
+				fb:      fb,
+				isShort: isShort,
+				rawSHAs: []string{fb.CommitSHA},
+			}
+			continue
+		}
+		prev.rawSHAs = append(prev.rawSHAs, fb.CommitSHA)
+		wins := false
+		switch {
+		case fb.FeedbackAt.After(prev.fb.FeedbackAt):
+			wins = true
+		case fb.FeedbackAt.Equal(prev.fb.FeedbackAt):
+			if !isShort && prev.isShort {
+				wins = true
+			} else if isShort == prev.isShort && feedbackTypeRank(fb.Type) > feedbackTypeRank(prev.fb.Type) {
+				wins = true
+			}
+		}
+		if wins {
+			prev.fb = fb
+			prev.isShort = isShort
+		}
+	}
+
+	// Derive rejectedPairs strictly from pairs whose winning effective feedback is Reject.
+	for canonicalSHA, byBead := range effectiveByPair {
+		for beadID, eff := range byBead {
+			if eff.fb.Type != FeedbackReject {
+				continue
+			}
+			recordReject(canonicalSHA, beadID)
+			for _, rawSHA := range eff.rawSHAs {
+				recordReject(rawSHA, beadID)
 			}
 		}
 	}
@@ -1394,12 +1468,16 @@ func applyFeedbackWithRepoAndOptions(store *FeedbackStore, ctx context.Context, 
 		kept := make([]CorrelatedCommit, 0, len(history.Commits))
 		changed := false
 		for _, commit := range history.Commits {
-			if rejectedPairs[commit.SHA][beadID] {
-				applied.Rejected++
-				changed = true
-				continue
+			var (
+				fb CorrelationFeedback
+				ok bool
+			)
+			if eff := effectiveByPair[commit.SHA][beadID]; eff != nil {
+				fb = eff.fb
+				ok = true
+			} else {
+				fb, ok = store.Get(commit.SHA, beadID)
 			}
-			fb, ok := store.Get(commit.SHA, beadID)
 			if !ok {
 				seen[commit.SHA] = true
 				kept = append(kept, commit)
@@ -1456,89 +1534,113 @@ func applyFeedbackWithRepoAndOptions(store *FeedbackStore, ctx context.Context, 
 		return ancCmd.Run() == nil
 	}
 
-	// Second pass over stored confirmations: synthesize confirmed orphan commits
-	// into history.Commits so --robot-orphans -> --robot-confirm-correlation
-	// works end-to-end without duplicating commits or bypassing window/reject rules.
-	for _, fb := range allFeedback {
-		if fb.Type != FeedbackConfirm {
-			continue
+	// Second pass over winning confirmations: synthesize confirmed orphan commits
+	// into history.Commits in deterministic order so --robot-orphans ->
+	// --robot-confirm-correlation works end-to-end without duplicating commits or
+	// bypassing window/last-write-wins rules.
+	canonicalSHAs := make([]string, 0, len(effectiveByPair))
+	for sha := range effectiveByPair {
+		canonicalSHAs = append(canonicalSHAs, sha)
+	}
+	sort.Strings(canonicalSHAs)
+	for _, canonicalSHA := range canonicalSHAs {
+		byBead := effectiveByPair[canonicalSHA]
+		beadIDs := make([]string, 0, len(byBead))
+		for beadID := range byBead {
+			beadIDs = append(beadIDs, beadID)
 		}
-		history, exists := histories[fb.BeadID]
-		if !exists {
-			continue
-		}
-		if seenByBead[fb.BeadID][fb.CommitSHA] || rejectedPairs[fb.CommitSHA][fb.BeadID] {
-			continue
-		}
-		if strings.TrimSpace(repoPath) == "" {
-			continue
-		}
-		resolved, err := ResolveCommitInRepo(ctx, repoPath, fb.CommitSHA)
-		if err != nil {
-			continue
-		}
-		if rejectedPairs[resolved.SHA][fb.BeadID] {
-			continue
-		}
-		if seenByBead[fb.BeadID][resolved.SHA] {
-			// Short-SHA confirm matched a commit already present under full SHA:
-			// upgrade it in-place instead of appending a duplicate.
-			for i := range history.Commits {
-				if history.Commits[i].SHA == resolved.SHA {
-					history.Commits[i].Confidence = 1.0
-					if !history.Commits[i].Confirmed {
-						history.Commits[i].Confirmed = true
-						if history.Commits[i].Reason == "" {
-							history.Commits[i].Reason = "confirmed by feedback (" + fb.FeedbackBy + ")"
-						} else {
-							history.Commits[i].Reason = history.Commits[i].Reason + "; confirmed by feedback (" + fb.FeedbackBy + ")"
-						}
-						applied.Confirmed++
-					}
-					break
+		sort.Strings(beadIDs)
+		for _, beadID := range beadIDs {
+			eff := byBead[beadID]
+			if eff == nil || eff.fb.Type != FeedbackConfirm {
+				continue
+			}
+			fb := eff.fb
+			history, exists := histories[beadID]
+			if !exists {
+				continue
+			}
+			if seenByBead[beadID][canonicalSHA] || seenByBead[beadID][fb.CommitSHA] || rejectedPairs[canonicalSHA][beadID] {
+				continue
+			}
+			if strings.TrimSpace(repoPath) == "" {
+				continue
+			}
+			resolved, err := ResolveCommitInRepo(ctx, repoPath, fb.CommitSHA)
+			if err != nil {
+				continue
+			}
+			if rejectedPairs[resolved.SHA][beadID] {
+				continue
+			}
+			if seenByBead[beadID][resolved.SHA] {
+				// If canonical resolved.SHA already has an effective feedback entry
+				// (handled in Pass 1, e.g. a newer Ignore or Confirm), do not double-count
+				// or override it with a stale unresolved alias.
+				if effectiveByPair[resolved.SHA][beadID] != nil {
+					seenByBead[beadID][canonicalSHA] = true
+					continue
 				}
+				// Short-SHA confirm matched an existing commit whose SHA wasn't resolved earlier:
+				// upgrade in-place and always count applied.Confirmed (matching Pass 1).
+				for i := range history.Commits {
+					if history.Commits[i].SHA == resolved.SHA {
+						applied.Confirmed++
+						history.Commits[i].Confidence = 1.0
+						if !history.Commits[i].Confirmed {
+							history.Commits[i].Confirmed = true
+							if history.Commits[i].Reason == "" {
+								history.Commits[i].Reason = "confirmed by feedback (" + fb.FeedbackBy + ")"
+							} else {
+								history.Commits[i].Reason = history.Commits[i].Reason + "; confirmed by feedback (" + fb.FeedbackBy + ")"
+							}
+						}
+						break
+					}
+				}
+				histories[beadID] = history
+				seenByBead[beadID][canonicalSHA] = true
+				continue
 			}
-			histories[fb.BeadID] = history
-			seenByBead[fb.BeadID][fb.CommitSHA] = true
-			continue
-		}
-		// Honor --since, --until, and --as-of revision boundaries for synthesized commits.
-		if opts.Since != nil && !resolved.Timestamp.IsZero() && resolved.Timestamp.Before(*opts.Since) {
-			continue
-		}
-		if opts.Until != nil && !resolved.Timestamp.IsZero() && resolved.Timestamp.After(*opts.Until) {
-			continue
-		}
-		if !commitInRevision(resolved.SHA) {
-			continue
-		}
-		synth := resolved
-		synth.BeadID = fb.BeadID
-		synth.Methods = []string{string(MethodExplicitID)}
-		reason := "confirmed by feedback (" + fb.FeedbackBy + ")"
-		if strings.TrimSpace(fb.Reason) != "" {
-			reason += ": " + strings.TrimSpace(fb.Reason)
-		}
-		synth.Reason = reason
-		synth.Confidence = 1.0
-		synth.Confirmed = true
-		history.Commits = append(history.Commits, synth)
-		sort.SliceStable(history.Commits, func(i, j int) bool {
-			if !history.Commits[i].Timestamp.Equal(history.Commits[j].Timestamp) {
-				return history.Commits[i].Timestamp.Before(history.Commits[j].Timestamp)
+			// Honor --since, --until, and --as-of revision boundaries for synthesized commits.
+			if opts.Since != nil && !resolved.Timestamp.IsZero() && resolved.Timestamp.Before(*opts.Since) {
+				continue
 			}
-			return history.Commits[i].SHA < history.Commits[j].SHA
-		})
-		if len(history.Commits) > 0 && history.Commits[len(history.Commits)-1].Author != "" {
-			history.LastAuthor = history.Commits[len(history.Commits)-1].Author
+			if opts.Until != nil && !resolved.Timestamp.IsZero() && resolved.Timestamp.After(*opts.Until) {
+				continue
+			}
+			if !commitInRevision(resolved.SHA) {
+				continue
+			}
+			synth := resolved
+			synth.BeadID = beadID
+			synth.Methods = []string{string(MethodExplicitID)}
+			reason := "confirmed by feedback (" + fb.FeedbackBy + ")"
+			if strings.TrimSpace(fb.Reason) != "" {
+				reason += ": " + strings.TrimSpace(fb.Reason)
+			}
+			synth.Reason = reason
+			synth.Confidence = 1.0
+			synth.Confirmed = true
+			history.Commits = append(history.Commits, synth)
+			sort.SliceStable(history.Commits, func(i, j int) bool {
+				if !history.Commits[i].Timestamp.Equal(history.Commits[j].Timestamp) {
+					return history.Commits[i].Timestamp.Before(history.Commits[j].Timestamp)
+				}
+				return history.Commits[i].SHA < history.Commits[j].SHA
+			})
+			if len(history.Commits) > 0 && history.Commits[len(history.Commits)-1].Author != "" {
+				history.LastAuthor = history.Commits[len(history.Commits)-1].Author
+			}
+			histories[beadID] = history
+			if seenByBead[beadID] == nil {
+				seenByBead[beadID] = make(map[string]bool)
+			}
+			seenByBead[beadID][synth.SHA] = true
+			seenByBead[beadID][canonicalSHA] = true
+			seenByBead[beadID][fb.CommitSHA] = true
+			applied.Confirmed++
 		}
-		histories[fb.BeadID] = history
-		if seenByBead[fb.BeadID] == nil {
-			seenByBead[fb.BeadID] = make(map[string]bool)
-		}
-		seenByBead[fb.BeadID][synth.SHA] = true
-		seenByBead[fb.BeadID][fb.CommitSHA] = true
-		applied.Confirmed++
 	}
 
 	return applied, rejectedPairs

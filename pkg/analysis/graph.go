@@ -2236,8 +2236,13 @@ func (a *Analyzer) activeDAGMetrics(stats *GraphStats) (map[string]float64, map[
 	stats.mu.RUnlock()
 
 	if len(activeIDs) == 0 {
-		emptyCP := map[string]float64{}
-		emptySl := map[string]float64{}
+		var emptyCP, emptySl map[string]float64
+		if wantCP {
+			emptyCP = map[string]float64{}
+		}
+		if wantSlack {
+			emptySl = map[string]float64{}
+		}
 		stats.mu.Lock()
 		stats.activeDAGKey = cacheKey
 		stats.activeCriticalPath = emptyCP
@@ -2247,7 +2252,7 @@ func (a *Analyzer) activeDAGMetrics(stats *GraphStats) (map[string]float64, map[
 		return emptyCP, emptySl, false, false
 	}
 
-	_, cpOut, slOut, hasCycle := a.computeActiveDAGMetricsWithKey(activeIDs, activeHash, status, nil, nil, false)
+	_, cpOut, slOut, hasCycle := a.computeActiveDAGMetricsWithKey(activeIDs, activeHash, status, wantCP, wantSlack, nil, nil, false)
 
 	stats.mu.Lock()
 	stats.activeDAGKey = cacheKey
@@ -2266,18 +2271,25 @@ func (a *Analyzer) computeActiveDAGMetricsWithKey(
 	activeIDs []string,
 	activeHash string,
 	status MetricStatus,
+	wantCP bool,
+	wantSlack bool,
 	activeGraph directedGraph,
 	activeSorted []graph.Node,
 	activeSortedValid bool,
 ) (string, map[string]float64, map[string]float64, bool) {
-	wantCP := status.Critical.State == "computed" || status.Critical.State == ""
-	wantSlack := status.Slack.State == "computed" || status.Slack.State == ""
 	if !wantCP && !wantSlack {
 		return "", nil, nil, false
 	}
 	cacheKey := activeHash + "|" + status.Critical.State + "|" + status.Slack.State
 	if len(activeIDs) == 0 {
-		return cacheKey, map[string]float64{}, map[string]float64{}, false
+		var emptyCP, emptySl map[string]float64
+		if wantCP {
+			emptyCP = map[string]float64{}
+		}
+		if wantSlack {
+			emptySl = map[string]float64{}
+		}
+		return cacheKey, emptyCP, emptySl, false
 	}
 
 	if activeGraph == nil {
@@ -3353,8 +3365,10 @@ func (a *Analyzer) computePhase2WithProfile(ctx context.Context, stats *GraphSta
 			if activeBW != nil {
 				activeBWRank = computeFloatRanks(activeBW)
 			}
+			wantActiveCP := localStatus.Critical.State == "computed" || (localStatus.Critical.State == "" && config.ComputeCriticalPath)
+			wantActiveSlack := localStatus.Slack.State == "computed" || (localStatus.Slack.State == "" && config.ComputeSlack)
 			activeDAGKey, activeCP, activeSl, activeDAGCyclic = a.computeActiveDAGMetricsWithKey(
-				activeIDs, activeHash, localStatus, activeGraph, activeSorted, activeTopoTried && !activeTopoFailed,
+				activeIDs, activeHash, localStatus, wantActiveCP, wantActiveSlack, activeGraph, activeSorted, activeTopoTried && !activeTopoFailed,
 			)
 		}
 	}
