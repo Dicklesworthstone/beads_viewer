@@ -458,14 +458,29 @@ func isNonNullJSONValue(raw json.RawMessage) bool {
 	return len(trimmed) > 0 && !bytes.Equal(trimmed, []byte("null"))
 }
 
+// isNonEmptyJSONString matches fusedLoadJSONL / model.Issue.Validate() for the
+// core string required fields (id, title, status), rejecting null, non-string
+// primitives/objects/arrays, and empty/whitespace-only strings.
+func isNonEmptyJSONString(raw json.RawMessage) bool {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) < 2 || trimmed[0] != '"' {
+		return false
+	}
+	var s string
+	if err := json.Unmarshal(trimmed, &s); err != nil {
+		return false
+	}
+	return strings.TrimSpace(s) != ""
+}
+
 func (p *defaultProbe) has(field string) bool {
 	switch field {
 	case "id":
-		return isNonNullJSONValue(p.ID)
+		return isNonEmptyJSONString(p.ID)
 	case "title":
-		return isNonNullJSONValue(p.Title)
+		return isNonEmptyJSONString(p.Title)
 	case "status":
-		return isNonNullJSONValue(p.Status)
+		return isNonEmptyJSONString(p.Status)
 	default:
 		return false
 	}
@@ -479,7 +494,15 @@ type rawProbe map[string]json.RawMessage
 
 func (p rawProbe) has(field string) bool {
 	raw, ok := p[field]
-	return ok && isNonNullJSONValue(raw)
+	if !ok {
+		return false
+	}
+	switch field {
+	case "id", "title", "status":
+		return isNonEmptyJSONString(raw)
+	default:
+		return isNonNullJSONValue(raw)
+	}
 }
 
 // isDefaultRequiredFields reports whether fields is exactly the default

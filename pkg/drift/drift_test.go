@@ -3431,3 +3431,23 @@ func TestRC36_DriftP0ConfigDuplicateLabelsAndInfoSuggestedActions(t *testing.T) 
 		t.Fatalf("expected both Info density_growth (%v) and Info actionable_change (%v), got %+v", seenDensityInfo, seenActionInfo, infoRes.Alerts)
 	}
 }
+
+func TestWave22_SaveConfigPreservesExplicitZerosFromDefaultConfig(t *testing.T) {
+	dir := t.TempDir()
+	cfg := DefaultConfig()
+	cfg.HighImpactPriorityMax = 0
+	cfg.DuplicateMaxAlerts = 0
+	if err := SaveConfig(dir, cfg); err != nil {
+		t.Fatalf("SaveConfig: %v", err)
+	}
+	if cfg.HighImpactPriorityMax != 0 || cfg.DuplicateMaxAlerts != 0 {
+		t.Fatalf("SaveConfig mutated explicit zeros: high=%d dup=%d", cfg.HighImpactPriorityMax, cfg.DuplicateMaxAlerts)
+	}
+	reloaded, err := LoadConfig(dir)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if reloaded.HighImpactPriorityMax != 0 || reloaded.DuplicateMaxAlerts != 0 {
+		t.Fatalf("reloaded explicit zeros lost: high=%d dup=%d", reloaded.HighImpactPriorityMax, reloaded.DuplicateMaxAlerts)
+	}
+}

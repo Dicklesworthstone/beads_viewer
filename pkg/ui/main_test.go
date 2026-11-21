@@ -1019,15 +1019,35 @@ func TestRC38_TutorialScrollUnwedgeMouseAndFactualContent(t *testing.T) {
 	tm.SetSize(100, 20) // Small enough to require scrolling
 
 	// Jump to bottom with 'G' -> scrollOffset must equal real maxScrollOffset (never 9999),
-	// and a SINGLE 'k' keypress must immediately scroll upward.
+	// and a SINGLE 'k' keypress must immediately scroll upward AND visibly change View().
 	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("G")})
 	atBottom := tm.scrollOffset
 	if atBottom <= 0 || atBottom >= 9999 {
 		t.Fatalf("expected realistic maxScrollOffset after 'G', got %d", atBottom)
 	}
+	viewAtBottom := tm.View()
 	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("k")})
 	if tm.scrollOffset != atBottom-1 {
 		t.Fatalf("expected single 'k' after 'G' to scroll up immediately from %d to %d, got %d", atBottom, atBottom-1, tm.scrollOffset)
+	}
+	if tm.View() == viewAtBottom {
+		t.Fatalf("expected first 'k' after 'G' to visibly change rendered View() at 100x20")
+	}
+
+	// Mouse wheel up from oversized offset must clamp first (not stay wedged above maxScrollOffset).
+	tm.scrollOffset = 9999
+	tm, _ = tm.Update(tea.MouseMsg{Button: tea.MouseButtonWheelUp})
+	if tm.scrollOffset > atBottom {
+		t.Fatalf("expected MouseButtonWheelUp to clamp oversized scrollOffset <= %d, got %d", atBottom, tm.scrollOffset)
+	}
+
+	// A page that fits cleanly within the terminal must NOT phantom-scroll on 'j' or 'G'.
+	tmFit := NewTutorialModel(theme)
+	tmFit.SetSize(120, 60)
+	tmFit.scrollOffset = 0
+	tmFit, _ = tmFit.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("G")})
+	if tmFit.scrollOffset != 0 {
+		t.Fatalf("expected fitting tutorial page at 120x60 to have maxScrollOffset=0, got %d", tmFit.scrollOffset)
 	}
 
 	// Mouse wheel down/up must scroll TutorialModel.
@@ -1236,4 +1256,289 @@ func TestRC38_DisplayWidthUTF8ThemeModalsBoardCacheAndUnifiedHelp(t *testing.T) 
 			t.Errorf("keyRegistry missing binding (%v, %q)", wantBinding.f, wantBinding.key)
 		}
 	}
+}
+
+func TestWave22_TUIRegressions(t *testing.T) {
+	now := time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC)
+
+	// 1. BackgroundWorker with sourceReload strips tombstones, counts warnings,
+	//    sets DatasetTier/LoadedOpenOnly=false, and heals m.sourceDegraded via SnapshotReadyMsg.
+	t.Run("BackgroundWorkerSourceReloadAndDegradedHeal", func(t *testing.T) {
+		degraded := true
+		bw, err := NewBackgroundWorker(WorkerConfig{
+			BeadsPath:      filepath.Join(t.TempDir(), "nonexistent.jsonl"),
+			SourceDegraded: true,
+			DebounceDelay:  50 * time.Millisecond,
+			SourceReload: func(context.Context) (SourceReloadResult, error) {
+				warns := []string{}
+				if degraded {
+					warns = []string{"fallback warning"}
+				}
+				return SourceReloadResult{
+					Issues: []model.Issue{
+						{ID: "LIVE-1", Title: "Visible", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask},
+						{ID: "TOMB-1", Title: "Deleted", Status: model.StatusTombstone, Priority: 2, IssueType: model.TypeTask},
+					},
+					Warnings:       warns,
+					SourceDegraded: degraded,
+				}, nil
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer bw.Stop()
+
+		snap1 := bw.buildSnapshot(true)
+		if snap1 == nil {
+			t.Fatal("buildSnapshot(degraded=true) returned nil")
+		}
+		if len(snap1.Issues) != 1 || snap1.Issues[0].ID != "LIVE-1" {
+			t.Fatalf("expected tombstone stripped from sourceReload snapshot, got %+v", snap1.Issues)
+		}
+		if snap1.LoadWarningCount != 1 || snap1.AuthorityComplete || !snap1.SourceDegraded || !snap1.SourceDegradedKnown {
+			t.Fatalf("unexpected degraded snapshot metadata: warn=%d complete=%v degraded=%v known=%v",
+				snap1.LoadWarningCount, snap1.AuthorityComplete, snap1.SourceDegraded, snap1.SourceDegradedKnown)
+		}
+		if snap1.LoadedOpenOnly || snap1.DatasetTier != datasetTierSmall || snap1.SourceIssueCountHint != 2 {
+			t.Fatalf("unexpected sourceReload tier metadata: openOnly=%v tier=%v hint=%d",
+				snap1.LoadedOpenOnly, snap1.DatasetTier, snap1.SourceIssueCountHint)
+		}
+
+		// Now heal the source and deliver healed snapshot to a previously degraded Model.
+		degraded = false
+		snap2 := bw.buildSnapshot(true)
+		if snap2 == nil || snap2.SourceDegraded || !snap2.AuthorityComplete || snap2.LoadWarningCount != 0 {
+			t.Fatalf("expected healed snapshot to clear SourceDegraded/warnings and mark AuthorityComplete, got %+v", snap2)
+		}
+
+		m := NewModel(snap1.Issues, nil, "", ReadinessScope{
+			AuthorityIncomplete: true,
+			SourceDegraded:      true,
+		})
+		t.Cleanup(m.Stop)
+		m.Update(tea.WindowSizeMsg{Width: 120, Height: 28})
+		if !m.sourceDegraded || !m.authorityIncomplete {
+			t.Fatalf("expected initial degraded state on Model")
+		}
+		m.Update(SnapshotReadyMsg{Snapshot: snap2, SnapshotVer: 2})
+		if m.sourceDegraded || m.authorityIncomplete {
+			t.Fatalf("expected healed SnapshotReadyMsg to clear sourceDegraded and authorityIncomplete, got degraded=%v incomplete=%v",
+				m.sourceDegraded, m.authorityIncomplete)
+		}
+	})
+
+	// 2. SetSourceReload stops any existing BackgroundWorker and routes startSourceReload to sourceReloadCmd.
+	t.Run("SetSourceReloadStopsExistingWorker", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		jsonlPath := filepath.Join(tmpDir, "issues.jsonl")
+		if err := os.WriteFile(jsonlPath, []byte(`{"id":"SR-1","title":"Initial","status":"open","priority":1,"issue_type":"task"}`+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		m := NewModel([]model.Issue{{ID: "SR-1", Title: "Initial", Status: model.StatusOpen, IssueType: model.TypeTask}}, nil, jsonlPath)
+		t.Cleanup(m.Stop)
+		bw, err := NewBackgroundWorker(WorkerConfig{BeadsPath: jsonlPath, DebounceDelay: 50 * time.Millisecond})
+		if err != nil {
+			t.Fatal(err)
+		}
+		m.backgroundWorker = bw
+		m.snapshotInitPending = true
+		m.restoreBackgroundAfterEdit = true
+		called := false
+		m.SetSourceReload(func(context.Context) (SourceReloadResult, error) {
+			called = true
+			return SourceReloadResult{
+				Issues: []model.Issue{{ID: "SR-2", Title: "Reloaded", Status: model.StatusOpen, IssueType: model.TypeTask}},
+			}, nil
+		})
+		if m.backgroundWorker != nil {
+			t.Fatal("expected SetSourceReload to stop and clear existing backgroundWorker")
+		}
+		if m.snapshotInitPending || m.restoreBackgroundAfterEdit {
+			t.Fatalf("expected SetSourceReload to clear snapshotInitPending & restoreBackgroundAfterEdit, got pending=%v restore=%v",
+				m.snapshotInitPending, m.restoreBackgroundAfterEdit)
+		}
+		cmd := m.TriggerSourceReload()
+		if cmd == nil {
+			t.Fatal("expected TriggerSourceReload to return sourceReloadCmd")
+		}
+		_ = cmd()
+		if !called {
+			t.Fatal("expected sourceReload callback to execute via TriggerSourceReload")
+		}
+	})
+
+	// 3. SprintView: 60x14 bottom border & footer intact, dep-blocked row shows ⛔, sprintScroll resets on reopen/wheel.
+	t.Run("SprintViewClampDepBlockedIconAndScrollReset", func(t *testing.T) {
+		issues := []model.Issue{
+			{ID: "SP-BLK", Title: "Upstream blocker", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask},
+			{
+				ID:        "SP-DEP",
+				Title:     "Open issue blocked by upstream dependency with a very long title to test line truncation",
+				Status:    model.StatusOpen,
+				Priority:  2,
+				IssueType: model.TypeTask,
+				Dependencies: []*model.Dependency{
+					{IssueID: "SP-DEP", DependsOnID: "SP-BLK", Type: model.DepBlocks},
+				},
+			},
+		}
+		sprints := []model.Sprint{
+			{ID: "sp-1", Name: "Sprint 1", StartDate: now.Add(-48 * time.Hour), EndDate: now.Add(48 * time.Hour), BeadIDs: []string{"SP-BLK", "SP-DEP"}},
+			{ID: "sp-2", Name: "Sprint 2", StartDate: now.Add(72 * time.Hour), EndDate: now.Add(144 * time.Hour), BeadIDs: []string{"SP-BLK"}},
+		}
+		m := NewModel(issues, nil, "")
+		t.Cleanup(m.Stop)
+		m.SetSprints(sprints)
+		m.Update(tea.WindowSizeMsg{Width: 100, Height: 40})
+		m.openSprintView()
+		plainTall := ansi.Strip(m.renderSprintDashboard())
+		if !strings.Contains(plainTall, "⛔ SP-DEP") {
+			t.Fatalf("expected dep-blocked open sprint bead to show ⛔ icon, got:\n%s", plainTall)
+		}
+
+		// Reopen resets sprintScroll even after scrolling down.
+		m.sprintScroll = 8
+		m.openSprintView()
+		if m.sprintScroll != 0 {
+			t.Fatalf("expected openSprintView to reset sprintScroll to 0, got %d", m.sprintScroll)
+		}
+
+		// Mouse wheel switching sprints resets sprintScroll.
+		m.sprintScroll = 4
+		m.Update(tea.MouseMsg{Button: tea.MouseButtonWheelDown})
+		if m.sprintScroll != 0 {
+			t.Fatalf("expected wheel sprint switch to reset sprintScroll to 0, got %d", m.sprintScroll)
+		}
+
+		// At 60x14, bottom rounded border AND footer hint must both survive intact.
+		m.Update(tea.WindowSizeMsg{Width: 60, Height: 14})
+		sprintNarrow := ansi.Strip(m.renderSprintDashboard())
+		if !strings.Contains(sprintNarrow, "╰") || !strings.Contains(sprintNarrow, "╯") {
+			t.Fatalf("Sprint view at 60x14 clipped bottom border:\n%s", sprintNarrow)
+		}
+		if !strings.Contains(sprintNarrow, "P/esc:") {
+			t.Fatalf("Sprint view at 60x14 dropped footer hint:\n%s", sprintNarrow)
+		}
+		if lipgloss.Height(sprintNarrow) > 13 {
+			t.Fatalf("Sprint view at 60x14 exceeded body height 13: got %d", lipgloss.Height(sprintNarrow))
+		}
+	})
+
+	// 4. canScrollShortcutsSidebar respects sidebarVisible() & focusSprint; empty LabelDashboard 'h' stays in LabelDashboard.
+	t.Run("SidebarScrollGuardAndEmptyLabelDashboardH", func(t *testing.T) {
+		m := NewModel([]model.Issue{{ID: "NL-1", Title: "Unlabeled", Status: model.StatusOpen, IssueType: model.TypeTask}}, nil, "")
+		t.Cleanup(m.Stop)
+		m.showShortcutsSidebar = true
+		m.Update(tea.WindowSizeMsg{Width: 48, Height: 24}) // too narrow for sidebarVisible() (< 56 cols)
+		if m.sidebarVisible() {
+			t.Fatal("expected sidebarVisible()=false at width 48")
+		}
+		if m.canScrollShortcutsSidebar("ctrl+j") {
+			t.Fatal("canScrollShortcutsSidebar must be false when sidebar is hidden due to narrow terminal")
+		}
+		m.Update(tea.WindowSizeMsg{Width: 180, Height: 30})
+		m.focused = focusSprint
+		if m.canScrollShortcutsSidebar("pgdown") || m.canScrollShortcutsSidebar("pgup") {
+			t.Fatal("canScrollShortcutsSidebar must yield pgup/pgdown when focusSprint is active")
+		}
+
+		// Empty LabelDashboard: pressing 'h' must NOT fall through to History view.
+		m.focused = focusLabelDashboard
+		m.isHistoryView = false
+		updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'h'}})
+		m = updated.(*Model)
+		if m.isHistoryView || m.focused == focusHistory {
+			t.Fatalf("pressing 'h' on empty LabelDashboard unexpectedly opened History view (focused=%v)", m.focused)
+		}
+	})
+
+	// 5. Width/height clamping regressions: AttentionModel width 40, FlowMatrix narrow detail,
+	//    VelocityComparison narrow footer, renderHelpOverlay 60x14, UpdateModal horizontal buttons + 60x14.
+	t.Run("NarrowTerminalWidthAndHeightClamping", func(t *testing.T) {
+		theme := DefaultTheme(lipgloss.NewRenderer(nil))
+
+		// AttentionModel at width 40: selected row must stay <= 40 cells.
+		am := NewAttentionModel(theme)
+		am.SetSize(40, 12)
+		am.SetData(analysis.LabelAttentionResult{
+			Labels: []analysis.LabelAttentionScore{
+				{Label: "very-long-label-name-here", AttentionScore: 42.5, PageRankSum: 0.9, StalenessFactor: 1.5, BlockImpact: 3, VelocityFactor: 2},
+			},
+		})
+		for _, ln := range strings.Split(am.View(), "\n") {
+			if w := lipgloss.Width(ln); w > 40 {
+				t.Errorf("AttentionModel line exceeded width 40 (got %d): %q", w, ansi.Strip(ln))
+			}
+		}
+
+		// FlowMatrix narrow detail pane: lines in right column must stay within pane width.
+		fm := NewFlowMatrixModel(theme)
+		fm.SetSize(60, 14)
+		flowIssues := []model.Issue{
+			{ID: "FM-1", Title: "A", Status: model.StatusOpen, Labels: []string{"very-long-source-label-alpha"}},
+			{
+				ID: "FM-2", Title: "B", Status: model.StatusOpen, Labels: []string{"very-long-target-label-beta"},
+				Dependencies: []*model.Dependency{{IssueID: "FM-2", DependsOnID: "FM-1", Type: model.DepBlocks}},
+			},
+		}
+		flow := analysis.ComputeCrossLabelFlow(flowIssues, analysis.DefaultLabelHealthConfig())
+		fm.SetData(&flow, flowIssues)
+		for _, ln := range strings.Split(fm.View(), "\n") {
+			if w := lipgloss.Width(ln); w > 60 {
+				t.Errorf("FlowMatrix line exceeded width 60 (got %d): %q", w, ansi.Strip(ln))
+			}
+		}
+
+		// VelocityComparison narrow footer stays <= 36 cols.
+		vm := NewVelocityComparisonModel(theme)
+		vm.SetSize(36, 12)
+		vm.SetDataAt(flowIssues, now)
+		for _, ln := range strings.Split(vm.View(), "\n") {
+			if w := lipgloss.Width(ln); w > 36 {
+				t.Errorf("VelocityComparison line exceeded width 36 (got %d): %q", w, ansi.Strip(ln))
+			}
+		}
+
+		// Help overlay at 60x14 must fit cleanly within 60x13 without clipping borders.
+		m := NewModel(flowIssues, nil, "")
+		t.Cleanup(m.Stop)
+		m.Update(tea.WindowSizeMsg{Width: 60, Height: 14})
+		helpOut := m.renderHelpOverlay()
+		if h := lipgloss.Height(helpOut); h > 13 {
+			t.Errorf("renderHelpOverlay at 60x14 exceeded height 13: got %d", h)
+		}
+		for _, ln := range strings.Split(helpOut, "\n") {
+			if w := lipgloss.Width(ln); w > 60 {
+				t.Errorf("renderHelpOverlay at 60x14 exceeded width 60 (got %d): %q", w, ansi.Strip(ln))
+			}
+		}
+
+		// UpdateModal buttons (including 3-button Update+Cancel+Rollback) sit side-by-side
+		// without truncated right border or bisected button box at 60x12.
+		um := NewUpdateModal("v0.1.0", "v0.2.0", theme)
+		um.canRollback = true
+		um.SetSize(60, 12)
+		centered := um.CenterModal(60, 12)
+		plainUM := ansi.Strip(centered)
+		if h := lipgloss.Height(centered); h > 12 {
+			t.Errorf("UpdateModal.CenterModal(60, 12) exceeded height 12: got %d\n%s", h, plainUM)
+		}
+		sameRow := false
+		for _, ln := range strings.Split(plainUM, "\n") {
+			if strings.Contains(ln, "Update") && strings.Contains(ln, "Cancel") && strings.Contains(ln, "Rollback") {
+				if strings.Contains(ln, "…") {
+					t.Errorf("3-button row truncated at 60 cols: %q", ln)
+				}
+				sameRow = true
+				break
+			}
+		}
+		if !sameRow {
+			t.Errorf("expected UpdateModal Update, Cancel, and Rollback buttons on the same horizontal row:\n%s", plainUM)
+		}
+		if strings.Count(plainUM, "╰") < 4 {
+			t.Errorf("expected intact outer modal + 3 button bottom borders at 60x12:\n%s", plainUM)
+		}
+	})
 }

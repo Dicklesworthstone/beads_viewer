@@ -11,6 +11,7 @@ import (
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // FlowMatrixModel renders an interactive dependency flow dashboard
@@ -832,14 +833,25 @@ func (m FlowMatrixModel) renderDetailPanel(width, maxHeight int) string {
 		Render(fmt.Sprintf("← BLOCKED BY (%d)", stat.IncomingCount))
 
 	padFlowCol := func(s string, colW int) string {
+		if colW <= 0 {
+			return ""
+		}
 		visW := lipgloss.Width(s)
+		if visW > colW {
+			suffix := "…"
+			if colW <= 2 {
+				suffix = ""
+			}
+			return ansi.Truncate(s, colW, suffix)
+		}
 		if visW < colW {
 			return s + strings.Repeat(" ", colW-visW)
 		}
 		return s
 	}
 
-	b.WriteString(padFlowCol(blocksHeader, halfWidth) + "  " + blockedByHeader + "\n")
+	rightWidth := max(1, width-halfWidth-2)
+	b.WriteString(padFlowCol(blocksHeader, halfWidth) + "  " + padFlowCol(blockedByHeader, rightWidth) + "\n")
 
 	maxEntries := m.detailMaxEntries(maxHeight)
 	outLabels := stat.OutgoingLabels
@@ -866,7 +878,7 @@ func (m FlowMatrixModel) renderDetailPanel(width, maxHeight int) string {
 			rightStr = fmt.Sprintf("  %s %s (%d)", miniBar, inLabels[i], count)
 		}
 
-		b.WriteString(padFlowCol(leftStr, halfWidth) + "  " + rightStr + "\n")
+		b.WriteString(padFlowCol(leftStr, halfWidth) + "  " + padFlowCol(rightStr, rightWidth) + "\n")
 	}
 
 	if len(outLabels) > maxEntries || len(inLabels) > maxEntries {
@@ -879,7 +891,7 @@ func (m FlowMatrixModel) renderDetailPanel(width, maxHeight int) string {
 		if len(inLabels) > maxEntries {
 			rightMore = fmt.Sprintf("  +%d more", len(inLabels)-maxEntries)
 		}
-		b.WriteString(padFlowCol(moreStyle.Render(leftMore), halfWidth) + "  " + moreStyle.Render(rightMore) + "\n")
+		b.WriteString(padFlowCol(moreStyle.Render(leftMore), halfWidth) + "  " + padFlowCol(moreStyle.Render(rightMore), rightWidth) + "\n")
 	}
 
 	if cascade := m.cascade.GetCascadeForLabel(stat.Label); cascade != nil && (cascade.BlockedCount > 0 || cascade.TotalImpact > 0) {

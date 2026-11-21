@@ -1785,7 +1785,7 @@ func cleanVersionProbeEnv(environ []string) []string {
 	cleaned := make([]string, 0, len(environ))
 	for _, entry := range environ {
 		key, _, _ := strings.Cut(entry, "=")
-		if strings.EqualFold(key, "BV_ROBOT") || strings.EqualFold(key, "BV_OUTPUT_FORMAT") {
+		if strings.EqualFold(key, "BV_ROBOT") || strings.EqualFold(key, "BV_OUTPUT_FORMAT") || strings.EqualFold(key, "TOON_DEFAULT_FORMAT") {
 			continue
 		}
 		cleaned = append(cleaned, entry)

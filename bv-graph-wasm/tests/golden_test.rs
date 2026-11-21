@@ -3,10 +3,15 @@
 //! These tests load graph definitions and expected metrics from the shared testdata
 //! directory, run the WASM algorithms, and compare results against the Go implementation.
 
-use bv_graph_wasm::{
-    betweenness, critical_path_heights, eigenvector_default, has_cycles, hits_default, kcore,
-    pagerank_default, slack, DiGraph,
-};
+use bv_graph_wasm::{betweenness, critical_path_heights, has_cycles, pagerank_default, DiGraph};
+#[cfg(feature = "eigenvector")]
+use bv_graph_wasm::eigenvector_default;
+#[cfg(feature = "hits")]
+use bv_graph_wasm::hits_default;
+#[cfg(feature = "kcore")]
+use bv_graph_wasm::kcore;
+#[cfg(feature = "slack")]
+use bv_graph_wasm::slack;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
@@ -412,6 +417,7 @@ fn test_golden_complex_20_critical_path() {
 // than matching Go exactly.
 // ==========================================================================
 
+#[cfg(feature = "eigenvector")]
 #[test]
 fn test_eigenvector_sum_to_one() {
     // Eigenvector scores should be normalized
@@ -435,6 +441,7 @@ fn test_eigenvector_sum_to_one() {
     }
 }
 
+#[cfg(feature = "eigenvector")]
 #[test]
 fn test_eigenvector_non_negative() {
     // All eigenvector scores should be non-negative
@@ -462,6 +469,7 @@ fn test_eigenvector_non_negative() {
 // HITS validation tests
 // ==========================================================================
 
+#[cfg(feature = "hits")]
 #[test]
 fn test_golden_chain_10_hits() {
     let (graph_path, golden_path) = graph_and_golden_paths("chain_10");
@@ -489,6 +497,7 @@ fn test_golden_chain_10_hits() {
     );
 }
 
+#[cfg(feature = "hits")]
 #[test]
 fn test_golden_star_10_hits() {
     let (graph_path, golden_path) = graph_and_golden_paths("star_10");
@@ -520,6 +529,7 @@ fn test_golden_star_10_hits() {
 // K-core validation tests
 // ==========================================================================
 
+#[cfg(feature = "kcore")]
 #[test]
 fn test_golden_chain_10_kcore() {
     let (graph_path, golden_path) = graph_and_golden_paths("chain_10");
@@ -543,6 +553,7 @@ fn test_golden_chain_10_kcore() {
 // Slack validation tests
 // ==========================================================================
 
+#[cfg(feature = "slack")]
 #[test]
 fn test_golden_chain_10_slack() {
     let (graph_path, golden_path) = graph_and_golden_paths("chain_10");
@@ -559,6 +570,7 @@ fn test_golden_chain_10_slack() {
     }
 }
 
+#[cfg(feature = "slack")]
 #[test]
 fn test_golden_diamond_5_slack() {
     let (graph_path, golden_path) = graph_and_golden_paths("diamond_5");

@@ -1036,7 +1036,7 @@ func mergeReportsWithOptions(c *Correlator, existing *HistoryReport, beads []Bea
 	var feedbackApplied *FeedbackApplied
 	var rejectedPairs map[string]map[string]bool
 	if c != nil && c.feedback != nil {
-		feedbackApplied, rejectedPairs = applyFeedbackWithRepo(c.feedback, c.ctx, c.repoPath, histories)
+		feedbackApplied, rejectedPairs = applyFeedbackWithRepoAndOptions(c.feedback, c.ctx, c.repoPath, histories, opts)
 	}
 
 	if opts.BeadID != "" {

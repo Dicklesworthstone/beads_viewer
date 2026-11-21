@@ -105,6 +105,12 @@ type GraphStats struct {
 	// Phase 2 status flags for robot visibility
 	status MetricStatus
 
+	// Observed Phase 2 betweenness approximation outcome (protected by mu so
+	// exported Config stays immutable after AnalyzeAsync returns — zero race and
+	// exact robot disk-cache ConfigHash round-trips).
+	betweennessIsApprox     bool
+	betweennessActualSample int
+
 	// Memoized active-subgraph metrics keyed by (activeSetHash|metricStates)
 	activeMetricsKey      string
 	activeBetweenness     map[string]float64
@@ -916,6 +922,76 @@ func (s *GraphStats) ActiveArticulationPoints() []string {
 	}
 	s.mu.RUnlock()
 	return s.ArticulationPoints()
+}
+
+// effectiveConfigLocked returns a copy of Config enriched with observed Phase 2
+// approximate-betweenness metadata. Caller must hold s.mu (read or write).
+func (s *GraphStats) effectiveConfigLocked() AnalysisConfig {
+	cfg := s.Config
+	if s.betweennessIsApprox {
+		cfg.BetweennessIsApproximate = true
+		if s.betweennessActualSample > 0 {
+			cfg.BetweennessSampleSize = s.betweennessActualSample
+		}
+	}
+	return cfg
+}
+
+// EffectiveConfig returns a thread-safe copy of the analysis configuration
+// reflecting whether Phase 2 actually executed approximate betweenness.
+func (s *GraphStats) EffectiveConfig() AnalysisConfig {
+	if s == nil {
+		return AnalysisConfig{}
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.effectiveConfigLocked()
+}
+
+// ActiveCriticalPathScore returns a copy of the active-subgraph CriticalPathScore
+// map when pre-populated for graphs with closed issues, or delegates to CriticalPathScore().
+func (s *GraphStats) ActiveCriticalPathScore() map[string]float64 {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	if s.activeDAGKey != "" {
+		if s.activeCriticalPath == nil {
+			s.mu.RUnlock()
+			return nil
+		}
+		cp := make(map[string]float64, len(s.activeCriticalPath))
+		for k, v := range s.activeCriticalPath {
+			cp[k] = v
+		}
+		s.mu.RUnlock()
+		return cp
+	}
+	s.mu.RUnlock()
+	return s.CriticalPathScore()
+}
+
+// ActiveSlack returns a copy of the active-subgraph Slack map when pre-populated
+// for graphs with closed issues, or delegates to Slack().
+func (s *GraphStats) ActiveSlack() map[string]float64 {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	if s.activeDAGKey != "" {
+		if s.activeSlack == nil {
+			s.mu.RUnlock()
+			return nil
+		}
+		cp := make(map[string]float64, len(s.activeSlack))
+		for k, v := range s.activeSlack {
+			cp[k] = v
+		}
+		s.mu.RUnlock()
+		return cp
+	}
+	s.mu.RUnlock()
+	return s.Slack()
 }
 
 // Slack returns per-node slack (longest-path slack; 0 on critical path).
@@ -2145,10 +2221,6 @@ func (a *Analyzer) activeDAGMetrics(stats *GraphStats) (map[string]float64, map[
 		}
 		return cp, sl, wantCP && len(cp) > 0, wantSlack && len(sl) > 0
 	}
-	if len(activeIDs) == 0 {
-		return map[string]float64{}, map[string]float64{}, false, false
-	}
-
 	cacheKey := activeHash + "|" + status.Critical.State + "|" + status.Slack.State
 	stats.mu.RLock()
 	if stats.activeDAGKey == cacheKey {
@@ -2159,9 +2231,21 @@ func (a *Analyzer) activeDAGMetrics(stats *GraphStats) (map[string]float64, map[
 		if hasCycle {
 			return nil, nil, false, false
 		}
-		return cpCached, slCached, wantCP && cpCached != nil, wantSlack && slCached != nil
+		return cpCached, slCached, wantCP && len(cpCached) > 0, wantSlack && len(slCached) > 0
 	}
 	stats.mu.RUnlock()
+
+	if len(activeIDs) == 0 {
+		emptyCP := map[string]float64{}
+		emptySl := map[string]float64{}
+		stats.mu.Lock()
+		stats.activeDAGKey = cacheKey
+		stats.activeCriticalPath = emptyCP
+		stats.activeSlack = emptySl
+		stats.activeDAGHasCycle = false
+		stats.mu.Unlock()
+		return emptyCP, emptySl, false, false
+	}
 
 	_, cpOut, slOut, hasCycle := a.computeActiveDAGMetricsWithKey(activeIDs, activeHash, status, nil, nil, false)
 
@@ -2175,7 +2259,7 @@ func (a *Analyzer) activeDAGMetrics(stats *GraphStats) (map[string]float64, map[
 	if hasCycle {
 		return nil, nil, false, false
 	}
-	return cpOut, slOut, wantCP && cpOut != nil, wantSlack && slOut != nil
+	return cpOut, slOut, wantCP && len(cpOut) > 0, wantSlack && len(slOut) > 0
 }
 
 func (a *Analyzer) computeActiveDAGMetricsWithKey(
@@ -2493,6 +2577,7 @@ func (a *Analyzer) AnalyzeAsyncWithConfig(ctx context.Context, config AnalysisCo
 				if !xfetchRefresh || ctx.Err() != nil {
 					if _, hasClosed, _ := a.ensureActiveSet(); hasClosed {
 						a.activeSubgraphMetrics(cached)
+						a.activeDAGMetrics(cached)
 					}
 					metrics.GraphCache.Hit()
 					return cached
@@ -2511,6 +2596,7 @@ func (a *Analyzer) AnalyzeAsyncWithConfig(ctx context.Context, config AnalysisCo
 			if cached, ok := getIncrementalGraphStatsCache(incCacheKey); ok {
 				if _, hasClosed, _ := a.ensureActiveSet(); hasClosed {
 					a.activeSubgraphMetrics(cached)
+					a.activeDAGMetrics(cached)
 				}
 				return cached
 			}
@@ -2644,42 +2730,44 @@ func (s *GraphStats) snapshotValue() GraphStats {
 	}
 
 	return GraphStats{
-		OutDegree:             s.OutDegree,
-		InDegree:              s.InDegree,
-		TopologicalOrder:      s.TopologicalOrder,
-		Density:               s.Density,
-		NodeCount:             s.NodeCount,
-		EdgeCount:             s.EdgeCount,
-		Config:                s.Config,
-		pageRank:              s.pageRank,
-		betweenness:           s.betweenness,
-		eigenvector:           s.eigenvector,
-		hubs:                  s.hubs,
-		authorities:           s.authorities,
-		criticalPathScore:     s.criticalPathScore,
-		pageRankRank:          s.pageRankRank,
-		betweennessRank:       s.betweennessRank,
-		eigenvectorRank:       s.eigenvectorRank,
-		hubsRank:              s.hubsRank,
-		authoritiesRank:       s.authoritiesRank,
-		criticalPathRank:      s.criticalPathRank,
-		inDegreeRank:          s.inDegreeRank,
-		outDegreeRank:         s.outDegreeRank,
-		coreNumber:            s.coreNumber,
-		articulation:          s.articulation,
-		slack:                 s.slack,
-		cycles:                s.cycles,
-		phase2Ready:           true,
-		status:                s.status,
-		activeMetricsKey:      s.activeMetricsKey,
-		activeBetweenness:     activeBW,
-		activeBetweennessRank: activeBWRank,
-		activeCoreNumber:      activeCore,
-		activeArticulation:    activeArt,
-		activeDAGKey:          s.activeDAGKey,
-		activeCriticalPath:    activeCP,
-		activeSlack:           activeSl,
-		activeDAGHasCycle:     s.activeDAGHasCycle,
+		OutDegree:               s.OutDegree,
+		InDegree:                s.InDegree,
+		TopologicalOrder:        s.TopologicalOrder,
+		Density:                 s.Density,
+		NodeCount:               s.NodeCount,
+		EdgeCount:               s.EdgeCount,
+		Config:                  s.effectiveConfigLocked(),
+		betweennessIsApprox:     s.betweennessIsApprox,
+		betweennessActualSample: s.betweennessActualSample,
+		pageRank:                s.pageRank,
+		betweenness:             s.betweenness,
+		eigenvector:             s.eigenvector,
+		hubs:                    s.hubs,
+		authorities:             s.authorities,
+		criticalPathScore:       s.criticalPathScore,
+		pageRankRank:            s.pageRankRank,
+		betweennessRank:         s.betweennessRank,
+		eigenvectorRank:         s.eigenvectorRank,
+		hubsRank:                s.hubsRank,
+		authoritiesRank:         s.authoritiesRank,
+		criticalPathRank:        s.criticalPathRank,
+		inDegreeRank:            s.inDegreeRank,
+		outDegreeRank:           s.outDegreeRank,
+		coreNumber:              s.coreNumber,
+		articulation:            s.articulation,
+		slack:                   s.slack,
+		cycles:                  s.cycles,
+		phase2Ready:             true,
+		status:                  s.status,
+		activeMetricsKey:        s.activeMetricsKey,
+		activeBetweenness:       activeBW,
+		activeBetweennessRank:   activeBWRank,
+		activeCoreNumber:        activeCore,
+		activeArticulation:      activeArt,
+		activeDAGKey:            s.activeDAGKey,
+		activeCriticalPath:      activeCP,
+		activeSlack:             activeSl,
+		activeDAGHasCycle:       s.activeDAGHasCycle,
 	}
 }
 
@@ -2751,8 +2839,9 @@ func (a *Analyzer) AnalyzeWithProfile(config AnalysisConfig) (*GraphStats, *Star
 	profile.Phase2 = time.Since(phase2Start)
 
 	stats.mu.RLock()
-	profile.Config = stats.Config
+	profile.Config = stats.effectiveConfigLocked()
 	stats.mu.RUnlock()
+	stats.Config = profile.Config
 
 	stats.phase2Ready = true
 	close(stats.phase2Done)
@@ -3279,9 +3368,9 @@ func (a *Analyzer) computePhase2WithProfile(ctx context.Context, stats *GraphSta
 		stats.mu.Unlock()
 		return
 	}
-	stats.Config.BetweennessIsApproximate = betweennessIsApprox
+	stats.betweennessIsApprox = betweennessIsApprox
 	if betweennessIsApprox && actualBetweennessSample > 0 {
-		stats.Config.BetweennessSampleSize = actualBetweennessSample
+		stats.betweennessActualSample = actualBetweennessSample
 	}
 	stats.pageRank = localPageRank
 	stats.betweenness = localBetweenness

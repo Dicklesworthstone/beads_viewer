@@ -81,14 +81,16 @@ capture_baseline() {
     check_testdata
 
     # Header
-    echo "=== BV Performance Baseline ===" > "$BASELINE_FILE"
-    echo "Date: $(date)" >> "$BASELINE_FILE"
-    echo "Git commit: $(git rev-parse HEAD 2>/dev/null || echo 'not in git repo')" >> "$BASELINE_FILE"
-    echo "Git branch: $(git branch --show-current 2>/dev/null || echo 'unknown')" >> "$BASELINE_FILE"
-    echo "Go version: $(go version)" >> "$BASELINE_FILE"
-    echo "CPU: $(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2 || sysctl -n machdep.cpu.brand_string 2>/dev/null || echo 'unknown')" >> "$BASELINE_FILE"
-    echo "Memory: $(free -h 2>/dev/null | awk '/^Mem:/{print $2}' || sysctl -n hw.memsize 2>/dev/null | awk '{printf "%.0f GB", $1/1024/1024/1024}' || echo 'unknown')" >> "$BASELINE_FILE"
-    echo "" >> "$BASELINE_FILE"
+    {
+        echo "=== BV Performance Baseline ==="
+        echo "Date: $(date)"
+        echo "Git commit: $(git rev-parse HEAD 2>/dev/null || echo 'not in git repo')"
+        echo "Git branch: $(git branch --show-current 2>/dev/null || echo 'unknown')"
+        echo "Go version: $(go version)"
+        echo "CPU: $(grep -m1 'model name' /proc/cpuinfo 2>/dev/null | cut -d: -f2 || sysctl -n machdep.cpu.brand_string 2>/dev/null || echo 'unknown')"
+        echo "Memory: $(free -h 2>/dev/null | awk '/^Mem:/{print $2}' || sysctl -n hw.memsize 2>/dev/null | awk '{printf "%.0f GB", $1/1024/1024/1024}' || echo 'unknown')"
+        echo ""
+    } > "$BASELINE_FILE"
 
     # 1. Loader Benchmarks
     print_section "Loader Benchmarks"
@@ -131,9 +133,16 @@ capture_baseline() {
             ds_dir="$tmp_bench_root/$dataset/.beads"
             mkdir -p "$ds_dir"
             cp "$datafile" "$ds_dir/issues.jsonl"
-            # Run 3 times and capture timing
+            # Run 3 times and capture timing without masking non-zero exits
             for _ in 1 2 3; do
-                { time BEADS_DIR="$ds_dir" timeout 60 "$bv_bin" --robot-triage >/dev/null 2>&1; } 2>&1 | grep real >> "$BASELINE_FILE" || echo "timeout or error" >> "$BASELINE_FILE"
+                local cmd_rc=0
+                local time_out=""
+                time_out=$({ time env -u BEADS_DB -u BD_DB -u BEADS_JSONL BEADS_DIR="$ds_dir" timeout 60 "$bv_bin" --robot-triage >/dev/null 2>&1; } 2>&1) || cmd_rc=$?
+                if [ "$cmd_rc" -eq 0 ]; then
+                    printf '%s\n' "$time_out" | grep real >> "$BASELINE_FILE" || echo "timing unavailable" >> "$BASELINE_FILE"
+                else
+                    echo "timeout or error (exit $cmd_rc)" >> "$BASELINE_FILE"
+                fi
             done
             echo "" >> "$BASELINE_FILE"
         fi
@@ -146,7 +155,7 @@ capture_baseline() {
         ds_dir="$tmp_bench_root/medium/.beads"
         mkdir -p "$ds_dir"
         cp "$TESTDATA_DIR/medium.jsonl" "$ds_dir/issues.jsonl"
-        BEADS_DIR="$ds_dir" GODEBUG=gctrace=1 timeout 30 "$bv_bin" --robot-triage 2>&1 | grep -E '^gc|total' | head -20 >> "$BASELINE_FILE" || echo "No GC data captured" >> "$BASELINE_FILE"
+        env -u BEADS_DB -u BD_DB -u BEADS_JSONL BEADS_DIR="$ds_dir" GODEBUG=gctrace=1 timeout 30 "$bv_bin" --robot-triage 2>&1 | grep -E '^gc|total' | head -20 >> "$BASELINE_FILE" || echo "No GC data captured" >> "$BASELINE_FILE"
     fi
 
     # 8. Test Dataset Statistics

@@ -309,12 +309,20 @@ func (hr *HistoryReport) findDependencyCluster(targetID string, opts RelatedWork
 		return []RelatedWorkBead{}
 	}
 
-	// BFS to find beads within 2 hops of target (direct deps and their deps)
+	// BFS to find beads within 2 hops of target (direct deps and their deps).
+	// Track all 1-hop graph neighbors independently of `seen` so a shared blocker
+	// already reported under CommitOverlap/FileOverlap still connects unseen
+	// 2-hop siblings and grandparents.
 	cluster := make(map[string]int) // beadID -> hop distance
+	firstHopSet := make(map[string]bool)
 
 	// Direct dependencies (things target depends on)
 	if deps, ok := opts.DependencyGraph[targetID]; ok {
 		for _, depID := range deps {
+			if depID == "" || depID == targetID {
+				continue
+			}
+			firstHopSet[depID] = true
 			if !seen[depID] {
 				cluster[depID] = 1
 			}
@@ -323,26 +331,25 @@ func (hr *HistoryReport) findDependencyCluster(targetID string, opts RelatedWork
 
 	// Reverse dependencies (things that depend on target)
 	for beadID, deps := range opts.DependencyGraph {
-		if seen[beadID] {
+		if beadID == "" || beadID == targetID {
 			continue
 		}
 		for _, depID := range deps {
 			if depID == targetID {
-				if _, exists := cluster[beadID]; !exists {
-					cluster[beadID] = 1
+				firstHopSet[beadID] = true
+				if !seen[beadID] {
+					if _, exists := cluster[beadID]; !exists {
+						cluster[beadID] = 1
+					}
 				}
 			}
 		}
 	}
 
 	// Second hop: deps of deps AND reverse deps (siblings sharing a common blocker)
-	firstHop := make([]string, 0, len(cluster))
-	for id := range cluster {
+	firstHop := make([]string, 0, len(firstHopSet))
+	for id := range firstHopSet {
 		firstHop = append(firstHop, id)
-	}
-	firstHopSet := make(map[string]bool, len(firstHop))
-	for _, id := range firstHop {
-		firstHopSet[id] = true
 	}
 
 	for _, hopID := range firstHop {

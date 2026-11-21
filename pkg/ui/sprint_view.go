@@ -9,6 +9,7 @@ import (
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // renderSprintDashboard renders the sprint view with progress, burndown, and at-risk items (bv-161)
@@ -22,10 +23,14 @@ func (m *Model) renderSprintDashboard() string {
 	// Laid out in the main content width (not m.width) so the shortcuts
 	// sidebar, when open, fits beside it (GH #209).
 	bodyWidth := m.mainContentWidth()
-	innerWidth := bodyWidth - 6
-	if innerWidth < 40 {
-		innerWidth = 40
+	boxWidth := min(80, max(bodyWidth-4, 1))
+	horizPad := 2
+	if boxWidth <= 6 {
+		horizPad = 0
+	} else if boxWidth <= 10 {
+		horizPad = 1
 	}
+	innerWidth := max(boxWidth-2*horizPad, 1)
 
 	var sb strings.Builder
 
@@ -218,13 +223,14 @@ func (m *Model) renderSprintDashboard() string {
 			statusIcon = "✓"
 			statusStyle = t.Renderer.NewStyle().Foreground(t.Open)
 		} else {
-			switch iss.Status {
-			case model.StatusInProgress:
-				statusIcon = "⏳"
-				statusStyle = t.Renderer.NewStyle().Foreground(t.Feature)
-			case model.StatusBlocked:
+			isDepBlocked := sprintReadiness != nil && len(sprintReadiness.Blockers(iss.ID)) > 0
+			switch {
+			case iss.Status == model.StatusBlocked || isDepBlocked:
 				statusIcon = "⛔"
 				statusStyle = t.Renderer.NewStyle().Foreground(t.Blocked)
+			case iss.Status == model.StatusInProgress:
+				statusIcon = "⏳"
+				statusStyle = t.Renderer.NewStyle().Foreground(t.Feature)
 			}
 		}
 		sb.WriteString(statusStyle.Render(fmt.Sprintf("  %s %s - %s\n", statusIcon, iss.ID, truncateStrSprint(iss.Title, 40))))
@@ -234,12 +240,40 @@ func (m *Model) renderSprintDashboard() string {
 		sb.WriteString("\n")
 	}
 
-	// Window inner content for short terminals while preserving the footer hint.
-	footerLine := t.Renderer.NewStyle().Foreground(t.Muted).Italic(true).Render(
-		"P/esc: close • j/k: next/prev sprint • ctrl+d/u: scroll • Enter: jump")
-	bodyLines := strings.Split(strings.TrimRight(sb.String(), "\n"), "\n")
-	// Box chrome: border (2) + vertical padding (2) + footer gap & line (2) = 6 lines.
-	maxBodyLines := max(m.height-7, 3)
+	// Window inner content for short/narrow terminals while preserving footer + borders.
+	vertPad := 1
+	if m.height > 0 && m.height <= 26 {
+		vertPad = 0
+	}
+	placeHeight := max(m.height-1, 1)
+	maxBoxH := max(m.height-2, 1)
+	if maxBoxH > placeHeight {
+		maxBoxH = placeHeight
+	}
+	clampLine := func(line string) string {
+		if lipgloss.Width(line) > innerWidth {
+			suffix := "…"
+			if innerWidth <= 2 {
+				suffix = ""
+			}
+			return ansi.Truncate(line, innerWidth, suffix)
+		}
+		return line
+	}
+	footerLine := clampLine(t.Renderer.NewStyle().Foreground(t.Muted).Italic(true).Render(
+		"P/esc: close • j/k: next/prev sprint • ctrl+d/u: scroll • Enter: jump"))
+	rawBodyLines := strings.Split(strings.TrimRight(sb.String(), "\n"), "\n")
+	bodyLines := make([]string, len(rawBodyLines))
+	for i, line := range rawBodyLines {
+		bodyLines[i] = clampLine(line)
+	}
+	// Box chrome: border (2) + vertical padding (2*vertPad) + footer (1) + optional spacer (1).
+	availInner := max(maxBoxH-2-2*vertPad, 1)
+	footerGap := 1
+	if availInner <= 2 {
+		footerGap = 0
+	}
+	maxBodyLines := max(availInner-1-footerGap, 1)
 	if len(bodyLines) > maxBodyLines {
 		maxScroll := len(bodyLines) - maxBodyLines
 		if m.sprintScroll > maxScroll {
@@ -253,19 +287,23 @@ func (m *Model) renderSprintDashboard() string {
 	} else {
 		m.sprintScroll = 0
 	}
-	finalContent := strings.Join(bodyLines, "\n") + "\n\n" + footerLine
+	sep := "\n\n"
+	if footerGap == 0 {
+		sep = "\n"
+	}
+	finalContent := strings.Join(bodyLines, "\n") + sep + footerLine
 
 	// Wrap in a box
 	boxStyle := t.Renderer.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(t.Primary).
-		Padding(1, 2).
-		Width(min(80, max(bodyWidth-4, 1))).
-		MaxHeight(max(m.height-2, 1))
+		Padding(vertPad, horizPad).
+		Width(boxWidth).
+		MaxHeight(maxBoxH)
 
 	return lipgloss.Place(
 		max(bodyWidth, 1),
-		max(m.height-1, 1),
+		placeHeight,
 		lipgloss.Center,
 		lipgloss.Top,
 		boxStyle.Render(finalContent),
@@ -347,6 +385,7 @@ func (m *Model) openSprintView() (*Model, tea.Cmd) {
 		m.showDetails = false
 	}
 	m.selectedSprint = &m.sprints[idx]
+	m.sprintScroll = 0
 	m.isSprintView = true
 	m.focused = focusSprint
 	m.sprintViewText = m.renderSprintDashboard()

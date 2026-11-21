@@ -745,7 +745,8 @@ func TestTutorialSpaceNavigates(t *testing.T) {
 
 func TestTutorialHalfPageScroll(t *testing.T) {
 	m := newTestTutorialModel()
-	m.SetSize(80, 30)
+	// Use a viewport shorter than page 0's rendered content (~20 lines) so half-page scrolling is genuinely exercised.
+	m.SetSize(80, 18)
 
 	// Ctrl+d should scroll half page down
 	m, _ = m.Update(tea.KeyMsg{Type: tea.KeyCtrlD})

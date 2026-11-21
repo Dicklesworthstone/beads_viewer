@@ -129,7 +129,23 @@ func (l *Loader) Load() error {
 	l.projectDir = projectDir
 	configPath := filepath.Join(l.projectDir, ".bv", "hooks.yaml")
 
-	data, err := os.ReadFile(configPath)
+	const maxHooksConfigBytes = 1 << 20 // 1 MiB cap against symlink/FIFO/huge-file DoS
+	bvDir := filepath.Join(l.projectDir, ".bv")
+	if bvInfo, lstatErr := os.Lstat(bvDir); lstatErr == nil {
+		if bvInfo.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("reading hooks config: refusing symlink directory %s", bvDir)
+		}
+		if !bvInfo.IsDir() {
+			return fmt.Errorf("reading hooks config: %s is not a directory", bvDir)
+		}
+	} else if os.IsNotExist(lstatErr) {
+		l.config = &Config{projectDir: projectDir, configPath: configPath}
+		return nil
+	} else {
+		return fmt.Errorf("reading hooks config: %w", lstatErr)
+	}
+
+	lstatInfo, err := os.Lstat(configPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			// No config file means no hooks - this is OK
@@ -137,6 +153,34 @@ func (l *Loader) Load() error {
 			return nil
 		}
 		return fmt.Errorf("reading hooks config: %w", err)
+	}
+	if lstatInfo.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("reading hooks config: refusing symlink %s", configPath)
+	}
+	if !lstatInfo.Mode().IsRegular() {
+		return fmt.Errorf("reading hooks config: %s is not a regular file", configPath)
+	}
+	if lstatInfo.Size() > maxHooksConfigBytes {
+		return fmt.Errorf("reading hooks config: %s exceeds maximum size (%d bytes)", configPath, maxHooksConfigBytes)
+	}
+	f, err := os.Open(configPath)
+	if err != nil {
+		return fmt.Errorf("reading hooks config: %w", err)
+	}
+	defer f.Close()
+	fInfo, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("reading hooks config: %w", err)
+	}
+	if !fInfo.Mode().IsRegular() || !os.SameFile(lstatInfo, fInfo) {
+		return fmt.Errorf("reading hooks config: %s changed during open", configPath)
+	}
+	data, err := io.ReadAll(io.LimitReader(f, maxHooksConfigBytes+1))
+	if err != nil {
+		return fmt.Errorf("reading hooks config: %w", err)
+	}
+	if len(data) > maxHooksConfigBytes {
+		return fmt.Errorf("reading hooks config: %s exceeds maximum size (%d bytes)", configPath, maxHooksConfigBytes)
 	}
 
 	config, err := ParseConfig(data)

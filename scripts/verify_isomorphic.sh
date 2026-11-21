@@ -24,6 +24,7 @@
 
 set -euo pipefail
 export BV_NO_BROWSER=1 BV_TEST_MODE=1 BV_NO_SAVED_CONFIG=1 BV_NO_UPDATE_CHECK=1
+export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-1788220800}"
 
 # Configuration
 BASELINE_REF="${1:-main}"
@@ -49,6 +50,7 @@ log_verbose() { [[ "$VERBOSE" == "1" ]] && echo -e "${BLUE}[DEBUG]${NC} $*" || t
 
 # Cleanup function: removes the temp dir and the detached baseline worktree.
 # The caller's worktree, index, and stash are never touched by this script.
+# shellcheck disable=SC2329 # invoked indirectly via trap
 cleanup() {
     local exit_code=$?
     if [[ -n "${BASELINE_WORKTREE:-}" ]] && [[ -d "$BASELINE_WORKTREE" ]]; then
@@ -60,7 +62,7 @@ cleanup() {
         log_verbose "Cleaning up $TEST_DIR"
         rm -rf "$TEST_DIR"
     fi
-    exit $exit_code
+    exit "$exit_code"
 }
 trap cleanup EXIT INT TERM
 
@@ -153,7 +155,7 @@ normalize_json_output() {
         jq -S '
           def scrub:
             if type == "object" then
-              del(.generated_at, .version, .analysis_time_ms)
+              del(.generated_at, .version, .analysis_time_ms, .compute_time_ms, .ms)
               | with_entries(.value |= scrub)
             elif type == "array" then
               map(scrub)
@@ -180,7 +182,7 @@ run_command() {
     # shellcheck disable=SC2206
     argv=($command)
 
-    (cd "$case_dir" && "$binary" "${argv[@]}" > "$raw_file" 2> "$err_file") || rc=$?
+    (cd "$case_dir" && env -u BEADS_DIR -u BEADS_DB -u BD_DB -u BEADS_JSONL "$binary" "${argv[@]}" > "$raw_file" 2> "$err_file") || rc=$?
     if [[ "$rc" -ne 0 ]]; then
         log_error "$case_dir ($binary $command) exited with status $rc"
         if [[ -s "$err_file" ]]; then

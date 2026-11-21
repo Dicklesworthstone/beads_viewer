@@ -383,7 +383,18 @@ func TestRC37_DiscoverAndLoadFollowRedirectAndMetadataDatabase(t *testing.T) {
 		t.Fatalf("LoadIssuesFromDir(custom metadata db) = (%+v, %v), want [CUST-1]", customLoaded.Issues, err)
 	}
 
-	// 3. Non-sqlite metadata.json backend must not discover custom database as SQLite.
+	// 3. Non-sqlite metadata.json backend must not discover custom database OR fallback beads.db as SQLite.
+	fallbackDBPath := filepath.Join(customDir, "beads.db")
+	fbDB, err := sql.Open("sqlite", fallbackDBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = fbDB.Exec(`CREATE TABLE issues (id TEXT PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL);
+		INSERT INTO issues (id, title, status) VALUES ('FB-1', 'Fallback DB', 'open');`)
+	_ = fbDB.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(customDir, "metadata.json"), []byte(`{"database":"tracker.sqlite","backend":"unknown-tracker"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -391,9 +402,119 @@ func TestRC37_DiscoverAndLoadFollowRedirectAndMetadataDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DiscoverSources(non-sqlite metadata backend) failed: %v", err)
 	}
-	for _, src := range nonSQLiteSources {
-		if filepath.Clean(src.Path) == filepath.Clean(customDBPath) {
-			t.Fatalf("DiscoverSources(non-sqlite metadata backend) must not discover %s as SQLite: %+v", customDBPath, nonSQLiteSources)
+	if len(nonSQLiteSources) != 0 {
+		t.Fatalf("DiscoverSources(non-sqlite metadata backend) leaked SQLite source(s): %+v", nonSQLiteSources)
+	}
+
+	// 4. metadata.json path traversal (absolute or ../ outside beadsDir) must be refused.
+	outsideDB := filepath.Join(outer, "outside.db")
+	oDB, err := sql.Open("sqlite", outsideDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = oDB.Exec(`CREATE TABLE issues (id TEXT PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL);
+		INSERT INTO issues (id, title, status) VALUES ('OUT-1', 'Outside DB', 'open');`)
+	_ = oDB.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	travDir := filepath.Join(outer, "trav-db", ".beads")
+	if err := os.MkdirAll(travDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(travDir, "metadata.json"), []byte(fmt.Sprintf(`{"database":%q,"backend":"sqlite"}`, outsideDB)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	travSources, err := DiscoverSources(DiscoveryOptions{BeadsDir: travDir, SkipWorktreeSources: true, ValidateAfterDiscovery: true})
+	if err != nil {
+		t.Fatalf("DiscoverSources(traversal metadata db) failed: %v", err)
+	}
+	if len(travSources) != 0 {
+		t.Fatalf("DiscoverSources(traversal metadata db) escaped beadsDir: %+v", travSources)
+	}
+
+	// 5. validateJSONL rejects empty-string and non-string required fields (matching fusedLoadJSONL).
+	for _, tc := range []struct {
+		name string
+		line string
+	}{
+		{"empty strings", `{"id":"","title":"","status":""}`},
+		{"whitespace strings", `{"id":"   ","title":"x","status":"open"}`},
+		{"numeric id", `{"id":123,"title":"x","status":"open"}`},
+	} {
+		t.Run("validateJSONL_"+tc.name, func(t *testing.T) {
+			p := filepath.Join(t.TempDir(), "issues.jsonl")
+			if err := os.WriteFile(p, []byte(tc.line+"\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			src := DataSource{Type: SourceTypeJSONLLocal, Path: p}
+			if err := ValidateSource(&src); err == nil {
+				t.Fatalf("ValidateSource(%s) accepted invalid required field line %s", tc.name, tc.line)
+			}
+		})
+	}
+}
+
+func TestWave22_Pass2MetadataJSONHardening(t *testing.T) {
+	outer := t.TempDir()
+	outsideDB := filepath.Join(outer, "outside.db")
+	oDB, err := sql.Open("sqlite", outsideDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = oDB.Exec(`CREATE TABLE issues (id TEXT PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL);
+		INSERT INTO issues (id, title, status) VALUES ('ESC-1', 'Outside', 'open');`)
+	_ = oDB.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Symlinked metadata.json must be refused by ReadMetadataJSON.
+	symMetaDir := filepath.Join(outer, "sym-meta", ".beads")
+	if err := os.MkdirAll(symMetaDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	realMeta := filepath.Join(outer, "real-metadata.json")
+	if err := os.WriteFile(realMeta, []byte(`{"backend":"sqlite","database":"beads.db"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realMeta, filepath.Join(symMetaDir, "metadata.json")); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	var dst map[string]any
+	if ReadMetadataJSON(symMetaDir, &dst) {
+		t.Fatal("ReadMetadataJSON accepted a symlinked metadata.json")
+	}
+
+	// 2. Oversized (>1 MiB) metadata.json must be refused without reading unbounded memory.
+	bigMetaDir := filepath.Join(outer, "big-meta", ".beads")
+	if err := os.MkdirAll(bigMetaDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bigBuf := append([]byte(`{"pad":"`), make([]byte, (1<<20)+64)...)
+	for i := 8; i < len(bigBuf); i++ {
+		bigBuf[i] = 'a'
+	}
+	bigBuf = append(bigBuf, []byte(`"}`)...)
+	if err := os.WriteFile(filepath.Join(bigMetaDir, "metadata.json"), bigBuf, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if ReadMetadataJSON(bigMetaDir, &dst) {
+		t.Fatal("ReadMetadataJSON accepted >1 MiB metadata.json")
+	}
+
+	// 3. Relative ../outside.db AND symlink inside .beads pointing outside must both be refused.
+	escapeDir := filepath.Join(outer, "escape", ".beads")
+	if err := os.MkdirAll(escapeDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := ResolveMetadataPathWithinDir(escapeDir, "../../outside.db"); ok {
+		t.Fatal("ResolveMetadataPathWithinDir accepted relative ../ traversal")
+	}
+	symDB := filepath.Join(escapeDir, "linked.db")
+	if err := os.Symlink(outsideDB, symDB); err == nil {
+		if _, ok := ResolveMetadataPathWithinDir(escapeDir, "linked.db"); ok {
+			t.Fatal("ResolveMetadataPathWithinDir accepted symlink escaping beadsDir")
 		}
 	}
 }

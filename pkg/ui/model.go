@@ -317,6 +317,12 @@ func (m *Model) SetSourceReload(reload func(context.Context) (SourceReloadResult
 		m.bdRefreshCancel()
 		m.bdRefreshCancel = nil
 	}
+	if m.backgroundWorker != nil {
+		m.backgroundWorker.Stop()
+		m.backgroundWorker = nil
+	}
+	m.snapshotInitPending = false
+	m.restoreBackgroundAfterEdit = false
 	m.pendingTrackerRefresh = nil
 	m.pendingExportSession = nil
 	m.sourceStaleReason = ""
@@ -368,11 +374,12 @@ func (m *Model) startSourceReload() tea.Cmd {
 	if m.pendingTrackerRefresh != nil {
 		return m.retryEditorExport()
 	}
-	if m.backgroundWorker != nil && m.backgroundWorker.State() != WorkerStopped {
+	if m.backgroundWorker != nil && m.backgroundWorker.State() != WorkerStopped &&
+		(m.sourceReload == nil || m.allowBackgroundAutoPromote) {
 		m.backgroundWorker.HandleRefreshRequest(RefreshRequestMsg{Force: true})
 		return nil
 	}
-	if m.backgroundWorker != nil {
+	if m.backgroundWorker != nil && m.backgroundWorker.State() == WorkerStopped {
 		m.backgroundWorker = nil
 	}
 	if m.sourceReload != nil {
@@ -5299,6 +5306,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		default:
 			m.authorityHash = analysis.ComputeDataHash(msg.Snapshot.Issues)
 		}
+		if msg.Snapshot.SourceDegradedKnown {
+			m.sourceDegraded = msg.Snapshot.SourceDegraded
+		}
 		m.authorityIncomplete = m.sourceDegraded || !msg.Snapshot.AuthorityComplete || msg.Snapshot.LoadWarningCount > 0
 		if m.pendingTrackerRefresh == nil {
 			m.sourceStaleReason = ""
@@ -6376,7 +6386,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.helpScroll = 0
 				m.showTutorial = true
 				m.tutorialModel.SetContextMode(false)
-				m.tutorialModel.SetSize(m.width, m.height)
+				m.syncTutorialSize()
 				m.tutorialModel.markCurrentPageViewed()
 				m.focused = focusTutorial
 				return m, nil
@@ -6394,7 +6404,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.showTutorial = true
 				m.tutorialModel.SetContext(ctx)
 				m.tutorialModel.SetContextMode(true)
-				m.tutorialModel.SetSize(m.width, m.height)
+				m.syncTutorialSize()
 				m.tutorialModel.markCurrentPageViewed()
 				m.focused = focusTutorial
 				return m, nil
@@ -6424,7 +6434,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 					m.tutorialModel.SetContext(ctx)
 					m.tutorialModel.SetContextMode(true)
-					m.tutorialModel.SetSize(m.width, m.height)
+					m.syncTutorialSize()
 					m.tutorialModel.markCurrentPageViewed()
 					m.focused = focusTutorial
 					return m, nil
@@ -7520,6 +7530,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							return m, nil
 						}
 					}
+					viewToggleHandled = true
 				case "d":
 					if len(m.labelDashboard.labels) > 0 {
 						idx := m.labelDashboard.cursor
@@ -8263,6 +8274,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						for i, s := range m.sprints {
 							if s.ID == m.selectedSprint.ID && i > 0 {
 								m.selectedSprint = &m.sprints[i-1]
+								m.sprintScroll = 0
 								m.sprintViewText = m.renderSprintDashboard()
 								break
 							}
@@ -8321,6 +8333,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						for i, s := range m.sprints {
 							if s.ID == m.selectedSprint.ID && i < len(m.sprints)-1 {
 								m.selectedSprint = &m.sprints[i+1]
+								m.sprintScroll = 0
 								m.sprintViewText = m.renderSprintDashboard()
 								break
 							}
@@ -8354,7 +8367,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.isSplitView = msg.Width > SplitViewThreshold
 		}
-		m.tutorialModel.SetSize(msg.Width, msg.Height)
+		m.syncTutorialSize()
 		if !isModalFocus(m.focused) {
 			m.focused = m.validateViewFocus(m.focused)
 		}
@@ -10010,9 +10023,19 @@ func (m *Model) openFullTutorialFromFocus(prior focus) {
 	m.showHelp = false
 	m.helpScroll = 0
 	m.tutorialModel.SetContextMode(false)
-	m.tutorialModel.SetSize(m.width, m.height)
+	m.syncTutorialSize()
 	m.tutorialModel.markCurrentPageViewed()
 	m.focused = focusTutorial
+}
+
+func (m *Model) syncTutorialSize() {
+	w, h := m.width, m.height
+	m.tutorialModel.SetSize(w, h)
+	if h > 0 {
+		m.tutorialModel.SetBodyHeight(max(1, h-1))
+	} else {
+		m.tutorialModel.SetBodyHeight(0)
+	}
 }
 
 func (m *Model) openContextTutorialWithContext(prior focus, ctx string) {
@@ -10028,7 +10051,7 @@ func (m *Model) openContextTutorialWithContext(prior focus, ctx string) {
 	m.showTutorial = true
 	m.tutorialModel.SetContext(ctx)
 	m.tutorialModel.SetContextMode(true)
-	m.tutorialModel.SetSize(m.width, m.height)
+	m.syncTutorialSize()
 	m.tutorialModel.markCurrentPageViewed()
 	m.focused = focusTutorial
 }
@@ -10261,7 +10284,7 @@ func (m *Model) handleHelpKeys(msg tea.KeyMsg) *Model {
 			m.showTutorial = true
 			if !reopenedFromTutorial {
 				m.tutorialModel.SetContextMode(false)
-				m.tutorialModel.SetSize(m.width, m.height)
+				m.syncTutorialSize()
 				m.tutorialModel.markCurrentPageViewed()
 			}
 			m.focused = focusTutorial
@@ -10822,9 +10845,12 @@ func (m *Model) buildHelpBodyLines() (bodyLines []string, availLines int) {
 		numCols = 1
 	}
 
-	// Calculate column width (accounting for gaps and outer padding)
-	totalPadding := 8 // outer padding
-	gapWidth := 2     // gap between columns
+	// Calculate column width (accounting for gaps, panel borders, and outer padding)
+	totalPadding := 8 // outer border (2) + outer padding (4) + panel border (2)
+	if effWidth <= 64 {
+		totalPadding = 6 // outer border (2) + narrow outer padding (2) + panel border (2)
+	}
+	gapWidth := 2 // gap between columns
 	availableWidth := effWidth - totalPadding - (gapWidth * (numCols - 1))
 	colWidth := availableWidth / numCols
 	if colWidth < 28 {
@@ -10851,7 +10877,7 @@ func (m *Model) buildHelpBodyLines() (bodyLines []string, availLines int) {
 			BorderStyle(lipgloss.Border{Bottom: "─"}).
 			BorderBottom(true).
 			BorderForeground(color).
-			Width(colWidth-4).
+			Width(max(colWidth-4, 12)).
 			Padding(0, 1)
 
 		keyStyle := t.Renderer.NewStyle().
@@ -10861,15 +10887,14 @@ func (m *Model) buildHelpBodyLines() (bodyLines []string, availLines int) {
 
 		descStyle := t.Renderer.NewStyle().
 			Foreground(t.Base.GetForeground()).
-			Width(colWidth - 16)
+			Width(max(colWidth-16, 10))
 
 		var content strings.Builder
 		content.WriteString(headerStyle.Render(icon + " " + title))
 		content.WriteString("\n")
 
 		for _, s := range shortcuts {
-			content.WriteString(keyStyle.Render(s.key))
-			content.WriteString(descStyle.Render(s.desc))
+			content.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, keyStyle.Render(s.key), descStyle.Render(s.desc)))
 			content.WriteString("\n")
 		}
 
@@ -11005,11 +11030,16 @@ func (m *Model) buildHelpBodyLines() (bodyLines []string, availLines int) {
 	bodyLines = strings.Split(body, "\n")
 
 	viewportHeight := max(effHeight-1, 1)
-	// Outer container chrome: border (2) + vertical padding (2) + title bar (1) + spacer (1) = 6 lines.
-	availNoIndicator := max(viewportHeight-6, 1)
+	vertPad := 1
+	if viewportHeight <= 14 {
+		vertPad = 0
+	}
+	// Outer container chrome: border (2) + vertical padding (2*vertPad) + title bar (1) + spacer (1).
+	outerChrome := 4 + 2*vertPad
+	availNoIndicator := max(viewportHeight-outerChrome, 1)
 	if len(bodyLines) > availNoIndicator {
 		// Reserve 1 extra line for the scroll indicator footer inside the modal.
-		availLines = max(viewportHeight-7, 1)
+		availLines = max(viewportHeight-outerChrome-1, 1)
 	} else {
 		availLines = availNoIndicator
 	}
@@ -11027,7 +11057,26 @@ func (m *Model) renderHelpOverlay() string {
 		m.helpScroll = 0
 	}
 
-	// Title bar
+	placeWidth := m.width
+	if placeWidth <= 0 {
+		placeWidth = 80
+	}
+	placeHeight := m.height - 1
+	if placeHeight <= 0 {
+		placeHeight = 23
+	}
+
+	vertPad := 1
+	if placeHeight <= 14 {
+		vertPad = 0
+	}
+	horizPad := 2
+	if placeWidth <= 64 {
+		horizPad = 1
+	}
+	maxInnerW := max(placeWidth-2-2*horizPad, 20)
+
+	// Title bar (compact/clamped on narrow terminals so it never wraps or breaks box borders)
 	titleStyle := t.Renderer.NewStyle().
 		Foreground(t.Primary).
 		Bold(true).
@@ -11040,6 +11089,14 @@ func (m *Model) renderHelpOverlay() string {
 	title := titleStyle.Render("⌨️  Keyboard Shortcuts")
 	subtitle := subtitleStyle.Render("Space: Tutorial │ ? or Esc to close")
 	titleBar := lipgloss.JoinHorizontal(lipgloss.Center, title, "  ", subtitle)
+	if lipgloss.Width(titleBar) > maxInnerW {
+		compactTitle := t.Renderer.NewStyle().Foreground(t.Primary).Bold(true).Render("⌨️ Shortcuts")
+		compactSub := subtitleStyle.Render("Space: Tutorial │ ?: Close")
+		titleBar = lipgloss.JoinHorizontal(lipgloss.Center, compactTitle, " │ ", compactSub)
+		if lipgloss.Width(titleBar) > maxInnerW {
+			titleBar = ansi.Truncate(titleBar, maxInnerW, "…")
+		}
+	}
 
 	visibleLines := bodyLines
 	scrollIndicator := ""
@@ -11049,6 +11106,9 @@ func (m *Model) renderHelpOverlay() string {
 		scrollIndicator = subtitleStyle.Render(
 			fmt.Sprintf("↑/↓ j/k scroll • lines %d-%d of %d", m.helpScroll+1, end, len(bodyLines)),
 		)
+		if lipgloss.Width(scrollIndicator) > maxInnerW {
+			scrollIndicator = ansi.Truncate(scrollIndicator, maxInnerW, "…")
+		}
 	}
 	body := strings.Join(visibleLines, "\n")
 
@@ -11061,25 +11121,12 @@ func (m *Model) renderHelpOverlay() string {
 	}
 
 	// Outer container
-	vertPad := 1
-	if m.height > 0 && m.height-1 < 8 {
-		vertPad = 0
-	}
 	containerStyle := t.Renderer.NewStyle().
 		Border(lipgloss.DoubleBorder()).
 		BorderForeground(t.Primary).
-		Padding(vertPad, 2)
+		Padding(vertPad, horizPad)
 
 	helpBox := containerStyle.Render(content)
-
-	placeWidth := m.width
-	if placeWidth <= 0 {
-		placeWidth = 80
-	}
-	placeHeight := m.height - 1
-	if placeHeight <= 0 {
-		placeHeight = 23
-	}
 
 	// Center in viewport
 	return lipgloss.Place(
@@ -16349,7 +16396,7 @@ func (m *Model) refreshLabelViews(underlyingFocus focus) {
 // intercept the given scroll key without stealing keys from active text inputs,
 // pickers, overlays, or detail panes.
 func (m *Model) canScrollShortcutsSidebar(key string) bool {
-	if !m.showShortcutsSidebar {
+	if !m.sidebarVisible() {
 		return false
 	}
 	if m.showHelp || m.showTutorial || m.showTimeTravelPrompt ||
@@ -16372,7 +16419,7 @@ func (m *Model) canScrollShortcutsSidebar(key string) bool {
 	case "pgup", "pgdown":
 		switch m.focused {
 		case focusDetail, focusGraph, focusTree, focusActionable, focusFlowMatrix,
-			focusInsights, focusAttention, focusLabelDashboard, focusVelocityComparison, focusHistory:
+			focusInsights, focusAttention, focusLabelDashboard, focusVelocityComparison, focusHistory, focusSprint:
 			return false
 		case focusBoard:
 			return !m.board.IsDetailShown() && len(m.board.columns[m.board.actualFocusedCol()]) <= 1

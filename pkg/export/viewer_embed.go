@@ -323,46 +323,6 @@ func (b *Bundle) CopyEmbeddedAssetsWithSubtitle(title, subtitle string) error {
 	return nil
 }
 
-// BindOfflineBundleAssets scans the held bundle root for all non-hidden runtime
-// files (excluding coi-serviceworker.js and dev-only assets) and binds their
-// SHA-256 manifest into coi-serviceworker.js. Used by filesystem-fallback asset
-// copying so offline service-worker verification matches embedded asset exports.
-func (b *Bundle) BindOfflineBundleAssets() error {
-	if b == nil || b.root == nil {
-		return nil
-	}
-	var offlineFiles []string
-	err := fs.WalkDir(b.root.FS(), ".", func(p string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if p == "." {
-			return nil
-		}
-		if strings.HasPrefix(d.Name(), ".") {
-			if d.IsDir() {
-				return fs.SkipDir
-			}
-			return nil
-		}
-		if d.IsDir() {
-			return nil
-		}
-		if p == "coi-serviceworker.js" || isDevOnlyAsset(p) {
-			return nil
-		}
-		if !d.Type().IsRegular() {
-			return fmt.Errorf("offline asset %s is not a regular file", p)
-		}
-		offlineFiles = append(offlineFiles, p)
-		return nil
-	})
-	if err != nil {
-		return fmt.Errorf("collecting offline bundle assets: %w", err)
-	}
-	return bindOfflineAssets(b, offlineFiles)
-}
-
 // bindOfflineAssets embeds the exact file hashes consumed by SW installation.
 // A missing or changed asset prevents activation; it cannot create a verified
 // partial offline bundle. This list exists only to serve the offline cache.

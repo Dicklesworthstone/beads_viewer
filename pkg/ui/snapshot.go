@@ -229,13 +229,15 @@ type DataSnapshot struct {
 	graphLayout *GraphLayout
 
 	// Metadata
-	CreatedAt         time.Time      // When this snapshot was built
-	DataHash          string         // Hash of source data for cache validation
-	AuthorityHash     string         // Full source identity, including hidden dependency records.
-	AuthorityComplete bool           // True when source authority is complete and warning-free.
-	RecipeName        string         // Active recipe name for this snapshot (bv-2h40)
-	RecipeHash        string         // Fingerprint of active recipe for this snapshot (bv-4ilb)
-	recipe            *recipe.Recipe // Retained to re-sort ViewIssues/ListItems when Phase 2 completes
+	CreatedAt           time.Time      // When this snapshot was built
+	DataHash            string         // Hash of source data for cache validation
+	AuthorityHash       string         // Full source identity, including hidden dependency records.
+	AuthorityComplete   bool           // True when source authority is complete and warning-free.
+	SourceDegraded      bool           // True when snapshot was built from a degraded/fallback source.
+	SourceDegradedKnown bool           // True when SourceDegraded was explicitly observed for this snapshot.
+	RecipeName          string         // Active recipe name for this snapshot (bv-2h40)
+	RecipeHash          string         // Fingerprint of active recipe for this snapshot (bv-4ilb)
+	recipe              *recipe.Recipe // Retained to re-sort ViewIssues/ListItems when Phase 2 completes
 	// DatasetTier is a tiered performance mode for large datasets (bv-9thm).
 	// When unknown, normal behavior applies.
 	DatasetTier datasetTier
@@ -1631,6 +1633,8 @@ func (s *DataSnapshot) WithPhase2(stats *analysis.GraphStats, insights analysis.
 		DataHash:             s.DataHash,
 		AuthorityHash:        s.AuthorityHash,
 		AuthorityComplete:    s.AuthorityComplete,
+		SourceDegraded:       s.SourceDegraded,
+		SourceDegradedKnown:  s.SourceDegradedKnown,
 		RecipeName:           s.RecipeName,
 		RecipeHash:           s.RecipeHash,
 		recipe:               s.recipe,

@@ -3780,6 +3780,23 @@ func TestComputeBlockageCascadeAndAttention_DeduplicationScopeAndBlockImpact(t *
 	if multiScore == nil || multiScore.BlockImpact != 2.0 || multiScore.BlockedCount != 1 {
 		t.Fatalf("label 'multi' got %+v, want BlockImpact=2.0 BlockedCount=1", multiScore)
 	}
+
+	// Regression (Wave 22): self-dependent issue must mark HasCycle=true instead of panicking in gonum SetEdge.
+	selfIssues := []model.Issue{
+		{
+			ID:     "SELF-1",
+			Title:  "Self loop",
+			Status: model.StatusOpen,
+			Labels: []string{"api"},
+			Dependencies: []*model.Dependency{
+				{IssueID: "SELF-1", DependsOnID: "SELF-1", Type: model.DepBlocks},
+			},
+		},
+	}
+	cpSelf := ComputeLabelCriticalPathFromIssues(selfIssues, "api")
+	if !cpSelf.HasCycle {
+		t.Fatalf("expected HasCycle=true on self-dependent issue without panic, got %+v", cpSelf)
+	}
 }
 
 func TestComputeLabelVelocity_ZeroNowDefaultsToUTCWallClock(t *testing.T) {

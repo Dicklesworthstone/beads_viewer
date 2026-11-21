@@ -1343,7 +1343,7 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 				UsageHints     []string                `json:"usage_hints"`
 			}{
 				RobotEnvelope:  ctx.Envelope(),
-				AnalysisConfig: config,
+				AnalysisConfig: stats.EffectiveConfig(),
 				Status:         stabilizeRobotMetricStatusForPinnedClock(stats.Status()),
 				LabelScope:     ctx.LabelScope,
 				LabelContext:   ctx.LabelContext,
@@ -1464,7 +1464,7 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 				Usage []string `json:"usage_hints"`
 			}{
 				RobotEnvelope:     ctx.Envelope(),
-				AnalysisConfig:    config,
+				AnalysisConfig:    stats.EffectiveConfig(),
 				Status:            stabilizeRobotMetricStatusForPinnedClock(stats.Status()),
 				LabelScope:        ctx.LabelScope,
 				LabelContext:      ctx.LabelContext,
@@ -3132,17 +3132,21 @@ func buildRobotInsightsPayload(ctx RobotContext, includeInactive, forceFull bool
 			Density:          scopedDensity,
 			NodeCount:        scopedNodes,
 			EdgeCount:        scopedEdges,
-			Config:           insights.Stats.Config,
+			Config:           insights.Stats.EffectiveConfig(),
 		}
 	}
 
 	betweennessMap := stats.ActiveBetweenness()
 	coreNumberMap := stats.ActiveCoreNumber()
 	articulationSlice := stats.ActiveArticulationPoints()
+	criticalPathMap := stats.ActiveCriticalPathScore()
+	slackMap := stats.ActiveSlack()
 	if includeInactive {
 		betweennessMap = stats.Betweenness()
 		coreNumberMap = stats.CoreNumber()
 		articulationSlice = stats.ArticulationPoints()
+		criticalPathMap = stats.CriticalPathScore()
+		slackMap = stats.Slack()
 	}
 
 	fullStats := struct {
@@ -3161,9 +3165,9 @@ func buildRobotInsightsPayload(ctx RobotContext, includeInactive, forceFull bool
 		Eigenvector:       limitMaps(filterFloatMap(stats.Eigenvector()), mapLimit),
 		Hubs:              limitMaps(filterFloatMap(stats.Hubs()), mapLimit),
 		Authorities:       limitMaps(filterFloatMap(stats.Authorities()), mapLimit),
-		CriticalPathScore: limitMaps(filterFloatMap(stats.CriticalPathScore()), mapLimit),
+		CriticalPathScore: limitMaps(filterFloatMap(criticalPathMap), mapLimit),
 		CoreNumber:        limitMapInt(filterIntMap(coreNumberMap), mapLimit),
-		Slack:             limitMaps(filterFloatMap(stats.Slack()), mapLimit),
+		Slack:             limitMaps(filterFloatMap(slackMap), mapLimit),
 		Articulation:      limitSlice(filterStringSlice(articulationSlice), mapLimit),
 	}
 
@@ -3185,7 +3189,7 @@ func buildRobotInsightsPayload(ctx RobotContext, includeInactive, forceFull bool
 		UsageHints       []string                   `json:"usage_hints"`
 	}{
 		RobotEnvelope:    ctx.Envelope(),
-		AnalysisConfig:   stats.Config,
+		AnalysisConfig:   stats.EffectiveConfig(),
 		Status:           stabilizeRobotMetricStatusForPinnedClock(stats.Status()),
 		LabelScope:       ctx.LabelScope,
 		LabelContext:     ctx.LabelContext,
@@ -5158,31 +5162,43 @@ func resolveWorkspaceFeedbackStoreAndRepoForBead(ctx RobotContext, workDir, bead
 			}
 		}
 	}
-	// Fallback: match by workspace source prefix for deleted/tombstoned beads absent from allIssues.
-	for _, ws := range sources {
+	// Fallback: match by longest workspace source prefix for deleted/tombstoned
+	// beads absent from allIssues (so api-v2- beats api-).
+	var bestMatch *workspaceCorrelationSource
+	bestPrefixLen := 0
+	for i := range sources {
+		ws := &sources[i]
 		if strings.TrimSpace(ctx.Repo) != "" && !sourceMatchesRepoFilter(ws.source, ctx.Repo) {
 			continue
 		}
 		prefix := ws.source.RepoPrefix
 		if prefix != "" && len(beadID) > len(prefix) && strings.EqualFold(beadID[:len(prefix)], prefix) {
-			store, err := loadCorrelationFeedbackStoreForBeadsPath(ws.repoRoot, ws.beadsPath)
-			if err != nil {
-				return nil, "", "", err
+			if len(prefix) > bestPrefixLen {
+				bestPrefixLen = len(prefix)
+				bestMatch = ws
 			}
-			stripped := beadID[len(prefix):]
-			if !strings.EqualFold(stripped, beadID) {
-				if part, corrErr := correlation.NewCorrelator(ws.repoRoot, ws.beadsPath).GenerateReportCached(nil, correlation.CorrelatorOptions{
-					BeadID:            stripped,
-					TargetBeadAliases: []string{beadID},
-					Revision:          workspaceSourceRevision(ctx, ws.source, ctx.AsOfCommit),
-				}); corrErr == nil {
-					if _, ok := part.Histories[beadID]; ok {
-						return store, beadID, ws.repoRoot, nil
-					}
+		}
+	}
+	if bestMatch != nil {
+		ws := *bestMatch
+		prefix := ws.source.RepoPrefix
+		store, err := loadCorrelationFeedbackStoreForBeadsPath(ws.repoRoot, ws.beadsPath)
+		if err != nil {
+			return nil, "", "", err
+		}
+		stripped := beadID[len(prefix):]
+		if !strings.EqualFold(stripped, beadID) {
+			if part, corrErr := correlation.NewCorrelator(ws.repoRoot, ws.beadsPath).GenerateReportCached(nil, correlation.CorrelatorOptions{
+				BeadID:            stripped,
+				TargetBeadAliases: []string{beadID},
+				Revision:          workspaceSourceRevision(ctx, ws.source, ctx.AsOfCommit),
+			}); corrErr == nil {
+				if _, ok := part.Histories[beadID]; ok {
+					return store, beadID, ws.repoRoot, nil
 				}
 			}
-			return store, stripped, ws.repoRoot, nil
 		}
+		return store, stripped, ws.repoRoot, nil
 	}
 	return nil, "", "", fmt.Errorf("workspace repository not found for bead %q", beadID)
 }
@@ -5328,6 +5344,11 @@ func detectWorkspaceOrphans(ctx RobotContext, limit int) (*correlation.OrphanRep
 		var matchedSubtrees []string
 		var unmatchedSubtrees []string
 		matchedRootStore := false
+		type partRejectSource struct {
+			report  *correlation.HistoryReport
+			qualify func(string) string
+		}
+		var partRejectSources []partRejectSource
 
 		for _, ws := range group {
 			idKey := workspaceSourceIdentityKey(ws)
@@ -5394,6 +5415,12 @@ func detectWorkspaceOrphans(ctx RobotContext, limit int) (*correlation.OrphanRep
 				rootFeedback.Rejected += part.Stats.FeedbackApplied.Rejected
 				rootFeedback.Ignored += part.Stats.FeedbackApplied.Ignored
 			}
+			partRejectSources = append(partRejectSources, partRejectSource{
+				report: part,
+				qualify: func(localID string) string {
+					return qualifyWorkspaceHistoricalID(localID, ws.source, localToQualified, knownQualified)
+				},
+			})
 			for localID, hist := range part.Histories {
 				qualID := qualifyWorkspaceHistoricalID(localID, ws.source, localToQualified, knownQualified)
 				hist.BeadID = qualID
@@ -5432,6 +5459,9 @@ func detectWorkspaceOrphans(ctx RobotContext, limit int) (*correlation.OrphanRep
 			Stats:       correlation.HistoryStats{FeedbackApplied: rootFeedback},
 			Histories:   scopedHistories,
 			CommitIndex: correlation.BuildCommitIndex(rootHistories),
+		}
+		for _, prs := range partRejectSources {
+			rootReport.MergeRejectedPairs(prs.report, prs.qualify)
 		}
 		detector := correlation.NewOrphanDetectorAt(rootReport, cleanRoot, ctx.ReferenceNow()).
 			WithStoreDirs(sharedMeta.storeDirsByRoot[cleanRoot]...)

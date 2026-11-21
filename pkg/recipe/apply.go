@@ -3,7 +3,6 @@ package recipe
 import (
 	"fmt"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -340,33 +339,46 @@ func compareTimes(a, b time.Time) int {
 	return 0
 }
 
-// naturalLess orders IDs sharing a prefix by their trailing number
-// ("bv-2" < "bv-10") and everything else lexically.
+// naturalLess defines a strict total order on strings by comparing alternating
+// non-digit and ASCII digit runs left-to-right: digit runs compare numerically
+// without integer overflow (by stripped-leading-zero length, then lexically),
+// and identical numeric interpretations break ties by raw byte order s1 < s2.
+// This guarantees transitivity even when numeric IDs ("bv-2", "bv-10") coexist
+// with alphanumeric hash IDs ("bv-1a") or arbitrarily long digit sequences.
 func naturalLess(s1, s2 string) bool {
-	split := func(s string) (string, int, bool) {
-		lastDigit := -1
-		for i := len(s) - 1; i >= 0; i-- {
-			if s[i] < '0' || s[i] > '9' {
-				break
+	isDigit := func(b byte) bool { return b >= '0' && b <= '9' }
+	i, j := 0, 0
+	for i < len(s1) && j < len(s2) {
+		d1, d2 := isDigit(s1[i]), isDigit(s2[j])
+		if d1 && d2 {
+			// Scan full digit runs in both strings.
+			iEnd := i
+			for iEnd < len(s1) && isDigit(s1[iEnd]) {
+				iEnd++
 			}
-			lastDigit = i
+			jEnd := j
+			for jEnd < len(s2) && isDigit(s2[jEnd]) {
+				jEnd++
+			}
+			n1 := strings.TrimLeft(s1[i:iEnd], "0")
+			n2 := strings.TrimLeft(s2[j:jEnd], "0")
+			if len(n1) != len(n2) {
+				return len(n1) < len(n2)
+			}
+			if n1 != n2 {
+				return n1 < n2
+			}
+			i, j = iEnd, jEnd
+			continue
 		}
-		if lastDigit == -1 {
-			return s, 0, false
+		if s1[i] != s2[j] {
+			return s1[i] < s2[j]
 		}
-		num, err := strconv.Atoi(s[lastDigit:])
-		if err != nil {
-			return s, 0, false
-		}
-		return s[:lastDigit], num, true
+		i++
+		j++
 	}
-	p1, n1, ok1 := split(s1)
-	p2, n2, ok2 := split(s2)
-	if ok1 && ok2 && p1 == p2 {
-		if n1 != n2 {
-			return n1 < n2
-		}
-		return s1 < s2
+	if len(s1)-i != len(s2)-j {
+		return len(s1)-i < len(s2)-j
 	}
 	return s1 < s2
 }

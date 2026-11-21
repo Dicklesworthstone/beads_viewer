@@ -956,7 +956,44 @@ func TestForceFullAnalysis_HonorsExactActiveBetweennessAndProfileMetrics(t *test
 	if len(pStats.InDegreeRank()) != activeN || len(pStats.OutDegreeRank()) != activeN {
 		t.Fatalf("computePhase1WithProfile omitted degree ranks: in=%d out=%d", len(pStats.InDegreeRank()), len(pStats.OutDegreeRank()))
 	}
-	if profile.Articulation <= 0 {
-		t.Fatalf("AnalyzeWithProfile reported Articulation=%v, want > 0 when ComputeArticulation=true", profile.Articulation)
+	if pStats.Status().Articulation.State != "computed" || len(pStats.ArticulationPoints()) != activeN-2 {
+		t.Fatalf("AnalyzeWithProfile articulation state=%q count=%d, want computed/%d",
+			pStats.Status().Articulation.State, len(pStats.ArticulationPoints()), activeN-2)
+	}
+	// Verify Articulation runs independently even when KCore is disabled.
+	cfgArtOnly := cfgSparse
+	cfgArtOnly.ComputeKCore = false
+	cfgArtOnly.ComputeArticulation = true
+	pArtStats, _ := NewAnalyzer(sparse).AnalyzeWithProfile(cfgArtOnly)
+	if pArtStats.Status().Articulation.State != "computed" || len(pArtStats.ArticulationPoints()) != activeN-2 {
+		t.Fatalf("Articulation with ComputeKCore=false: state=%q count=%d, want computed/%d",
+			pArtStats.Status().Articulation.State, len(pArtStats.ArticulationPoints()), activeN-2)
+	}
+}
+
+func TestWave22_ComputeGrahamBounds_ClosedParentStopsInheritedBlocking(t *testing.T) {
+	now := time.Date(2026, 11, 21, 0, 0, 0, 0, time.UTC)
+	closedAt := now.Add(-48 * time.Hour)
+	est120 := 120
+	issues := []model.Issue{
+		{ID: "X", Title: "Open blocker", Status: model.StatusOpen, IssueType: model.TypeTask, EstimatedMinutes: &est120},
+		{
+			ID: "P", Title: "Closed epic", Status: model.StatusClosed, IssueType: model.TypeEpic,
+			ClosedAt:     &closedAt,
+			Dependencies: []*model.Dependency{{IssueID: "P", DependsOnID: "X", Type: model.DepBlocks}},
+		},
+		{
+			ID: "C", Title: "Open child of closed epic", Status: model.StatusOpen, IssueType: model.TypeTask,
+			EstimatedMinutes: &est120,
+			Dependencies:     []*model.Dependency{{IssueID: "C", DependsOnID: "P", Type: model.DepParentChild}},
+		},
+	}
+	openOnly := []model.Issue{issues[0], issues[2]}
+	gb := ComputeGrahamBounds(openOnly, issues, nil, 2, now)
+	// X and C are both ready in parallel (closed parent P stops inheritance per model.ReadinessIndex).
+	// Total work = 2 * estimate(120m task) = 264m; critical path = single task (132m), NOT 264m!
+	if gb.CriticalPathMinutes >= gb.TotalMinutes {
+		t.Fatalf("closed parent P leaked inherited blocker into Graham critical path: crit=%d total=%d",
+			gb.CriticalPathMinutes, gb.TotalMinutes)
 	}
 }

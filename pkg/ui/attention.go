@@ -197,9 +197,10 @@ func attentionColumnWidths(width int) []int {
 	if avail < 12 {
 		avail = 12
 	}
-	// Preserve 18-cell label readability down to width 40 while shrinking rank,
+	// Preserve 18-cell label readability down to width 40 (including the 2-cell
+	// Selected frame, where selectedWidth=38 -> avail=29) while shrinking rank,
 	// attention, and reason columns so total width stays <= width.
-	labelW := min(18, max(8, avail-13))
+	labelW := min(18, max(8, avail-11))
 	rem := max(avail-labelW, 6)
 	rankW := min(4, max(2, rem/4))
 	attnW := min(10, max(4, (rem-rankW)/2))
@@ -227,8 +228,8 @@ func (m AttentionModel) View() string {
 	}
 	colWidths := attentionColumnWidths(width)
 	selectedWidth := width - m.theme.Selected.GetHorizontalFrameSize()
-	if selectedWidth < 40 {
-		selectedWidth = 40
+	if selectedWidth < 27 {
+		selectedWidth = 27
 	}
 	selectedColWidths := attentionColumnWidths(selectedWidth)
 

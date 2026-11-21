@@ -404,7 +404,11 @@ func (m *VelocityComparisonModel) View() string {
 		Foreground(ColorFooterHint).
 		Italic(true)
 	sb.WriteString("\n")
-	sb.WriteString(footerStyle.Render("j/k: navigate | enter: filter by label | esc: back"))
+	footer := footerStyle.Render("j/k: navigate | enter: filter by label | esc: back")
+	if m.width > 0 && lipgloss.Width(footer) > m.width {
+		footer = ansi.Truncate(footer, m.width, "…")
+	}
+	sb.WriteString(footer)
 
 	return sb.String()
 }

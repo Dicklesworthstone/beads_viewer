@@ -1609,34 +1609,39 @@ func (w *BackgroundWorker) buildSnapshotResultContext(ctx context.Context, force
 	recipeHash := w.currentRecipeHash
 	w.mu.RUnlock()
 
-	// Determine dataset tier using a fast line count (bv-9thm).
+	// Determine dataset tier using a fast line count for file-backed reloads (bv-9thm).
+	// Custom sourceReload closures load from their own authority (e.g., SQLite/Dolt/workspace)
+	// rather than w.beadsPath, so derive their count/tier from res.Issues below.
 	sourceLineCount := 0
 	tier := datasetTierUnknown
-	var countStart time.Time
-	if profileSnapshot {
-		countStart = time.Now()
-	}
-	countErr := w.safeCompute("count_lines", func() error {
-		n, err := countIssuesForReloadContext(ctx, w.beadsPath)
-		if err != nil {
-			return err
+	loadOpenOnly := false
+	if w.sourceReload == nil {
+		var countStart time.Time
+		if profileSnapshot {
+			countStart = time.Now()
 		}
-		sourceLineCount = n
-		tier = datasetTierForIssueCount(n)
-		return nil
-	})
-	if profileSnapshot {
-		recordTiming("line_count", time.Since(countStart))
-	}
-	if countErr != nil {
-		w.logEvent(LogLevelDebug, "snapshot_line_count_failed", map[string]any{
-			"path":  w.beadsPath,
-			"error": countErr.Error(),
+		countErr := w.safeCompute("count_lines", func() error {
+			n, err := countIssuesForReloadContext(ctx, w.beadsPath)
+			if err != nil {
+				return err
+			}
+			sourceLineCount = n
+			tier = datasetTierForIssueCount(n)
+			return nil
 		})
-	}
+		if profileSnapshot {
+			recordTiming("line_count", time.Since(countStart))
+		}
+		if countErr != nil {
+			w.logEvent(LogLevelDebug, "snapshot_line_count_failed", map[string]any{
+				"path":  w.beadsPath,
+				"error": countErr.Error(),
+			})
+		}
 
-	// Huge tier: default to open-only unless the recipe explicitly includes closed/tombstone.
-	loadOpenOnly := tier == datasetTierHuge && !recipeIncludesClosedStatuses(currentRecipe)
+		// Huge tier: default to open-only unless the recipe explicitly includes closed/tombstone.
+		loadOpenOnly = tier == datasetTierHuge && !recipeIncludesClosedStatuses(currentRecipe)
+	}
 
 	// Load issues from file with panic recovery
 	var issues []model.Issue
@@ -1644,6 +1649,8 @@ func (w *BackgroundWorker) buildSnapshotResultContext(ctx context.Context, force
 	var authority *model.ReadinessIndex
 	var authorityHash string
 	authorityComplete := true
+	sourceDegraded := w.sourceDegraded
+	sourceDegradedKnown := true
 	loadWarningCount := 0
 	var loadStart time.Time
 	if profileSnapshot {
@@ -1655,13 +1662,18 @@ func (w *BackgroundWorker) buildSnapshotResultContext(ctx context.Context, force
 			if err != nil {
 				return err
 			}
-			issues = res.Issues
+			authorityHash = analysis.ComputeDataHash(res.Issues)
 			authority = res.Authority
-			authorityHash = analysis.ComputeDataHash(issues)
 			if authority == nil {
-				authority = model.NewReadinessIndex(issues)
+				authority = model.NewReadinessIndex(res.Issues)
 			}
-			authorityComplete = !res.AuthorityIncomplete && !res.SourceDegraded
+			issues = issuesWithoutTombstones(res.Issues)
+			sourceLineCount = len(res.Issues)
+			tier = datasetTierForIssueCount(sourceLineCount)
+			loadWarningCount = len(res.Warnings)
+			sourceDegraded = res.SourceDegraded
+			sourceDegradedKnown = true
+			authorityComplete = !res.AuthorityIncomplete && !res.SourceDegraded && loadWarningCount == 0
 			return nil
 		}
 		var err error
@@ -1711,6 +1723,7 @@ func (w *BackgroundWorker) buildSnapshotResultContext(ctx context.Context, force
 		prevSnapshot.explicitProjectDir == projectDir &&
 		prevSnapshot.AuthorityHash == authorityHash &&
 		prevSnapshot.AuthorityComplete == authorityComplete &&
+		prevSnapshot.SourceDegraded == sourceDegraded &&
 		prevSnapshot.SourceIssueCountHint == sourceLineCount &&
 		prevSnapshot.LoadWarningCount == loadWarningCount &&
 		prevSnapshot.DatasetTier == tier &&
@@ -1778,6 +1791,8 @@ func (w *BackgroundWorker) buildSnapshotResultContext(ctx context.Context, force
 		snapshot.DataHash = hash
 		snapshot.AuthorityHash = authorityHash
 		snapshot.AuthorityComplete = authorityComplete
+		snapshot.SourceDegraded = sourceDegraded
+		snapshot.SourceDegradedKnown = sourceDegradedKnown
 		snapshot.LoadWarningCount = loadWarningCount
 		snapshot.RecipeName = recipeID
 		snapshot.RecipeHash = recipeHash

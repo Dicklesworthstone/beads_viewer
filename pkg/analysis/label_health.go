@@ -2713,6 +2713,10 @@ func ComputeLabelCriticalPath(sg LabelSubgraph) LabelCriticalPathResult {
 			if !exists {
 				continue
 			}
+			if toNode == fromNode {
+				result.HasCycle = true
+				return result
+			}
 			g.SetEdge(g.NewEdge(g.Node(fromNode), g.Node(toNode)))
 		}
 	}

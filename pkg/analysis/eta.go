@@ -389,7 +389,7 @@ func longestWeightedChainWithContext(openIssues []model.Issue, contextIssues []m
 			}
 			visitedAnc[ancID] = true
 			anc, ok := issueByID[ancID]
-			if !ok {
+			if !ok || isClosedLikeStatus(anc.Status) {
 				continue
 			}
 			for _, dep := range anc.Dependencies {

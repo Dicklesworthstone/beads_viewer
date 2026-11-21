@@ -229,6 +229,39 @@ type HistoryReport struct {
 	rejectedPairs map[string]map[string]bool
 }
 
+// MergeRejectedPairs copies per-pair feedback rejections from other into r.
+// When qualify is non-nil and returns a non-empty namespaced ID, only the
+// qualified ID is recorded so a rejection in one workspace repo cannot poison
+// an unprefixed sibling store in a shared-git monorepo.
+func (r *HistoryReport) MergeRejectedPairs(other *HistoryReport, qualify func(string) string) {
+	if r == nil || other == nil || len(other.rejectedPairs) == 0 {
+		return
+	}
+	if r.rejectedPairs == nil {
+		r.rejectedPairs = make(map[string]map[string]bool, len(other.rejectedPairs))
+	}
+	for sha, beads := range other.rejectedPairs {
+		if sha == "" || len(beads) == 0 {
+			continue
+		}
+		if r.rejectedPairs[sha] == nil {
+			r.rejectedPairs[sha] = make(map[string]bool, len(beads))
+		}
+		for beadID, rejected := range beads {
+			if !rejected || beadID == "" {
+				continue
+			}
+			targetID := beadID
+			if qualify != nil {
+				if qualID := qualify(beadID); qualID != "" {
+					targetID = qualID
+				}
+			}
+			r.rejectedPairs[sha][targetID] = true
+		}
+	}
+}
+
 // FilterOptions controls which beads to include in the history report
 type FilterOptions struct {
 	BeadIDs       []string   `json:"bead_ids,omitempty"`       // Specific beads to include (nil = all)

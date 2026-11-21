@@ -4,6 +4,7 @@ package instance
 
 import (
 	"errors"
+	"math"
 
 	"golang.org/x/sys/windows"
 )
@@ -13,7 +14,7 @@ import (
 // treating ERROR_ACCESS_DENIED as alive (process exists under another user or
 // elevated integrity level).
 func isProcessAlive(pid int) bool {
-	if pid <= 0 {
+	if pid <= 0 || int64(pid) > math.MaxUint32 {
 		return false
 	}
 

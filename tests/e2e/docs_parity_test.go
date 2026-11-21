@@ -2086,10 +2086,13 @@ func TestDocsParity_RC40CrossDocumentTruthAndNegativeControls(t *testing.T) {
 		checkReadmeProse := func(readmeText string) error {
 			for _, stale := range []string{
 				"critical_paths array is empty",
+				"`critical_paths` array is empty",
 				"label-to-path",
 				"across all statuses",
 				"ignored by hash",
+				"ignored by `hash`",
 				"wizard does not run hooks",
+				"`--pages` wizard does not run hooks",
 				"`Enter` jumps to the selected sprint issue",
 				"| `0` | First column |",
 				"| `$` | Last column |",
@@ -2104,6 +2107,7 @@ func TestDocsParity_RC40CrossDocumentTruthAndNegativeControls(t *testing.T) {
 				"`extractPathHints`",
 				"active non-closed, non-parked issues",
 				"FNV-1a token seed and search index cache filename",
+				"the interactive `--pages` wizard does run `.bv/hooks.yaml` unless `--no-hooks` is passed",
 				"| `BV_WORKER_LOG_LEVEL` | Log level for the background snapshot worker (`none`, `error`, `warn`, `info`, `debug`, `trace`). | `none` |",
 				"unified help overlay",
 				"`[REOPENED]`",
@@ -2371,9 +2375,23 @@ func TestDocsParity_RC40CrossDocumentTruthAndNegativeControls(t *testing.T) {
 			t.Fatalf("ctrl+u did not restore Sprint Dashboard top view")
 		}
 
-		// Close sprint with P, verify Board 0/$ move within column (not switching columns).
-		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'P'}})
+		// Press Enter in Sprint Dashboard: must exit Sprint view and jump to first sprint bead SP-01.
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 		m = updated.(*ui.Model)
+		afterSprintEnter := m.View()
+		if !strings.Contains(afterSprintEnter, "SP-01") || strings.Contains(afterSprintEnter, "Beads in Sprint:") {
+			t.Fatalf("%s", formatLog(rc40AuditLog{
+				FixtureID: "sprint_dashboard_enter_jump",
+				DocPath:   "README.md",
+				Expected:  "Enter exits Sprint Dashboard and jumps to first sprint bead SP-01",
+				Observed:  "Sprint Enter did not jump to SP-01 detail view",
+			}))
+		}
+		// Return to list before Board and Tree checks.
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+		m = updated.(*ui.Model)
+
+		// Verify Board 0/$ move within column (not switching columns).
 		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'b'}})
 		m = updated.(*ui.Model)
 		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'$'}})
@@ -2388,6 +2406,37 @@ func TestDocsParity_RC40CrossDocumentTruthAndNegativeControls(t *testing.T) {
 				DocPath:   "pkg/ui/keybindings.go",
 				Expected:  "$ and 0 jump to last/first item in Open column",
 				Observed:  "board view identical after $ and 0",
+			}))
+		}
+
+		// Return to list, open Tree view with E, jump to bottom with G, then back to top with gg.
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+		m = updated.(*ui.Model)
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'E'}})
+		m = updated.(*ui.Model)
+		treeTopInitial := m.View()
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'G'}})
+		m = updated.(*ui.Model)
+		treeBottom := m.View()
+		if treeBottom == treeTopInitial {
+			t.Fatalf("%s", formatLog(rc40AuditLog{
+				FixtureID: "tree_G_bottom_jump",
+				DocPath:   "README.md",
+				Expected:  "G jumps to last node in Tree view",
+				Observed:  "tree view identical after G",
+			}))
+		}
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+		m = updated.(*ui.Model)
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'g'}})
+		m = updated.(*ui.Model)
+		treeTopAfterGG := m.View()
+		if treeTopAfterGG != treeTopInitial {
+			t.Fatalf("%s", formatLog(rc40AuditLog{
+				FixtureID: "tree_gg_top_jump",
+				DocPath:   "README.md",
+				Expected:  "gg jumps back to first node in Tree view",
+				Observed:  "tree view after gg did not match initial top view",
 			}))
 		}
 	})

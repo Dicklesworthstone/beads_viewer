@@ -1743,16 +1743,22 @@ func TestSymlinkedSQLiteWALFreshnessValidationAndWatch(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	select {
-	case updated := <-armCh:
-		if updated.Path != symlinkDB {
-			t.Fatalf("callback source path = %q, want %q", updated.Path, symlinkDB)
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	lastCount := -1
+	for {
+		select {
+		case updated := <-armCh:
+			if updated.Path != symlinkDB {
+				t.Fatalf("callback source path = %q, want %q", updated.Path, symlinkDB)
+			}
+			lastCount = updated.IssueCount
+			if updated.IssueCount == 4 {
+				return
+			}
+		case <-deadline.C:
+			t.Fatalf("timed out waiting for AutoRefreshManager callback with IssueCount=4 on symlinked SQLite WAL update (lastCount=%d, callbacks=%d)", lastCount, armCallbacks.Load())
 		}
-		if updated.IssueCount != 4 {
-			t.Fatalf("callback IssueCount = %d, want 4", updated.IssueCount)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatalf("timed out waiting for AutoRefreshManager callback on symlinked SQLite WAL update (count=%d)", armCallbacks.Load())
 	}
 }
 

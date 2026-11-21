@@ -277,12 +277,14 @@ func TestVersionProbeScrubsRobotAndOutputFormatEnv(t *testing.T) {
 		"bv_robot=true",
 		"BV_OUTPUT_FORMAT=json",
 		"Bv_Output_Format=toon",
+		"TOON_DEFAULT_FORMAT=toon",
+		"toon_default_format=json",
 		"BV_OTHER=keep",
 	})
 	if len(cleaned) != 2 || cleaned[0] != "PATH=/usr/bin" || cleaned[1] != "BV_OTHER=keep" {
 		t.Fatalf("cleanVersionProbeEnv returned %v, want [PATH=/usr/bin BV_OTHER=keep]", cleaned)
 	}
-	if empty := cleanVersionProbeEnv([]string{"BV_ROBOT=1"}); empty == nil || len(empty) != 0 {
+	if empty := cleanVersionProbeEnv([]string{"BV_ROBOT=1", "TOON_DEFAULT_FORMAT=toon"}); empty == nil || len(empty) != 0 {
 		t.Fatalf("expected non-nil empty slice so exec.Cmd does not fall back to os.Environ(), got %#v", empty)
 	}
 
@@ -292,12 +294,13 @@ func TestVersionProbeScrubsRobotAndOutputFormatEnv(t *testing.T) {
 
 	t.Setenv("BV_ROBOT", "1")
 	t.Setenv("BV_OUTPUT_FORMAT", "json")
+	t.Setenv("TOON_DEFAULT_FORMAT", "toon")
 
 	const tag = "v0.99.0"
 	assetName := getAssetName(tag)
 	binaryDir := t.TempDir()
 	execPath := filepath.Join(binaryDir, "bv")
-	initialScript := []byte("#!/bin/sh\nif [ -n \"$BV_ROBOT\" ] || [ -n \"$BV_OUTPUT_FORMAT\" ]; then\n  echo '{\"version\":\"v0.26.1\"}'\n  exit 2\nfi\necho 'bv v0.26.1'\n")
+	initialScript := []byte("#!/bin/sh\nif [ -n \"$BV_ROBOT\" ] || [ -n \"$BV_OUTPUT_FORMAT\" ] || [ -n \"$TOON_DEFAULT_FORMAT\" ]; then\n  echo '{\"version\":\"v0.26.1\"}'\n  exit 2\nfi\necho 'bv v0.26.1'\n")
 	if err := os.WriteFile(execPath, initialScript, 0o755); err != nil {
 		t.Fatal(err)
 	}

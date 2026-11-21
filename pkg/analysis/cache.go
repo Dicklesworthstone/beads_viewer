@@ -627,6 +627,7 @@ func (ca *CachedAnalyzer) AnalyzeAsync(ctx context.Context) *GraphStats {
 	if stats, ok := ca.cache.GetByHash(fullHash); ok {
 		if _, hasClosed, _ := ca.Analyzer.ensureActiveSet(); hasClosed {
 			ca.Analyzer.activeSubgraphMetrics(stats)
+			ca.Analyzer.activeDAGMetrics(stats)
 		}
 		ca.cacheHit = true
 		metrics.GraphCache.Hit()
@@ -655,6 +656,7 @@ func (ca *CachedAnalyzer) Analyze() GraphStats {
 	stats.WaitForPhase2()
 	if _, hasClosed, _ := ca.Analyzer.ensureActiveSet(); hasClosed {
 		ca.Analyzer.activeSubgraphMetrics(stats)
+		ca.Analyzer.activeDAGMetrics(stats)
 	}
 	// AnalyzeAsync publishes to the cache from a goroutine once Phase 2 is
 	// done; a synchronous caller must not race it, so a fresh computation is
@@ -1307,13 +1309,15 @@ func expandInt(set bool, idx []int32, vals []int, nodes []string) map[string]int
 
 func (b graphStatsCacheBlob) toGraphStats() *GraphStats {
 	stats := &GraphStats{
-		OutDegree:        b.OutDegree,
-		InDegree:         b.InDegree,
-		TopologicalOrder: b.TopologicalOrder,
-		Density:          b.Density,
-		NodeCount:        b.NodeCount,
-		EdgeCount:        b.EdgeCount,
-		Config:           b.Config,
+		OutDegree:               b.OutDegree,
+		InDegree:                b.InDegree,
+		TopologicalOrder:        b.TopologicalOrder,
+		Density:                 b.Density,
+		NodeCount:               b.NodeCount,
+		EdgeCount:               b.EdgeCount,
+		Config:                  b.Config,
+		betweennessIsApprox:     b.Status.Betweenness.Sample > 0 && (b.Status.Betweenness.State == "computed" || b.Status.Betweenness.State == "approx"),
+		betweennessActualSample: b.Status.Betweenness.Sample,
 
 		phase2Ready: true,
 		phase2Done:  make(chan struct{}),

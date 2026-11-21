@@ -14,6 +14,7 @@ run_build() {
   local name="$1" source="$2"; shift 2
   local status=0
   bash "$source/scripts/build_graph_wasm.sh" --out-dir "$tmp/$name" "$@" >"$tmp/$name.log" 2>&1 || status=$?
+  if [ "$status" -eq 2 ]; then cat "$tmp/$name.log"; exit 2; fi
   if [ "$status" -ne 0 ]; then cat "$tmp/$name.log"; fail "$name exited $status"; fi
   echo "ok: $name ($tmp/$name/receipt.json)"
 }

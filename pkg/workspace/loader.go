@@ -593,6 +593,13 @@ func (l *AggregateLoader) loadSingleRepo(ctx context.Context, repo RepoConfig, k
 		result.WatchPaths = append(result.WatchPaths, sourcePath)
 		if result.SourceKind == string(datasource.SourceTypeSQLite) && sourcePath != "" {
 			result.WatchPaths = append(result.WatchPaths, sourcePath+"-wal")
+			if resolvedWAL := datasource.SQLiteWALPath(sourcePath); resolvedWAL != "" && resolvedWAL != sourcePath+"-wal" {
+				resolvedDB := strings.TrimSuffix(resolvedWAL, "-wal")
+				if resolvedDB != "" && resolvedDB != sourcePath {
+					result.WatchPaths = append(result.WatchPaths, resolvedDB)
+				}
+				result.WatchPaths = append(result.WatchPaths, resolvedWAL)
+			}
 		}
 	}
 
@@ -702,10 +709,12 @@ func hasWorkspaceSelectableSource(beadsDir string) bool {
 	if _, err := loader.FindJSONLPath(beadsDir); err == nil {
 		return true
 	}
-	if info, err := os.Stat(filepath.Join(beadsDir, "beads.db")); err == nil && !info.IsDir() {
-		return true
-	}
-	return false
+	sources, err := datasource.DiscoverSources(datasource.DiscoveryOptions{
+		BeadsDir:               beadsDir,
+		ValidateAfterDiscovery: false,
+		SkipWorktreeSources:    true,
+	})
+	return err == nil && len(sources) > 0
 }
 
 func sortWorkspaceCandidates(sources []datasource.DataSource) {

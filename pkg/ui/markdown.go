@@ -231,8 +231,10 @@ func (mr *MarkdownRenderer) SetWidthWithTheme(width int, theme Theme) {
 		return
 	}
 
-	// Allow recreation even if width is the same (theme might have changed)
-	styleConfig := buildStyleFromTheme(theme, mr.isDark)
+	// Derive dark/light polarity from the incoming theme so dark<->light theme
+	// swaps never retain stale colors from the renderer's original construction.
+	isDark := boardDarkMode(theme)
+	styleConfig := buildStyleFromTheme(theme, isDark)
 
 	r, err := glamour.NewTermRenderer(
 		glamour.WithStyles(styleConfig),
@@ -241,7 +243,7 @@ func (mr *MarkdownRenderer) SetWidthWithTheme(width int, theme Theme) {
 	if err != nil {
 		// Fall back to built-in style if custom theme fails
 		var styleName string
-		if mr.isDark {
+		if isDark {
 			styleName = "dracula"
 		} else {
 			styleName = "light"
@@ -255,6 +257,7 @@ func (mr *MarkdownRenderer) SetWidthWithTheme(width int, theme Theme) {
 		mr.renderer = r
 		mr.paddingRenderer, mr.paddingRendererBase = nil, nil
 		mr.width = width
+		mr.isDark = isDark
 		mr.theme = &theme
 		mr.useTheme = true
 	}

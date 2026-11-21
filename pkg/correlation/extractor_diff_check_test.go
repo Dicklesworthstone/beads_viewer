@@ -788,3 +788,229 @@ func TestRC36_OrphanConfirmFeedbackAndPerPairRejectionAndEdgeFixes(t *testing.T)
 		t.Fatal("readCacheFileBounded accepted file exceeding maxBytes")
 	}
 }
+
+func TestWave22_CorrelationDiskCacheRejectedPairsResolveAndRelatedSibling(t *testing.T) {
+	t.Setenv("BV_ROBOT", "1")
+	t.Setenv("BV_NO_CACHE", "")
+	t.Setenv("BV_CACHE_DIR", t.TempDir())
+
+	repo := t.TempDir()
+	runGitMR7(t, repo, "init", "-q")
+	beadsDir := filepath.Join(repo, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	issuesPath := filepath.Join(beadsDir, "issues.jsonl")
+	if err := os.WriteFile(issuesPath, []byte("{\"id\":\"bv-a1\",\"title\":\"Alpha\",\"status\":\"open\"}\n{\"id\":\"bv-b2\",\"title\":\"Beta\",\"status\":\"open\"}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "alpha.go"), []byte("package a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitMR7(t, repo, "add", ".")
+	runGitMR7(t, repo, "commit", "-m", "feat(bv-a1): seed alpha")
+	a1SHA := strings.TrimSpace(runGitMR7(t, repo, "rev-parse", "HEAD"))
+
+	if err := os.WriteFile(filepath.Join(repo, "beta.go"), []byte("package b\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitMR7(t, repo, "add", "beta.go")
+	runGitMR7(t, repo, "commit", "-m", "feat(bv-b2): add beta")
+	b2SHA := strings.TrimSpace(runGitMR7(t, repo, "rev-parse", "HEAD"))
+
+	// Rename beta.go -> beta_renamed.go + annotated tag to test ResolveCommitInRepo hardening.
+	runGitMR7(t, repo, "mv", "beta.go", "beta_renamed.go")
+	runGitMR7(t, repo, "commit", "-m", "refactor: orphan rename commit")
+	renameSHA := strings.TrimSpace(runGitMR7(t, repo, "rev-parse", "HEAD"))
+	runGitMR7(t, repo, "tag", "-a", "v-annot", "-m", "annotated tag", renameSHA)
+
+	// 1. ResolveCommitInRepo: reject range, peel annotated tag, preserve clean paths without {old => new}.
+	if _, err := ResolveCommitInRepo(context.Background(), repo, a1SHA+".."+renameSHA); err == nil {
+		t.Fatal("ResolveCommitInRepo accepted a commit range instead of a single commit")
+	}
+	tagged, err := ResolveCommitInRepo(context.Background(), repo, "v-annot")
+	if err != nil || tagged.SHA != renameSHA {
+		t.Fatalf("ResolveCommitInRepo(annotated tag) = (%+v, %v), want SHA %s", tagged, err, renameSHA)
+	}
+	for _, f := range tagged.Files {
+		if strings.Contains(f.Path, "=>") {
+			t.Fatalf("ResolveCommitInRepo emitted rename brace syntax %q; want --no-renames paths", f.Path)
+		}
+	}
+
+	// 2. Layer 1 disk-cache hit preserves rejectedPairs so per-pair rejection never disables
+	// unrelated explicit matching on warm runs; short-SHA confirm upgrades without duplicating.
+	store := NewFeedbackStore(beadsDir)
+	if err := store.Reject(a1SHA, "bv-a1", "tester", 0.90, "wrong link"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Confirm(b2SHA[:8], "bv-b2", "tester", 0.90, "short-sha confirm existing"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Confirm(renameSHA, "bv-b2", "tester", 0.0, "confirm future orphan"); err != nil {
+		t.Fatal(err)
+	}
+
+	beads := []BeadInfo{
+		{ID: "bv-a1", Title: "Alpha", Status: "open"},
+		{ID: "bv-b2", Title: "Beta", Status: "open"},
+	}
+	c1 := NewCorrelator(repo, ".beads/issues.jsonl").WithFeedbackStore(store)
+	repCold, err := c1.GenerateReportCached(beads, CorrelatorOptions{Limit: 50})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Verify short-SHA confirm on b2SHA did not duplicate b2SHA in bv-b2's commits.
+	b2Count := 0
+	for _, cc := range repCold.Histories["bv-b2"].Commits {
+		if cc.SHA == b2SHA {
+			b2Count++
+			if !cc.Confirmed {
+				t.Fatalf("short-SHA confirm did not mark existing b2SHA commit Confirmed: %+v", cc)
+			}
+		}
+	}
+	if b2Count != 1 {
+		t.Fatalf("short-SHA confirm produced %d copies of b2SHA, want 1", b2Count)
+	}
+
+	// Verify --as-of (Revision = b2SHA) excludes synthesized confirmed orphan commit renameSHA (descendant).
+	cAsOf := NewCorrelator(repo, ".beads/issues.jsonl").WithFeedbackStore(store)
+	repAsOf, err := cAsOf.GenerateReport(beads, CorrelatorOptions{Limit: 50, Revision: b2SHA})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, cc := range repAsOf.Histories["bv-b2"].Commits {
+		if cc.SHA == renameSHA {
+			t.Fatalf("--as-of Revision=%s leaked future confirmed commit %s", b2SHA, renameSHA)
+		}
+	}
+
+	// Second call hits Layer 1 disk cache!
+	c2 := NewCorrelator(repo, ".beads/issues.jsonl").WithFeedbackStore(store)
+	repWarm, err := c2.GenerateReportCached(beads, CorrelatorOptions{Limit: 50})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Remove b2SHA from CommitIndex to exercise explicit-ID fallback in ReverseLookup on the warm report.
+	delete(repWarm.CommitIndex, b2SHA)
+	rlWarm := NewReverseLookupWithRepo(repWarm, repo)
+	orphansWarm, _, err := rlWarm.FindOrphanCommits(ExtractOptions{Limit: 50})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range orphansWarm {
+		if o.SHA == b2SHA {
+			t.Fatalf("Layer 1 disk cache dropped rejectedPairs and globally disabled explicit fallback for unrelated commit %s", b2SHA)
+		}
+	}
+
+	// 3. findDependencyCluster finds 2-hop sibling B even when shared blocker P already matched FileOverlap.
+	relReport := &HistoryReport{
+		Histories: map[string]BeadHistory{
+			"T": {BeadID: "T", Title: "Target", Status: "open", Commits: []CorrelatedCommit{{SHA: "s1", Files: []FileChange{{Path: "shared.go"}}}}},
+			"P": {BeadID: "P", Title: "Shared Blocker", Status: "open", Commits: []CorrelatedCommit{{SHA: "s2", Files: []FileChange{{Path: "shared.go"}}}}},
+			"B": {BeadID: "B", Title: "Unseen Sibling", Status: "open", Commits: []CorrelatedCommit{{SHA: "s3", Files: []FileChange{{Path: "other.go"}}}}},
+		},
+		CommitIndex: CommitIndex{"s1": {"T"}, "s2": {"P"}, "s3": {"B"}},
+	}
+	rel := relReport.FindRelatedWork("T", RelatedWorkOptions{
+		DependencyGraph: map[string][]string{"T": {"P"}, "B": {"P"}},
+		MinRelevance:    1,
+		MaxResults:      10,
+	})
+	foundB := false
+	for _, d := range rel.DependencyCluster {
+		if d.BeadID == "B" {
+			foundB = true
+		}
+	}
+	if !foundB {
+		t.Fatalf("FindRelatedWork missed 2-hop sibling B when shared blocker P matched FileOverlap: %+v", rel)
+	}
+}
+
+func TestWave22_Pass2ShortSHARejectIncrementalWindowAndMergeRejectedPairs(t *testing.T) {
+	t.Setenv("BV_CACHE_DIR", t.TempDir())
+	repo := t.TempDir()
+	runGitMR7(t, repo, "init")
+	runGitMR7(t, repo, "config", "user.name", "Test")
+	runGitMR7(t, repo, "config", "user.email", "test@example.com")
+
+	beadsDir := filepath.Join(repo, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "issues.jsonl"),
+		[]byte("{\"id\":\"bv-s1\",\"title\":\"S1\",\"status\":\"open\"}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "f1.go"), []byte("package p\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitMR7(t, repo, "add", ".")
+	runGitMR7(t, repo, "commit", "-m", "feat(bv-s1): first commit")
+	firstSHA := strings.TrimSpace(runGitMR7(t, repo, "rev-parse", "HEAD"))
+
+	if err := os.WriteFile(filepath.Join(repo, "f2.go"), []byte("package p\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGitMR7(t, repo, "add", "f2.go")
+	runGitMR7(t, repo, "commit", "-m", "chore: second orphan commit")
+	secondSHA := strings.TrimSpace(runGitMR7(t, repo, "rev-parse", "HEAD"))
+
+	// 1. Short-SHA Reject(firstSHA[:8], "bv-s1") must filter out full-SHA firstSHA in Pass 1
+	//    AND block full-SHA Confirm(firstSHA, "bv-s1") in Pass 2 AND record fullSHA in rejectedPairs.
+	store := NewFeedbackStore(beadsDir)
+	if err := store.Reject(firstSHA[:8], "bv-s1", "tester", 0.95, "short-sha reject"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Confirm(firstSHA, "bv-s1", "tester", 0.95, "full-sha confirm should be blocked"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Confirm(secondSHA, "bv-s1", "tester", 0.0, "future confirm"); err != nil {
+		t.Fatal(err)
+	}
+
+	beads := []BeadInfo{{ID: "bv-s1", Title: "S1", Status: "open"}}
+	c := NewCorrelator(repo, ".beads/issues.jsonl").WithFeedbackStore(store)
+	rep, err := c.GenerateReport(beads, CorrelatorOptions{Limit: 50})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, cc := range rep.Histories["bv-s1"].Commits {
+		if cc.SHA == firstSHA {
+			t.Fatalf("short-SHA rejection failed to exclude full-SHA commit %s", firstSHA)
+		}
+	}
+	if !rep.rejectedPairs[firstSHA]["bv-s1"] {
+		t.Fatalf("expected resolved full SHA %s in rejectedPairs, got %+v", firstSHA, rep.rejectedPairs)
+	}
+
+	// 2. IncrementalCorrelator mergeIncremental honors opts.Revision (--as-of) when applying feedback.
+	inc := NewIncrementalCorrelator(repo, ".beads/issues.jsonl").WithFeedbackStore(store)
+	repInc, err := inc.GenerateReport(beads, CorrelatorOptions{Limit: 50, Revision: firstSHA})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, cc := range repInc.Histories["bv-s1"].Commits {
+		if cc.SHA == secondSHA {
+			t.Fatalf("IncrementalCorrelator leaked post-Revision confirmed commit %s", secondSHA)
+		}
+	}
+
+	// 3. MergeRejectedPairs with qualify != nil records ONLY qualified ID (no unprefixed sibling poison).
+	rootRep := &HistoryReport{}
+	subRep := &HistoryReport{
+		rejectedPairs: map[string]map[string]bool{
+			firstSHA: {"bv-1": true},
+		},
+	}
+	rootRep.MergeRejectedPairs(subRep, func(id string) string { return "api-" + id })
+	if !rootRep.rejectedPairs[firstSHA]["api-bv-1"] {
+		t.Fatalf("MergeRejectedPairs missing qualified ID api-bv-1: %+v", rootRep.rejectedPairs)
+	}
+	if rootRep.rejectedPairs[firstSHA]["bv-1"] {
+		t.Fatalf("MergeRejectedPairs poisoned unprefixed sibling ID bv-1: %+v", rootRep.rejectedPairs)
+	}
+}

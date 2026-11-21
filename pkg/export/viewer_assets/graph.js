@@ -1228,9 +1228,13 @@ function computeMetrics(layout = null) {
         store.metrics.criticalPath = activeGraph.criticalPathHeights();
 
         // Eigenvector (influence): on DAGs, directed power iteration returns a flat
-        // uniform vector (max - min < 1e-9 when len > 1); prefer differentiated
-        // Go eigenvector values exported in issue_overview_mv / layout when present.
-        let eigScores = store.wasmGraph.eigenvectorDefault();
+        // uniform vector (max - min < 1e-9 when len > 1), and core-only WASM builds
+        // omit eigenvectorDefault; prefer differentiated Go eigenvector values
+        // exported in issue_overview_mv / layout when present.
+        let eigScores = typeof store.wasmGraph.eigenvectorDefault === 'function'
+            ? store.wasmGraph.eigenvectorDefault()
+            : null;
+        let needFallbackEig = !eigScores;
         if (eigScores && eigScores.length > 1) {
             let minEv = Infinity;
             let maxEv = -Infinity;
@@ -1240,35 +1244,38 @@ function computeMetrics(layout = null) {
                 if (v > maxEv) maxEv = v;
             }
             if (maxEv - minEv < 1e-9) {
-                const layoutEig = layout?.centralityValues?.eigenvector || layout?.centrality?.eigenvector || null;
-                const fallbackEig = new Float64Array(fullNodeCount);
-                let minFb = Infinity;
-                let maxFb = -Infinity;
-                let hasFb = false;
-                for (let i = 0; i < fullNodeCount; i++) {
-                    const id = store.wasmGraph.nodeId(i);
-                    const issue = id ? store.nodeMap.get(id) : null;
-                    const rawVal = (layoutEig && typeof layoutEig === 'object' && Object.hasOwn(layoutEig, id))
-                        ? layoutEig[id]
-                        : issue?.eigenvector;
-                    const numVal = Number(rawVal);
-                    if (rawVal !== undefined && rawVal !== null && Number.isFinite(numVal)) {
-                        fallbackEig[i] = numVal;
-                        if (numVal < minFb) minFb = numVal;
-                        if (numVal > maxFb) maxFb = numVal;
-                        hasFb = true;
-                    }
+                needFallbackEig = true;
+            }
+        }
+        if (needFallbackEig) {
+            const layoutEig = layout?.centralityValues?.eigenvector || layout?.centrality?.eigenvector || null;
+            const fallbackEig = new Float64Array(fullNodeCount);
+            let minFb = Infinity;
+            let maxFb = -Infinity;
+            let hasFb = false;
+            for (let i = 0; i < fullNodeCount; i++) {
+                const id = store.wasmGraph.nodeId(i);
+                const issue = id ? store.nodeMap.get(id) : null;
+                const rawVal = (layoutEig && typeof layoutEig === 'object' && Object.hasOwn(layoutEig, id))
+                    ? layoutEig[id]
+                    : issue?.eigenvector;
+                const numVal = Number(rawVal);
+                if (rawVal !== undefined && rawVal !== null && Number.isFinite(numVal)) {
+                    fallbackEig[i] = numVal;
+                    if (numVal < minFb) minFb = numVal;
+                    if (numVal > maxFb) maxFb = numVal;
+                    hasFb = true;
                 }
-                if (hasFb && maxFb - minFb >= 1e-9) {
-                    eigScores = fallbackEig;
-                }
+            }
+            if (hasFb && (!eigScores || maxFb - minFb >= 1e-9)) {
+                eigScores = fallbackEig;
             }
         }
         store.metrics.eigenvector = eigScores;
 
         // K-core (cohesion) computed on active subgraph and projected to full graph indices (0 for closed)
         const projectedKCore = new Uint32Array(fullNodeCount);
-        if (activeNodeCount > 0) {
+        if (activeNodeCount > 0 && typeof activeGraph.kcore === 'function') {
             const rawKCore = activeGraph.kcore();
             if (rawKCore) {
                 for (let aIdx = 0; aIdx < activeNodeCount; aIdx++) {
@@ -1303,16 +1310,21 @@ function computeMetrics(layout = null) {
         }
 
         // HITS (hub and authority scores)
-        try {
-            store.metrics.hits = computeHITSMetrics(store.wasmGraph);
-        } catch (e) {
-            console.warn('[bv-graph] HITS computation skipped:', e);
+        if (typeof store.wasmGraph.hitsDefault === 'function') {
+            try {
+                store.metrics.hits = computeHITSMetrics(store.wasmGraph);
+            } catch (e) {
+                console.warn('[bv-graph] HITS computation skipped:', e);
+                store.metrics.hits = null;
+            }
+        } else {
+            store.metrics.hits = null;
         }
 
         // Slack (topological float in hops - only valid on active acyclic DAGs)
         const hasCycles = Boolean(activeGraph.hasCycles());
         store.metrics.hasCycles = hasCycles;
-        if (!hasCycles) {
+        if (!hasCycles && typeof activeGraph.slack === 'function') {
             try {
                 store.metrics.slack = activeGraph.slack();
             } catch (e) {
@@ -1323,19 +1335,23 @@ function computeMetrics(layout = null) {
         }
 
         // Articulation points (cut vertices on active subgraph - removing them disconnects active work)
-        try {
-            const artPoints = activeGraph.articulationPoints();
-            if (artPoints && artPoints.length > 0) {
-                store.metrics.articulationPoints = new Set(
-                    Array.from(artPoints)
-                        .map(idx => activeGraph.nodeId(idx))
-                        .filter(Boolean)
-                );
-            } else {
-                store.metrics.articulationPoints = new Set();
+        if (typeof activeGraph.articulationPoints === 'function') {
+            try {
+                const artPoints = activeGraph.articulationPoints();
+                if (artPoints && artPoints.length > 0) {
+                    store.metrics.articulationPoints = new Set(
+                        Array.from(artPoints)
+                            .map(idx => activeGraph.nodeId(idx))
+                            .filter(Boolean)
+                    );
+                } else {
+                    store.metrics.articulationPoints = new Set();
+                }
+            } catch (e) {
+                console.warn('[bv-graph] Articulation points computation skipped:', e);
             }
-        } catch (e) {
-            console.warn('[bv-graph] Articulation points computation skipped:', e);
+        } else {
+            store.metrics.articulationPoints = new Set();
         }
 
         // Cycles (enumerated on active graph so closed historical cycles are ignored)
@@ -3312,22 +3328,60 @@ export function highlightDependencyPath(node) {
     store.highlightedNodes.clear();
     store.highlightedLinks.clear();
 
-    if (!node || !store.wasmReady) return;
+    if (!node || !store.graph) return;
 
-    const idx = store.wasmGraph.nodeIdx(node.id);
-    if (idx === undefined) return;
+    let blockers = [];
+    let dependents = [];
 
-    // Get all nodes that block this one (upstream)
-    const blockers = store.wasmGraph.reachableFrom(idx);
-    // Get all nodes blocked by this one (downstream)
-    const dependents = store.wasmGraph.reachableTo(idx);
+    const hasWasmReachability = store.wasmReady && store.wasmGraph &&
+        typeof store.wasmGraph.reachableFrom === 'function' &&
+        typeof store.wasmGraph.reachableTo === 'function';
 
-    // Highlight nodes
+    if (hasWasmReachability) {
+        const idx = store.wasmGraph.nodeIdx(node.id);
+        if (idx === undefined) return;
+        // Get all nodes that block this one (upstream) and all blocked by it (downstream),
+        // normalized to string IDs excluding self to match the JS BFS fallback.
+        const rawBlockers = Array.from(store.wasmGraph.reachableFrom(idx));
+        const rawDependents = Array.from(store.wasmGraph.reachableTo(idx));
+        blockers = rawBlockers
+            .map(i => store.wasmGraph.nodeId(i))
+            .filter(id => id && id !== node.id);
+        dependents = rawDependents
+            .map(i => store.wasmGraph.nodeId(i))
+            .filter(id => id && id !== node.id);
+    } else {
+        // Fallback BFS over blocking dependencies when reachability WASM feature is omitted.
+        const blockingDeps = (store.dependencies || []).filter(isBlockingDependency);
+        const blockerSet = new Set();
+        const fwd = [node.id];
+        while (fwd.length > 0) {
+            const cur = fwd.shift();
+            for (const d of blockingDeps) {
+                if (d.issue_id === cur && d.depends_on_id && d.depends_on_id !== node.id && !blockerSet.has(d.depends_on_id)) {
+                    blockerSet.add(d.depends_on_id);
+                    fwd.push(d.depends_on_id);
+                }
+            }
+        }
+        const depSet = new Set();
+        const rev = [node.id];
+        while (rev.length > 0) {
+            const cur = rev.shift();
+            for (const d of blockingDeps) {
+                if (d.depends_on_id === cur && d.issue_id && d.issue_id !== node.id && !depSet.has(d.issue_id)) {
+                    depSet.add(d.issue_id);
+                    rev.push(d.issue_id);
+                }
+            }
+        }
+        blockers = Array.from(blockerSet);
+        dependents = Array.from(depSet);
+    }
+
     store.highlightedNodes.add(node.id);
-    [...blockers, ...dependents].forEach(i => {
-        const id = store.wasmGraph.nodeId(i);
-        if (id) store.highlightedNodes.add(id);
-    });
+    for (const id of blockers) store.highlightedNodes.add(id);
+    for (const id of dependents) store.highlightedNodes.add(id);
 
     // Highlight links
     const graphData = store.graph.graphData();
@@ -3638,7 +3692,7 @@ const dependencyConeState = {
 
 function computeDependencyConeIds(focusId) {
     if (!focusId) return new Set();
-    if (store.wasmReady && store.wasmGraph) {
+    if (store.wasmReady && store.wasmGraph && typeof store.wasmGraph.dependencyCone === 'function') {
         const idx = store.wasmGraph.nodeIdx(focusId);
         if (idx !== undefined) {
             const coneIndices = store.wasmGraph.dependencyCone(idx);

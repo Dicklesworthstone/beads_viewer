@@ -6,6 +6,7 @@ package datasource
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -278,6 +279,81 @@ func sqliteWALPath(dbPath string) string {
 	return resolveSourceTargetPath(dbPath) + "-wal"
 }
 
+// SQLiteWALPath returns the symlink-resolved -wal companion path for a SQLite DB.
+func SQLiteWALPath(dbPath string) string {
+	return sqliteWALPath(dbPath)
+}
+
+const maxBeadsMetadataBytes = 1 << 20
+
+// ReadMetadataJSON reads and unmarshals <beadsDir>/metadata.json safely:
+// refuses symlinks and non-regular files (FIFOs, sockets, devices), checks
+// os.SameFile across Lstat/Open, and enforces a 1 MiB read ceiling.
+func ReadMetadataJSON(beadsDir string, dst any) bool {
+	metaPath := filepath.Join(beadsDir, "metadata.json")
+	linfo, err := os.Lstat(metaPath)
+	if err != nil || !linfo.Mode().IsRegular() || linfo.Size() > maxBeadsMetadataBytes {
+		return false
+	}
+	f, err := os.Open(metaPath)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	finfo, err := f.Stat()
+	if err != nil || !finfo.Mode().IsRegular() || !os.SameFile(linfo, finfo) || finfo.Size() > maxBeadsMetadataBytes {
+		return false
+	}
+	raw, err := io.ReadAll(io.LimitReader(f, maxBeadsMetadataBytes+1))
+	if err != nil || len(raw) > maxBeadsMetadataBytes {
+		return false
+	}
+	return json.Unmarshal(raw, dst) == nil
+}
+
+// ResolveMetadataPathWithinDir resolves a metadata.json path field relative to
+// beadsDir and verifies both the lexical and symlink-resolved regular target
+// remain inside beadsDir (failing closed on EvalSymlinks errors or non-regular files).
+func ResolveMetadataPathWithinDir(beadsDir, target string) (string, bool) {
+	target = strings.TrimSpace(target)
+	if target == "" {
+		return "", false
+	}
+	baseAbs, err := filepath.Abs(beadsDir)
+	if err != nil {
+		return "", false
+	}
+	baseCanon, err := filepath.EvalSymlinks(baseAbs)
+	if err != nil || baseCanon == "" {
+		return "", false
+	}
+	candidate := target
+	if !filepath.IsAbs(candidate) {
+		candidate = filepath.Join(baseAbs, candidate)
+	}
+	candAbs, err := filepath.Abs(candidate)
+	if err != nil {
+		return "", false
+	}
+	rel, err := filepath.Rel(baseAbs, candAbs)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+	info, statErr := os.Stat(candAbs)
+	if statErr != nil || !info.Mode().IsRegular() {
+		return "", false
+	}
+	candCanon, err := filepath.EvalSymlinks(candAbs)
+	if err != nil || candCanon == "" {
+		return "", false
+	}
+	relCanon, err := filepath.Rel(baseCanon, candCanon)
+	if err != nil || relCanon == ".." || strings.HasPrefix(relCanon, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+	return candAbs, true
+}
+
 // discoverSQLiteSources finds SQLite databases in the beads directory
 func discoverSQLiteSources(beadsDir string, opts DiscoveryOptions) ([]DataSource, error) {
 	if loader.IsBDWorkspace(beadsDir) {
@@ -285,8 +361,9 @@ func discoverSQLiteSources(beadsDir string, opts DiscoveryOptions) ([]DataSource
 	}
 	var sources []DataSource
 
-	// Check metadata.json "database" field first (if it names a custom SQLite file),
-	// then standard beads.db, deduplicating paths.
+	// Check metadata.json "backend" and "database" fields first (if it names a
+	// custom SQLite file confined within beadsDir), then standard beads.db.
+	// A non-SQLite backend (e.g., unknown-tracker) must not fall through to beads.db.
 	var candidates []string
 	seen := make(map[string]bool)
 	addCandidate := func(p string) {
@@ -296,24 +373,17 @@ func discoverSQLiteSources(beadsDir string, opts DiscoveryOptions) ([]DataSource
 			candidates = append(candidates, clean)
 		}
 	}
-	if rawMeta, err := os.ReadFile(filepath.Join(beadsDir, "metadata.json")); err == nil {
-		var meta struct {
-			Backend  string `json:"backend"`
-			Database string `json:"database"`
+	var meta struct {
+		Backend  string `json:"backend"`
+		Database string `json:"database"`
+	}
+	if ReadMetadataJSON(beadsDir, &meta) {
+		backend := strings.ToLower(strings.TrimSpace(meta.Backend))
+		if backend != "" && backend != "sqlite" {
+			return nil, nil
 		}
-		if json.Unmarshal(rawMeta, &meta) == nil {
-			backend := strings.ToLower(strings.TrimSpace(meta.Backend))
-			if backend == "" || backend == "sqlite" {
-				if dbName := strings.TrimSpace(meta.Database); dbName != "" {
-					metaPath := dbName
-					if !filepath.IsAbs(metaPath) {
-						metaPath = filepath.Join(beadsDir, metaPath)
-					}
-					if info, statErr := os.Stat(metaPath); statErr == nil && !info.IsDir() {
-						addCandidate(metaPath)
-					}
-				}
-			}
+		if metaPath, ok := ResolveMetadataPathWithinDir(beadsDir, meta.Database); ok {
+			addCandidate(metaPath)
 		}
 	}
 	addCandidate(filepath.Join(beadsDir, "beads.db"))

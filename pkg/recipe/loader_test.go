@@ -1014,12 +1014,35 @@ func TestRC37_RecipeSymlinkSizeSortDirectionAndNaturalOrder(t *testing.T) {
 	if _, err := recipe.LoadFile(linkRecipe); err == nil || !strings.Contains(err.Error(), "symlink") {
 		t.Fatalf("LoadFile(symlink) = %v, want symlink rejection", err)
 	}
+	projSymlink := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(projSymlink, ".bv"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realRecipe, filepath.Join(projSymlink, ".bv", "recipes.yaml")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	projLoader := recipe.NewLoader(recipe.WithProjectDir(projSymlink), recipe.WithUserPath(filepath.Join(projSymlink, "absent.yaml")))
+	if err := projLoader.Load(); err != nil {
+		t.Fatalf("project loader Load() error: %v", err)
+	}
+	if len(projLoader.Warnings()) == 0 || projLoader.Get("legit") != nil {
+		t.Fatalf("project loader must reject symlink .bv/recipes.yaml with warning, warnings=%v got=%v", projLoader.Warnings(), projLoader.Get("legit"))
+	}
 
-	// 2. Oversized (> 1 MiB) recipe file must be rejected.
+	// 2. Oversized (> 1 MiB) recipe file must be rejected by both LoadFile and project loader.
 	hugeRecipe := filepath.Join(dir, "huge.yaml")
 	writeFile(t, hugeRecipe, "name: huge\ndescription: "+strings.Repeat("x", (1<<20)+64)+"\n")
 	if _, err := recipe.LoadFile(hugeRecipe); err == nil || !strings.Contains(err.Error(), "exceeds maximum size") {
 		t.Fatalf("LoadFile(>1MiB) = %v, want size cap rejection", err)
+	}
+	projHuge := t.TempDir()
+	writeFile(t, filepath.Join(projHuge, ".bv", "recipes.yaml"), "recipes:\n  huge:\n    description: "+strings.Repeat("x", (1<<20)+64)+"\n")
+	hugeLoader := recipe.NewLoader(recipe.WithProjectDir(projHuge), recipe.WithUserPath(filepath.Join(projHuge, "absent.yaml")))
+	if err := hugeLoader.Load(); err != nil {
+		t.Fatalf("huge project loader Load() error: %v", err)
+	}
+	if len(hugeLoader.Warnings()) == 0 || hugeLoader.Get("huge") != nil {
+		t.Fatalf("project loader must reject >1MiB .bv/recipes.yaml, warnings=%v", hugeLoader.Warnings())
 	}
 
 	// 3. Invalid sort.direction with blank sort.field must be rejected by Validate().
@@ -1029,5 +1052,33 @@ func TestRC37_RecipeSymlinkSizeSortDirectionAndNaturalOrder(t *testing.T) {
 	}
 	if err := badSort.Validate(); err == nil || !strings.Contains(err.Error(), "sort.direction") {
 		t.Fatalf("Validate(blank field + bogus direction) = %v, want sort.direction error", err)
+	}
+
+	// 4. Transitivity / strict total order regression (Wave 22): bv-2, bv-10, bv-1a, huge digits.
+	ids := []string{"bv-2", "bv-10", "bv-1a", "bv-01", "bv-1", "bv-100000000000000000000", "bv-99999999999999999999"}
+	sortRec := &recipe.Recipe{Name: "id-order", Sort: recipe.SortConfig{Field: "id", Direction: "asc"}}
+	makeIssues := func(order []string) []model.Issue {
+		out := make([]model.Issue, len(order))
+		for i, id := range order {
+			out[i] = model.Issue{ID: id, Title: id, Status: model.StatusOpen}
+		}
+		return out
+	}
+	fwd, err := recipe.Apply(makeIssues(ids), recipe.Metrics{}, sortRec, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	revIDs := make([]string, len(ids))
+	for i := range ids {
+		revIDs[i] = ids[len(ids)-1-i]
+	}
+	rev, err := recipe.Apply(makeIssues(revIDs), recipe.Metrics{}, sortRec, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range fwd {
+		if fwd[i].ID != rev[i].ID {
+			t.Fatalf("naturalLess sort is permutation-dependent (non-transitive): fwd=%v rev=%v", fwd, rev)
+		}
 	}
 }

@@ -417,3 +417,34 @@ func TestResolveHooksProjectDir_StopsAtGitBoundaryAndIgnoresRelativeCeiling(t *t
 		t.Fatalf("relative GIT_CEILING_DIRECTORIES broke valid enclosing-repo hooks discovery: %+v", lOuter.GetHooks(PreExport))
 	}
 }
+
+func TestWave22_HooksLoaderRejectsSymlinkAndOversizedConfig(t *testing.T) {
+	// 1. Symlink .bv/hooks.yaml rejected before reading target.
+	outside := filepath.Join(t.TempDir(), "secret.yaml")
+	if err := os.WriteFile(outside, []byte("hooks:\n  pre-export:\n    - name: leaked\n      command: echo leaked\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	proj := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(proj, ".bv"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(proj, ".bv", "hooks.yaml")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := NewLoader(WithProjectDir(proj)).Load(); err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("expected symlink .bv/hooks.yaml rejection, got %v", err)
+	}
+
+	// 2. Oversized (> 1 MiB) .bv/hooks.yaml rejected.
+	bigProj := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(bigProj, ".bv"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	bigYAML := "hooks:\n  pre-export:\n    - name: big\n      command: echo " + strings.Repeat("a", (1<<20)+64) + "\n"
+	if err := os.WriteFile(filepath.Join(bigProj, ".bv", "hooks.yaml"), []byte(bigYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := NewLoader(WithProjectDir(bigProj)).Load(); err == nil || !strings.Contains(err.Error(), "exceeds maximum size") {
+		t.Fatalf("expected >1MiB .bv/hooks.yaml rejection, got %v", err)
+	}
+}

@@ -68,7 +68,9 @@ const (
 	// 3 = reports carry per-commit methods, the
 	// walked window, strategy timings and feedback_applied (v2 reports lack
 	// them and must not be served as-is).
-	correlationDiskCacheVersion      = 5
+	// 6 adds per-pair rejected_pairs persistence for ReverseLookup;
+	// 5 = reports carry...
+	correlationDiskCacheVersion      = 6
 	correlationDiskCacheFileName     = "correlation_report_cache.json"
 	correlationDiskCacheDirName      = "bv"
 	correlationDiskCacheMaxEntries   = 6
@@ -86,13 +88,14 @@ type correlationDiskCacheFile struct {
 }
 
 type correlationDiskCacheEntry struct {
-	CreatedAt  time.Time      `json:"created_at"`
-	AccessedAt time.Time      `json:"accessed_at"`
-	Namespace  string         `json:"namespace"`
-	HeadSHA    string         `json:"head_sha"`
-	BeadsHash  string         `json:"beads_hash"`
-	OptsHash   string         `json:"opts_hash"`
-	Report     *HistoryReport `json:"report"`
+	CreatedAt     time.Time                  `json:"created_at"`
+	AccessedAt    time.Time                  `json:"accessed_at"`
+	Namespace     string                     `json:"namespace"`
+	HeadSHA       string                     `json:"head_sha"`
+	BeadsHash     string                     `json:"beads_hash"`
+	OptsHash      string                     `json:"opts_hash"`
+	Report        *HistoryReport             `json:"report"`
+	RejectedPairs map[string]map[string]bool `json:"rejected_pairs,omitempty"`
 }
 
 // correlationDiskCacheEnabled reports whether the persistent report cache is
@@ -317,6 +320,9 @@ func getCorrelationDiskCachedReport(namespace, headSHA, beadsHash, optsHash stri
 	if !cacheCreatedAtIsFresh(entry.CreatedAt, now, correlationDiskCacheMaxAge) {
 		return nil, false
 	}
+	if entry.Report != nil && len(entry.RejectedPairs) > 0 {
+		entry.Report.rejectedPairs = entry.RejectedPairs
+	}
 	return entry.Report, true
 }
 
@@ -355,13 +361,14 @@ func putCorrelationDiskCachedReport(namespace, headSHA, beadsHash, optsHash stri
 		cf.Entries = map[string]correlationDiskCacheEntry{}
 	}
 	cf.Entries[correlationDiskCacheKey(namespace, headSHA, beadsHash, optsHash)] = correlationDiskCacheEntry{
-		CreatedAt:  now,
-		AccessedAt: now,
-		Namespace:  namespace,
-		HeadSHA:    headSHA,
-		BeadsHash:  beadsHash,
-		OptsHash:   optsHash,
-		Report:     report,
+		CreatedAt:     now,
+		AccessedAt:    now,
+		Namespace:     namespace,
+		HeadSHA:       headSHA,
+		BeadsHash:     beadsHash,
+		OptsHash:      optsHash,
+		Report:        report,
+		RejectedPairs: report.rejectedPairs,
 	}
 	evictCorrelationDiskCacheLRU(cf.Entries)
 	_ = writeCorrelationDiskCacheLocked(f, cf)

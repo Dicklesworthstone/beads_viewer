@@ -1013,3 +1013,28 @@ func TestBuildStyleFromTheme(t *testing.T) {
 		t.Errorf("expected light mode BackgroundColor to be nil, got %v", lightConfig.Document.BackgroundColor)
 	}
 }
+
+func TestWave22_SetWidthWithThemeUpdatesDarkPolarity(t *testing.T) {
+	origOverride := BVThemeOverride
+	t.Cleanup(func() { BVThemeOverride = origOverride })
+
+	BVThemeOverride = "dark"
+	darkTheme := DefaultTheme(lipgloss.NewRenderer(nil))
+	mr := NewMarkdownRendererWithTheme(80, darkTheme)
+	if !mr.IsDarkMode() {
+		t.Fatalf("expected initial renderer IsDarkMode()=true under dark override")
+	}
+
+	BVThemeOverride = "light"
+	lightTheme := DefaultTheme(lipgloss.NewRenderer(nil))
+	mr.SetWidthWithTheme(80, lightTheme)
+	if mr.IsDarkMode() {
+		t.Fatalf("expected SetWidthWithTheme with light theme to update IsDarkMode()=false")
+	}
+
+	BVThemeOverride = "dark"
+	mr.SetWidthWithTheme(72, darkTheme)
+	if !mr.IsDarkMode() {
+		t.Fatalf("expected SetWidthWithTheme with dark theme to update IsDarkMode()=true")
+	}
+}

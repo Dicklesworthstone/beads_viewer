@@ -2333,7 +2333,9 @@ func main() {
 		explicitEnvRobot := env.Robot.Bool()
 		envRobot := explicitEnvRobot
 		stdoutIsTTY := term.IsTerminal(int(os.Stdout.Fd()))
-		structuredFormatRequested := flag.CommandLine.Changed("format") || strings.TrimSpace(env.OutputFormat.Get()) != ""
+		structuredFormatRequested := flag.CommandLine.Changed("format") ||
+			strings.TrimSpace(env.OutputFormat.Get()) != "" ||
+			strings.TrimSpace(env.ToonDefaultFormat.Get()) != ""
 
 		primaryRobotRegistries := []*RobotRegistry{&phaseOneRobotRegistry, &phaseTwoRobotRegistry, &phaseThreeRobotRegistry}
 		robotMode := envRobot ||
@@ -7299,11 +7301,24 @@ func prepareBundleWasmAssets(bundle *export.Bundle, projectDir string, noHooks b
 		}
 	}
 	if !noHooks {
-		if strings.TrimSpace(projectDir) != "" {
-			addCandidate(filepath.Join(projectDir, ".bv", "wasm", "hybrid"))
+		addLocalHybridDir := func(root string) {
+			if strings.TrimSpace(root) == "" {
+				return
+			}
+			// Reject symlinked .bv / .bv/wasm / .bv/wasm/hybrid components so an
+			// untrusted repository cannot symlink out of the checkout to exfiltrate
+			// arbitrary host JS/WASM files into exported Pages bundles.
+			for _, rel := range []string{".bv", filepath.Join(".bv", "wasm"), filepath.Join(".bv", "wasm", "hybrid")} {
+				info, lerr := os.Lstat(filepath.Join(root, rel))
+				if lerr != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+					return
+				}
+			}
+			addCandidate(filepath.Join(root, ".bv", "wasm", "hybrid"))
 		}
+		addLocalHybridDir(projectDir)
 		if cwd, err := os.Getwd(); err == nil && cwd != "" {
-			addCandidate(filepath.Join(cwd, ".bv", "wasm", "hybrid"))
+			addLocalHybridDir(cwd)
 		}
 	}
 	for _, wasmSrc := range candidateDirs {
@@ -7406,9 +7421,30 @@ func copyWasmAssets(src string, bundle *export.Bundle, dstName string) error {
 		if !info.Mode().IsRegular() {
 			return fmt.Errorf("wasm runtime artifact %s is not a regular file", srcPath)
 		}
-		data, readErr := os.ReadFile(srcPath)
+		const maxWasmArtifactBytes = 32 << 20 // 32 MiB ceiling
+		if info.Size() > maxWasmArtifactBytes {
+			return fmt.Errorf("wasm runtime artifact %s exceeds maximum size (%d bytes)", srcPath, maxWasmArtifactBytes)
+		}
+		f, openErr := os.Open(srcPath)
+		if openErr != nil {
+			return openErr
+		}
+		fInfo, statErr := f.Stat()
+		if statErr != nil {
+			_ = f.Close()
+			return statErr
+		}
+		if !fInfo.Mode().IsRegular() || !os.SameFile(info, fInfo) {
+			_ = f.Close()
+			return fmt.Errorf("wasm runtime artifact %s changed during open", srcPath)
+		}
+		data, readErr := io.ReadAll(io.LimitReader(f, maxWasmArtifactBytes+1))
+		_ = f.Close()
 		if readErr != nil {
 			return readErr
+		}
+		if len(data) > maxWasmArtifactBytes {
+			return fmt.Errorf("wasm runtime artifact %s exceeds maximum size (%d bytes)", srcPath, maxWasmArtifactBytes)
 		}
 		if entryName == "bv_hybrid_scorer_bg.wasm" {
 			if len(data) < 8 || data[0] != 0x00 || data[1] != 0x61 || data[2] != 0x73 || data[3] != 0x6d {
@@ -8468,37 +8504,24 @@ func countIssuesInBeadsDir(beadsDir string) (int, error) {
 }
 
 type beadsMetadata struct {
+	Backend     string `json:"backend"`
 	Database    string `json:"database"`
 	JSONLExport string `json:"jsonl_export"`
 }
 
 func metadataPreferredSource(beadsDir string) (string, datasource.SourceType) {
-	metaPath := filepath.Join(beadsDir, "metadata.json")
-	data, err := os.ReadFile(metaPath)
-	if err != nil {
-		return "", ""
-	}
 	var meta beadsMetadata
-	if err := json.Unmarshal(data, &meta); err != nil {
+	if !datasource.ReadMetadataJSON(beadsDir, &meta) {
 		return "", ""
 	}
-	if dbTarget := strings.TrimSpace(meta.Database); dbTarget != "" {
-		path := dbTarget
-		if !filepath.IsAbs(path) {
-			path = filepath.Join(beadsDir, path)
-		}
-		if info, err := os.Stat(path); err == nil && !info.IsDir() {
+	backend := strings.ToLower(strings.TrimSpace(meta.Backend))
+	if backend == "" || backend == "sqlite" {
+		if path, ok := datasource.ResolveMetadataPathWithinDir(beadsDir, meta.Database); ok {
 			return path, datasource.SourceTypeSQLite
 		}
 	}
-	if jsonlTarget := strings.TrimSpace(meta.JSONLExport); jsonlTarget != "" {
-		path := jsonlTarget
-		if !filepath.IsAbs(path) {
-			path = filepath.Join(beadsDir, path)
-		}
-		if info, err := os.Stat(path); err == nil && !info.IsDir() {
-			return path, datasource.SourceTypeJSONLLocal
-		}
+	if path, ok := datasource.ResolveMetadataPathWithinDir(beadsDir, meta.JSONLExport); ok {
+		return path, datasource.SourceTypeJSONLLocal
 	}
 	return "", ""
 }

@@ -9934,15 +9934,17 @@ func TestRC37_CLIExclusivityOptionalFlagsWasmBoolAndExportInactiveE2E(t *testing
 	var profResp struct {
 		DataPath string `json:"data_path"`
 		Profile  struct {
-			NodeCount int `json:"node_count"`
-			EdgeCount int `json:"edge_count"`
+			NodeCount  int   `json:"node_count"`
+			EdgeCount  int   `json:"edge_count"`
+			BuildGraph int64 `json:"build_graph"`
+			Total      int64 `json:"total"`
 		} `json:"profile"`
 	}
 	if err := json.Unmarshal([]byte(profOut), &profResp); err != nil {
 		t.Fatalf("unmarshal profile JSON: %v\n%s", err, profOut)
 	}
-	if profResp.DataPath != jsonlPath || profResp.Profile.NodeCount != 3 || profResp.Profile.EdgeCount != 1 {
-		t.Fatalf("unexpected profile response: %+v (want data_path=%s, nodes=3, edges=1)", profResp, jsonlPath)
+	if profResp.DataPath != jsonlPath || profResp.Profile.NodeCount != 3 || profResp.Profile.EdgeCount != 1 || profResp.Profile.Total <= 0 || profResp.Profile.Total < profResp.Profile.BuildGraph {
+		t.Fatalf("unexpected profile response: %+v (want data_path=%s, nodes=3, edges=1, total>=build_graph>0)", profResp, jsonlPath)
 	}
 
 	// 6. --export --robot-include-inactive succeeds; fatal write error goes to stderr (not stdout).

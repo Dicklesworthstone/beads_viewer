@@ -12,6 +12,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // UpdateState represents the current state of the update process
@@ -454,11 +455,23 @@ func (m UpdateModal) View() string {
 	modalWidth := m.effectiveWidth()
 
 	// Modal container style
+	vertPad := 1
+	if m.height > 0 && m.height <= 18 {
+		vertPad = 0
+	}
+	horizPad := 2
+	if modalWidth <= 30 {
+		horizPad = 1
+	}
+	innerWidth := max(1, modalWidth-2*horizPad)
 	modalStyle := r.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(m.theme.Primary).
-		Padding(1, 2).
+		Padding(vertPad, horizPad).
 		Width(modalWidth)
+	if m.height > 0 {
+		modalStyle = modalStyle.MaxHeight(m.height)
+	}
 
 	// Header style
 	headerStyle := r.NewStyle().
@@ -504,12 +517,17 @@ func (m UpdateModal) View() string {
 	switch m.state {
 	case UpdateStateConfirm:
 		hasUpdate := strings.TrimSpace(m.newVersion) != ""
+		compactVert := m.height > 0 && m.height <= 14
 		if hasUpdate {
 			b.WriteString(headerStyle.Render("Update Available"))
 		} else {
 			b.WriteString(headerStyle.Render("Rollback Binary"))
 		}
-		b.WriteString("\n\n")
+		if compactVert {
+			b.WriteString("\n")
+		} else {
+			b.WriteString("\n\n")
+		}
 
 		b.WriteString("Current version: ")
 		b.WriteString(currentVersionStyle.Render(m.currentVersion))
@@ -518,42 +536,68 @@ func (m UpdateModal) View() string {
 		if hasUpdate {
 			b.WriteString("New version:     ")
 			b.WriteString(newVersionStyle.Render(m.newVersion))
-			b.WriteString("\n\n")
-			b.WriteString("Would you like to update now?\n\n")
+			if compactVert {
+				b.WriteString("\nWould you like to update now?\n")
+			} else {
+				b.WriteString("\n\nWould you like to update now?\n\n")
+			}
 		} else {
-			b.WriteString("\nA previous binary backup is available to restore.\n\n")
+			if compactVert {
+				b.WriteString("A previous binary backup is available to restore.\n")
+			} else {
+				b.WriteString("\nA previous binary backup is available to restore.\n\n")
+			}
 		}
 
-		// Buttons
+		// Buttons joined horizontally so multi-line rounded borders align cleanly.
+		// Tighten horizontal padding/gap when 3 buttons appear on narrow modals (e.g. 60 cols).
+		btnStyle := buttonStyle
+		selBtnStyle := selectedButtonStyle
+		btnGap := "  "
+		if (hasUpdate && m.CanRollback()) || innerWidth < 48 {
+			btnStyle = btnStyle.Padding(0, 1)
+			selBtnStyle = selBtnStyle.Padding(0, 1)
+			btnGap = " "
+		}
 		var cancelBtn string
 		if m.confirmFocus == 1 {
-			cancelBtn = selectedButtonStyle.Render(" Cancel ")
+			cancelBtn = selBtnStyle.Render(" Cancel ")
 		} else {
-			cancelBtn = buttonStyle.Render(" Cancel ")
+			cancelBtn = btnStyle.Render(" Cancel ")
 		}
+		var btnParts []string
 		if hasUpdate {
 			var updateBtn string
 			if m.confirmFocus == 0 {
-				updateBtn = selectedButtonStyle.Render(" Update ")
+				updateBtn = selBtnStyle.Render(" Update ")
 			} else {
-				updateBtn = buttonStyle.Render(" Update ")
+				updateBtn = btnStyle.Render(" Update ")
 			}
-			b.WriteString("  ")
-			b.WriteString(updateBtn)
+			btnParts = append(btnParts, updateBtn)
 		}
-		b.WriteString("  ")
-		b.WriteString(cancelBtn)
+		btnParts = append(btnParts, cancelBtn)
 		if m.CanRollback() {
 			var rollbackBtn string
 			if m.confirmFocus == 2 {
-				rollbackBtn = selectedButtonStyle.Render(" Rollback ")
+				rollbackBtn = selBtnStyle.Render(" Rollback ")
 			} else {
-				rollbackBtn = buttonStyle.Render(" Rollback ")
+				rollbackBtn = btnStyle.Render(" Rollback ")
 			}
-			b.WriteString("  ")
-			b.WriteString(rollbackBtn)
+			btnParts = append(btnParts, rollbackBtn)
 		}
-		b.WriteString("\n\n")
+		joinedBtns := make([]string, 0, len(btnParts)*2)
+		for i, btn := range btnParts {
+			if i > 0 {
+				joinedBtns = append(joinedBtns, btnGap)
+			}
+			joinedBtns = append(joinedBtns, btn)
+		}
+		b.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, joinedBtns...))
+		if compactVert {
+			b.WriteString("\n")
+		} else {
+			b.WriteString("\n\n")
+		}
 
 		if hasUpdate && m.CanRollback() {
 			b.WriteString(subtextStyle.Render("[Y] Update   [R] Rollback   [N] Cancel   [Enter] Select"))
@@ -655,7 +699,30 @@ func (m UpdateModal) View() string {
 		}
 	}
 
-	return modalStyle.Render(b.String())
+	rawLines := strings.Split(strings.TrimRight(b.String(), "\n"), "\n")
+	for i, line := range rawLines {
+		if lipgloss.Width(line) > innerWidth {
+			suffix := "…"
+			if innerWidth <= 2 {
+				suffix = ""
+			}
+			rawLines[i] = ansi.Truncate(line, innerWidth, suffix)
+		}
+	}
+	if m.height > 0 {
+		maxInner := max(1, m.height-2-2*vertPad)
+		if len(rawLines) > maxInner {
+			if maxInner == 1 {
+				rawLines = rawLines[len(rawLines)-1:]
+			} else {
+				// Preserve top lines and the bottom action hint line on short terminals.
+				footer := rawLines[len(rawLines)-1]
+				rawLines = append(rawLines[:maxInner-1], footer)
+			}
+		}
+	}
+
+	return modalStyle.Render(strings.Join(rawLines, "\n"))
 }
 
 // renderPhaseSteps renders the 3-phase update stepper (Download -> Verify -> Install).
@@ -762,6 +829,9 @@ func (m UpdateModal) IsInProgress() bool {
 func (m UpdateModal) CenterModal(termWidth, termHeight int) string {
 	if termWidth > 0 {
 		m.termWidth = termWidth
+	}
+	if termHeight > 0 {
+		m.height = termHeight
 	}
 	modal := m.View()
 

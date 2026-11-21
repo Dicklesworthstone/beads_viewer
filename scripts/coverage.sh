@@ -14,6 +14,8 @@
 
 set -euo pipefail
 
+ORIG_BV_NO_BROWSER="${BV_NO_BROWSER:-}"
+ORIG_BV_TEST_MODE="${BV_TEST_MODE:-}"
 export BV_NO_BROWSER=1 BV_TEST_MODE=1 BV_NO_SAVED_CONFIG=1 BV_NO_UPDATE_CHECK=1
 
 COVERAGE_DIR="${COVERAGE_DIR:-coverage}"
@@ -143,8 +145,8 @@ generate_html() {
     go tool cover -html="$COVERAGE_FILE" -o "$HTML_FILE"
     echo "Report generated: $HTML_FILE"
 
-    # Open in browser unless BV_NO_BROWSER / BV_TEST_MODE is set
-    if [ -n "${BV_NO_BROWSER:-}" ] || [ -n "${BV_TEST_MODE:-}" ]; then
+    # Open in browser unless caller set BV_NO_BROWSER / BV_TEST_MODE
+    if [ -n "$ORIG_BV_NO_BROWSER" ] || [ -n "$ORIG_BV_TEST_MODE" ]; then
         echo "Browser launch suppressed (BV_NO_BROWSER/BV_TEST_MODE): $HTML_FILE"
     elif command -v open &> /dev/null; then
         open "$HTML_FILE"

@@ -147,6 +147,8 @@ func DefaultConfig() *Config {
 		ProactiveMaxIssues:            2000,                     // Skip the expensive checks above this many issues
 		SprintBlockedDays:             2,                        // Blocked sprint items flagged after 2 days
 		SprintInactiveDays:            4,                        // In-progress sprint items flagged after 4 days idle
+		highImpactPriorityMaxSet:      true,
+		duplicateMaxAlertsSet:         true,
 	}
 }
 

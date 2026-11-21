@@ -1817,3 +1817,131 @@ func TestRobotDiskCache_MetadataDotDirectoryAndDoltNoms600TableFiles(t *testing.
 		t.Fatal("in-place mutation of Dolt manifest past 600 table files failed to invalidate robot disk cache")
 	}
 }
+
+func TestWave22_RobotDiskCacheApproximateBetweennessHitsAndActiveDAGAccessors(t *testing.T) {
+	t.Setenv("BV_ROBOT", "1")
+	t.Setenv("BV_NO_CACHE", "")
+	cacheDir := t.TempDir()
+	t.Setenv("BV_CACHE_DIR", cacheDir)
+
+	// 60-node chain with TriageConfig() triggers approximate betweenness (>50 nodes).
+	// Previously, mutating stats.Config.BetweennessIsApproximate in Phase 2 caused
+	// ComputeConfigHash(&entry.Result.Config) != entry.ConfigHash (0% hit rate) and
+	// raced with concurrent readers of stats.Config.
+	issues := make([]model.Issue, 60)
+	for i := 0; i < 60; i++ {
+		id := fmt.Sprintf("APPROX-%03d", i)
+		issues[i] = model.Issue{ID: id, Title: id, Status: model.StatusOpen, IssueType: model.TypeTask}
+		if i > 0 {
+			issues[i].Dependencies = []*model.Dependency{{IssueID: id, DependsOnID: fmt.Sprintf("APPROX-%03d", i-1), Type: model.DepBlocks}}
+		}
+	}
+	// Add a 10-node closed chain to test ActiveSlack / ActiveCriticalPathScore across cache hits.
+	closedAt := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	for i := 0; i < 10; i++ {
+		id := fmt.Sprintf("CL-%02d", i)
+		iss := model.Issue{ID: id, Title: id, Status: model.StatusClosed, IssueType: model.TypeTask, ClosedAt: &closedAt}
+		if i > 0 {
+			iss.Dependencies = []*model.Dependency{{IssueID: id, DependsOnID: fmt.Sprintf("CL-%02d", i-1), Type: model.DepBlocks}}
+		}
+		issues = append(issues, iss)
+	}
+	cfg := analysis.TriageConfig()
+	cfg.ComputeCriticalPath = true
+	cfg.ComputeSlack = true
+
+	// First run: populate disk cache while concurrently reading exported stats.Config under -race.
+	s1 := analysis.NewAnalyzer(issues).AnalyzeAsyncWithConfig(context.Background(), cfg)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 100; i++ {
+			_ = s1.Config.BetweennessIsApproximate
+			_ = s1.EffectiveConfig().BetweennessIsApproximate
+		}
+	}()
+	s1.WaitForPhase2()
+	<-done
+	if !s1.EffectiveConfig().BetweennessIsApproximate {
+		t.Fatalf("expected EffectiveConfig().BetweennessIsApproximate=true on 70-node TriageConfig")
+	}
+
+	// Pin cache file inode + contents to verify the 2nd lookup is a genuine disk-cache HIT
+	// (no delete/recompute).
+	entries, err := filepath.Glob(filepath.Join(cacheDir, "analysis_cache", "*.json"))
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("expected 1 analysis cache entry, got %v (err=%v)", entries, err)
+	}
+	beforeBytes, err := os.ReadFile(entries[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Second run: MUST hit the disk cache and preserve EffectiveConfig + ActiveSlack/ActiveCriticalPathScore.
+	s2 := analysis.NewAnalyzer(issues).AnalyzeAsyncWithConfig(context.Background(), cfg)
+	s2.WaitForPhase2()
+	afterBytes, err := os.ReadFile(entries[0])
+	if err != nil || string(afterBytes) != string(beforeBytes) {
+		t.Fatal("2nd AnalyzeAsyncWithConfig with approximate betweenness missed/rewrote disk cache entry")
+	}
+	if !s2.EffectiveConfig().BetweennessIsApproximate {
+		t.Fatal("disk cache hit lost EffectiveConfig().BetweennessIsApproximate=true")
+	}
+	activeSlack := s2.ActiveSlack()
+	activeCP := s2.ActiveCriticalPathScore()
+	if activeSlack["APPROX-000"] != 0 || activeCP["APPROX-000"] != 60 {
+		t.Fatalf("cache-hit ActiveSlack/ActiveCriticalPathScore wrong: slack=%v cp=%v", activeSlack["APPROX-000"], activeCP["APPROX-000"])
+	}
+	if _, leakedClosed := activeSlack["CL-00"]; leakedClosed {
+		t.Fatalf("ActiveSlack leaked closed node CL-00: %v", activeSlack["CL-00"])
+	}
+}
+
+func TestWave22_Pass2SmallTriageExactFallbackAndAllClosedActiveDAGCacheHit(t *testing.T) {
+	t.Setenv("BV_ROBOT", "1")
+	t.Setenv("BV_NO_CACHE", "")
+	t.Setenv("BV_CACHE_DIR", t.TempDir())
+
+	// 1. <=50-node TriageConfig graph falls back to exact Brandes (BetweennessIsApproximate=false)
+	//    on BOTH cold run and warm disk-cache hit.
+	small := make([]model.Issue, 5)
+	for i := range small {
+		id := fmt.Sprintf("SM-%d", i)
+		small[i] = model.Issue{ID: id, Title: id, Status: model.StatusOpen, IssueType: model.TypeTask}
+		if i > 0 {
+			small[i].Dependencies = []*model.Dependency{{IssueID: id, DependsOnID: fmt.Sprintf("SM-%d", i-1), Type: model.DepBlocks}}
+		}
+	}
+	cfg := analysis.TriageConfig()
+	s1 := analysis.NewAnalyzer(small).AnalyzeAsyncWithConfig(context.Background(), cfg)
+	s1.WaitForPhase2()
+	if s1.EffectiveConfig().BetweennessIsApproximate {
+		t.Fatal("cold <=50-node TriageConfig run should use exact betweenness fallback")
+	}
+	s2 := analysis.NewAnalyzer(small).AnalyzeAsyncWithConfig(context.Background(), cfg)
+	s2.WaitForPhase2()
+	if s2.EffectiveConfig().BetweennessIsApproximate {
+		t.Fatal("warm <=50-node TriageConfig disk-cache hit flipped BetweennessIsApproximate to true")
+	}
+
+	// 2. All-closed graph warm disk-cache hit must NOT leak closed IDs in ActiveCriticalPathScore/ActiveSlack.
+	closedAt := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	allClosed := []model.Issue{
+		{ID: "AC-1", Title: "Closed 1", Status: model.StatusClosed, IssueType: model.TypeTask, ClosedAt: &closedAt},
+		{
+			ID: "AC-2", Title: "Closed 2", Status: model.StatusClosed, IssueType: model.TypeTask, ClosedAt: &closedAt,
+			Dependencies: []*model.Dependency{{IssueID: "AC-2", DependsOnID: "AC-1", Type: model.DepBlocks}},
+		},
+	}
+	fullCfg := analysis.FullAnalysisConfig()
+	c1 := analysis.NewAnalyzer(allClosed).AnalyzeAsyncWithConfig(context.Background(), fullCfg)
+	c1.WaitForPhase2()
+	if len(c1.ActiveCriticalPathScore()) != 0 || len(c1.ActiveSlack()) != 0 {
+		t.Fatalf("cold all-closed graph leaked active DAG maps: cp=%v slack=%v", c1.ActiveCriticalPathScore(), c1.ActiveSlack())
+	}
+	c2 := analysis.NewAnalyzer(allClosed).AnalyzeAsyncWithConfig(context.Background(), fullCfg)
+	c2.WaitForPhase2()
+	if len(c2.ActiveCriticalPathScore()) != 0 || len(c2.ActiveSlack()) != 0 {
+		t.Fatalf("warm all-closed disk-cache hit leaked closed nodes: cp=%v slack=%v", c2.ActiveCriticalPathScore(), c2.ActiveSlack())
+	}
+}
