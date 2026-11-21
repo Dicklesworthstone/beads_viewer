@@ -5993,18 +5993,68 @@ function beadsApp() {
         }
       }
 
-      // Add click handlers for available issues
+      // Build a sanitized Mermaid node-ID -> issue-ID lookup map for DOM click
+      // delegation. Mermaid securityLevel:'strict' intentionally suppresses
+      // inline `click ... call` handlers to prevent XSS, so we bind safe DOM
+      // listeners on rendered `.node` SVG elements after rendering.
+      const nodeIdToIssueId = new Map();
       for (const id of navigableIds) {
-        const nodeId = sanitizeId(id);
-        const safeId = String(id).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-        diagram += `  click ${nodeId} call window.beadsViewer.navigateToIssue("${safeId}")\n`;
+        nodeIdToIssueId.set(sanitizeId(id), id);
       }
 
       try {
         // Render the diagram
         const { svg } = await mermaid.render('dep-graph-' + nextToastId().replace(/[^a-zA-Z0-9]/g, '_'), diagram);
         if (this._depGraphRenderSeq !== renderSeq || !this.showDepGraph || !this.selectedIssue || this.selectedIssue.id !== targetIssueId || !this.$refs.depGraph) return;
-        this.$refs.depGraph.innerHTML = svg;
+        const container = this.$refs.depGraph;
+        container.innerHTML = svg;
+
+        const resolveNodeIssueId = (nodeEl) => {
+          if (!nodeEl) return null;
+          const dataId = nodeEl.getAttribute('data-id');
+          if (dataId && nodeIdToIssueId.has(dataId)) return nodeIdToIssueId.get(dataId);
+          const rawElId = nodeEl.getAttribute('id') || '';
+          for (const [nodeId, issueId] of nodeIdToIssueId.entries()) {
+            if (rawElId === nodeId || rawElId.startsWith('flowchart-' + nodeId + '-') || rawElId.endsWith('-' + nodeId)) {
+              return issueId;
+            }
+          }
+          const labelText = (nodeEl.textContent || '').trim();
+          if (labelText && navigableIds.has(labelText)) return labelText;
+          return null;
+        };
+
+        container.querySelectorAll('.node').forEach((nodeEl) => {
+          const targetId = resolveNodeIssueId(nodeEl);
+          if (!targetId) return;
+          nodeEl.setAttribute('data-bv-issue-id', targetId);
+          nodeEl.setAttribute('role', 'button');
+          nodeEl.setAttribute('tabindex', '0');
+          nodeEl.style.cursor = 'pointer';
+        });
+
+        const activateNode = (event) => {
+          const nodeEl = event.target?.closest?.('.node[data-bv-issue-id]');
+          if (!nodeEl || !container.contains(nodeEl)) return;
+          const nextId = nodeEl.getAttribute('data-bv-issue-id');
+          if (!nextId) return;
+          event.preventDefault();
+          navigateToIssue(nextId);
+        };
+        if (this._depGraphClickHandler) {
+          container.removeEventListener('click', this._depGraphClickHandler);
+        }
+        if (this._depGraphKeyHandler) {
+          container.removeEventListener('keydown', this._depGraphKeyHandler);
+        }
+        this._depGraphClickHandler = activateNode;
+        this._depGraphKeyHandler = (event) => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            activateNode(event);
+          }
+        };
+        container.addEventListener('click', this._depGraphClickHandler);
+        container.addEventListener('keydown', this._depGraphKeyHandler);
       } catch (err) {
         console.warn('Mermaid render failed:', err);
         if (this._depGraphRenderSeq === renderSeq && this.showDepGraph && this.selectedIssue && this.selectedIssue.id === targetIssueId && this.$refs.depGraph) {

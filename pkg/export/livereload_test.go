@@ -252,6 +252,124 @@ func TestLiveReloadScriptHandler_ServesScriptAsFile(t *testing.T) {
 	}
 }
 
+func TestRC39_LiveReloadTrailingEdgeAtomicRenameAndNewSubdir(t *testing.T) {
+	dir := t.TempDir()
+	hub, err := NewLiveReloadHub(dir)
+	if err != nil {
+		t.Fatalf("NewLiveReloadHub: %v", err)
+	}
+	hub.debounce = 60 * time.Millisecond
+	if err := hub.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer hub.Stop()
+
+	clientCh := make(chan struct{}, 4)
+	hub.addClient(clientCh)
+	defer hub.removeClient(clientCh)
+
+	// 1. Writing .bv-export-* temp file alone must NOT trigger a premature reload.
+	tmpFile := filepath.Join(dir, ".bv-export-staging123")
+	if err := os.WriteFile(tmpFile, []byte("partial"), 0o644); err != nil {
+		t.Fatalf("write temp file: %v", err)
+	}
+	select {
+	case <-clientCh:
+		t.Fatal("staging .bv-export-* write triggered premature live-reload event")
+	case <-time.After(140 * time.Millisecond):
+	}
+
+	// 2. Atomic rename into place MUST trigger trailing-edge reload after completion.
+	finalFile := filepath.Join(dir, "index.html")
+	if err := os.Rename(tmpFile, finalFile); err != nil {
+		t.Fatalf("rename temp file: %v", err)
+	}
+	select {
+	case <-clientCh:
+	case <-time.After(time.Second):
+		t.Fatal("atomic rename did not trigger trailing-edge live-reload notification")
+	}
+
+	// Drain any residual burst notification before testing dynamic subdir watch.
+	time.Sleep(120 * time.Millisecond)
+	for len(clientCh) > 0 {
+		<-clientCh
+	}
+
+	// 3. Dynamically created subdirectory must be watched automatically.
+	subDir := filepath.Join(dir, "data-dynamic")
+	if err := os.MkdirAll(subDir, 0o755); err != nil {
+		t.Fatalf("mkdir subdir: %v", err)
+	}
+	// Wait for subdir watch registration and clear the directory-create notification.
+	select {
+	case <-clientCh:
+	case <-time.After(time.Second):
+		t.Fatal("subdir creation did not notify")
+	}
+	time.Sleep(120 * time.Millisecond)
+	for len(clientCh) > 0 {
+		<-clientCh
+	}
+
+	// Write a file inside the newly created subdirectory and verify notification arrives.
+	if err := os.WriteFile(filepath.Join(subDir, "meta.json"), []byte(`{"v":2}`), 0o644); err != nil {
+		t.Fatalf("write nested file: %v", err)
+	}
+	select {
+	case <-clientCh:
+	case <-time.After(time.Second):
+		t.Fatal("file write inside newly created subdirectory did not trigger live-reload")
+	}
+}
+
+func TestRC39_ViewerAssetsExclusionReportOptionsStandaloneCSPAndPreviewFD(t *testing.T) {
+	// 1. Dev-only files must NOT be embedded in ViewerAssetsFS; runtime files MUST be.
+	for _, excluded := range []string{"viewer_assets/graph-demo.html", "viewer_assets/hybrid_scorer.test.js"} {
+		if _, err := ViewerAssetsFS.Open(excluded); err == nil {
+			t.Errorf("ViewerAssetsFS unexpectedly embeds dev-only file %q", excluded)
+		}
+	}
+	for _, required := range []string{"viewer_assets/index.html", "viewer_assets/viewer.js", "viewer_assets/vendor/bv_graph_bg.wasm"} {
+		f, err := ViewerAssetsFS.Open(required)
+		if err != nil {
+			t.Errorf("ViewerAssetsFS missing required runtime asset %q: %v", required, err)
+			continue
+		}
+		_ = f.Close()
+	}
+
+	// 2. Direct callers can disable action plan cleanly via DefaultReportOptions() or OmitActionPlan.
+	optsDefault := DefaultReportOptions()
+	optsDefault.IncludeActionPlan = false
+	if optsDefault.includeActions() {
+		t.Fatal("DefaultReportOptions() with IncludeActionPlan=false still enabled actions")
+	}
+	optsOmit := ReportOptions{Format: "markdown", OmitActionPlan: true}
+	if optsOmit.includeActions() {
+		t.Fatal("ReportOptions{OmitActionPlan: true} still enabled actions")
+	}
+
+	// 3. Standalone interactive HTML graph includes offline CSP meta tag.
+	htmlOut := generateUltimateHTML("Test Graph", "abc123", `{"nodes":[],"links":[]}`, 0, 0, "proj", "", "")
+	if !strings.Contains(htmlOut, `http-equiv="Content-Security-Policy"`) || !strings.Contains(htmlOut, `default-src 'none'`) || !strings.Contains(htmlOut, `connect-src 'none'`) {
+		t.Errorf("standalone HTML graph missing offline CSP meta tag")
+	}
+
+	// 4. validatePreviewBundle returned handle closes cleanly.
+	bundleDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bundleDir, "index.html"), []byte("<html></html>"), 0o644); err != nil {
+		t.Fatalf("write index.html: %v", err)
+	}
+	previewDir, err := validatePreviewBundle(bundleDir)
+	if err != nil {
+		t.Fatalf("validatePreviewBundle: %v", err)
+	}
+	if err := previewDir.Close(); err != nil {
+		t.Fatalf("previewDir.Close(): %v", err)
+	}
+}
+
 func TestLiveReloadHub_FileChangeNotification(t *testing.T) {
 	dir := t.TempDir()
 

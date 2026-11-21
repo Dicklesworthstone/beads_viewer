@@ -937,9 +937,11 @@ func (w *Wizard) OfferPreview() (string, error) {
 	fmt.Println("Use the prompt below when done previewing.")
 	fmt.Println("")
 
-	if _, err := validatePreviewBundle(w.bundlePath); err != nil {
+	previewDir, err := validatePreviewBundle(w.bundlePath)
+	if err != nil {
 		return "", fmt.Errorf("preview bundle is not valid: %w", err)
 	}
+	_ = previewDir.Close()
 
 	// Start preview server
 	port, err := FindAvailablePort(PreviewPortRangeStart, PreviewPortRangeEnd)

@@ -2160,14 +2160,9 @@ func TestRobotGroupedTriageSchemasMatchHandlerOutput(t *testing.T) {
 	} {
 		t.Run(tc.command, func(t *testing.T) {
 			properties := requireRobotSchemaProperties(t, schemas, tc.command)
-			for _, name := range []string{"generated_at", "data_hash", "triage", "usage_hints"} {
+			for _, name := range []string{"generated_at", "data_hash", "output_format", "version", "triage", "usage_hints"} {
 				if properties[name] == nil {
 					t.Fatalf("%s schema missing top-level property %q", tc.command, name)
-				}
-			}
-			for _, stale := range []string{"output_format", "version"} {
-				if properties[stale] != nil {
-					t.Fatalf("%s schema still exposes stale generic property %q", tc.command, stale)
 				}
 			}
 

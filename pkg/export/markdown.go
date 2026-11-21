@@ -35,6 +35,7 @@ type ReportOptions struct {
 	IncludeGraph      bool
 	IncludeActionPlan bool
 	IncludeActions    *bool
+	OmitActionPlan    bool
 	actionPlanSet     bool
 	Template          string
 	GroupBy           string
@@ -57,9 +58,25 @@ type ReportOptions struct {
 	IncludeInactive   bool
 }
 
+// DefaultReportOptions returns initialized report defaults with actionPlanSet
+// enabled so direct callers can flip opts.IncludeActionPlan = false without
+// needing a pointer wrapper.
+func DefaultReportOptions() ReportOptions {
+	return ReportOptions{
+		Format:            "markdown",
+		Title:             "Beads Export",
+		IncludeGraph:      true,
+		IncludeActionPlan: true,
+		actionPlanSet:     true,
+	}
+}
+
 func (opts ReportOptions) includeActions() bool {
 	if opts.IncludeActions != nil {
 		return *opts.IncludeActions
+	}
+	if opts.OmitActionPlan {
+		return false
 	}
 	if opts.actionPlanSet {
 		return opts.IncludeActionPlan

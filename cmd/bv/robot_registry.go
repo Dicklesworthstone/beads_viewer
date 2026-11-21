@@ -1514,12 +1514,11 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 
 			exportIssues := ctx.Issues
 			if rootIssueID != "" {
-				sourceIssues := ctx.GraphRootSourceIssues()
-				if !isGraphRootInActiveScope(ctx, rootIssueID) || !containsIssueID(sourceIssues, rootIssueID) {
+				if !isGraphRootInActiveScope(ctx, rootIssueID) || !containsIssueID(ctx.Issues, rootIssueID) {
 					fmt.Fprintf(ctx.StderrOrDefault(), "Root issue not found: %s\n", rootIssueID)
 					return newReportedRobotHandlerExit(1)
 				}
-				exportIssues = extractBidirectionalSubgraphIssues(sourceIssues, rootIssueID, graphDepth)
+				exportIssues = extractBidirectionalSubgraphIssues(ctx.Issues, rootIssueID, graphDepth)
 				ctx.GraphRoot = rootIssueID
 				ctx.Issues = exportIssues
 				ctx.DataHash = analysis.ComputeDataHash(exportIssues)

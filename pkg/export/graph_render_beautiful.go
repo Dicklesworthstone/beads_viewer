@@ -100,6 +100,7 @@ func generateUltimateHTMLWithTime(title, dataHash, graphDataJSON string, nodeCou
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
     <title>%s | bv Graph</title>
     <link rel="icon" href="data:,">
     <!-- Self-contained by design: no external stylesheets, scripts, or fonts.

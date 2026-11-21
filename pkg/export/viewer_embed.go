@@ -24,11 +24,12 @@ import (
 
 // Note: WriteGitHubActionsWorkflow is defined in github.go
 
-// ViewerAssetsFS embeds the tracked viewer_assets files for static site export
-// without accidentally embedding gitignored local wasm-pack output directories
-// (viewer_assets/wasm/, which is populated opt-in per bundle via BV_BUILD_HYBRID_WASM).
+// ViewerAssetsFS embeds the tracked production viewer_assets files for static
+// site export without dev-only files (graph-demo.html, hybrid_scorer.test.js)
+// or gitignored local wasm-pack output directories (viewer_assets/wasm/, which
+// is populated opt-in per bundle via BV_BUILD_HYBRID_WASM / .bv/wasm/hybrid).
 //
-//go:embed viewer_assets/*.html viewer_assets/*.js viewer_assets/*.css viewer_assets/vendor
+//go:embed viewer_assets/index.html viewer_assets/head_init.js viewer_assets/viewer.js viewer_assets/styles.css viewer_assets/graph.js viewer_assets/charts.js viewer_assets/hybrid_scorer.js viewer_assets/wasm_loader.js viewer_assets/coi-serviceworker.js viewer_assets/vendor
 var ViewerAssetsFS embed.FS
 
 // Bundle anchors all generated files to the output directory selected by the

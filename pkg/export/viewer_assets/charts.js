@@ -584,7 +584,7 @@ function initPriorityChart() {
                     callbacks: {
                         label: (context) => {
                             const total = context.dataset.data.reduce((a, b) => a + b, 0);
-                            const pct = ((context.raw / total) * 100).toFixed(1);
+                            const pct = total > 0 ? ((context.raw / total) * 100).toFixed(1) : '0.0';
                             return `${context.label}: ${context.raw} (${pct}%)`;
                         }
                     }

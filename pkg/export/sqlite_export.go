@@ -195,8 +195,8 @@ func (e *SQLiteExporter) ExportBundle(bundle *Bundle) error {
 
 	// Create FTS index (modernc.org/sqlite has FTS5 built-in)
 	if err := CreateFTSIndex(db); err != nil {
-		// Defensive: log but continue if FTS5 creation fails for any reason
-		fmt.Printf("Warning: FTS5 not available: %v\n", err)
+		// Defensive: log to stderr (never stdout) and continue if FTS5 creation fails
+		fmt.Fprintf(os.Stderr, "Warning: FTS5 not available: %v\n", err)
 	}
 
 	// Create materialized views
@@ -823,15 +823,12 @@ func (e *SQLiteExporter) populateOverviewMetrics(db *sql.DB) error {
 }
 
 // bundleHasHybridWasm reports whether the optional bv_hybrid_scorer WASM bundle
-// is present in either the output bundle directory or embedded viewer assets.
+// was staged into the output bundle directory.
 func bundleHasHybridWasm(bundle *Bundle) bool {
 	if bundle != nil && bundle.root != nil {
 		if info, err := bundle.root.Stat("wasm/bv_hybrid_scorer.js"); err == nil && !info.IsDir() {
 			return true
 		}
-	}
-	if info, err := fs.Stat(ViewerAssetsFS, "viewer_assets/wasm/bv_hybrid_scorer.js"); err == nil && !info.IsDir() {
-		return true
 	}
 	return false
 }

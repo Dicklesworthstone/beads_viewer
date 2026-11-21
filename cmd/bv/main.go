@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
-	"html"
 	"io"
 	"os"
 	"os/exec"
@@ -1976,7 +1975,7 @@ func main() {
 	watchExport := flag.Bool("watch-export", false, "Watch for beads changes and auto-regenerate export (use with --export-pages)")
 	pagesWizard := flag.Bool("pages", false, "Launch interactive Pages deployment wizard")
 	// Debug rendering flag (for diagnosing TUI issues)
-	debugRender := flag.String("debug-render", "", "Render a TUI view to stdout and exit (views: triage, list, insights, board, history, graph, tree, actionable, sprint, flow, attention, labels)")
+	debugRender := flag.String("debug-render", "", "Render a TUI view to stdout and exit (views: triage, list, insights, board, history, graph, tree, actionable, sprint, flow, attention, labels, velocity)")
 	debugWidth := flag.Int("debug-width", 180, "Width for debug render")
 	debugHeight := flag.Int("debug-height", 50, "Height for debug render")
 	// Explicit light/dark palette selection for terminals where background
@@ -7411,85 +7410,15 @@ func buildAttentionReason(score analysis.LabelAttentionScore) string {
 // Static Pages Export Helpers (bv-73f)
 // ============================================================================
 
-// copyViewerAssetsWithSubtitle copies viewer HTML/JS/CSS assets and applies
-// optional title and subtitle customization to index.html.
+// copyViewerAssetsWithSubtitle copies embedded viewer HTML/JS/CSS assets and
+// applies optional title and subtitle customization to index.html.
 func copyViewerAssetsWithSubtitle(bundle *export.Bundle, title, subtitle, projectDir string, noHooks bool) error {
-	// First try to use embedded assets (production builds)
-	if export.HasEmbeddedAssets() {
-		// Prepare optional hybrid WASM assets before CopyEmbeddedAssetsWithSubtitle
-		// binds coi-serviceworker.js's OFFLINE_ASSETS manifest.
-		if err := prepareBundleWasmAssets(bundle, projectDir, noHooks); err != nil {
-			return err
-		}
-		return bundle.CopyEmbeddedAssetsWithSubtitle(title, subtitle)
-	}
-
-	// Fall back to filesystem-based approach (development mode)
-	assetsDir := findViewerAssetsDir()
-	if assetsDir == "" {
-		return fmt.Errorf("viewer assets not found")
-	}
-
-	// Files to copy
-	files := []string{
-		"index.html",
-		"head_init.js",
-		"viewer.js",
-		"styles.css",
-		"graph.js",
-		"charts.js",
-		"hybrid_scorer.js",
-		"wasm_loader.js",
-		"coi-serviceworker.js",
-	}
-
-	for _, file := range files {
-		src := filepath.Join(assetsDir, file)
-
-		// Special handling for index.html to replace title/subtitle and add cache-busting
-		if file == "index.html" {
-			if err := copyFileWithTitleSubtitleAndCacheBusting(src, bundle, file, title, subtitle); err != nil {
-				return fmt.Errorf("copy %s: %w", file, err)
-			}
-			continue
-		}
-
-		if err := copyFile(src, bundle, file); err != nil {
-			// Skip missing optional files
-			if os.IsNotExist(err) {
-				continue
-			}
-			return fmt.Errorf("copy %s: %w", file, err)
-		}
-	}
-
-	// Copy vendor directory
-	vendorSrc := filepath.Join(assetsDir, "vendor")
-	if err := copyDir(vendorSrc, bundle, "vendor"); err != nil {
-		if !os.IsNotExist(err) {
-			return fmt.Errorf("copy vendor: %w", err)
-		}
-	}
-
-	// Stage optional WASM directory when not already evaluated by prepareBundleWasmAssets
+	// Prepare optional hybrid WASM assets before CopyEmbeddedAssetsWithSubtitle
+	// binds coi-serviceworker.js's OFFLINE_ASSETS manifest.
 	if err := prepareBundleWasmAssets(bundle, projectDir, noHooks); err != nil {
 		return err
 	}
-	if err := bundle.BindOfflineBundleAssets(); err != nil {
-		return err
-	}
-	if err := bundle.WriteFile(".nojekyll", []byte{}, 0644); err != nil {
-		return fmt.Errorf("writing .nojekyll: %w", err)
-	}
-
-	// Always add GitHub Actions workflow for reliable Pages deployment
-	// This ensures the workflow is in the bundle regardless of deployment target
-	if err := bundle.WriteFile(".github/workflows/static.yml", []byte(export.GitHubActionsWorkflowContent), 0644); err != nil {
-		// Non-fatal - just log a warning
-		fmt.Printf("  Warning: Could not add GitHub Actions workflow: %v\n", err)
-	}
-
-	return nil
+	return bundle.CopyEmbeddedAssetsWithSubtitle(title, subtitle)
 }
 
 // prepareBundleWasmAssets populates wasm/ in bundle before SQLite/JSON metadata
@@ -7540,11 +7469,6 @@ func prepareBundleWasmAssets(bundle *export.Bundle, projectDir string, noHooks b
 		}
 		if cwd, err := os.Getwd(); err == nil && cwd != "" {
 			addCandidate(filepath.Join(cwd, ".bv", "wasm", "hybrid"))
-		}
-		if !export.HasEmbeddedAssets() {
-			if assetsDir := findViewerAssetsDir(); assetsDir != "" {
-				addCandidate(filepath.Join(assetsDir, "wasm"))
-			}
 		}
 	}
 	for _, wasmSrc := range candidateDirs {
@@ -7715,65 +7639,6 @@ func copyFile(src string, bundle *export.Bundle, name string) error {
 	defer srcFile.Close()
 
 	return bundle.CopyFile(name, srcFile, 0666)
-}
-
-func copyFileWithTitleSubtitleAndCacheBusting(src string, bundle *export.Bundle, name, title, subtitle string) error {
-	content, err := os.ReadFile(src)
-	if err != nil {
-		return err
-	}
-
-	result := string(content)
-
-	// Replace title in <title> tag and in the h1 header (if title provided)
-	if title != "" {
-		safeTitle := html.EscapeString(title)
-		result = strings.Replace(result, "<title>Beads Viewer</title>", "<title>"+safeTitle+"</title>", 1)
-		result = strings.Replace(result, `<h1 class="text-lg sm:text-xl font-semibold">Beads Viewer</h1>`, `<h1 class="text-lg sm:text-xl font-semibold">`+safeTitle+`</h1>`, 1)
-		result = strings.Replace(result, `<h1 class="text-xl font-semibold">Beads Viewer</h1>`, `<h1 class="text-xl font-semibold">`+safeTitle+`</h1>`, 1)
-	}
-	if strings.TrimSpace(subtitle) != "" {
-		result = export.ReplaceSubtitle(result, subtitle)
-	}
-
-	// Always add cache-busting to script tags to prevent CDN from serving stale JS files
-	result = export.AddScriptCacheBusting(result)
-
-	return bundle.WriteFile(name, []byte(result), 0644)
-}
-
-// copyDir recursively copies a directory.
-func copyDir(src string, bundle *export.Bundle, name string) error {
-	srcInfo, err := os.Stat(src)
-	if err != nil {
-		return err
-	}
-
-	if err := bundle.MkdirAll(name, srcInfo.Mode().Perm()); err != nil {
-		return err
-	}
-
-	entries, err := os.ReadDir(src)
-	if err != nil {
-		return err
-	}
-
-	for _, entry := range entries {
-		srcPath := filepath.Join(src, entry.Name())
-		dstPath := filepath.Join(name, entry.Name())
-
-		if entry.IsDir() {
-			if err := copyDir(srcPath, bundle, dstPath); err != nil {
-				return err
-			}
-		} else {
-			if err := copyFile(srcPath, bundle, dstPath); err != nil {
-				return err
-			}
-		}
-	}
-
-	return nil
 }
 
 // generateREADME creates a README.md file for the GitHub Pages repository.
@@ -10719,6 +10584,9 @@ func robotFlagExampleForm(flag string) string {
 		{"<ref>", "HEAD~1"},
 		{"<id>", "ISSUE_ID"},
 		{"<n>", "10"},
+		{"<csv>", "waiting,needs-spec"},
+		{"<ms>", "10000"},
+		{"<user>", "alice"},
 	}
 	for _, replacement := range replacements {
 		flag = strings.ReplaceAll(flag, replacement.old, replacement.new)

@@ -128,7 +128,7 @@ async function resolveHasHybridWasm(metaOverride) {
 
   if (typeof fetch === 'function') {
     try {
-      const resp = await fetch('./data/meta.json');
+      const resp = await fetch(`./data/meta.json?_t=${Date.now()}`, { cache: 'no-store' });
       if (resp.ok) {
         const json = await resp.json();
         if (typeof window !== 'undefined') {

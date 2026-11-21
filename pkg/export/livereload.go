@@ -7,7 +7,9 @@ package export
 import (
 	"bytes"
 	"fmt"
+	"io/fs"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -29,9 +31,8 @@ type LiveReloadHub struct {
 	done     chan struct{}
 	stopOnce sync.Once
 
-	// debounce rapid file changes
-	lastEvent time.Time
-	debounce  time.Duration
+	// trailing-edge debounce for rapid file changes (e.g., atomic bundle re-export)
+	debounce time.Duration
 }
 
 // NewLiveReloadHub creates a new live-reload hub for the given bundle path.
@@ -52,24 +53,36 @@ func NewLiveReloadHub(bundlePath string) (*LiveReloadHub, error) {
 	return hub, nil
 }
 
-// Start begins watching the bundle directory for changes.
+// Start begins watching the bundle directory and its subdirectories for changes.
 func (h *LiveReloadHub) Start() error {
 	// Watch the bundle directory
 	if err := h.watcher.Add(h.bundlePath); err != nil {
 		return fmt.Errorf("watch bundle path: %w", err)
 	}
 
-	// Also watch subdirectories (one level deep for common cases)
-	entries, err := filepath.Glob(filepath.Join(h.bundlePath, "*"))
-	if err == nil {
-		for _, entry := range entries {
-			// Best effort - ignore errors for individual subdirs
-			_ = h.watcher.Add(entry)
-		}
-	}
+	// Recursively watch existing subdirectories (best effort on nested dirs).
+	h.watchDirTree(h.bundlePath)
 
 	go h.watchLoop()
 	return nil
+}
+
+// watchDirTree registers root and any nested regular subdirectories with fsnotify.
+func (h *LiveReloadHub) watchDirTree(root string) {
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || !d.IsDir() {
+			return nil
+		}
+		if path != root && strings.HasPrefix(d.Name(), ".bv-export-") {
+			return filepath.SkipDir
+		}
+		_ = h.watcher.Add(path)
+		return nil
+	})
+}
+
+func isLiveReloadTempPath(path string) bool {
+	return strings.HasPrefix(filepath.Base(path), ".bv-export-")
 }
 
 // Stop shuts down the live-reload hub.
@@ -95,31 +108,72 @@ func (h *LiveReloadHub) ClientCount() int {
 	return len(h.clients)
 }
 
-// watchLoop processes file system events and notifies clients.
+// watchLoop processes file system events with a trailing-edge debounce timer,
+// ignores .bv-export-* staging temp files, and dynamically watches newly
+// created subdirectories so atomic re-exports trigger reload AFTER completion.
 func (h *LiveReloadHub) watchLoop() {
+	var timer *time.Timer
+	var timerCh <-chan time.Time
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
+
+	resetDebounce := func() {
+		delay := h.debounce
+		if delay <= 0 {
+			delay = 10 * time.Millisecond
+		}
+		if timer == nil {
+			timer = time.NewTimer(delay)
+			timerCh = timer.C
+			return
+		}
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		timer.Reset(delay)
+		timerCh = timer.C
+	}
+
 	for {
 		select {
 		case <-h.done:
 			return
+
+		case <-timerCh:
+			timerCh = nil
+			h.notifyClients()
 
 		case event, ok := <-h.watcher.Events:
 			if !ok {
 				return
 			}
 
-			// Only notify on write/create events (not chmod, etc)
-			if event.Op&(fsnotify.Write|fsnotify.Create) == 0 {
+			// Ignore staging temp files created by atomic Bundle.WriteFile; wait for
+			// the final rename/create/write into place.
+			if isLiveReloadTempPath(event.Name) {
 				continue
 			}
 
-			// Debounce rapid changes
-			now := time.Now()
-			if now.Sub(h.lastEvent) < h.debounce {
+			// Dynamically watch newly created subdirectories so files later written
+			// inside them also trigger reload notifications.
+			if event.Op&fsnotify.Create != 0 {
+				if info, err := os.Stat(event.Name); err == nil && info.IsDir() {
+					h.watchDirTree(event.Name)
+				}
+			}
+
+			// Notify on write, create, or atomic rename completion (not chmod).
+			if event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename) == 0 {
 				continue
 			}
-			h.lastEvent = now
 
-			h.notifyClients()
+			resetDebounce()
 
 		case _, ok := <-h.watcher.Errors:
 			if !ok {
