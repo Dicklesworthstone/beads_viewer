@@ -553,6 +553,52 @@ func (r *ReadinessIndex) Blockers(id string) []string {
 	return ids
 }
 
+// SoleUnblockerIfNoParent identifies the unique issue whose single-step
+// completion transitions id from not-ready to ready when id has no
+// DepParentChild edges. When id has any DepParentChild edge, hasParent is true
+// and callers should evaluate parent-chain readiness via ReadyAfterSingle.
+// This matches (!Ready(id, now) && ReadyAfterSingle(id, now, X)) exactly in
+// O(deg(id)) time without allocating per-edge maps.
+func (r *ReadinessIndex) SoleUnblockerIfNoParent(id string, now time.Time) (blockerID string, ok bool, hasParent bool) {
+	if r == nil {
+		return "", false, false
+	}
+	idx, exists := r.idToIdx[id]
+	if !exists {
+		return "", false, false
+	}
+	issue := &r.issues[idx]
+	if (issue.Status != StatusOpen && issue.Status != StatusInProgress) ||
+		issue.isWithheldFromReady() || issue.isDeferredAt(now) ||
+		r.states[idx] == DependenciesSatisfied {
+		return "", false, false
+	}
+	if issue.hasParentEdge {
+		return "", false, true
+	}
+	soleIdx := int32(-1)
+	for _, dep := range issue.Dependencies {
+		if !dep.Type.IsBlocking() {
+			continue
+		}
+		if dep.DependsOnIdx < 0 {
+			return "", false, false
+		}
+		if closedForReadiness(r.issues[dep.DependsOnIdx].Status) {
+			continue
+		}
+		if soleIdx == -1 {
+			soleIdx = dep.DependsOnIdx
+		} else if soleIdx != dep.DependsOnIdx {
+			return "", false, false
+		}
+	}
+	if soleIdx < 0 || int(soleIdx) == idx {
+		return "", false, false
+	}
+	return r.ids[soleIdx], true, false
+}
+
 // ReadyAfterSingle evaluates ReadyAfter when simulating completion of a single
 // issue without allocating a map per query.
 func (r *ReadinessIndex) ReadyAfterSingle(id string, now time.Time, completedID string) bool {
