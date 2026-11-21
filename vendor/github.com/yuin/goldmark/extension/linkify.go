@@ -11,9 +11,9 @@ import (
 	"github.com/yuin/goldmark/util"
 )
 
-var wwwURLRegxp = regexp.MustCompile(`^www\.[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-z]+(?:[/#?][-a-zA-Z0-9@:%_\+.~#!?&/=\(\);,'">\^{}\[\]` + "`" + `]*)?`) //nolint:golint,lll
+var wwwURLRegxp = regexp.MustCompile(`^www\.[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-z]+(?:[/#?][-a-zA-Z0-9@:%_\+.~#!?&/=\(\);,'">\^{}\[\]` + "`" + `]*)?`) //nolint:lll
 
-var urlRegexp = regexp.MustCompile(`^(?:http|https|ftp)://[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-z]+(?::\d+)?(?:[/#?][-a-zA-Z0-9@:%_+.~#$!?&/=\(\);,'">\^{}\[\]` + "`" + `]*)?`) //nolint:golint,lll
+var urlRegexp = regexp.MustCompile(`^(?:http|https|ftp)://[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-z]+(?::\d+)?(?:[/#?][-a-zA-Z0-9@:%_+.~#$!?&/=\(\);,'">\^{}\[\]` + "`" + `]*)?`) //nolint:lll
 
 // An LinkifyConfig struct is a data structure that holds configuration of the
 // Linkify extension.
@@ -244,31 +244,36 @@ func (s *linkifyParser) Parse(parent ast.Node, block text.Reader, pc parser.Cont
 		s := segment.WithStop(segment.Start + 1)
 		ast.MergeOrAppendTextSegment(parent, s)
 	}
-	i := m[1] - 1
-	for ; i > 0; i-- {
-		c := line[i]
-		switch c {
+	opening := bytes.Count(line[:m[1]], []byte{'('})
+	closing := bytes.Count(line[:m[1]], []byte{')'})
+	i := m[1]
+	for i > 1 {
+		switch line[i-1] {
 		case '?', '!', '.', ',', ':', '*', '_', '~':
+			i--
+		case ')':
+			if closing <= opening {
+				goto endfor
+			}
+			closing--
+			i--
+		case ';':
+			j := i - 2
+			for ; j > 0; j-- {
+				if util.IsAlphaNumeric(line[j]) {
+					continue
+				}
+				break
+			}
+			if j == i-2 || line[j] != '&' {
+				goto endfor
+			}
+			i = j
 		default:
 			goto endfor
 		}
 	}
 endfor:
-	i++
-	if line[i-1] == ')' {
-		i -= max(0, bytes.Count(line[:i], []byte{')'})-bytes.Count(line[:i], []byte{'('}))
-	} else if line[i-1] == ';' {
-		j := i - 2
-		for ; j >= m[0]; j-- {
-			if util.IsAlphaNumeric(line[j]) {
-				continue
-			}
-			break
-		}
-		if j != i-2 && line[j] == '&' {
-			i = j
-		}
-	}
 	consumes += i
 	block.Advance(consumes)
 	n := ast.NewTextSegment(text.NewSegment(start, start+i))
