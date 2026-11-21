@@ -124,7 +124,8 @@ printf 'Fixture release source.\n' >"$fixture/README.md"
 printf 'cmd/bv/ignored.go\n' >"$fixture/.gitignore"
 for script in scripts/check_action_pins.sh scripts/verify_vendor.sh scripts/benchmark.sh \
     scripts/robot_smoke.sh tests/scripts/benchmark_compare_test.sh \
-    tests/scripts/release_gate_test.sh tests/scripts/install_ps1_test.sh; do
+    tests/scripts/release_gate_test.sh tests/scripts/graph_wasm_test.sh \
+    tests/scripts/install_ps1_test.sh; do
   cat >"$fixture/$script" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail

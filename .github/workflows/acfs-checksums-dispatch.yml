@@ -1,5 +1,6 @@
 name: Notify ACFS checksum monitor
 
+# Retained as input for local DSR/act execution. GitHub Actions stays disabled.
 on:
   push:
     branches: [main]

@@ -16,7 +16,7 @@
     and verifies the executable's embedded Go version before installation.
     Source and build diagnostics are retained if installation fails.
 .PARAMETER Version
-    Release tag to install, e.g. v0.23.0. Default: the latest GitHub release.
+    Release tag to install, e.g. v0.26.1. Default: the latest GitHub release.
 .PARAMETER InstallDir
     Where bv.exe is placed. Default: %LOCALAPPDATA%\Programs\bv.
 .PARAMETER FromSource
@@ -27,7 +27,7 @@
 .EXAMPLE
     # Pin the script to a commit rather than piping `main` (see README):
     irm https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/<commit>/install.ps1 -OutFile install.ps1
-    .\install.ps1 -Version v0.23.0
+    .\install.ps1 -Version v0.26.1
 .NOTES
     BV_INSTALL_API_URL, BV_INSTALL_DOWNLOAD_URL and BV_INSTALL_SOURCE_URL
     override the GitHub API, download and Git source locations for isolated
@@ -117,7 +117,7 @@ function Resolve-ReleaseTag {
     if ($Requested) {
         $tag = $Requested.Trim()
         if ($tag -notmatch '^v') { $tag = "v$tag" }
-        if ($tag -notmatch '^v\d+\.\d+\.\d+([-.][0-9A-Za-z.]+)?$') { Fail "Version '$Requested' is not a release tag like v0.23.0" }
+        if ($tag -notmatch '^v\d+\.\d+\.\d+([-.][0-9A-Za-z.]+)?$') { Fail "Version '$Requested' is not a release tag like v0.26.1" }
         return $tag
     }
     $latest = Invoke-JsonGet "$apiBase/releases/latest"

@@ -1,5 +1,6 @@
 name: Flake Update
 
+# Retained as input for local DSR/act execution. GitHub Actions stays disabled.
 on:
   schedule:
     # Weekly on Sunday at 00:00 UTC

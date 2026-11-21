@@ -771,6 +771,14 @@ script_self_tests() {
   elif [ "$rc" -ne 0 ]; then
     return "$rc"
   fi
+  bash tests/scripts/graph_wasm_test.sh
+  rc=$?
+  if [ "$rc" -eq 2 ]; then
+    echo "graph_wasm_test skipped: required WASM/Node toolchain unavailable"
+    helper_skipped=1
+  elif [ "$rc" -ne 0 ]; then
+    return "$rc"
+  fi
   local pwsh="${PWSH:-pwsh}"
   if command -v "$pwsh" >/dev/null 2>&1; then
     PWSH="$pwsh" tests/scripts/install_ps1_test.sh || return 1

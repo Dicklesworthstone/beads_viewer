@@ -1,4 +1,5 @@
 # .github/workflows/notify-acfs.yml
+# Retained as input for local DSR/act execution. GitHub Actions stays disabled.
 #
 # Notifies ACFS when installer scripts change, triggering checksum updates.
 # Use this template for repos with install.sh at the repository root.

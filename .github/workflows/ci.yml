@@ -27,19 +27,27 @@ jobs:
         
     # The release gate is the single source of truth for "is this shippable":
     # gofmt, build+vet, unit tests with -race, e2e with -race, docs parity,
-    # action pins, vendor hashes, robot smoke. Local releases run the same
-    # script, so CI and a developer's machine cannot disagree. Stage 8
-    # (benchmark comparison) needs benchstat and a refreshed baseline and is
-    # skipped here until that lands.
+    # action pins, vendor hashes, robot smoke, script tests, vuln audit.
+    # Stage 8 (benchmark comparison) is skipped in local diagnostic CI until a
+    # fresh baseline is attached; diagnostic skip runs exit 2 (never 0), while
+    # exit 1 signals an actual stage failure.
     - name: Release gate
-      run: RELEASE_GATE_SKIP="8" RELEASE_GATE_ALLOW_MISSING=1 scripts/release_gate.sh
+      run: |
+        mkdir -p "${RUNNER_TEMP:-/tmp}/bv-release-gate"
+        rc=0
+        RELEASE_GATE_SKIP="8" RELEASE_GATE_ALLOW_MISSING=1 RELEASE_GATE_OUTPUT_DIR="${RUNNER_TEMP:-/tmp}/bv-release-gate" bash scripts/release_gate.sh || rc=$?
+        if [ "$rc" -ne 0 ] && [ "$rc" -ne 2 ]; then
+          exit "$rc"
+        fi
 
     - name: Upload release gate log
       if: always()
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
       with:
         name: release-gate-log
-        path: tests/artifacts/release_gate_*.log
+        path: |
+          ${{ runner.temp }}/bv-release-gate/**/gate.log
+          ${{ runner.temp }}/bv-release-gate/**/receipt.json
         if-no-files-found: ignore
 
     - name: Test with Coverage

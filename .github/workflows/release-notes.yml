@@ -1,5 +1,6 @@
 name: Auto Release Notes
 
+# Retained as input for local DSR/act execution. GitHub Actions stays disabled.
 on:
   release:
     types: [created, edited]

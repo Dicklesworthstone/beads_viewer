@@ -1620,3 +1620,370 @@ func TestAggregateLoader_SharedPathDistinctBeadsPathMonorepo(t *testing.T) {
 		t.Fatalf("expected both api-1 and web-1 loaded, got %v", seenIDs)
 	}
 }
+
+func TestAggregateLoader_ResolvedReposAndSourceFallbacks(t *testing.T) {
+	// Nil loader guard on ResolvedRepos.
+	var nilLoader *workspace.AggregateLoader
+	if _, err := nilLoader.ResolvedRepos(); err == nil {
+		t.Fatal("expected nil AggregateLoader.ResolvedRepos() to return error")
+	}
+
+	// ResolveWorkspaceBaseDir fallback when configPath is empty.
+	if got := workspace.ResolveWorkspaceBaseDir(""); got == "" {
+		t.Fatal("expected ResolveWorkspaceBaseDir(\"\") to return non-empty working directory")
+	}
+
+	wsRoot := t.TempDir()
+
+	// 1) Repo with corrupt SQLite DB + valid issues.jsonl -> falls back to JSONL, marks sibling SQLite corrupt.
+	corruptRepo := filepath.Join(wsRoot, "corrupt-sqlite")
+	if err := os.MkdirAll(filepath.Join(corruptRepo, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	corruptDB := filepath.Join(corruptRepo, ".beads", "beads.db")
+	if err := os.WriteFile(corruptDB, []byte("not-a-valid-sqlite-database"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	jsonlPath := filepath.Join(corruptRepo, ".beads", "issues.jsonl")
+	if err := os.WriteFile(jsonlPath, []byte(`{"id":"1","title":"Fallback issue","status":"open","priority":1,"issue_type":"task","dependencies":[{"issue_id":"1","depends_on_id":"sqlonly-1","type":"blocks"}],"comments":[{"id":1,"issue_id":"1","author":"dev","text":"note"}]}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Make corrupt DB newer so candidate sorting picks SQLite first and exercises fallback.
+	now := time.Now()
+	_ = os.Chtimes(jsonlPath, now.Add(-time.Minute), now.Add(-time.Minute))
+	_ = os.Chtimes(corruptDB, now, now)
+
+	// 2) Repo with SQLite only (no JSONL) discovered via auto-discovery.
+	sqlOnlyRepo := filepath.Join(wsRoot, "sqlonly")
+	if err := os.MkdirAll(filepath.Join(sqlOnlyRepo, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", filepath.Join(sqlOnlyRepo, ".beads", "beads.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		`CREATE TABLE issues (id TEXT PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL, priority INTEGER DEFAULT 2, issue_type TEXT DEFAULT 'task')`,
+		`INSERT INTO issues (id, title, status) VALUES ('1', 'SQLite discovered issue', 'open')`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			_ = db.Close()
+			t.Fatal(err)
+		}
+	}
+	_ = db.Close()
+
+	// 3) Repo with corrupt newer issues.jsonl + valid older beads.db -> exercises JSONL->SQLite fallback & tie-breakers.
+	fallbackJSONLRepo := filepath.Join(wsRoot, "jsonl-fallback")
+	if err := os.MkdirAll(filepath.Join(fallbackJSONLRepo, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	badJSONL := filepath.Join(fallbackJSONLRepo, ".beads", "issues.jsonl")
+	goodDB := filepath.Join(fallbackJSONLRepo, ".beads", "beads.db")
+	if err := os.WriteFile(badJSONL, []byte("{not-json\n{also-bad\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	db2, err := sql.Open("sqlite", goodDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		`CREATE TABLE issues (id TEXT PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL, priority INTEGER DEFAULT 2, issue_type TEXT DEFAULT 'task')`,
+		`INSERT INTO issues (id, title, status) VALUES ('2', 'Good SQLite fallback', 'open')`,
+	} {
+		if _, err := db2.Exec(stmt); err != nil {
+			_ = db2.Close()
+			t.Fatal(err)
+		}
+	}
+	_ = db2.Close()
+	// Make corrupt JSONL newer so candidate sorting picks JSONL first and exercises JSONL->SQLite fallback.
+	_ = os.Chtimes(goodDB, now.Add(-time.Minute), now.Add(-time.Minute))
+	_ = os.Chtimes(badJSONL, now, now)
+
+	// 4) Repo with newer valid issues.jsonl + older corrupt sibling beads.db + metadata.json ->
+	//    exercises sibling SQLite validation + ReadOnlyReason annotation.
+	siblingCorruptRepo := filepath.Join(wsRoot, "sibling-corrupt")
+	if err := os.MkdirAll(filepath.Join(siblingCorruptRepo, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sibDB := filepath.Join(siblingCorruptRepo, ".beads", "beads.db")
+	sibJSONL := filepath.Join(siblingCorruptRepo, ".beads", "issues.jsonl")
+	if err := os.WriteFile(sibDB, []byte("corrupt-sibling-sqlite"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(siblingCorruptRepo, ".beads", "metadata.json"), []byte(`{"database":"beads.db","jsonl_export":"issues.jsonl"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sibJSONL, []byte(`{"id":"1","title":"Fresh JSONL with corrupt sibling DB","status":"open","priority":1,"issue_type":"task"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Chtimes(sibDB, now.Add(-time.Minute), now.Add(-time.Minute))
+	_ = os.Chtimes(sibJSONL, now, now)
+
+	// 5) Repo with newer high-error-rate issues.jsonl (1 valid + 9 bad > maxErrorRate) + valid older beads.db ->
+	//    exercises JSONL error-rate threshold fallback to SQLite.
+	highErrRepo := filepath.Join(wsRoot, "high-err-jsonl")
+	if err := os.MkdirAll(filepath.Join(highErrRepo, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	highErrJSONL := filepath.Join(highErrRepo, ".beads", "issues.jsonl")
+	highErrDB := filepath.Join(highErrRepo, ".beads", "beads.db")
+	if err := os.WriteFile(highErrJSONL, []byte(`{"id":"1","title":"Only valid","status":"open"}`+"\n"+strings.Repeat("{bad\n", 9)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	db3, err := sql.Open("sqlite", highErrDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		`CREATE TABLE issues (id TEXT PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL, priority INTEGER DEFAULT 2, issue_type TEXT DEFAULT 'task')`,
+		`INSERT INTO issues (id, title, status) VALUES ('3', 'Recovered from SQLite', 'open')`,
+	} {
+		if _, err := db3.Exec(stmt); err != nil {
+			_ = db3.Close()
+			t.Fatal(err)
+		}
+	}
+	_ = db3.Close()
+	_ = os.Chtimes(highErrDB, now.Add(-time.Minute), now.Add(-time.Minute))
+	_ = os.Chtimes(highErrJSONL, now, now)
+
+	// 6) Repo with equal-mtime beads.db and issues.jsonl -> exercises priority tie-breaker in sortWorkspaceCandidates.
+	tieRepo := filepath.Join(wsRoot, "tie-priority")
+	if err := os.MkdirAll(filepath.Join(tieRepo, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	tieDB := filepath.Join(tieRepo, ".beads", "beads.db")
+	tieJSONL := filepath.Join(tieRepo, ".beads", "issues.jsonl")
+	db4, err := sql.Open("sqlite", tieDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range []string{
+		`CREATE TABLE issues (id TEXT PRIMARY KEY, title TEXT NOT NULL, status TEXT NOT NULL, priority INTEGER DEFAULT 2, issue_type TEXT DEFAULT 'task')`,
+		`INSERT INTO issues (id, title, status) VALUES ('4', 'SQLite priority tie win', 'open')`,
+	} {
+		if _, err := db4.Exec(stmt); err != nil {
+			_ = db4.Close()
+			t.Fatal(err)
+		}
+	}
+	_ = db4.Close()
+	if err := os.WriteFile(tieJSONL, []byte(`{"id":"4","title":"JSONL tie","status":"open","priority":2,"issue_type":"task"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Chtimes(tieDB, now, now)
+	_ = os.Chtimes(tieJSONL, now, now)
+
+	// 7) Excluded directory and non-tracker directory under discovery root.
+	if err := os.MkdirAll(filepath.Join(wsRoot, "ignored-dir", ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wsRoot, "ignored-dir", ".beads", "issues.jsonl"), []byte(`{"id":"9","title":"Ignored","status":"open"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(wsRoot, "empty-beads", ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wsRoot, "plain-file"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &workspace.Config{
+		Repos: []workspace.RepoConfig{
+			{Name: "corrupt-sqlite", Path: "corrupt-sqlite", Prefix: "cs-"},
+			{Name: "jsonl-fallback", Path: "jsonl-fallback", Prefix: "jf-"},
+			{Name: "sibling-corrupt", Path: "sibling-corrupt", Prefix: "sc-"},
+			{Name: "high-err-jsonl", Path: "high-err-jsonl", Prefix: "he-"},
+			{Name: "tie-priority", Path: "tie-priority", Prefix: "tp-"},
+		},
+		Discovery: workspace.DiscoveryConfig{
+			Enabled:  true,
+			Patterns: []string{"*"},
+			Exclude:  []string{"ignored-*", ""},
+			MaxDepth: 1,
+		},
+	}
+	agg := workspace.NewAggregateLoader(cfg, wsRoot)
+	agg.SetLogger(log.New(io.Discard, "", 0))
+
+	resolved, err := agg.ResolvedRepos()
+	if err != nil {
+		t.Fatalf("ResolvedRepos() error = %v", err)
+	}
+	if len(resolved) != 6 {
+		t.Fatalf("len(ResolvedRepos()) = %d, want 6 (5 configured + 1 sqlonly discovered): %+v", len(resolved), resolved)
+	}
+
+	issues, results, err := agg.LoadAll(context.Background())
+	if err != nil {
+		t.Fatalf("LoadAll() error = %v", err)
+	}
+	byName := map[string]workspace.LoadResult{}
+	for _, r := range results {
+		byName[r.RepoName] = r
+		if r.Error != nil {
+			t.Fatalf("unexpected load error for %s: %v", r.RepoName, r.Error)
+		}
+	}
+	if byName["corrupt-sqlite"].SourceKind != "jsonl_local" || len(byName["corrupt-sqlite"].AuthorityWarnings) == 0 {
+		t.Fatalf("expected corrupt-sqlite to fall back to jsonl_local with warnings, got %+v", byName["corrupt-sqlite"])
+	}
+	if byName["jsonl-fallback"].SourceKind != "sqlite" || !strings.HasSuffix(byName["jsonl-fallback"].SourcePath, "beads.db") {
+		t.Fatalf("expected jsonl-fallback to fall back to beads.db, got %+v", byName["jsonl-fallback"])
+	}
+	if byName["sibling-corrupt"].SourceKind != "jsonl_local" || len(byName["sibling-corrupt"].AuthorityWarnings) == 0 {
+		t.Fatalf("expected sibling-corrupt to warn on corrupt sibling DB, got %+v", byName["sibling-corrupt"])
+	}
+	if byName["high-err-jsonl"].SourceKind != "sqlite" {
+		t.Fatalf("expected high-err-jsonl to fall back to sqlite, got %+v", byName["high-err-jsonl"])
+	}
+	if byName["tie-priority"].SourceKind != "sqlite" {
+		t.Fatalf("expected equal-mtime tie-priority to prefer sqlite by priority, got %+v", byName["tie-priority"])
+	}
+	if byName["sqlonly"].SourceKind != "sqlite" {
+		t.Fatalf("expected sqlonly discovered repo to load sqlite, got %+v", byName["sqlonly"])
+	}
+	// Verify sibling-corrupt issue marks sibling SQLite read-only reason.
+	var foundCS, foundSC bool
+	for _, iss := range issues {
+		if iss.ID == "cs-1" {
+			foundCS = true
+			if len(iss.Dependencies) != 1 || iss.Dependencies[0].DependsOnID != "sqlonly-1" {
+				t.Fatalf("expected cross-repo dep sqlonly-1 preserved, got %+v", iss.Dependencies)
+			}
+			if len(iss.Comments) != 1 || iss.Comments[0].IssueID != "cs-1" {
+				t.Fatalf("expected comment issue ID qualified to cs-1, got %+v", iss.Comments)
+			}
+		}
+		if iss.ID == "sc-1" {
+			foundSC = true
+			if iss.Origin == nil || !strings.Contains(iss.Origin.ReadOnlyReason, "corrupt") {
+				t.Fatalf("expected sc-1 ReadOnlyReason to note corrupt sibling DB, got %+v", iss.Origin)
+			}
+		}
+	}
+	if !foundCS || !foundSC {
+		t.Fatalf("expected cs-1 and sc-1 in loaded issues, got foundCS=%v foundSC=%v", foundCS, foundSC)
+	}
+
+	// Verify sole-source corrupt SQLite returns an error cleanly instead of crashing.
+	soleCorruptDir := filepath.Join(wsRoot, "sole-corrupt")
+	if err := os.MkdirAll(filepath.Join(soleCorruptDir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(soleCorruptDir, ".beads", "beads.db"), []byte("corrupt-only"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	soleCfg := &workspace.Config{Repos: []workspace.RepoConfig{{Name: "sole-corrupt", Path: "sole-corrupt", Prefix: "sole-"}}}
+	soleAgg := workspace.NewAggregateLoader(soleCfg, wsRoot)
+	soleAgg.SetLogger(log.New(io.Discard, "", 0))
+	if _, soleRes, soleErr := soleAgg.LoadAll(context.Background()); soleErr == nil || len(soleRes) != 1 || soleRes[0].Error == nil {
+		t.Fatalf("expected sole corrupt SQLite repo to fail cleanly, err=%v results=%+v", soleErr, soleRes)
+	}
+
+	// Verify empty JSONL with corrupt sibling SQLite triggers probe-origin validation warning.
+	emptyProbeDir := filepath.Join(wsRoot, "empty-probe")
+	if err := os.MkdirAll(filepath.Join(emptyProbeDir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	epDB := filepath.Join(emptyProbeDir, ".beads", "beads.db")
+	epJSONL := filepath.Join(emptyProbeDir, ".beads", "issues.jsonl")
+	if err := os.WriteFile(epDB, []byte("corrupt-probe-db"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(emptyProbeDir, ".beads", "metadata.json"), []byte(`{"database":"beads.db","jsonl_export":"issues.jsonl"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(epJSONL, []byte(""), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Chtimes(epDB, now.Add(-time.Minute), now.Add(-time.Minute))
+	_ = os.Chtimes(epJSONL, now, now)
+	epCfg := &workspace.Config{Repos: []workspace.RepoConfig{{Name: "empty-probe", Path: "empty-probe", Prefix: "ep-"}}}
+	epAgg := workspace.NewAggregateLoader(epCfg, wsRoot)
+	epAgg.SetLogger(log.New(io.Discard, "", 0))
+	if _, epRes, epErr := epAgg.LoadAll(context.Background()); epErr != nil || len(epRes) != 1 || len(epRes[0].AuthorityWarnings) == 0 {
+		t.Fatalf("expected empty-probe to warn on corrupt sibling DB, err=%v results=%+v", epErr, epRes)
+	}
+
+	// Verify Dolt/BD workspace branch loads compatibility JSONL and reports malformed-only failure cleanly.
+	bdRepo := filepath.Join(wsRoot, "bd-dolt")
+	if err := os.MkdirAll(filepath.Join(bdRepo, ".beads", "dolt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bdRepo, ".beads", "metadata.json"), []byte(`{"backend":"dolt","jsonl_export":"issues.jsonl"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bdRepo, ".beads", "issues.jsonl"), []byte(`{"id":"10","title":"BD issue","status":"open","priority":1,"issue_type":"task","dependencies":[{"issue_id":"10","depends_on_id":"ext-99","type":"blocks"}]}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	bdCfg := &workspace.Config{Repos: []workspace.RepoConfig{{Name: "bd-dolt", Path: "bd-dolt", Prefix: "bd-"}}}
+	bdAgg := workspace.NewAggregateLoader(bdCfg, wsRoot)
+	bdAgg.SetLogger(log.New(io.Discard, "", 0))
+	bdIssues, bdRes, bdErr := bdAgg.LoadAll(context.Background())
+	if bdErr != nil || len(bdRes) != 1 || bdRes[0].Error != nil || len(bdIssues) != 1 || bdIssues[0].ID != "bd-10" {
+		t.Fatalf("expected bd-dolt repo to load bd-10, err=%v res=%+v issues=%+v", bdErr, bdRes, bdIssues)
+	}
+	if len(bdIssues[0].Dependencies) != 1 || bdIssues[0].Dependencies[0].DependsOnID != "bd-ext-99" {
+		t.Fatalf("expected unknown prefix dep qualified locally to bd-ext-99, got %+v", bdIssues[0].Dependencies)
+	}
+	// Malformed-only BD compatibility export must return a clear error.
+	if err := os.WriteFile(filepath.Join(bdRepo, ".beads", "issues.jsonl"), []byte("{corrupt-bd\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, badBDRes, badBDErr := bdAgg.LoadAll(context.Background()); badBDErr == nil || len(badBDRes) != 1 || badBDRes[0].Error == nil {
+		t.Fatalf("expected malformed BD JSONL to fail cleanly, err=%v res=%+v", badBDErr, badBDRes)
+	}
+
+	// Verify broken .beads/redirect preserves recovery WatchPaths and returns resolution error.
+	redirRoot := t.TempDir()
+	brokenRedir := filepath.Join(redirRoot, "broken-redirect")
+	if err := os.MkdirAll(filepath.Join(brokenRedir, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(brokenRedir, ".beads", "redirect"), []byte("../nonexistent-target/.beads\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	redirAgg := workspace.NewAggregateLoader(&workspace.Config{
+		Repos: []workspace.RepoConfig{{Name: "broken-redirect", Path: "broken-redirect", Prefix: "br-"}},
+	}, redirRoot)
+	redirAgg.SetLogger(log.New(io.Discard, "", 0))
+	if _, redirRes, redirErr := redirAgg.LoadAll(context.Background()); redirErr == nil || len(redirRes) != 1 || redirRes[0].Error == nil || len(redirRes[0].WatchPaths) == 0 {
+		t.Fatalf("expected broken redirect to return error with WatchPaths, err=%v res=%+v", redirErr, redirRes)
+	}
+
+	// Verify equal-mtime issues.jsonl vs beads.jsonl chooses PreferredJSONLNames order (issues.jsonl first).
+	dualJSONL := filepath.Join(wsRoot, "dual-jsonl")
+	if err := os.MkdirAll(filepath.Join(dualJSONL, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	djIssues := filepath.Join(dualJSONL, ".beads", "issues.jsonl")
+	djLegacy := filepath.Join(dualJSONL, ".beads", "beads.jsonl")
+	if err := os.WriteFile(djIssues, []byte(`{"id":"20","title":"Preferred issues.jsonl","status":"open","priority":1,"issue_type":"task"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(djLegacy, []byte(`{"id":"21","title":"Legacy beads.jsonl","status":"open","priority":1,"issue_type":"task"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Chtimes(djIssues, now, now)
+	_ = os.Chtimes(djLegacy, now, now)
+	djAgg := workspace.NewAggregateLoader(&workspace.Config{
+		Repos: []workspace.RepoConfig{{Name: "dual-jsonl", Path: "dual-jsonl", Prefix: "dj-"}},
+	}, wsRoot)
+	djIssuesOut, djRes, djErr := djAgg.LoadAll(context.Background())
+	if djErr != nil || len(djRes) != 1 || !strings.HasSuffix(djRes[0].SourcePath, "issues.jsonl") || len(djIssuesOut) != 1 || djIssuesOut[0].ID != "dj-20" {
+		t.Fatalf("expected equal-mtime dual JSONL to prefer issues.jsonl, err=%v res=%+v issues=%+v", djErr, djRes, djIssuesOut)
+	}
+
+	// Verify FindWorkspaceConfig("") defaults to current working directory cleanly.
+	_, _ = workspace.FindWorkspaceConfig("")
+
+	// Pre-canceled context returns cancellation error.
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, err := agg.LoadAll(canceledCtx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled on canceled context, got %v", err)
+	}
+}

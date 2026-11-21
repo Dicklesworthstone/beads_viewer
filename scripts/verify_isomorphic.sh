@@ -23,6 +23,7 @@
 #   SKIP_BUILD=1  Skip building (use existing binaries)
 
 set -euo pipefail
+export BV_NO_BROWSER=1 BV_TEST_MODE=1 BV_NO_SAVED_CONFIG=1 BV_NO_UPDATE_CHECK=1
 
 # Configuration
 BASELINE_REF="${1:-main}"
@@ -111,7 +112,7 @@ build_baseline() {
 # Build current version
 build_current() {
     log_info "Building current version..."
-    go build -o "$CURRENT_BIN" "$PROJECT_ROOT/cmd/bv" 2>/dev/null
+    (cd "$PROJECT_ROOT" && go build -o "$CURRENT_BIN" ./cmd/bv)
     log_success "Current built: $CURRENT_BIN"
 }
 
@@ -120,27 +121,16 @@ setup_fixtures() {
     log_info "Setting up test fixtures..."
 
     FIXTURE_DIR="$TEST_DIR/fixtures"
-    mkdir -p "$FIXTURE_DIR"
+    mkdir -p "$FIXTURE_DIR/cases"
 
-    # Copy existing test data if available
-    if [[ -d "$PROJECT_ROOT/testdata/graphs" ]]; then
-        cp -r "$PROJECT_ROOT/testdata/graphs" "$FIXTURE_DIR/"
-        log_verbose "Copied testdata/graphs"
-    fi
-
-    # Create .beads directories for each test case
-    for graph_file in "$FIXTURE_DIR/graphs"/*.json; do
-        [[ -f "$graph_file" ]] || continue
-
-        base_name=$(basename "$graph_file" .json)
-        test_case_dir="$FIXTURE_DIR/cases/$base_name"
-        beads_dir="$test_case_dir/.beads"
-        mkdir -p "$beads_dir"
-
-        # Convert graph JSON to beads.jsonl (simplified conversion)
-        # In a real setup, this would use the testutil.Generator
-        log_verbose "Preparing test case: $base_name"
-    done
+    # Create a deterministic synthetic fixture with dependencies and mixed statuses
+    SYNTH_CASE="$FIXTURE_DIR/cases/synthetic"
+    mkdir -p "$SYNTH_CASE/.beads"
+    cat > "$SYNTH_CASE/.beads/issues.jsonl" <<'EOF'
+{"id":"ISO-1","title":"Root task","status":"open","priority":1,"issue_type":"task","labels":["core"],"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z"}
+{"id":"ISO-2","title":"Blocked child","status":"open","priority":2,"issue_type":"task","labels":["core"],"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z","dependencies":[{"issue_id":"ISO-2","depends_on_id":"ISO-1","type":"blocks"}]}
+{"id":"ISO-3","title":"Closed task","status":"closed","priority":3,"issue_type":"task","labels":["ui"],"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z","closed_at":"2026-01-02T00:00:00Z"}
+EOF
 
     # Create a default test case from current project if .beads exists
     if [[ -d "$PROJECT_ROOT/.beads" ]]; then
@@ -155,16 +145,50 @@ setup_fixtures() {
     log_success "Test fixtures ready"
 }
 
-# Run a command and capture output
+# Normalize volatile per-run JSON fields (timestamps, binary version strings)
+normalize_json_output() {
+    local raw_file="$1"
+    local norm_file="$2"
+    if command -v jq >/dev/null 2>&1 && jq -e . "$raw_file" >/dev/null 2>&1; then
+        jq -S '
+          def scrub:
+            if type == "object" then
+              del(.generated_at, .version, .analysis_time_ms)
+              | with_entries(.value |= scrub)
+            elif type == "array" then
+              map(scrub)
+            else
+              .
+            end;
+          scrub
+        ' "$raw_file" > "$norm_file"
+    else
+        cp "$raw_file" "$norm_file"
+    fi
+}
+
+# Run a command and capture output (fails closed on non-zero exit)
 run_command() {
     local binary="$1"
     local case_dir="$2"
     local command="$3"
     local output_file="$4"
+    local raw_file="${output_file}.raw"
+    local err_file="${output_file}.err"
+    local rc=0
+    local -a argv=()
+    # shellcheck disable=SC2206
+    argv=($command)
 
-    cd "$case_dir"
-    "$binary" $command > "$output_file" 2>&1 || true
-    cd - > /dev/null
+    (cd "$case_dir" && "$binary" "${argv[@]}" > "$raw_file" 2> "$err_file") || rc=$?
+    if [[ "$rc" -ne 0 ]]; then
+        log_error "$case_dir ($binary $command) exited with status $rc"
+        if [[ -s "$err_file" ]]; then
+            sed 's/^/  stderr: /' "$err_file" | head -10
+        fi
+        return "$rc"
+    fi
+    normalize_json_output "$raw_file" "$output_file"
 }
 
 # Compare outputs
@@ -205,9 +229,15 @@ test_command() {
 
         mkdir -p "$TEST_DIR/output"
 
-        # Run both versions
-        run_command "$BASELINE_BIN" "$case_dir" "$cmd" "$baseline_out"
-        run_command "$CURRENT_BIN" "$case_dir" "$cmd" "$current_out"
+        # Run both versions (non-zero exit counts as failure)
+        if ! run_command "$BASELINE_BIN" "$case_dir" "$cmd" "$baseline_out"; then
+            ((failures++))
+            continue
+        fi
+        if ! run_command "$CURRENT_BIN" "$case_dir" "$cmd" "$current_out"; then
+            ((failures++))
+            continue
+        fi
 
         # Compare
         if ! compare_outputs "$baseline_out" "$current_out" "$case_name/$cmd"; then

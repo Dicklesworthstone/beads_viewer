@@ -105,13 +105,14 @@ usage() {
 Usage: install.sh [options]
 
 Options:
-  --version <tag>   Install a specific release tag (e.g. v0.26.0)
+  --version <tag>   Install a specific release tag (e.g. v0.26.1)
   --from-source     Skip pre-built release binaries and build from source
   -h, --help        Show this help message
 
 Environment:
   INSTALL_DIR       Target directory for installed binary (default: auto-detected)
   BV_VERSION        Same as --version <tag>
+  BV_SOURCE_REF     Optional git commit/tag to pin when building --from-source
   BV_FROM_SOURCE    Set to 1 to force building from source
 EOF
 }
@@ -895,30 +896,59 @@ try_go_install() {
             fi
         fi
     else
-        print_info "Fetching source..."
+        local source_ref="${BV_SOURCE_REF:-}"
+        if [ -n "$source_ref" ]; then
+            print_info "Fetching pinned source ref ${source_ref}..."
+            if command -v git >/dev/null 2>&1; then
+                if git clone --depth 1 --branch "$source_ref" "$repo_url" "$src_dir" >/dev/null 2>&1; then
+                    fetched=1
+                elif git init "$src_dir" >/dev/null 2>&1 && git -C "$src_dir" fetch --depth 1 "$repo_url" "$source_ref" >/dev/null 2>&1 && git -C "$src_dir" checkout --detach FETCH_HEAD >/dev/null 2>&1; then
+                    fetched=1
+                else
+                    print_warn "git clone/fetch for ref $source_ref failed, attempting pinned tarball download..."
+                fi
+            fi
+            if [ "$fetched" -ne 1 ]; then
+                tarball_url="https://codeload.github.com/${REPO_OWNER}/${REPO_NAME}/tar.gz/${source_ref}"
+                tarball_path="$tmp_dir/source.tar.gz"
+                if ! download_file "$tarball_url" "$tarball_path"; then
+                    print_error "Failed to download source tarball for ref $source_ref from GitHub."
+                    exit 1
+                fi
+                tar -xzf "$tarball_path" -C "$tmp_dir"
+                src_dir=$(find "$tmp_dir" -maxdepth 1 -type d -name "${REPO_NAME}-*" | head -1)
+                if [ -z "$src_dir" ]; then
+                    print_error "Could not locate extracted source directory."
+                    exit 1
+                fi
+            fi
+        else
+            print_warn "No --version or BV_SOURCE_REF specified; fetching floating main branch (pass --version v0.26.1 or BV_SOURCE_REF=<sha> for a pinned build)."
+            print_info "Fetching source..."
 
-        if command -v git >/dev/null 2>&1; then
-            if git clone --depth 1 "$repo_url" "$src_dir" >/dev/null 2>&1; then
-                fetched=1
-            else
-                print_warn "git clone failed, attempting tarball download..."
+            if command -v git >/dev/null 2>&1; then
+                if git clone --depth 1 "$repo_url" "$src_dir" >/dev/null 2>&1; then
+                    fetched=1
+                else
+                    print_warn "git clone failed, attempting tarball download..."
+                fi
             fi
-        fi
 
-        if [ "$fetched" -ne 1 ]; then
-            tarball_url="https://codeload.github.com/${REPO_OWNER}/${REPO_NAME}/tar.gz/refs/heads/main"
-            tarball_path="$tmp_dir/source.tar.gz"
-            if ! download_file "$tarball_url" "$tarball_path"; then
-                print_error "Failed to download source tarball from GitHub."
-                exit 1
+            if [ "$fetched" -ne 1 ]; then
+                tarball_url="https://codeload.github.com/${REPO_OWNER}/${REPO_NAME}/tar.gz/refs/heads/main"
+                tarball_path="$tmp_dir/source.tar.gz"
+                if ! download_file "$tarball_url" "$tarball_path"; then
+                    print_error "Failed to download source tarball from GitHub."
+                    exit 1
+                fi
+                tar -xzf "$tarball_path" -C "$tmp_dir"
+                src_dir=$(find "$tmp_dir" -maxdepth 1 -type d -name "${REPO_NAME}-*" | head -1)
+                if [ -z "$src_dir" ]; then
+                    print_error "Could not locate extracted source directory."
+                    exit 1
+                fi
+                used_main_tarball=1
             fi
-            tar -xzf "$tarball_path" -C "$tmp_dir"
-            src_dir=$(find "$tmp_dir" -maxdepth 1 -type d -name "${REPO_NAME}-*" | head -1)
-            if [ -z "$src_dir" ]; then
-                print_error "Could not locate extracted source directory."
-                exit 1
-            fi
-            used_main_tarball=1
         fi
     fi
 

@@ -14,6 +14,7 @@
 #   benchmarks/baseline_latest.txt             # Symlink to latest baseline
 
 set -e
+export BV_NO_BROWSER=1 BV_TEST_MODE=1 BV_NO_SAVED_CONFIG=1 BV_NO_UPDATE_CHECK=1
 
 # Configuration
 BENCHMARK_DIR="benchmarks"
@@ -92,39 +93,47 @@ capture_baseline() {
     # 1. Loader Benchmarks
     print_section "Loader Benchmarks"
     echo "Running loader benchmarks..."
-    go test -bench=. -benchmem -count=3 ./pkg/loader/... 2>&1 >> "$BASELINE_FILE" || true
+    go test -bench=. -benchmem -count=3 ./pkg/loader/... >> "$BASELINE_FILE" 2>&1 || true
 
     # 2. Analysis Benchmarks (core graph algorithms)
     print_section "Analysis Benchmarks"
     echo "Running analysis benchmarks..."
-    go test -bench=. -benchmem -count=3 ./pkg/analysis/... 2>&1 >> "$BASELINE_FILE" || true
+    go test -bench=. -benchmem -count=3 ./pkg/analysis/... >> "$BASELINE_FILE" 2>&1 || true
 
     # 3. UI Benchmarks
     print_section "UI Benchmarks"
     echo "Running UI benchmarks..."
-    go test -bench=. -benchmem -count=3 ./pkg/ui/... 2>&1 >> "$BASELINE_FILE" || true
+    go test -bench=. -benchmem -count=3 ./pkg/ui/... >> "$BASELINE_FILE" 2>&1 || true
 
     # 4. Export Benchmarks
     print_section "Export Benchmarks"
     echo "Running export benchmarks..."
-    go test -bench=. -benchmem -count=3 ./pkg/export/... 2>&1 >> "$BASELINE_FILE" || true
+    go test -bench=. -benchmem -count=3 ./pkg/export/... >> "$BASELINE_FILE" 2>&1 || true
 
     # 5. Search Benchmarks
     print_section "Search Benchmarks"
     echo "Running search benchmarks..."
-    go test -bench=. -benchmem -count=3 ./pkg/search/... 2>&1 >> "$BASELINE_FILE" || true
+    go test -bench=. -benchmem -count=3 ./pkg/search/... >> "$BASELINE_FILE" 2>&1 || true
 
     # 6. Robot Mode Timing (end-to-end)
     print_section "Robot Mode Timing (End-to-End)"
     echo "Running robot-triage timing..."
 
+    tmp_bench_root=$(mktemp -d "${TMPDIR:-/tmp}/bv-baseline-ds.XXXXXX")
+    trap 'rm -rf "$tmp_bench_root"' EXIT
+    bv_bin="$tmp_bench_root/bv"
+    go build -o "$bv_bin" ./cmd/bv
+
     for dataset in small medium large; do
         datafile="$TESTDATA_DIR/$dataset.jsonl"
         if [ -f "$datafile" ]; then
             echo "Dataset: $dataset" >> "$BASELINE_FILE"
+            ds_dir="$tmp_bench_root/$dataset/.beads"
+            mkdir -p "$ds_dir"
+            cp "$datafile" "$ds_dir/issues.jsonl"
             # Run 3 times and capture timing
-            for i in 1 2 3; do
-                { time BEADS_FILE="$datafile" timeout 60 go run ./cmd/bv --robot-triage >/dev/null 2>&1; } 2>&1 | grep real >> "$BASELINE_FILE" || echo "timeout or error" >> "$BASELINE_FILE"
+            for _ in 1 2 3; do
+                { time BEADS_DIR="$ds_dir" timeout 60 "$bv_bin" --robot-triage >/dev/null 2>&1; } 2>&1 | grep real >> "$BASELINE_FILE" || echo "timeout or error" >> "$BASELINE_FILE"
             done
             echo "" >> "$BASELINE_FILE"
         fi
@@ -134,7 +143,10 @@ capture_baseline() {
     print_section "Memory Profile"
     echo "Capturing memory profile..."
     if [ -f "$TESTDATA_DIR/medium.jsonl" ]; then
-        BEADS_FILE="$TESTDATA_DIR/medium.jsonl" GODEBUG=gctrace=1 timeout 30 go run ./cmd/bv --robot-triage 2>&1 | grep -E '^gc|total' | head -20 >> "$BASELINE_FILE" || echo "No GC data captured" >> "$BASELINE_FILE"
+        ds_dir="$tmp_bench_root/medium/.beads"
+        mkdir -p "$ds_dir"
+        cp "$TESTDATA_DIR/medium.jsonl" "$ds_dir/issues.jsonl"
+        BEADS_DIR="$ds_dir" GODEBUG=gctrace=1 timeout 30 "$bv_bin" --robot-triage 2>&1 | grep -E '^gc|total' | head -20 >> "$BASELINE_FILE" || echo "No GC data captured" >> "$BASELINE_FILE"
     fi
 
     # 8. Test Dataset Statistics
