@@ -521,7 +521,8 @@ func computeTimeToImpact(criticalPathDepth float64, estimatedMinutes *int, media
 
 	// Combined score: weight depth more heavily since it represents structural importance
 	// Depth contributes 70%, time efficiency contributes 30%
-	score := depthNorm*0.7 + timeFactor*0.3
+	// Explicit float64() prevents arm64 FMADD contraction so scores are bit-identical across amd64 and arm64.
+	score := float64(depthNorm*0.7) + float64(timeFactor*0.3)
 
 	// Generate explanation
 	var explanation string

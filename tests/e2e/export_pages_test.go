@@ -86,6 +86,9 @@ func TestExportPagesWorkspaceWatchUsesLoadedRoutes(t *testing.T) {
 				t.Setenv("BV_FORCE_POLLING", "1")
 			}
 			root := t.TempDir()
+			if resolved, err := filepath.EvalSymlinks(root); err == nil {
+				root = resolved
+			}
 			configPath := filepath.Join(root, ".bv", "workspace.yaml")
 			if err := os.MkdirAll(filepath.Dir(configPath), 0o755); err != nil {
 				t.Fatal(err)
@@ -456,6 +459,9 @@ func TestExportPagesWatchUsesLoadedSource(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			root := t.TempDir()
+			if resolved, err := filepath.EvalSymlinks(root); err == nil {
+				root = resolved
+			}
 			t.Setenv("BEADS_DIR", "")
 			t.Setenv("BEADS_DB", "")
 			t.Setenv("BV_FORCE_POLL", "")

@@ -519,12 +519,28 @@ func TestDefaultInstallDirSkipsRelativePathEntries(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Do not create ~/.local/bin so default_install_dir reaches PATH fallback.
+	// On hosts with a user-writable Homebrew/standard prefix (e.g. /opt/homebrew/bin
+	// on macOS), default_install_dir selects that prefix before scanning PATH;
+	// redirect only the hardcoded system-prefix list in the sourced function copy
+	// using pure bash substitution (PATH intentionally omits system bins) so the
+	// actual PATH fallback loop in install.sh is exercised on every host.
+	setup := `
+INSTALL_DIR=""
+fn_def=$(declare -f default_install_dir)
+s1=/usr/local/bin
+s2=/opt/homebrew/bin
+s3=/opt/local/bin
+fn_def=${fn_def//"$s1"//nonexistent-usr-local-bin}
+fn_def=${fn_def//"$s2"//nonexistent-opt-homebrew-bin}
+fn_def=${fn_def//"$s3"//nonexistent-opt-local-bin}
+eval "$fn_def"
+`
 	// Relative ".", "", and "./bin" entries must never be selected.
 	out, stderr, code := runInstallFunc(t, []string{
 		"HOME=" + home,
 		"INSTALL_DIR=",
 		"PATH=.:./bin::" + absBin,
-	}, "", `default_install_dir`, "")
+	}, setup, `default_install_dir`, "")
 	if code != 0 || strings.TrimSpace(out) != absBin {
 		t.Fatalf("default_install_dir picked relative dir or failed: exit=%d out=%q want=%q stderr=%s", code, out, absBin, stderr)
 	}

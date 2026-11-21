@@ -619,10 +619,32 @@ func (w *Watcher) watchFsnotifyWithBackend(
 		}
 	}
 
+	// On macOS/BSD kqueue, atomically replacing a symlink via symlink + rename
+	// can complete before fsnotify scans the directory, emitting zero events.
+	// When watching a symlinked path against a real fsnotify backend, poll the
+	// symlink target lightly so atomic retargets are never missed.
+	var symlinkTicker *time.Ticker
+	var symlinkTickC <-chan time.Time
+	if fsw != nil && len(linkEntries) > 0 {
+		symlinkTicker = time.NewTicker(100 * time.Millisecond)
+		symlinkTickC = symlinkTicker.C
+		defer symlinkTicker.Stop()
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
+
+		case <-symlinkTickC:
+			retargeted, active := w.refreshResolvedTarget(runGeneration)
+			if !active {
+				return
+			}
+			if retargeted {
+				syncBackendDirs()
+				w.inspectTargetAfterSymlinkEvent(runGeneration, true)
+			}
 
 		case event, ok := <-events:
 			if !ok {
@@ -643,10 +665,41 @@ func (w *Watcher) watchFsnotifyWithBackend(
 				continue
 			}
 
+			// On macOS/BSD kqueue, atomically replacing an existing symlink via
+			// rename(tmpLink, link) emits an event for tmpLink rather than link.
+			// Re-check symlink resolution when an event arrives in a link parent dir.
+			if len(linkEntries) > 0 && event.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename|fsnotify.Remove) != 0 {
+				eventDir := filepath.Clean(filepath.Dir(cleanEvent))
+				inLinkDir := false
+				for linkPath := range linkEntries {
+					linkDir := filepath.Clean(filepath.Dir(linkPath))
+					if eventDir == linkDir {
+						inLinkDir = true
+						break
+					}
+					if resolvedDir, err := filepath.EvalSymlinks(linkDir); err == nil && filepath.Clean(resolvedDir) == eventDir {
+						inLinkDir = true
+						break
+					}
+				}
+				if inLinkDir {
+					retargeted, active := w.refreshResolvedTarget(runGeneration)
+					if !active {
+						return
+					}
+					if retargeted {
+						syncBackendDirs()
+						w.inspectTargetAfterSymlinkEvent(runGeneration, true)
+						continue
+					}
+				}
+			}
+
 			// fsnotify removes a directory watch when that directory moves or
 			// disappears, without necessarily closing the notification stream.
 			// Poll the selected path so recreating the directory can recover.
-			if cleanEvent == targetDir &&
+			origDir := filepath.Clean(filepath.Dir(cleanOrigPath))
+			if (cleanEvent == targetDir || cleanEvent == origDir) &&
 				event.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
 				w.fallbackToPolling(ctx, runGeneration, ErrWatchUnavailable)
 				return
@@ -727,7 +780,9 @@ func (w *Watcher) handleFsnotifyFileEvent(runGeneration uint64, op fsnotify.Op) 
 		}
 		return
 	}
-	if op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename) == 0 {
+	// Include Chmod because macOS/BSD kqueue reports os.Truncate as NOTE_ATTRIB
+	// (fsnotify.Chmod); observePathSample filters pure metadata-only chmods.
+	if op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename|fsnotify.Chmod) == 0 {
 		return
 	}
 
