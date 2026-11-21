@@ -1,9 +1,9 @@
 {
   "_comment": "Provenance of every vendored viewer asset. scripts/verify_vendor.sh and pkg/export/vendor_manifest_test.go recompute the sha256 of each file and fail on any mismatch or unlisted file. A version of \"unknown\" means the artifact carries no version marker; the hash still pins the exact bytes shipped. Update this file (hash, version, date, reviewed_by) whenever an asset is replaced.",
-  "reviewed_by": "library-updater 2026-09-12; pipeline TMPDIR confinement + rch force_local refresh 2026-11-12; Wave 14 bv-apal.70 k_paths/cycles/topk_set rebuild 2026-11-15; Wave 15.1 self-loop cycles rebuild 2026-11-16; Wave 16 bv-apal.78 parallel_cut/topk_set rebuild 2026-11-16; Wave 18 bv-apal.86 kcore self-loop + deterministic bridges/betweennessApprox rebuild 2026-11-18; Wave 19.1 R1-C3 betweenness_approx sample_size=0 guard rebuild 2026-11-18",
-  "date": "2026-11-18",
+  "reviewed_by": "library-updater 2026-09-12; pipeline TMPDIR confinement + rch force_local refresh 2026-11-12; Wave 14 bv-apal.70 k_paths/cycles/topk_set rebuild 2026-11-15; Wave 15.1 self-loop cycles rebuild 2026-11-16; Wave 16 bv-apal.78 parallel_cut/topk_set rebuild 2026-11-16; Wave 18 bv-apal.86 kcore self-loop + deterministic bridges/betweennessApprox rebuild 2026-11-18; Wave 19.1 R1-C3 betweenness_approx sample_size=0 guard rebuild 2026-11-18; Wave 20 bv-9xac real Cargo feature gates + opt-level=z + dead-mod cleanup rebuild 2026-11-21",
+  "date": "2026-11-21",
   "graph_wasm": {
-    "source_sha256": "677bc4139748e53274ce1d94ac48437c1701a015c82fb31569e5b422f842d362",
+    "source_sha256": "500c61457a45b58a6ca95c2114bf1f6ec95d6ec6659d41c39ddf79c235faaf9e",
     "cargo_lock_sha256": "dfe6b9df8c27da85d65a3bebd14931130e57c11653d1b39f0a507e0923df7cf7",
     "pipeline": {
       "bindgen_executable_sha256": "dc9e4f1e03996c26fb8bfedfded73d81120a37251c3f19eb87bb460f1f89a5be",
@@ -55,7 +55,7 @@
       "upstream": "bv-graph-wasm (this repository)",
       "version": "bv-graph-wasm 0.1.0; paired pinned source rebuild recorded in graph_wasm",
       "license": "MIT (repository license)",
-      "sha256": "e3261ebd3ae7bd9219903ad00b395e62890e7c169b3b8828773a193e7178f780",
+      "sha256": "bc9ef6787d4621bf088e7f392e2c3231fbdbf508b7ecd0ae91d6e6765fbd201d",
       "source_url": "bv-graph-wasm/src",
       "build_command": "scripts/build_graph_wasm.sh (pinned rustc, locked Cargo, wasm-bindgen 0.2.128, Binaryen 132 -Os); see graph_wasm and docs/PROVENANCE.md"
     },

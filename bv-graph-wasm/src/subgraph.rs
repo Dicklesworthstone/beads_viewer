@@ -1,5 +1,2 @@
-//! Subgraph extraction and operations.
-//!
-//! Create subgraphs from node sets for focused analysis.
-
-// Subgraph implementation will be added in bv-ywd5
+//! Legacy placeholder file (unreferenced from lib.rs; subgraph extraction
+//! lives in src/algorithms/subgraph.rs).

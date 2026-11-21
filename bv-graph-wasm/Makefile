@@ -39,8 +39,8 @@ clean:
 size: build-release
 	@echo "WASM size:"
 	@wc -c ../pkg/export/viewer_assets/vendor/bv_graph_bg.wasm
-	@echo "Gzipped:"
-	@gzip -c ../pkg/export/viewer_assets/vendor/bv_graph_bg.wasm | wc -c
+	@echo "Gzipped (-n -9):"
+	@gzip -n -9 -c ../pkg/export/viewer_assets/vendor/bv_graph_bg.wasm | wc -c
 
 # Format code
 fmt:

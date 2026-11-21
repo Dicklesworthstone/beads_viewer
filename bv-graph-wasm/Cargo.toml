@@ -11,19 +11,19 @@ license = "MIT"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-default = ["console_error_panic_hook", "core"]
+default = ["console_error_panic_hook", "full"]
 
 # Core algorithms used by the viewer (required)
 core = []
 
-# Optional algorithms that can be excluded to reduce bundle size
-eigenvector = []    # Eigenvector centrality (~2KB)
-kcore = []          # K-core decomposition (~1KB)
-slack = []          # Slack/float calculations (~1KB)
-hits = []           # HITS algorithm (~2KB)
-reachability = []   # Reachability queries (~1KB)
+# Optional algorithms that can be excluded with --no-default-features --features core
+eigenvector = []    # Eigenvector centrality
+kcore = []          # K-core decomposition
+slack = []          # Slack/float calculations
+hits = []           # HITS algorithm
+reachability = []   # Reachability & blocker queries
 
-# Include all algorithms
+# Include all algorithms (enabled in default so viewer.js/graph.js have full parity)
 full = ["core", "eigenvector", "kcore", "slack", "hits", "reachability"]
 
 [dependencies]
@@ -39,8 +39,11 @@ getrandom = { version = "0.4", features = ["wasm_js"] }
 wasm-bindgen-test = "0.3"
 
 [profile.release]
-# Optimize for size - critical for WASM bundles
-opt-level = "s"
+# Optimize aggressively for size - critical for WASM bundles.
+# Do NOT set strip = true here: Cargo stripping drops the wasm target_features
+# custom section required by Binaryen wasm-opt -Os (which strips debug/name
+# sections itself after validating bulk-memory instructions).
+opt-level = "z"
 lto = true
 codegen-units = 1
 panic = "abort"

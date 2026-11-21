@@ -3,6 +3,8 @@
 //! Find all nodes reachable from or that can reach a given node.
 //! Essential for impact analysis and dependency exploration.
 
+#![cfg_attr(not(feature = "reachability"), allow(dead_code))]
+
 use crate::graph::DiGraph;
 use std::collections::VecDeque;
 

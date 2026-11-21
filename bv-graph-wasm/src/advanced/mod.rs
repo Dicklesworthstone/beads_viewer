@@ -1,10 +1,2 @@
-//! Advanced graph operations.
-//!
-//! Higher-level algorithms built on core graph primitives.
-
-// Advanced modules will be added as they're implemented:
-// pub mod topk_set;
-// pub mod coverage;
-// pub mod k_paths;
-// pub mod parallel_cut;
-// pub mod cycle_break;
+//! Legacy placeholder file (unreferenced from lib.rs; all advanced algorithms
+//! live under src/algorithms/{topk_set,coverage,k_paths,parallel_cut,cycles}.rs).

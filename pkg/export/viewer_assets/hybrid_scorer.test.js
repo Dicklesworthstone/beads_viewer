@@ -351,7 +351,7 @@
       const fs = require('node:fs');
       const path = require('node:path');
       const { pathToFileURL } = require('node:url');
-      const wasmDir = process.env.BV_HYBRID_WASM_DIR || path.join(__dirname, 'wasm');
+      const wasmDir = process.env.BV_HYBRID_WASM_DIR || path.resolve(__dirname, '..', '..', '..', '.bv', 'wasm', 'hybrid');
       const wasmJsPath = path.join(wasmDir, 'bv_hybrid_scorer.js');
       const wasmBgPath = path.join(wasmDir, 'bv_hybrid_scorer_bg.wasm');
       if (fs.existsSync(wasmJsPath) && fs.existsSync(wasmBgPath)) {

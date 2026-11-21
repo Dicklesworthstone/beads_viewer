@@ -262,27 +262,6 @@ impl DiGraph {
         serde_wasm_bindgen::to_value(&scores).unwrap_or(JsValue::NULL)
     }
 
-    /// Compute eigenvector centrality using power iteration.
-    /// Returns array of scores in node index order, normalized to unit length.
-    #[wasm_bindgen(js_name = eigenvector)]
-    pub fn eigenvector(&self, iterations: u32) -> JsValue {
-        use crate::algorithms::eigenvector::{eigenvector, EigenvectorConfig};
-        let config = EigenvectorConfig {
-            iterations,
-            tolerance: 1e-6,
-        };
-        let scores = eigenvector(self, &config);
-        serde_wasm_bindgen::to_value(&scores).unwrap_or(JsValue::NULL)
-    }
-
-    /// Compute eigenvector centrality with default parameters (50 iterations).
-    #[wasm_bindgen(js_name = eigenvectorDefault)]
-    pub fn eigenvector_default(&self) -> JsValue {
-        use crate::algorithms::eigenvector::eigenvector_default;
-        let scores = eigenvector_default(self);
-        serde_wasm_bindgen::to_value(&scores).unwrap_or(JsValue::NULL)
-    }
-
     /// Compute exact betweenness centrality using Brandes' algorithm.
     /// Returns array of scores in node index order.
     /// Complexity: O(V*E) - use betweenness_approx for large graphs.
@@ -300,44 +279,6 @@ impl DiGraph {
     pub fn betweenness_approx(&self, sample_size: usize) -> JsValue {
         let scores = self.betweenness_approx_seeded(sample_size);
         serde_wasm_bindgen::to_value(&scores).unwrap_or(JsValue::NULL)
-    }
-
-    /// Compute HITS hub and authority scores.
-    /// Returns JSON object: { hubs: number[], authorities: number[], iterations: number }
-    #[wasm_bindgen(js_name = hits)]
-    pub fn hits(&self, tolerance: f64, max_iterations: u32) -> JsValue {
-        use crate::algorithms::hits::{hits, HITSConfig};
-        let config = HITSConfig {
-            tolerance,
-            max_iterations,
-        };
-        let result = hits(self, &config);
-        serde_wasm_bindgen::to_value(&result).unwrap_or(JsValue::NULL)
-    }
-
-    /// Compute HITS with default parameters (tolerance=1e-6, max_iterations=100).
-    #[wasm_bindgen(js_name = hitsDefault)]
-    pub fn hits_default(&self) -> JsValue {
-        use crate::algorithms::hits::hits_default;
-        let result = hits_default(self);
-        serde_wasm_bindgen::to_value(&result).unwrap_or(JsValue::NULL)
-    }
-
-    /// Compute k-core numbers for all nodes.
-    /// Uses undirected view of the graph.
-    /// Returns array of core numbers in node index order.
-    #[wasm_bindgen(js_name = kcore)]
-    pub fn kcore(&self) -> JsValue {
-        use crate::algorithms::kcore::kcore;
-        let cores = kcore(self);
-        serde_wasm_bindgen::to_value(&cores).unwrap_or(JsValue::NULL)
-    }
-
-    /// Get the degeneracy of the graph (maximum core number).
-    #[wasm_bindgen(js_name = degeneracy)]
-    pub fn degeneracy(&self) -> u32 {
-        use crate::algorithms::kcore::degeneracy;
-        degeneracy(self)
     }
 
     /// Find articulation points (cut vertices) in the graph.
@@ -403,24 +344,6 @@ impl DiGraph {
         use crate::algorithms::cycles::quick_cycle_break_edges;
         let result = quick_cycle_break_edges(self, limit);
         serde_wasm_bindgen::to_value(&result).unwrap_or(JsValue::NULL)
-    }
-
-    /// Compute slack for each node in the DAG.
-    /// Slack = critical_path_length - longest_path_through_node.
-    /// Zero slack means the node is on the critical path.
-    /// Returns array of slack values, or zeros for cyclic graphs.
-    #[wasm_bindgen(js_name = slack)]
-    pub fn slack(&self) -> JsValue {
-        use crate::algorithms::slack::slack;
-        let s = slack(self);
-        serde_wasm_bindgen::to_value(&s).unwrap_or(JsValue::NULL)
-    }
-
-    /// Get the total float (maximum slack) in the graph.
-    #[wasm_bindgen(js_name = totalFloat)]
-    pub fn total_float(&self) -> f64 {
-        use crate::algorithms::slack::total_float;
-        total_float(self)
     }
 
     /// Compute coverage set (greedy vertex cover).
@@ -530,81 +453,6 @@ impl DiGraph {
         extract_subgraph(self, indices)
     }
 
-    /// Get all node indices reachable from a source node (outgoing direction).
-    #[wasm_bindgen(js_name = reachableFrom)]
-    pub fn reachable_from(&self, source: usize) -> JsValue {
-        use crate::algorithms::subgraph::reachable_from;
-        let nodes = reachable_from(self, source);
-        serde_wasm_bindgen::to_value(&nodes).unwrap_or(JsValue::NULL)
-    }
-
-    /// Get all node indices that can reach a target node (incoming direction).
-    #[wasm_bindgen(js_name = reachableTo)]
-    pub fn reachable_to(&self, target: usize) -> JsValue {
-        use crate::algorithms::subgraph::reachable_to;
-        let nodes = reachable_to(self, target);
-        serde_wasm_bindgen::to_value(&nodes).unwrap_or(JsValue::NULL)
-    }
-
-    /// Get all nodes in the dependency cone (ancestors + node + descendants).
-    #[wasm_bindgen(js_name = dependencyCone)]
-    pub fn dependency_cone(&self, node: usize) -> JsValue {
-        use crate::algorithms::subgraph::dependency_cone;
-        let nodes = dependency_cone(self, node);
-        serde_wasm_bindgen::to_value(&nodes).unwrap_or(JsValue::NULL)
-    }
-
-    // ========================================================================
-    // Actionable queries (work with closed_set to determine workable items)
-    // ========================================================================
-
-    /// Get direct blockers (successors) of a node.
-    /// These are issues that must be completed before this node can start.
-    #[wasm_bindgen(js_name = blockers)]
-    pub fn blockers(&self, node: usize) -> JsValue {
-        use crate::reachability::blockers;
-        let nodes = blockers(self, node);
-        serde_wasm_bindgen::to_value(&nodes).unwrap_or(JsValue::NULL)
-    }
-
-    /// Get direct dependents (predecessors) of a node.
-    /// These are issues that depend on this node being completed.
-    #[wasm_bindgen(js_name = dependents)]
-    pub fn dependents(&self, node: usize) -> JsValue {
-        use crate::reachability::dependents;
-        let nodes = dependents(self, node);
-        serde_wasm_bindgen::to_value(&nodes).unwrap_or(JsValue::NULL)
-    }
-
-    /// Get all actionable nodes (open nodes with all prerequisites in closed_set).
-    /// closed_set is an array of bytes where non-zero means closed.
-    #[wasm_bindgen(js_name = actionableNodes)]
-    pub fn actionable_nodes(&self, closed_set: &[u8]) -> JsValue {
-        use crate::reachability::actionable_nodes;
-        let closed: Vec<bool> = closed_set.iter().map(|&b| b != 0).collect();
-        let nodes = actionable_nodes(self, &closed);
-        serde_wasm_bindgen::to_value(&nodes).unwrap_or(JsValue::NULL)
-    }
-
-    /// Get open blockers for a node (successors not in closed_set).
-    /// closed_set is an array of bytes where non-zero means closed.
-    #[wasm_bindgen(js_name = openBlockers)]
-    pub fn open_blockers(&self, node: usize, closed_set: &[u8]) -> JsValue {
-        use crate::reachability::open_blockers;
-        let closed: Vec<bool> = closed_set.iter().map(|&b| b != 0).collect();
-        let nodes = open_blockers(self, node, &closed);
-        serde_wasm_bindgen::to_value(&nodes).unwrap_or(JsValue::NULL)
-    }
-
-    /// Get count of open blockers for a node.
-    /// closed_set is an array of bytes where non-zero means closed.
-    #[wasm_bindgen(js_name = openBlockerCount)]
-    pub fn open_blocker_count(&self, node: usize, closed_set: &[u8]) -> usize {
-        use crate::reachability::open_blocker_count;
-        let closed: Vec<bool> = closed_set.iter().map(|&b| b != 0).collect();
-        open_blocker_count(self, node, &closed)
-    }
-
     // ========================================================================
     // What-If simulation (cascade impact analysis)
     // ========================================================================
@@ -685,6 +533,174 @@ impl DiGraph {
         let closed: Vec<bool> = closed_set.iter().map(|&b| b != 0).collect();
         let result = topk_set_default(self, &closed);
         serde_wasm_bindgen::to_value(&result).unwrap_or(JsValue::NULL)
+    }
+}
+
+#[cfg(feature = "eigenvector")]
+#[wasm_bindgen]
+impl DiGraph {
+    /// Compute eigenvector centrality using power iteration.
+    /// Returns array of scores in node index order, normalized to unit length.
+    #[wasm_bindgen(js_name = eigenvector)]
+    pub fn eigenvector(&self, iterations: u32) -> JsValue {
+        use crate::algorithms::eigenvector::{eigenvector, EigenvectorConfig};
+        let config = EigenvectorConfig {
+            iterations,
+            tolerance: 1e-6,
+        };
+        let scores = eigenvector(self, &config);
+        serde_wasm_bindgen::to_value(&scores).unwrap_or(JsValue::NULL)
+    }
+
+    /// Compute eigenvector centrality with default parameters (50 iterations).
+    #[wasm_bindgen(js_name = eigenvectorDefault)]
+    pub fn eigenvector_default(&self) -> JsValue {
+        use crate::algorithms::eigenvector::eigenvector_default;
+        let scores = eigenvector_default(self);
+        serde_wasm_bindgen::to_value(&scores).unwrap_or(JsValue::NULL)
+    }
+}
+
+#[cfg(feature = "hits")]
+#[wasm_bindgen]
+impl DiGraph {
+    /// Compute HITS hub and authority scores.
+    /// Returns JSON object: { hubs: number[], authorities: number[], iterations: number }
+    #[wasm_bindgen(js_name = hits)]
+    pub fn hits(&self, tolerance: f64, max_iterations: u32) -> JsValue {
+        use crate::algorithms::hits::{hits, HITSConfig};
+        let config = HITSConfig {
+            tolerance,
+            max_iterations,
+        };
+        let result = hits(self, &config);
+        serde_wasm_bindgen::to_value(&result).unwrap_or(JsValue::NULL)
+    }
+
+    /// Compute HITS with default parameters (tolerance=1e-6, max_iterations=100).
+    #[wasm_bindgen(js_name = hitsDefault)]
+    pub fn hits_default(&self) -> JsValue {
+        use crate::algorithms::hits::hits_default;
+        let result = hits_default(self);
+        serde_wasm_bindgen::to_value(&result).unwrap_or(JsValue::NULL)
+    }
+}
+
+#[cfg(feature = "kcore")]
+#[wasm_bindgen]
+impl DiGraph {
+    /// Compute k-core numbers for all nodes.
+    /// Uses undirected view of the graph.
+    /// Returns array of core numbers in node index order.
+    #[wasm_bindgen(js_name = kcore)]
+    pub fn kcore(&self) -> JsValue {
+        use crate::algorithms::kcore::kcore;
+        let cores = kcore(self);
+        serde_wasm_bindgen::to_value(&cores).unwrap_or(JsValue::NULL)
+    }
+
+    /// Get the degeneracy of the graph (maximum core number).
+    #[wasm_bindgen(js_name = degeneracy)]
+    pub fn degeneracy(&self) -> u32 {
+        use crate::algorithms::kcore::degeneracy;
+        degeneracy(self)
+    }
+}
+
+#[cfg(feature = "slack")]
+#[wasm_bindgen]
+impl DiGraph {
+    /// Compute slack for each node in the DAG.
+    /// Slack = critical_path_length - longest_path_through_node.
+    /// Zero slack means the node is on the critical path.
+    /// Returns array of slack values, or zeros for cyclic graphs.
+    #[wasm_bindgen(js_name = slack)]
+    pub fn slack(&self) -> JsValue {
+        use crate::algorithms::slack::slack;
+        let s = slack(self);
+        serde_wasm_bindgen::to_value(&s).unwrap_or(JsValue::NULL)
+    }
+
+    /// Get the total float (maximum slack) in the graph.
+    #[wasm_bindgen(js_name = totalFloat)]
+    pub fn total_float(&self) -> f64 {
+        use crate::algorithms::slack::total_float;
+        total_float(self)
+    }
+}
+
+#[cfg(feature = "reachability")]
+#[wasm_bindgen]
+impl DiGraph {
+    /// Get all node indices reachable from a source node (outgoing direction).
+    #[wasm_bindgen(js_name = reachableFrom)]
+    pub fn reachable_from(&self, source: usize) -> JsValue {
+        use crate::algorithms::subgraph::reachable_from;
+        let nodes = reachable_from(self, source);
+        serde_wasm_bindgen::to_value(&nodes).unwrap_or(JsValue::NULL)
+    }
+
+    /// Get all node indices that can reach a target node (incoming direction).
+    #[wasm_bindgen(js_name = reachableTo)]
+    pub fn reachable_to(&self, target: usize) -> JsValue {
+        use crate::algorithms::subgraph::reachable_to;
+        let nodes = reachable_to(self, target);
+        serde_wasm_bindgen::to_value(&nodes).unwrap_or(JsValue::NULL)
+    }
+
+    /// Get all nodes in the dependency cone (ancestors + node + descendants).
+    #[wasm_bindgen(js_name = dependencyCone)]
+    pub fn dependency_cone(&self, node: usize) -> JsValue {
+        use crate::algorithms::subgraph::dependency_cone;
+        let nodes = dependency_cone(self, node);
+        serde_wasm_bindgen::to_value(&nodes).unwrap_or(JsValue::NULL)
+    }
+
+    /// Get direct blockers (successors) of a node.
+    /// These are issues that must be completed before this node can start.
+    #[wasm_bindgen(js_name = blockers)]
+    pub fn blockers(&self, node: usize) -> JsValue {
+        use crate::reachability::blockers;
+        let nodes = blockers(self, node);
+        serde_wasm_bindgen::to_value(&nodes).unwrap_or(JsValue::NULL)
+    }
+
+    /// Get direct dependents (predecessors) of a node.
+    /// These are issues that depend on this node being completed.
+    #[wasm_bindgen(js_name = dependents)]
+    pub fn dependents(&self, node: usize) -> JsValue {
+        use crate::reachability::dependents;
+        let nodes = dependents(self, node);
+        serde_wasm_bindgen::to_value(&nodes).unwrap_or(JsValue::NULL)
+    }
+
+    /// Get all actionable nodes (open nodes with all prerequisites in closed_set).
+    /// closed_set is an array of bytes where non-zero means closed.
+    #[wasm_bindgen(js_name = actionableNodes)]
+    pub fn actionable_nodes(&self, closed_set: &[u8]) -> JsValue {
+        use crate::reachability::actionable_nodes;
+        let closed: Vec<bool> = closed_set.iter().map(|&b| b != 0).collect();
+        let nodes = actionable_nodes(self, &closed);
+        serde_wasm_bindgen::to_value(&nodes).unwrap_or(JsValue::NULL)
+    }
+
+    /// Get open blockers for a node (successors not in closed_set).
+    /// closed_set is an array of bytes where non-zero means closed.
+    #[wasm_bindgen(js_name = openBlockers)]
+    pub fn open_blockers(&self, node: usize, closed_set: &[u8]) -> JsValue {
+        use crate::reachability::open_blockers;
+        let closed: Vec<bool> = closed_set.iter().map(|&b| b != 0).collect();
+        let nodes = open_blockers(self, node, &closed);
+        serde_wasm_bindgen::to_value(&nodes).unwrap_or(JsValue::NULL)
+    }
+
+    /// Get count of open blockers for a node.
+    /// closed_set is an array of bytes where non-zero means closed.
+    #[wasm_bindgen(js_name = openBlockerCount)]
+    pub fn open_blocker_count(&self, node: usize, closed_set: &[u8]) -> usize {
+        use crate::reachability::open_blocker_count;
+        let closed: Vec<bool> = closed_set.iter().map(|&b| b != 0).collect();
+        open_blocker_count(self, node, &closed)
     }
 }
 

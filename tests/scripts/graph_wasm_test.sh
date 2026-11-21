@@ -166,24 +166,51 @@ for (const name of ['chain_10', 'diamond_5', 'star_10', 'cycle_5', 'complex_20']
   console.log(`ok: real WASM ${name}: three modules, 12 metrics, independent goldens and viewer HITS`);
 }
 
-// Execute the real optional-loader failure path and real JS scorer, with no
+// Execute BOTH real optional-loader paths and real JS scorer, with no
 // substitute WASM module. This is a Node module test, not a rendered browser.
-const context = vm.createContext({ console, WebAssembly, Date });
-context.window = context;
-for (const file of ['hybrid_scorer.js', 'wasm_loader.js']) {
-  vm.runInContext(fs.readFileSync(path.join(viewer, file), 'utf8'), context, {
-    filename: path.join(viewer, file),
-    importModuleDynamically: spec => import(pathToFileURL(path.resolve(viewer, spec)).href)
-  });
-}
-assert.equal(await context.initHybridWasmScorer(5000), false);
-assert.equal(context.getHybridWasmStatus().ready, false);
-assert.equal(context.getHybridWasmStatus().attempted, true);
-assert.match(context.getHybridWasmStatus().reason, /Cannot find module/);
-const ranked = context.scoreBatchHybrid([{ id: 'low', textScore: 0.1 }, { id: 'high', textScore: 0.9 }],
+const runLoaderContext = () => {
+  const ctx = vm.createContext({ console, WebAssembly, Date });
+  ctx.window = ctx;
+  for (const file of ['hybrid_scorer.js', 'wasm_loader.js']) {
+    vm.runInContext(fs.readFileSync(path.join(viewer, file), 'utf8'), ctx, {
+      filename: path.join(viewer, file),
+      importModuleDynamically: spec => import(pathToFileURL(path.resolve(viewer, spec)).href)
+    });
+  }
+  return ctx;
+};
+// (a) Default unbundled bundle (meta absent -> has_hybrid_wasm not true):
+// skips dynamic import cleanly without attempting a 404 fetch.
+const unbundledCtx = runLoaderContext();
+assert.equal(await unbundledCtx.initHybridWasmScorer(5000), false);
+assert.equal(unbundledCtx.getHybridWasmStatus().ready, false);
+assert.equal(unbundledCtx.getHybridWasmStatus().attempted, true);
+assert.equal(unbundledCtx.getHybridWasmStatus().reason, 'Optional hybrid WASM module not bundled');
+const ranked = unbundledCtx.scoreBatchHybrid([{ id: 'low', textScore: 0.1 }, { id: 'high', textScore: 0.9 }],
   { text: 1, pagerank: 0, status: 0, impact: 0, priority: 0, recency: 0 });
 assert.deepEqual(Array.from(ranked, r => [r.id, r.hybrid_score]), [['high', 0.9], ['low', 0.1]]);
-console.log('ok: missing optional hybrid WASM preserves actual JS ranking');
+// (b) Advertised bundle (meta.has_hybrid_wasm === true) whose optional WASM
+// file is missing at import time: fails closed into JS fallback with import error.
+const advertisedMissingCtx = vm.createContext({ console, WebAssembly, Date });
+advertisedMissingCtx.window = advertisedMissingCtx;
+const isolatedViewerDir = path.join(path.dirname(a), 'isolated-viewer');
+fs.mkdirSync(isolatedViewerDir, { recursive: true });
+for (const file of ['hybrid_scorer.js', 'wasm_loader.js']) {
+  const filePath = path.join(isolatedViewerDir, file);
+  fs.copyFileSync(path.join(viewer, file), filePath);
+  vm.runInContext(fs.readFileSync(filePath, 'utf8'), advertisedMissingCtx, {
+    filename: filePath,
+    importModuleDynamically: spec => import(pathToFileURL(path.resolve(isolatedViewerDir, spec)).href)
+  });
+}
+assert.equal(await advertisedMissingCtx.initHybridWasmScorer(5000, { has_hybrid_wasm: true }), false);
+assert.equal(advertisedMissingCtx.getHybridWasmStatus().ready, false);
+assert.equal(advertisedMissingCtx.getHybridWasmStatus().attempted, true);
+assert.match(advertisedMissingCtx.getHybridWasmStatus().reason, /Cannot find module/);
+const rankedFallback = advertisedMissingCtx.scoreBatchHybrid([{ id: 'low', textScore: 0.1 }, { id: 'high', textScore: 0.9 }],
+  { text: 1, pagerank: 0, status: 0, impact: 0, priority: 0, recency: 0 });
+assert.deepEqual(Array.from(rankedFallback, r => [r.id, r.hybrid_score]), [['high', 0.9], ['low', 0.1]]);
+console.log('ok: missing optional hybrid WASM (unbundled & advertised-missing) preserves actual JS ranking');
 JS
 
 # Fault-injected tools exercise rejection, never the successful builds above.
