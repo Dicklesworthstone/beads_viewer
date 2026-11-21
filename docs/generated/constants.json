@@ -3,7 +3,7 @@
     "co_committed": {
       "description": "Changed in same commit as bead update (direct causation)",
       "max": 0.99,
-      "min": 0.85
+      "min": 0.8
     },
     "explicit_id": {
       "description": "Commit message explicitly references bead ID (developer intent)",

@@ -101,6 +101,67 @@ every reported vulnerability has an exploitable execution path in bv.
   `3b3625b7`): drain ready output in `install.ps1` tests, isolate tracker test
   helpers, and record root-cause follow-up on `bv-8k8m` after `bv-apal.20`.
 
+### Wave 18–21 reality-check closure (2026-11-18..2026-11-21)
+
+- **Analysis math, active-subgraph Slack/CriticalPath, and inherited Graham bounds**
+  (`bv-apal.82`, `bv-apal.83`, `bv-xb1e`, `bv-9w8r`): unify `DepParentChild`
+  unlock propagation, canonical label suggestions, and `ActiveBetweennessRank`;
+  flip `ComputeLabelPageRank` edge direction to `dependent -> prerequisite`
+  (verified by rapid `MR-6`); guard nil/uncomputed Slack against fabricating
+  `"Zero slack on critical chain"` and compute memoized active-subgraph
+  `ActiveCriticalPath`/`ActiveSlack` immune to closed historical chains
+  (`MR-8`); honor explicit `--force-full-analysis` exact betweenness on `>=500`
+  active nodes; align `ComputeProjectVelocity`, `eta.go`, and `abandoned_claim`
+  closure/assignee semantics; report distinct downstream `BlockedCount` in
+  `computeLabelAttention`; include inherited `DepParentChild` ancestor blockers
+  in Graham makespan bounds (`MR-9`); and shield robot disk caches from
+  non-`noms` Dolt subdir lock churn.
+- **Correlation deletion parity, orphan-confirm loop, Drift & Cass**
+  (`bv-rjas`, `bv-yl01`): unify full-file `.beads/issues.jsonl` deletion
+  `EventDeleted` parity across `<64KB`/`>=64KB` blobs and causal history
+  (`MR-7`); make `--robot-orphans` → `--robot-confirm-correlation SHA:BEAD`
+  resolve unlinked repo commits end-to-end; align `defaultBeadsFiles` to prefer
+  `.beads/issues.jsonl`; reject negative `source_drift_max_alerts`, honor
+  unlimited `duplicate_max_alerts: 0` and explicit P0-only
+  `high_impact_priority_max: 0`, populate `AlertPotentialDuplicate` `Labels`,
+  and emit non-empty `SuggestedAction` across all 16 `AlertType`s; and harden
+  `pkg/cass` pre-`rankAndLimit` `TotalFound` & PATH-present health status.
+- **46-command CLI contract, Hooks `.git` isolation, Loader/Datasource/Recipe**
+  (`bv-apal.88`, `bv-apal.89`, `bv-63za`, `bv-j1yw`): register `--robot-cass`
+  (46th machine command); enforce exhaustive primary-flag exclusivity,
+  `--db`/`--workspace` mutual exclusion, bare `--save-baseline`/
+  `--robot-impact-network`/`--export-graph`, and `BV_BUILD_HYBRID_WASM=0`
+  `.Bool()` parsing; lock all 46 commands and live `--help` flags via single-source
+  `cliModifierFlagRules`/`cliPrimaryRobotCommandGroups` in
+  `TestRobotRegistry_TotalContract`; stop hook discovery at `.git` boundaries;
+  strip UTF-8 BOM before `TrimSpace`; follow `.beads/redirect` and
+  `metadata.json` `"database"`; harden recipe symlink/size/natural-order
+  handling; and unskip `TestLoadRealIssues`.
+- **TUI auto-promotion, alt-screen silence, Time-Travel, width-60 MR-10 & 29/29 tests**
+  (`bv-apal.84`, `bv-apal.85`, `bv-r7pf`, `bv-n3wp`): wire `SetSourceReload`
+  background auto-promotion and default unset `BV_WORKER_LOG_LEVEL` to
+  `LogLevelNone`; add Time-Travel `DiffStatusReopened`, `n`/`N` jumps, and
+  Summary Panel; fix History Bead-mode filter isolation, Git unfiltered counts,
+  and width-60 header clamping (`0` overflows across all 13 `--debug-render`
+  views including `velocity`); fix Tutorial `G`→`k`/wheel, `U`-key check,
+  `MarkdownRenderer` theme/override dark mode, `BoardModel` detail cache,
+  `keybindings.go`-driven `?` Help Overlay; and upgrade all 29/29 formerly
+  assertion-free `pkg/ui` & `pkg/watcher` tests (`0` zero-assertion tests).
+- **Pages LiveReload/FD/Mermaid, WASM features/rebuild, 46/46 smoke & doc parity**
+  (`bv-apal.86`, `bv-apal.87`, `bv-9xac`, `bv-itwl`, `bv-vjsx`, `bv-j9i7`):
+  preserve semantic `issue_count` mismatch errors across near-deadline cloud
+  deployment polls; switch LiveReload to trailing-edge debounce with recursive
+  subdir watch; close `*safePreviewDir` in `Wizard.OfferPreview()` (verified
+  across 40 live cycles with 0 leaked FDs); keep Mermaid `securityLevel: 'strict'`
+  with DOM click delegation verified by real CDP pointer clicks in Chrome; wire
+  real `bv-graph-wasm` Cargo feature gates + `opt-level = "z"` (`204 KiB` raw /
+  `86 KiB` gz full, `82 KiB` gz core, bit-exact `verify_vendor.sh --source` and
+  `graph_wasm_test.sh` wired in Stage 10); expand `scripts/robot_smoke.sh` to
+  `46/46`; raise `pkg/workspace` coverage to `85.6%`; and reconcile all
+  cross-document prose contradictions (`README.md`, `AGENTS.md`, `SKILL.md`
+  `46/46`, `docs/*`, `bv-graph-wasm/README.md`, `pages_load.json`) under
+  executable `TestDocsParity_*` guards.
+
 ### Post-516e96aa reality-check gap closure (2026-11-12)
 
 - **Robot CLI contract, `--robot-drift`, and environment confinement**

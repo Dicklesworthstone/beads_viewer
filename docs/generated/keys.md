@@ -54,17 +54,22 @@
 |  | `U` | Self-update check |
 | **list,detail,board,graph,insights,tree,actionable,flow,history** | `V` | Cass sessions |
 | **list,detail** | `\` | Toggle split view |
+|  | `tab` | Switch split pane focus |
+|  | `<` | Narrow list pane |
+|  | `>` | Widen list pane |
 | **graph** | `hjkl` | Navigate graph |
 |  | `H` | Scroll left |
 |  | `L` | Scroll right |
 |  | `J/K` | Scroll graph vertically |
 |  | `space` | Expand/collapse dependency paths |
-|  | `PgUp` | Previous 10 nodes |
-|  | `PgDn` | Next 10 nodes |
+|  | `PgUp` | Page nodes (prev 10) |
+|  | `PgDn` | Page nodes (next 10) |
 | **board** | `h` | Previous column |
 |  | `l` | Next column |
 |  | `H` | First column |
+|  | `0` | First column |
 |  | `L` | Last column |
+|  | `$` | Last column |
 |  | `1-4` | Jump to column 1-4 |
 |  | `/` | Search cards |
 |  | `n` | Next search match |
@@ -107,7 +112,8 @@
 |  | `H` | Heatmap toggle |
 |  | `<` | Widen detail panel |
 |  | `>` | Narrow detail panel |
-| **history** | `v` | Toggle git/bead mode |
+| **history** | `g` | Jump to graph view |
+|  | `v` | Toggle git/bead mode |
 |  | `/` | Search history |
 |  | `A` | Filter by commit author |
 |  | `c` | Cycle confidence filter |

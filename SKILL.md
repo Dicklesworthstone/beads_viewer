@@ -72,10 +72,13 @@ bv --robot-priority            # Priority misalignment detection
 ```bash
 bv --robot-insights            # Full metrics: PageRank, betweenness, HITS, cycles, etc.
 bv --robot-label-health        # Per-label health: healthy|warning|critical
-bv --robot-label-flow          # Cross-label dependency flow matrix + blockage_cascade
+bv --robot-label-flow          # Cross-label dependency flow matrix + blockage_cascade + critical_paths
 bv --robot-label-attention     # Attention-ranked labels
 bv --robot-whatif <id>         # Counterfactual unblock & impact delta if <id> completes
 bv --robot-blocker-chain <id>  # Full upstream blocker chain for one issue
+bv --robot-impact-network [id] # Dependency & co-change impact network (omit id for full graph)
+bv --robot-related <id>        # Related beads via commit overlap, file overlap, and sibling blockers
+bv --robot-causality <id>      # Causal lifecycle & git commit timeline for one bead
 ```
 
 ### History, Provenance & Search
@@ -112,6 +115,9 @@ bv --init-drift                        # Bootstrap default .bv/drift.yaml thresh
 bv --check-drift --robot-drift         # Saved-baseline drift check as structured JSON (--severity/--alert-type/--alert-label)
 bv --robot-suggest                     # Hygiene: duplicates, missing deps, cycle breaks
 bv --robot-graph                       # Dependency graph export (JSON, DOT, Mermaid)
+bv --robot-metrics                     # Internal performance, cache, and memory metrics
+bv --robot-help                        # AI agent command & modifier quick reference
+bv --robot-docs guide                  # Structured machine documentation (guide|commands|examples|env|exit-codes|all)
 bv --robot-capabilities                # Machine-readable command/flag/env/schema discovery
 bv --robot-schema                      # JSON Schema definitions for all robot commands
 bv --export-graph graph.html           # Self-contained interactive HTML (or .svg / .png snapshot)

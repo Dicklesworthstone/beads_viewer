@@ -1757,3 +1757,535 @@ func TestDocsParity_TutorialKeysFileBeadsGlobAndLabelFlowCascade(t *testing.T) {
 		t.Fatalf("expected --robot-label-flow blockage_cascade with 2 blocked issues and top_unblocks, got %+v", flowPayload.BlockageCascade)
 	}
 }
+
+// TestDocsParity_RC40CrossDocumentTruthAndNegativeControls (bv-vjsx / bv-j9i7):
+// locks every cross-document reconciliation across README.md, AGENTS.md,
+// SKILL.md, docs/{performance,PROVENANCE,RELEASING,testing}.md,
+// bv-graph-wasm/README.md, CHANGELOG.md, and MANIFEST.json against live
+// runtime behavior and planted stale-doc negative controls, emitting structured
+// JSON diagnostics on every check.
+func TestDocsParity_RC40CrossDocumentTruthAndNegativeControls(t *testing.T) {
+	for _, name := range []string{"BEADS_DIR", "BEADS_DB", "BD_DB", "BEADS_JSONL"} {
+		t.Setenv(name, "")
+	}
+	repo, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceRev := "unknown"
+	if out, err := exec.Command("git", "-C", repo, "rev-parse", "--short", "HEAD").Output(); err == nil {
+		sourceRev = strings.TrimSpace(string(out))
+	}
+
+	type rc40AuditLog struct {
+		SourceRev string   `json:"source_rev"`
+		FixtureID string   `json:"fixture_id"`
+		DocPath   string   `json:"doc_path"`
+		Argv      []string `json:"argv,omitempty"`
+		Expected  string   `json:"expected"`
+		Observed  string   `json:"observed"`
+		Stdout    string   `json:"stdout,omitempty"`
+		Stderr    string   `json:"stderr,omitempty"`
+		ExitCode  int      `json:"exit_code"`
+	}
+	formatLog := func(entry rc40AuditLog) string {
+		entry.SourceRev = sourceRev
+		b, err := json.Marshal(entry)
+		if err != nil {
+			return fmt.Sprintf("marshal audit log: %v", err)
+		}
+		return string(b)
+	}
+
+	bv := buildBvBinary(t)
+
+	// 1. SKILL.md covers 46/46 primary commands from live --robot-capabilities.
+	t.Run("skill_md_46_command_parity", func(t *testing.T) {
+		cmd := exec.Command(bv, "--robot-capabilities")
+		cmd.Dir = t.TempDir()
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("%s", formatLog(rc40AuditLog{
+				FixtureID: "empty_temp_dir",
+				DocPath:   "SKILL.md",
+				Argv:      cmd.Args,
+				Expected:  "exit 0 with 46 registered commands",
+				Observed:  err.Error(),
+				Stdout:    string(out),
+				Stderr:    stderr.String(),
+				ExitCode:  1,
+			}))
+		}
+		var caps struct {
+			Commands []struct {
+				Name string `json:"name"`
+				Flag string `json:"flag"`
+			} `json:"commands"`
+		}
+		if err := json.Unmarshal(out, &caps); err != nil {
+			t.Fatalf("decode --robot-capabilities: %v", err)
+		}
+		if len(caps.Commands) != 46 {
+			t.Fatalf("%s", formatLog(rc40AuditLog{
+				FixtureID: "robot_capabilities_count",
+				DocPath:   "SKILL.md",
+				Argv:      cmd.Args,
+				Expected:  "46 commands",
+				Observed:  fmt.Sprintf("%d commands", len(caps.Commands)),
+				Stderr:    stderr.String(),
+				ExitCode:  0,
+			}))
+		}
+		checkSkillDoc := func(skillText string) error {
+			var missing []string
+			for _, c := range caps.Commands {
+				fields := strings.Fields(c.Flag)
+				if len(fields) == 0 {
+					continue
+				}
+				if !strings.Contains(skillText, fields[0]) {
+					missing = append(missing, fields[0])
+				}
+			}
+			if len(missing) > 0 {
+				return fmt.Errorf("SKILL.md missing %d registered command(s): %s", len(missing), strings.Join(missing, ", "))
+			}
+			return nil
+		}
+		skillDoc := repoFile(t, "SKILL.md")
+		if err := checkSkillDoc(skillDoc); err != nil {
+			t.Fatalf("%s", formatLog(rc40AuditLog{
+				FixtureID: "live_skill_md",
+				DocPath:   "SKILL.md",
+				Argv:      cmd.Args,
+				Expected:  "all 46 registered commands present",
+				Observed:  err.Error(),
+				Stderr:    stderr.String(),
+				ExitCode:  0,
+			}))
+		}
+		// Planted negative control: remove --robot-causality from synthetic SKILL.md.
+		staleSkill := strings.ReplaceAll(skillDoc, "--robot-causality", "--robot-removed-control")
+		if err := checkSkillDoc(staleSkill); err == nil {
+			t.Fatalf("negative control failed: SKILL.md missing --robot-causality unexpectedly passed")
+		} else {
+			t.Logf("negative_control_pass %s", formatLog(rc40AuditLog{
+				FixtureID: "planted_missing_robot_causality",
+				DocPath:   "SKILL.md",
+				Argv:      cmd.Args,
+				Expected:  "missing --robot-causality error",
+				Observed:  err.Error(),
+				ExitCode:  0,
+			}))
+		}
+	})
+
+	// 2. docs/PROVENANCE.md & bv-graph-wasm/README.md match MANIFEST.json and live vendor files byte-for-byte.
+	t.Run("manifest_provenance_and_wasm_readme_parity", func(t *testing.T) {
+		rawManifest := repoFile(t, filepath.Join("pkg", "export", "viewer_assets", "vendor", "MANIFEST.json"))
+		var manifest struct {
+			GraphWasm struct {
+				SourceSHA256 string `json:"source_sha256"`
+			} `json:"graph_wasm"`
+			Files []struct {
+				Name   string `json:"name"`
+				SHA256 string `json:"sha256"`
+			} `json:"files"`
+		}
+		if err := json.Unmarshal([]byte(rawManifest), &manifest); err != nil {
+			t.Fatalf("decode MANIFEST.json: %v", err)
+		}
+		byName := make(map[string]string, len(manifest.Files))
+		for _, f := range manifest.Files {
+			byName[f.Name] = f.SHA256
+		}
+		sourceSHA := manifest.GraphWasm.SourceSHA256
+		if sourceSHA == "" || byName["bv_graph_bg.wasm"] == "" || byName["bv_graph.js"] == "" {
+			t.Fatalf("unexpected MANIFEST.json entries: source_sha256=%q wasm=%q js=%q", sourceSHA, byName["bv_graph_bg.wasm"], byName["bv_graph.js"])
+		}
+		wasmStat, err := os.Stat(filepath.Join(repo, "pkg", "export", "viewer_assets", "vendor", "bv_graph_bg.wasm"))
+		if err != nil {
+			t.Fatalf("stat bv_graph_bg.wasm: %v", err)
+		}
+		jsStat, err := os.Stat(filepath.Join(repo, "pkg", "export", "viewer_assets", "vendor", "bv_graph.js"))
+		if err != nil {
+			t.Fatalf("stat bv_graph.js: %v", err)
+		}
+		formatBytes := func(n int64) string {
+			s := strconv.FormatInt(n, 10)
+			if len(s) <= 3 {
+				return s
+			}
+			var parts []string
+			for len(s) > 3 {
+				parts = append([]string{s[len(s)-3:]}, parts...)
+				s = s[:len(s)-3]
+			}
+			parts = append([]string{s}, parts...)
+			return strings.Join(parts, ",")
+		}
+		wasmBytesStr := formatBytes(wasmStat.Size())
+		jsBytesStr := formatBytes(jsStat.Size())
+
+		checkProvenance := func(provText string) error {
+			for _, want := range []string{
+				sourceSHA,
+				"`" + wasmBytesStr + "` bytes",
+				"`" + jsBytesStr + "` bytes",
+				"explicit tracked-only `//go:embed` globs",
+				"`218` `bv-graph-wasm`",
+			} {
+				if !strings.Contains(provText, want) {
+					return fmt.Errorf("docs/PROVENANCE.md missing %q", want)
+				}
+			}
+			if strings.Contains(provText, "15175bfceaf") {
+				return fmt.Errorf("docs/PROVENANCE.md still contains stale 2026-09-09 source_sha256")
+			}
+			return nil
+		}
+		provDoc := repoFile(t, "docs/PROVENANCE.md")
+		if err := checkProvenance(provDoc); err != nil {
+			t.Fatalf("%s", formatLog(rc40AuditLog{
+				FixtureID: "manifest_vs_provenance",
+				DocPath:   "docs/PROVENANCE.md",
+				Expected:  fmt.Sprintf("source_sha256=%s wasm=%s js=%s", sourceSHA, wasmBytesStr, jsBytesStr),
+				Observed:  err.Error(),
+			}))
+		}
+		staleProv := strings.ReplaceAll(provDoc, sourceSHA, "15175bfceaf00000000000000000000000000000000000000000000000000000")
+		if err := checkProvenance(staleProv); err == nil {
+			t.Fatal("negative control failed: stale source_sha256 in docs/PROVENANCE.md unexpectedly passed")
+		} else {
+			t.Logf("negative_control_pass %s", formatLog(rc40AuditLog{
+				FixtureID: "planted_stale_provenance_sha",
+				DocPath:   "docs/PROVENANCE.md",
+				Expected:  "mismatch error on stale source_sha256",
+				Observed:  err.Error(),
+			}))
+		}
+
+		wasmReadme := repoFile(t, "bv-graph-wasm/README.md")
+		for _, want := range []string{
+			wasmBytesStr + " B",
+			jsBytesStr + " B",
+			`opt-level = "z"`,
+			"`full`",
+			"`core`",
+			"gzip -n -9",
+		} {
+			if !strings.Contains(wasmReadme, want) {
+				t.Fatalf("%s", formatLog(rc40AuditLog{
+					FixtureID: "manifest_vs_wasm_readme",
+					DocPath:   "bv-graph-wasm/README.md",
+					Expected:  want,
+					Observed:  "missing from bv-graph-wasm/README.md",
+				}))
+			}
+		}
+	})
+
+	// 3. README.md ETA fallback (median/7, 60/7 ~= 8.57 min/day) matches live pkg/analysis/eta.go.
+	t.Run("readme_eta_fallback_matches_live_eta_go", func(t *testing.T) {
+		now := time.Date(2026, 11, 21, 0, 0, 0, 0, time.UTC)
+		issues := []model.Issue{
+			{ID: "ETA-1", Title: "No-history fallback task", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 2},
+		}
+		stats := analysis.NewAnalyzer(issues).Analyze()
+		eta, err := analysis.EstimateETAForIssue(issues, &stats, "ETA-1", 1, now)
+		if err != nil {
+			t.Fatalf("EstimateETAForIssue failed: %v", err)
+		}
+		wantVel := 60.0 / 7.0
+		if math.Abs(eta.VelocityMinutesPerDay-wantVel) > 1e-6 {
+			t.Fatalf("%s", formatLog(rc40AuditLog{
+				FixtureID: "eta_no_history_single_task",
+				DocPath:   "README.md",
+				Expected:  fmt.Sprintf("velocity=%.6f (60/7)", wantVel),
+				Observed:  fmt.Sprintf("velocity=%.6f", eta.VelocityMinutesPerDay),
+			}))
+		}
+		checkETADoc := func(readmeText string) error {
+			if strings.Contains(readmeText, "median/5") {
+				return fmt.Errorf("README.md contains stale median/5 velocity fallback")
+			}
+			for _, want := range []string{"median/7", "60/7", "8.57 min/day"} {
+				if !strings.Contains(readmeText, want) {
+					return fmt.Errorf("README.md missing live ETA fallback clause %q", want)
+				}
+			}
+			return nil
+		}
+		readme := repoFile(t, "README.md")
+		if err := checkETADoc(readme); err != nil {
+			t.Fatalf("%s", formatLog(rc40AuditLog{
+				FixtureID: "eta_no_history_single_task",
+				DocPath:   "README.md",
+				Expected:  "median/7 and 60/7 (~8.57 min/day)",
+				Observed:  err.Error(),
+			}))
+		}
+		staleReadme := strings.ReplaceAll(readme, "median/7", "median/5")
+		if err := checkETADoc(staleReadme); err == nil {
+			t.Fatal("negative control failed: stale median/5 README snippet unexpectedly passed")
+		} else {
+			t.Logf("negative_control_pass %s", formatLog(rc40AuditLog{
+				FixtureID: "planted_stale_eta_median_div_5",
+				DocPath:   "README.md",
+				Expected:  "stale median/5 rejected",
+				Observed:  err.Error(),
+			}))
+		}
+	})
+
+	// 4. README.md --robot-label-flow critical_paths, --pages hooks, temporal hints, Freshness, BV_SEMANTIC_MODEL, BV_WORKER_LOG_LEVEL, Sprint & Time-Travel.
+	t.Run("readme_runtime_prose_reconciliations", func(t *testing.T) {
+		ws := t.TempDir()
+		writeIssuesJSONL(t, ws, strings.Join([]string{
+			`{"id":"LF-1","title":"Schema","status":"open","priority":1,"issue_type":"task","labels":["schema"]}`,
+			`{"id":"LF-2","title":"API","status":"open","priority":1,"issue_type":"task","labels":["api"],"dependencies":[{"issue_id":"LF-2","depends_on_id":"LF-1","type":"blocks"}]}`,
+			`{"id":"LF-3","title":"Web","status":"open","priority":2,"issue_type":"task","labels":["web"],"dependencies":[{"issue_id":"LF-3","depends_on_id":"LF-2","type":"blocks"}]}`,
+		}, "\n")+"\n")
+		cmd := exec.Command(bv, "--robot-label-flow")
+		cmd.Dir = ws
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("%s", formatLog(rc40AuditLog{
+				FixtureID: "label_flow_3_labels",
+				DocPath:   "README.md",
+				Argv:      cmd.Args,
+				Expected:  "exit 0 with populated flow.critical_paths",
+				Observed:  err.Error(),
+				Stdout:    string(out),
+				Stderr:    stderr.String(),
+				ExitCode:  1,
+			}))
+		}
+		var flowResp struct {
+			Flow struct {
+				CriticalPaths []any `json:"critical_paths"`
+			} `json:"flow"`
+		}
+		if err := json.Unmarshal(out, &flowResp); err != nil || len(flowResp.Flow.CriticalPaths) == 0 {
+			t.Fatalf("%s", formatLog(rc40AuditLog{
+				FixtureID: "label_flow_3_labels",
+				DocPath:   "README.md",
+				Argv:      cmd.Args,
+				Expected:  "len(flow.critical_paths) > 0",
+				Observed:  fmt.Sprintf("len=%d err=%v", len(flowResp.Flow.CriticalPaths), err),
+				Stdout:    string(out),
+				Stderr:    stderr.String(),
+			}))
+		}
+
+		checkReadmeProse := func(readmeText string) error {
+			for _, stale := range []string{
+				"critical_paths array is empty",
+				"label-to-path",
+				"across all statuses",
+				"ignored by hash",
+				"wizard does not run hooks",
+			} {
+				if strings.Contains(strings.ToLower(readmeText), strings.ToLower(stale)) {
+					return fmt.Errorf("README.md still contains stale claim %q", stale)
+				}
+			}
+			for _, must := range []string{
+				"`flow.critical_paths` (up to 10 cross-label paths)",
+				"`extractPathHints`",
+				"active non-closed, non-parked issues",
+				"FNV-1a token seed and search index cache filename",
+				"| `BV_WORKER_LOG_LEVEL` | Log level for the background snapshot worker (`none`, `error`, `warn`, `info`, `debug`). | `none` |",
+				"unified help overlay",
+				"`[REOPENED]`",
+				"`Enter` jumps to the selected sprint issue",
+			} {
+				if !strings.Contains(readmeText, must) {
+					return fmt.Errorf("README.md missing reconciled truth %q", must)
+				}
+			}
+			return nil
+		}
+		readme := repoFile(t, "README.md")
+		if err := checkReadmeProse(readme); err != nil {
+			t.Fatalf("%s", formatLog(rc40AuditLog{
+				FixtureID: "readme_reconciled_prose",
+				DocPath:   "README.md",
+				Expected:  "all RC-C40 README reconciliations present and stale phrases absent",
+				Observed:  err.Error(),
+			}))
+		}
+		staleReadme := readme + "\nThe current critical_paths array is empty.\n"
+		if err := checkReadmeProse(staleReadme); err == nil {
+			t.Fatal("negative control failed: stale critical_paths prose unexpectedly passed")
+		} else {
+			t.Logf("negative_control_pass %s", formatLog(rc40AuditLog{
+				FixtureID: "planted_stale_critical_paths",
+				DocPath:   "README.md",
+				Expected:  "stale critical_paths claim rejected",
+				Observed:  err.Error(),
+			}))
+		}
+	})
+
+	// 5. AGENTS.md zero raw os.Getenv("BV_*"/"BEADS_*") code examples + accurate stores/packages/jq.
+	t.Run("agents_md_truth_and_no_raw_getenv_examples", func(t *testing.T) {
+		rawGetenvRe := regexp.MustCompile(`os\.Getenv\("(?:BV_|BEADS_)`)
+		checkAgentsDoc := func(agentsText string) error {
+			for i, line := range strings.Split(agentsText, "\n") {
+				if !rawGetenvRe.MatchString(line) {
+					continue
+				}
+				// The rule sentence forbidding raw os.Getenv("BV_*") is allowed; code snippets calling it are forbidden.
+				if strings.Contains(line, "never call raw") {
+					continue
+				}
+				return fmt.Errorf("AGENTS.md:%d contains raw env example: %s", i+1, strings.TrimSpace(line))
+			}
+			for _, stale := range []string{
+				"Git hooks integration",
+				"Agent detection and session tracking",
+			} {
+				if strings.Contains(agentsText, stale) {
+					return fmt.Errorf("AGENTS.md still contains stale package description %q", stale)
+				}
+			}
+			for _, must := range []string{
+				"env.NoBrowser.IsSet() || env.TestMode.IsSet()",
+				"Export lifecycle hooks",
+				"AGENTS.md blurb detection, verification, and injection",
+				"`.beads/beads.db` SQLite and `.beads/issues.jsonl`",
+				"{status: .status.Cycles, cycles: .Cycles}",
+			} {
+				if !strings.Contains(agentsText, must) {
+					return fmt.Errorf("AGENTS.md missing reconciled truth %q", must)
+				}
+			}
+			return nil
+		}
+		agentsDoc := repoFile(t, "AGENTS.md")
+		if err := checkAgentsDoc(agentsDoc); err != nil {
+			t.Fatalf("%s", formatLog(rc40AuditLog{
+				FixtureID: "live_agents_md",
+				DocPath:   "AGENTS.md",
+				Expected:  "zero raw os.Getenv code examples and accurate descriptions",
+				Observed:  err.Error(),
+			}))
+		}
+		staleAgents := strings.ReplaceAll(agentsDoc, "env.NoBrowser.IsSet() || env.TestMode.IsSet()", `os.Getenv("BV_NO_BROWSER") != "" || os.Getenv("BV_TEST_MODE") != ""`)
+		if err := checkAgentsDoc(staleAgents); err == nil {
+			t.Fatal("negative control failed: raw os.Getenv(\"BV_NO_BROWSER\") example in AGENTS.md unexpectedly passed")
+		} else {
+			t.Logf("negative_control_pass %s", formatLog(rc40AuditLog{
+				FixtureID: "planted_raw_getenv_in_agents_md",
+				DocPath:   "AGENTS.md",
+				Expected:  "raw os.Getenv(\"BV_NO_BROWSER\") example rejected",
+				Observed:  err.Error(),
+			}))
+		}
+	})
+
+	// 6. docs/{performance,RELEASING,testing}.md and CHANGELOG.md parity with live scripts.
+	t.Run("docs_perf_releasing_testing_and_changelog_parity", func(t *testing.T) {
+		checkPerfDoc := func(perfText string) error {
+			if strings.Contains(perfText, "and the P1 implementation and proof beads remain open.") {
+				return fmt.Errorf("docs/performance.md still claims closed beads bv-apal.1/.2 remain open")
+			}
+			if !strings.Contains(perfText, "`bv-apal.1` and `bv-apal.2` subsequently completed") || !strings.Contains(perfText, "2026-09-19") {
+				return fmt.Errorf("docs/performance.md missing truthful 2026-09-19 closure update for bv-apal.1/.2")
+			}
+			return nil
+		}
+		perfDoc := repoFile(t, "docs/performance.md")
+		if err := checkPerfDoc(perfDoc); err != nil {
+			t.Fatalf("%s", formatLog(rc40AuditLog{
+				FixtureID: "docs_performance_closed_beads",
+				DocPath:   "docs/performance.md",
+				Expected:  "truthful historical + 2026-09-19 closure status for bv-apal.1/.2",
+				Observed:  err.Error(),
+			}))
+		}
+		if err := checkPerfDoc("The remaining CLI evidence cannot be replaced by the UI pass, and the P1 implementation and proof beads remain open."); err == nil {
+			t.Fatal("negative control failed: stale docs/performance.md open-bead claim unexpectedly passed")
+		}
+
+		checkReleasingDoc := func(relText string) error {
+			for _, must := range []string{
+				"scripts/verify_vendor.sh --source",
+				"all 46 registered robot commands",
+				"tests/scripts/graph_wasm_test.sh",
+				"Go 1.26.11",
+			} {
+				if !strings.Contains(relText, must) {
+					return fmt.Errorf("docs/RELEASING.md missing %q", must)
+				}
+			}
+			return nil
+		}
+		releasingDoc := repoFile(t, "docs/RELEASING.md")
+		if err := checkReleasingDoc(releasingDoc); err != nil {
+			t.Fatalf("%s", formatLog(rc40AuditLog{
+				FixtureID: "docs_releasing_stage7_and_stage10",
+				DocPath:   "docs/RELEASING.md",
+				Expected:  "verify_vendor.sh --source, 46 robot commands, graph_wasm_test.sh, Go 1.26.11",
+				Observed:  err.Error(),
+			}))
+		}
+		if err := checkReleasingDoc(strings.ReplaceAll(releasingDoc, "scripts/verify_vendor.sh --source", "scripts/verify_vendor.sh")); err == nil {
+			t.Fatal("negative control failed: docs/RELEASING.md omitting --source unexpectedly passed")
+		}
+
+		// Verify docs/testing.md timeout matches scripts/release_gate.sh and thresholds match scripts/coverage.sh.
+		gateScript := repoFile(t, "scripts/release_gate.sh")
+		if !strings.Contains(gateScript, "-timeout=30m") {
+			t.Fatalf("scripts/release_gate.sh no longer uses -timeout=30m; update docs/testing.md and this parity check together")
+		}
+		covScript := repoFile(t, "scripts/coverage.sh")
+		covThresholds := make(map[string]string)
+		for _, row := range regexp.MustCompile(`github\.com/Dicklesworthstone/beads_viewer/(pkg/[a-z_]+)\) echo ([0-9]+) ;;`).FindAllStringSubmatch(covScript, -1) {
+			covThresholds[row[1]] = row[2]
+		}
+		checkTestingDoc := func(testDocText string) error {
+			if strings.Contains(testDocText, "-timeout=45m") {
+				return fmt.Errorf("docs/testing.md still contains stale -timeout=45m")
+			}
+			if !strings.Contains(testDocText, "go test ./tests/e2e -timeout=30m") {
+				return fmt.Errorf("docs/testing.md missing -timeout=30m matching scripts/release_gate.sh")
+			}
+			docThresholds := make(map[string]string)
+			for _, row := range regexp.MustCompile("(?m)^\\| `(pkg/[a-z_]+)` \\| ([0-9]+)% \\|$").FindAllStringSubmatch(testDocText, -1) {
+				docThresholds[row[1]] = row[2]
+			}
+			if len(covThresholds) < 8 || !reflect.DeepEqual(docThresholds, covThresholds) {
+				return fmt.Errorf("docs/testing.md coverage thresholds %v != scripts/coverage.sh %v", docThresholds, covThresholds)
+			}
+			return nil
+		}
+		testingDoc := repoFile(t, "docs/testing.md")
+		if err := checkTestingDoc(testingDoc); err != nil {
+			t.Fatalf("%s", formatLog(rc40AuditLog{
+				FixtureID: "docs_testing_timeout_and_coverage",
+				DocPath:   "docs/testing.md",
+				Expected:  "-timeout=30m and exact match with scripts/coverage.sh thresholds",
+				Observed:  err.Error(),
+			}))
+		}
+		if err := checkTestingDoc(strings.ReplaceAll(testingDoc, "-timeout=30m", "-timeout=45m")); err == nil {
+			t.Fatal("negative control failed: stale -timeout=45m in docs/testing.md unexpectedly passed")
+		}
+
+		changelog := repoFile(t, "CHANGELOG.md")
+		if !strings.Contains(changelog, "### Wave 18–21 reality-check closure") {
+			t.Fatalf("%s", formatLog(rc40AuditLog{
+				FixtureID: "changelog_wave18_21",
+				DocPath:   "CHANGELOG.md",
+				Expected:  "Wave 18–21 reality-check closure section under Unreleased",
+				Observed:  "missing",
+			}))
+		}
+	})
+}

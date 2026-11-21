@@ -98,21 +98,25 @@ are not marked closed. The mask does not truncate downstream cascades.
 
 ### Current Measurements
 
-| Component | Raw | Gzipped | Budget |
-|-----------|-----|---------|--------|
-| WASM binary | 221 KiB | 95 KiB | <80 KiB |
-| JS glue | 34 KiB | 7 KiB | <25 KiB |
-| **Total** | **255 KiB** | **102 KiB** | **<120 KiB** |
+| Component | Raw | Gzipped (`gzip -n -9`) | Budget |
+|-----------|-----|------------------------|--------|
+| WASM binary (`default` / `full`) | 204 KiB (208,792 B) | 86 KiB (88,054 B) | <80 KiB |
+| WASM binary (`--no-default-features --features core`) | 192 KiB (196,762 B) | 82 KiB (84,162 B) | <80 KiB |
+| JS glue (`bv_graph.js`) | 35 KiB (35,456 B) | 7 KiB (7,100 B) | <25 KiB |
+| **Shipped Total (`full` + glue)** | **239 KiB (244,248 B)** | **93 KiB (95,154 B)** | **<120 KiB** |
 
-Measured with `gzip -n -9` on the reviewed pair. The total compressed size is
-within budget; the separate WASM size target remains unmet.
+Measured with `gzip -n -9` on the reviewed pair (`source_sha256`
+`500c61457a45b58a6ca95c2114bf1f6ec95d6ec6659d41c39ddf79c235faaf9e`). The total
+compressed size (`93 KiB`) is well within the `<120 KiB` budget; the separate
+`<80 KiB` WASM-only target remains unmet (`86 KiB` shipped `full`, `82 KiB`
+`core`-only) due to `serde`/`serde_json`/`serde-wasm-bindgen` runtime floor.
 
 ### Size Optimization
 
 The build pipeline applies multiple optimizations:
 
 1. **Cargo.toml profile settings**:
-   - `opt-level = "s"` - Optimize for size
+   - `opt-level = "z"` - Optimize aggressively for size
    - `lto = true` - Link-time optimization
    - `codegen-units = 1` - Better optimization
    - `panic = "abort"` - Remove panic unwinding
@@ -131,24 +135,26 @@ documented in [PROVENANCE.md](../docs/PROVENANCE.md).
 ### Checking Size
 
 ```bash
-make size  # Shows raw and gzipped sizes
+make size  # Shows raw and gzipped (-n -9) sizes
 ```
 
 ### Feature Flags
 
-The crate declares the following feature names. Algorithm modules are currently
-exported unconditionally, so selecting these flags does not trim the exported
-API or establish a smaller release pipeline. The reviewed build uses defaults.
+Optional algorithm groups are gated behind real `#[cfg(feature = "...")]`
+blocks on `DiGraph`. The reviewed viewer bundle enables `full` by default so
+`viewer.js` and `graph.js` have complete parity, while custom builds can trim
+16 JS/WASM exports (`~12 KiB` raw / `~4 KiB` gzipped) with
+`cargo build --release --target wasm32-unknown-unknown --no-default-features --features core`.
 
 | Feature | Description | Default |
 |---------|-------------|---------|
-| `core` | Core algorithms (pagerank, betweenness, cycles, critical path) | Yes |
-| `eigenvector` | Eigenvector centrality | No |
-| `kcore` | K-core decomposition | No |
-| `slack` | Slack/float calculations | No |
-| `hits` | HITS algorithm | No |
-| `reachability` | Reachability queries | No |
-| `full` | All algorithms | No |
+| `core` | Core algorithms (pagerank, betweenness, cycles, critical path, topo, articulation, subgraph, what-if, topk_set, parallel_cut, k_paths, coverage) | Yes (via `full`) |
+| `eigenvector` | Eigenvector centrality | Yes (via `full`) |
+| `kcore` | K-core decomposition | Yes (via `full`) |
+| `slack` | Slack/float calculations | Yes (via `full`) |
+| `hits` | HITS algorithm | Yes (via `full`) |
+| `reachability` | Reachability & blocker queries | Yes (via `full`) |
+| `full` | All algorithms (`core` + all 5 optional groups) | Yes |
 
 ## License
 

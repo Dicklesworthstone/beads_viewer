@@ -59,8 +59,10 @@ resolved. No full post-change qualification is claimed.
 
 The September 10–11 run completed the original UI matrix, but **the overall
 latency matrix failed**. The final timed CLI cohort stopped when a baseline
-process was killed. The remaining CLI evidence cannot be replaced by the UI
-pass, and the P1 implementation and proof beads remain open.
+process was killed. At the time of that September 11 run, the remaining CLI
+evidence could not be replaced by the UI pass and the P1 implementation and
+proof beads remained open; `bv-apal.1` and `bv-apal.2` subsequently completed
+and closed on 2026-09-19.
 
 The measured current source is
 [`4ffc37c6`](https://github.com/Dicklesworthstone/beads_viewer/commit/4ffc37c6f162d3e5b9de6f35511744ca12a0a2eb),

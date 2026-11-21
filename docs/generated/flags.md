@@ -158,7 +158,7 @@
 | `--workspace` | string | (empty) | Load issues from workspace config file (.bv/workspace.yaml) | Search & Filters |
 | `--cpu-profile` | string | (empty) | Write CPU profile to file | Debug Flags |
 | `--debug-height` | int | `50` | Height for debug render | Debug Flags |
-| `--debug-render` | string | (empty) | Render a TUI view to stdout and exit (views: triage, list, insights, board, history, graph, tree, actionable, sprint, flow, attention, labels) | Debug Flags |
+| `--debug-render` | string | (empty) | Render a TUI view to stdout and exit (views: triage, list, insights, board, history, graph, tree, actionable, sprint, flow, attention, labels, velocity) | Debug Flags |
 | `--debug-width` | int | `180` | Width for debug render | Debug Flags |
 | `--generate-docs` | bool | `false` | Generate documentation markdown and JSON artifacts | Debug Flags |
 | `--profile-json` | bool | `false` | Output profile in JSON format (use with --profile-startup) | Debug Flags |

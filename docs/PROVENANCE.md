@@ -66,10 +66,12 @@ automatically to an installation that bypasses it.
 
 The static dashboard that `bv --export-pages` produces ships a set of
 third-party JavaScript libraries, two WebAssembly modules, and two fonts from
-`pkg/export/viewer_assets/vendor/`. They are embedded into the `bv` binary
-(`pkg/export/viewer_embed.go`, `//go:embed viewer_assets`) and copied into
-every exported bundle, so a tampered or silently replaced file would reach
-every dashboard viewer. This document states how those files are tracked.
+`pkg/export/viewer_assets/vendor/`. They are embedded into the `bv` binary via
+explicit tracked-only `//go:embed` globs in `pkg/export/viewer_embed.go`
+(excluding dev-only `graph-demo.html` and `hybrid_scorer.test.js`, and never
+embedding ignored `wasm/` outputs) and copied into every exported bundle, so a
+tampered or silently replaced file would reach every dashboard viewer. This
+document states how those files are tracked.
 
 ## The manifest
 
@@ -179,16 +181,23 @@ success. Retire a receipt when its source/pipeline or shipped pair is
 superseded. No automatic cleanup is performed. These module tests establish
 neither rendered-browser behavior nor a complete native release gate.
 
-The September 9 graph pair corrects prerequisite/dependent traversal in
-what-if, actionable-node and parallel-cut queries. Edges still point from
-dependent to prerequisite; generic traversal and metric algorithms retain
-their direction. Two isolated rebuilds match the manifest's source fingerprint
-`15175bfceaf3f1f7b7811937e2d615fa6584c450fd9368d5746add3f89126aea`.
-The 227 Rust tests and five existing graph fixtures pass without regenerated
-goldens. Separately, the opt-in Chromium harness executes the real exported
-WASM, checks rendered counts and edge pixels, and cancels delayed simulation
-callbacks. It covers both included and omitted closed rows; this is browser
-fixture evidence, not native-platform or full tracker-eligibility proof.
+The current reviewed graph pair (Wave 20 `bv-9xac`, 2026-11-21) ships real
+Cargo feature gates (`default = ["console_error_panic_hook", "full"]`),
+`opt-level = "z"`, deterministic `bridges`/`betweennessApprox`, self-loop
+exclusion in `kcore` and cycle enumeration, and prerequisite/dependent traversal
+in what-if, actionable-node, `topk_set`, and parallel-cut queries. Edges point
+from dependent to prerequisite; generic traversal and metric algorithms retain
+their direction. Two isolated rebuilds from distinct physical Rust homes match
+the manifest's source fingerprint
+`500c61457a45b58a6ca95c2114bf1f6ec95d6ec6659d41c39ddf79c235faaf9e`
+(`bv_graph.js`: `35,456` bytes raw / `7,100` bytes `gzip -n -9`;
+`bv_graph_bg.wasm`: `208,792` bytes raw / `88,054` bytes `gzip -n -9`).
+The `218` `bv-graph-wasm` Rust release unit tests and five committed graph
+fixtures pass without regenerated goldens. Separately, the opt-in Chromium
+harness executes the real exported WASM, checks rendered counts, edge pixels,
+and strict-mode Mermaid node clicks, and cancels delayed simulation callbacks.
+It covers both included and omitted closed rows; this is browser fixture
+evidence, not native-platform or full tracker-eligibility proof.
 
 The optional hybrid scorer WASM is not shipped. The real JavaScript scorer
 and loader fallback remain tested with the optional module absent; no hybrid

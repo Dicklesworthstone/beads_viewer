@@ -70,16 +70,16 @@ Releases up to v0.22.0 used unversioned names (`bv_linux_amd64.tar.gz`); `bv --u
 Prefer Homebrew, Scoop, or a checksum-verified release archive above. If you do pipe the script, pin it to a commit you have read instead of the moving `main` branch:
 
 ```bash
-# Pinned to a reviewed commit; read it first: https://github.com/Dicklesworthstone/beads_viewer/blob/8698c9b6511aae516096727816b1ae61e09e7126/install.sh
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/8698c9b6511aae516096727816b1ae61e09e7126/install.sh" | bash
+# Pinned to a reviewed commit; read it first: https://github.com/Dicklesworthstone/beads_viewer/blob/9f7d0b703d845f2c050e6fdcd68887414e2b1a3f/install.sh
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/9f7d0b703d845f2c050e6fdcd68887414e2b1a3f/install.sh" | bash
 ```
 
 > **Warning:** `curl ... | bash` runs whatever the URL serves at that moment. The pinned form above cannot change under you; the `main` form can. `install.sh` downloads the release archive for your platform, verifies it against the release `checksums.txt`, and refuses to install on a mismatch.
 
 **Windows (PowerShell):**
 ```powershell
-# Pinned to a reviewed commit; read it first: https://github.com/Dicklesworthstone/beads_viewer/blob/8698c9b6511aae516096727816b1ae61e09e7126/install.ps1
-irm "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/8698c9b6511aae516096727816b1ae61e09e7126/install.ps1" | iex
+# Pinned to a reviewed commit; read it first: https://github.com/Dicklesworthstone/beads_viewer/blob/9f7d0b703d845f2c050e6fdcd68887414e2b1a3f/install.ps1
+irm "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/9f7d0b703d845f2c050e6fdcd68887414e2b1a3f/install.ps1" | iex
 ```
 > **Note:** The pinned installer above downloads the Windows release zip, verifies it against the release `checksums.txt` with `Get-FileHash`, and refuses anything that does not verify; no Go toolchain is needed. Pass `-Version v0.26.0` to pin a release or `-InstallDir` to choose the folder (default `%LOCALAPPDATA%\Programs\bv`). Scoop installs the archive selected by its manifest. For best display, use Windows Terminal with a [Nerd Font](https://www.nerdfonts.com/).
 
@@ -208,7 +208,7 @@ SQLite or aggregated workspace views.
 
 ### 🔌 Automation Hooks
 
-Configure pre- and post-export hooks in `.bv/hooks.yaml` to run validations, notifications, or uploads. **Project hooks require explicit approval by the invoking user.** Report exports (`--export` / `--export-md`), direct Pages exports (`--export-pages`), graph exports (`--export-graph`), priority briefs (`--priority-brief`), and agent brief bundles (`--agent-brief`) fail before running hooks or writing the export when configured hooks have not been approved. Projects without hooks export normally. To export without running any project hooks, pass `--no-hooks`; this also bypasses hook configuration parsing, so it works with invalid YAML.
+Configure pre- and post-export hooks in `.bv/hooks.yaml` to run validations, notifications, or uploads. **Project hooks require explicit approval by the invoking user.** Report exports (`--export` / `--export-md`), direct Pages exports (`--export-pages`), the interactive Pages wizard (`--pages`), graph exports (`--export-graph`), priority briefs (`--priority-brief`), and agent brief bundles (`--agent-brief`) fail before running hooks or writing the export when configured hooks have not been approved. Projects without hooks export normally. To export without running any project hooks, pass `--no-hooks`; this also bypasses hook configuration parsing, so it works with invalid YAML.
 
 A runnable hook selects exactly one execution form: `command` for a shell command, or `argv` to invoke a program directly. `argv` must be a nonempty list of strings with a nonempty executable name as its first element. Each subsequent element is one literal argument, including empty strings or values containing spaces. For example:
 
@@ -276,7 +276,7 @@ Both execution forms require the same explicit approval and credential grants an
 
 Each hook retains at most **1 MiB (1,048,576 bytes) of stdout and 1 MiB of stderr**. Excess output is drained and discarded. Hook results expose `StdoutTruncated` and `StderrTruncated`, and the execution summary identifies truncated streams. Truncation alone does not fail a hook or change its `on_error` policy.
 
-**Approval permits arbitrary code execution with your operating-system privileges.** Direct `argv` execution and environment filtering are not sandboxes: an approved program or explicitly selected interpreter can access files, launch programs, and use the network. The digest approves hook declarations, not the transitive contents of referenced scripts or executables. Review changes to those dependencies before running approved hooks again. The interactive `--pages` wizard, TUI exports, and robot analysis do not run this hook pipeline.
+**Approval permits arbitrary code execution with your operating-system privileges.** Direct `argv` execution and environment filtering are not sandboxes: an approved program or explicitly selected interpreter can access files, launch programs, and use the network. The digest approves hook declarations, not the transitive contents of referenced scripts or executables. Review changes to those dependencies before running approved hooks again. TUI exports and robot analysis do not run this hook pipeline (the interactive `--pages` wizard does run `.bv/hooks.yaml` unless `--no-hooks` is passed, and requires `--trust-hooks` when project hooks are present).
 
 ---
 
@@ -1945,7 +1945,7 @@ Press `Enter` on a label to see its actual cross-label blocking relationships. E
 | `Esc` | Return from endpoint details to the relationship, then the label view |
 | `f` / `q` | Step back from details or relationships; exit from the label view |
 
-Endpoint inspection preserves the active recipe and work-selection scope. Open relationships and details refresh when issue data changes; closed or removed relationships disappear. The view does not currently display critical-path annotations for labels.
+Endpoint inspection preserves the active recipe and work-selection scope. Open relationships and details refresh when issue data changes; closed or removed relationships disappear. The TUI view focuses on direct cross-label relationships and `blockage_cascade`, while `--robot-label-flow` also populates `flow.critical_paths` (up to 10 cross-label paths).
 
 ### Robot Command
 
@@ -2023,7 +2023,7 @@ Press `;` (semicolon) or `F2` to toggle the **Shortcuts Sidebar**—a persistent
 
 ### Why a Sidebar (Not Just Help)?
 
-The `?` help overlay shows shortcuts but blocks your view. The shortcuts sidebar stays visible while you work, perfect for:
+The `?` unified help overlay shows context-aware shortcuts sourced from the same `pkg/ui/keybindings.go` registry as the shortcuts sidebar, but blocks your view while open. The shortcuts sidebar stays visible while you work, perfect for:
 - Learning keyboard shortcuts without interrupting your flow
 - Quick reference during complex navigation
 - Teaching new users while pair programming
@@ -2217,7 +2217,7 @@ graph TD
 | `explicit_id` | 0.70 – 0.99 | Commit message contains the bead ID (custom ID shapes via `--id-pattern`) |
 | `temporal_author` | 0.20 – 0.85 | Code commit by the author of the recorded claim, between retained claim and close events; both milestones are required |
 
-There is no path-matching strategy; label-to-path hints only nudge temporal scores inside `temporal.go`.
+There is no path-matching strategy; title-based path hints (`extractPathHints`) only nudge temporal scores inside `temporal.go`.
 
 ### Confidence Scoring
 
@@ -2313,6 +2313,7 @@ Navigate to a file and press `Enter` to see all beads and commits that touched i
 | **Filtering** | |
 | `c` | Cycle confidence threshold (0.0 → 0.5 → 0.75 → 0.9) |
 | `/` | Search commits or beads |
+| `A` | Filter by commit author |
 | **Actions** | |
 | `y` | Copy selected commit SHA to clipboard |
 | `o` | Open commit in browser (GitHub/GitLab) |
@@ -2757,7 +2758,7 @@ When cass is available, press `V` in History to open the separate session modal 
 
 ## 📅 Sprint Dashboard: Burndown & Progress Tracking
 
-The **Sprint Dashboard** (`pkg/ui/sprint_view.go`) shows sprint progress, a simple burndown chart, at-risk items, and sprint beads, driven by `.beads/sprints.jsonl`. Historical scope changes are available through `--robot-burndown`, not this dashboard. Press `P` from the list or detail view to open it on the sprint active today (the status line says so when no sprints are defined); `j`/`k` step between sprints, and `P`, `Esc`, or `q` close it.
+The **Sprint Dashboard** (`pkg/ui/sprint_view.go`) shows sprint progress, a simple burndown chart, at-risk items, and sprint beads, driven by `.beads/sprints.jsonl`. Historical scope changes are available through `--robot-burndown`, not this dashboard. Press `P` from the list or detail view to open it on the sprint active today (the status line says so when no sprints are defined); `j`/`k` step between sprints, `Ctrl+d`/`Ctrl+u` scroll, `Enter` jumps to the selected sprint issue, and `P`, `Esc`, or `q` close it.
 
 ### Dashboard Layout
 
@@ -2848,7 +2849,7 @@ $$
 | Component | Weight | Meaning |
 |-----------|--------|---------|
 | **Velocity** | 0.25 | Throughput of closed issues (recent closes score higher) |
-| **Freshness** | 0.25 | `100 - 100 × average_update_age_days / (2 × stale_threshold_days)`, truncated to an integer and clamped to 0–100. Averages nonzero update timestamps across all statuses; no timestamps yields 100. |
+| **Freshness** | 0.25 | `100 - 100 × average_update_age_days / (2 × stale_threshold_days)`, truncated to an integer and clamped to 0–100. Averages nonzero update timestamps across active non-closed, non-parked issues; no timestamps yields 100. |
 | **Flow** | 0.25 | `100 - 5 x incoming cross-label dependencies` (fewer external blockers score higher) |
 | **Criticality** | 0.25 | Up to 50 points from the label's average PageRank relative to the project maximum, plus up to 50 from its highest betweenness |
 
@@ -2909,7 +2910,7 @@ ui          4      2       -      0
 docs        0      0       0      -
 ```
 
-Read as: "api issues block auth issues through 3 dependency relationships." Rows are blocker labels and columns are dependent labels. Counts are relationships, not distinct issues: one issue can contribute several dependencies, and multiple labels contribute their cross-product. High values indicate coupling between domains; `bottleneck_labels` lists labels with the highest outgoing relationship count. The current `critical_paths` array is empty; this matrix does not provide critical-path annotations.
+Read as: "api issues block auth issues through 3 dependency relationships." Rows are blocker labels and columns are dependent labels. Counts are relationships, not distinct issues: one issue can contribute several dependencies, and multiple labels contribute their cross-product. High values indicate coupling between domains; `bottleneck_labels` lists labels with the highest outgoing relationship count, and `critical_paths` lists up to 10 cross-label dependency paths ranked by weight and length (empty only when no cross-label dependencies exist).
 
 ---
 
@@ -3019,15 +3020,15 @@ If the `wasm/` assets are missing, the viewer automatically falls back to the JS
 
 ```
 ./bv-pages/
-├── index.html              # Main dashboard with Alpine.js + Tailwind (303 KB)
+├── index.html              # Main dashboard with Alpine.js + Tailwind (367 KB)
 ├── .nojekyll               # Prevents Jekyll asset stripping on static hosts
 ├── .github/workflows/      # Optional static Pages bundle deployment template (static.yml)
-├── beads.sqlite3           # Full SQLite database (5.5 MB for this repository's 676 issues, plus 1 MiB chunk files above the 5 MiB threshold)
+├── beads.sqlite3           # Full SQLite database (6.9 MB for this repository's 773 issues, plus 1 MiB chunk files above the 5 MiB threshold)
 ├── data/
-│   ├── graph_layout.json   # Pre-computed positions + metrics (158 KB for 676 issues / 816 edges)
+│   ├── graph_layout.json   # Pre-computed positions + metrics (182 KB for 773 issues / 954 edges)
 │   ├── meta.json           # Export metadata
-│   ├── triage.json         # Triage recommendations (19 KB)
-│   └── history.json        # Recorded issue lifecycle for graph time travel (122 KB)
+│   ├── triage.json         # Triage recommendations (15 KB)
+│   └── history.json        # Recorded issue lifecycle for graph time travel (127 KB)
 └── vendor/
     ├── d3.v7.min.js        # Visualization library
     ├── force-graph.min.js  # Graph rendering
@@ -3062,14 +3063,14 @@ The export includes both graph-layout data and a SQLite database:
 
 | Component | Size | Purpose |
 |-----------|------|---------|
-| `graph_layout.json` | 158 KB for 676 issues / 816 edges | Pre-computed node positions + graph metrics |
-| `beads.sqlite3` | 5.5 MB for 676 issues | Full issue data for detail pane, search, tables |
+| `graph_layout.json` | 182 KB for 773 issues / 954 edges | Pre-computed node positions + graph metrics |
+| `beads.sqlite3` | 6.9 MB for 773 issues | Full issue data for detail pane, search, tables |
 
-Sizes are measured, not estimated: `tests/e2e/export_pages_test.go` re-exports this repository on every e2e run and checks the bundle against `tests/artifacts/perf/pages_load.json` (whole bundle 17.5 MB, of which 5.6 MB is the vendored viewer libraries; crossing the 5 MiB SQLite chunking threshold adds 1 MiB chunk files alongside `beads.sqlite3`); the record is rewritten only when the test runs with `BV_RECORD_PERF=1`, and a bundle that grows by more than a quarter fails the run.
+Sizes are measured, not estimated: `tests/e2e/export_pages_test.go` re-exports this repository on every e2e run and checks the bundle against `tests/artifacts/perf/pages_load.json` (whole bundle 20.6 MB, of which 5.6 MB is the vendored viewer libraries; crossing the 5 MiB SQLite chunking threshold adds 1 MiB chunk files alongside `beads.sqlite3`); the record is rewritten only when the test runs with `BV_RECORD_PERF=1`, and a bundle that grows by more than a quarter fails the run.
 
 **Current viewer behavior:** `viewer.js` waits for SQLite to load, then uses exported coordinates to seed live force simulation if every node and directed blocking edge matches the database. Missing, malformed, or mismatched layouts fall back to ordinary force initialization. Nodes remain movable, and the browser computes its own metrics, including critical path and cycles. The layout does not make the graph render before the database or bypass simulation.
 
-Load-time figures are not measured in the repository yet; the sizes above are from the retained September 29, 2026 export, not a measurement of the current checkout.
+Load-time figures are not measured in the repository yet; the sizes above are from the retained November 21, 2026 export, not a live browser timing measurement.
 
 ### Detail Pane
 
@@ -3479,7 +3480,7 @@ bv --robot-triage --format toon --stats           # Show JSON vs TOON token esti
 | `--workspace` | string | (empty) | Load issues from workspace config file (.bv/workspace.yaml) | Search & Filters |
 | `--cpu-profile` | string | (empty) | Write CPU profile to file | Debug Flags |
 | `--debug-height` | int | `50` | Height for debug render | Debug Flags |
-| `--debug-render` | string | (empty) | Render a TUI view to stdout and exit (views: triage, list, insights, board, history, graph, tree, actionable, sprint, flow, attention, labels) | Debug Flags |
+| `--debug-render` | string | (empty) | Render a TUI view to stdout and exit (views: triage, list, insights, board, history, graph, tree, actionable, sprint, flow, attention, labels, velocity) | Debug Flags |
 | `--debug-width` | int | `180` | Width for debug render | Debug Flags |
 | `--generate-docs` | bool | `false` | Generate documentation markdown and JSON artifacts | Debug Flags |
 | `--profile-json` | bool | `false` | Output profile in JSON format (use with --profile-startup) | Debug Flags |
@@ -3556,7 +3557,7 @@ bv --agent-brief ./agent-bundle/
 
 These are heuristics, not a scheduler. For `--robot-forecast`, choose a base from a positive `estimated_minutes`, otherwise the median positive estimate in the loaded issues (default 60 minutes). **Both explicit and inferred bases receive all multipliers:** type (`task`/`bug`: 1, `chore`: 0.8, `feature`: 1.3, `epic`: 2), dependency depth (`1 + min(1, depth/10)`), and description length (`1 + min(1, Unicode runes/2000)`). The product is truncated to integer minutes. Depth uses the available critical-path score; unavailable scores contribute zero depth.
 
-Velocity is complexity-weighted work minutes closed in the last 30 days divided by 30 (using the same `base × type × depth × description` formula as open estimates), shrunk per matching label toward global velocity via Bühlmann-Straub empirical-Bayes credibility weighting (`n / (n + 5)`), picking the slowest nonzero shrunk label velocity, then global velocity, then median/5 (with 60 min/day as a final fallback). ETA days = work minutes / (velocity × agents). Its confidence band is rule-based and has not been calibrated as a statistical probability. `--robot-capacity` reports serial critical-path work, parallelizable work, and top-level Graham (1969) parallel list-scheduling makespan bounds (`graham_min_days`, `graham_max_days`, `critical_path_minutes`, and `velocity_minutes_per_day`, implementing `[max(L_crit, W/m), L_crit + (W - L_crit)/m]`); it does not assign issues to agents or account for their availability. Payloads expose the factors behind these estimates. Both `--robot-forecast`'s per-issue `estimated_days` and `--robot-capacity`'s `estimated_days` divide complexity-weighted minutes by historical velocity (clamped to `[graham_min_days, graham_max_days]` in `--robot-capacity`, falling back to `480` min/day only when velocity is zero), whereas `--robot-capacity`'s `total_days` and `--robot-forecast`'s `summary.total_days` convert minutes at a fixed eight-hour workday (`minutes / 480`), and `summary.total_days` ignores `--forecast-agents`.
+Velocity is complexity-weighted work minutes closed in the last 30 days divided by 30 (using the same `base × type × depth × description` formula as open estimates), shrunk per matching label toward global velocity via Bühlmann-Straub empirical-Bayes credibility weighting (`n / (n + 5)`), picking the slowest nonzero shrunk label velocity, then global velocity, then `median/7` (one median-sized issue per 7-day calendar week, with `60/7` ≈ 8.57 min/day as a final fallback when no estimates exist). ETA days = work minutes / (velocity × agents). Its confidence band is rule-based and has not been calibrated as a statistical probability. `--robot-capacity` reports serial critical-path work, parallelizable work, and top-level Graham (1969) parallel list-scheduling makespan bounds (`graham_min_days`, `graham_max_days`, `critical_path_minutes`, and `velocity_minutes_per_day`, implementing `[max(L_crit, W/m), L_crit + (W - L_crit)/m]`); it does not assign issues to agents or account for their availability. Payloads expose the factors behind these estimates. Both `--robot-forecast`'s per-issue `estimated_days` and `--robot-capacity`'s `estimated_days` divide complexity-weighted minutes by historical velocity (clamped to `[graham_min_days, graham_max_days]` in `--robot-capacity`, falling back to `480` min/day only when velocity is zero), whereas `--robot-capacity`'s `total_days` and `--robot-forecast`'s `summary.total_days` convert minutes at a fixed eight-hour workday (`minutes / 480`), and `summary.total_days` ignores `--forecast-agents`.
 
 Forecast output applies the global issue selection and intersects it with
 `--forecast-label` and `--forecast-sprint`, when supplied. These filters also
@@ -4194,8 +4195,8 @@ The fastest way to get started. Detects your OS and architecture automatically.
 Prefer Homebrew, Scoop, or a checksum-verified release archive above. If you do pipe the script, pin it to a commit you have read instead of the moving `main` branch:
 
 ```bash
-# Pinned to a reviewed commit; read it first: https://github.com/Dicklesworthstone/beads_viewer/blob/8698c9b6511aae516096727816b1ae61e09e7126/install.sh
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/8698c9b6511aae516096727816b1ae61e09e7126/install.sh" | bash
+# Pinned to a reviewed commit; read it first: https://github.com/Dicklesworthstone/beads_viewer/blob/9f7d0b703d845f2c050e6fdcd68887414e2b1a3f/install.sh
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/9f7d0b703d845f2c050e6fdcd68887414e2b1a3f/install.sh" | bash
 ```
 
 > **Warning:** `curl ... | bash` runs whatever the URL serves at that moment. The pinned form above cannot change under you; the `main` form can. `install.sh` downloads the release archive for your platform, verifies it against the release `checksums.txt`, and refuses to install on a mismatch.
@@ -4204,8 +4205,8 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/869
 For Windows users using PowerShell:
 
 ```powershell
-# Pinned to a reviewed commit; read it first: https://github.com/Dicklesworthstone/beads_viewer/blob/8698c9b6511aae516096727816b1ae61e09e7126/install.ps1
-irm "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/8698c9b6511aae516096727816b1ae61e09e7126/install.ps1" | iex
+# Pinned to a reviewed commit; read it first: https://github.com/Dicklesworthstone/beads_viewer/blob/9f7d0b703d845f2c050e6fdcd68887414e2b1a3f/install.ps1
+irm "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/9f7d0b703d845f2c050e6fdcd68887414e2b1a3f/install.ps1" | iex
 ```
 
 **Requirements:**
@@ -4327,17 +4328,22 @@ bv has a comprehensive built-in help system:
 |  | `U` | Self-update check |
 | **list,detail,board,graph,insights,tree,actionable,flow,history** | `V` | Cass sessions |
 | **list,detail** | `\` | Toggle split view |
+|  | `tab` | Switch split pane focus |
+|  | `<` | Narrow list pane |
+|  | `>` | Widen list pane |
 | **graph** | `hjkl` | Navigate graph |
 |  | `H` | Scroll left |
 |  | `L` | Scroll right |
 |  | `J/K` | Scroll graph vertically |
 |  | `space` | Expand/collapse dependency paths |
-|  | `PgUp` | Previous 10 nodes |
-|  | `PgDn` | Next 10 nodes |
+|  | `PgUp` | Page nodes (prev 10) |
+|  | `PgDn` | Page nodes (next 10) |
 | **board** | `h` | Previous column |
 |  | `l` | Next column |
 |  | `H` | First column |
+|  | `0` | First column |
 |  | `L` | Last column |
+|  | `$` | Last column |
 |  | `1-4` | Jump to column 1-4 |
 |  | `/` | Search cards |
 |  | `n` | Next search match |
@@ -4380,7 +4386,8 @@ bv has a comprehensive built-in help system:
 |  | `H` | Heatmap toggle |
 |  | `<` | Widen detail panel |
 |  | `>` | Narrow detail panel |
-| **history** | `v` | Toggle git/bead mode |
+| **history** | `g` | Jump to graph view |
+|  | `v` | Toggle git/bead mode |
 |  | `/` | Search history |
 |  | `A` | Filter by commit author |
 |  | `c` | Cycle confidence filter |
@@ -4463,14 +4470,14 @@ bv has a comprehensive built-in help system:
 | `BV_SEARCH_WEIGHTS` | JSON weight map for hybrid search; overrides the preset. | (preset) |
 | `BV_SEMANTIC_DIM` | Embedding dimension for the hashed search index. | `384` |
 | `BV_SEMANTIC_EMBEDDER` | Embedding provider for `bv --search` and TUI search. Only `hash` (FNV-1a keyword feature hashing) is implemented; `python-sentence-transformers` and `openai` are reserved names that fail with "not implemented". | `hash` |
-| `BV_SEMANTIC_MODEL` | Model name for a future non-hash provider; ignored by `hash`. | (empty) |
+| `BV_SEMANTIC_MODEL` | Model identifier folded into the `hash` embedder's FNV-1a token seed and search index cache filename (and reserved for future non-hash providers). | (empty) |
 | `BV_SKIP_PHASE2` | Skip all Phase 2 graph metrics (centrality, cycles, critical path, k-core, articulation points, slack) (`1`/`0`). | (disabled) |
 | `BV_TEST_MODE` | Any value: test harness mode; suppresses browser opening, terminal capability queries, and the background worker's idle GC tuning. | (unset) |
 | `BV_THEME` | Pin the TUI palette: `light` or `dark` (overridden by `--theme`). | (auto-detect) |
 | `BV_TUI_AUTOCLOSE_MS` | Quit the TUI automatically after this many milliseconds (for automated tests). | (unset) |
 | `BV_UPDATE_USE_TOKEN` | Allow update checks and `--update` to send ambient `GITHUB_TOKEN` / `GH_TOKEN` only to the exact HTTPS origins api.github.com and github.com with `1`/`true`/`yes`/`on`; `0`/`false`/`no`/`off` denies it. Cross-origin redirects receive no token. Nonempty values override `updates.use_token` in user config (case-insensitive, trimmed); invalid values deny token use, and empty values preserve config. | (never sent) |
 | `BV_WATCHDOG_INTERVAL_S` | Background worker watchdog interval (seconds). | `10` |
-| `BV_WORKER_LOG_LEVEL` | Log level for the background snapshot worker. | (default) |
+| `BV_WORKER_LOG_LEVEL` | Log level for the background snapshot worker (`none`, `error`, `warn`, `info`, `debug`). | `none` |
 | `BV_WORKER_METRICS` | Truthy value: the background worker records its own metrics. | (off) |
 | `BV_WORKER_TRACE` | Path to a trace file the background worker appends to. | (off) |
 | `SOURCE_DATE_EPOCH` | Unix epoch timestamp (seconds) pinning robot report timestamps and running timeout-raced metrics to deterministic completion. | (unset) |
@@ -4689,7 +4696,7 @@ Copyright (c) 2026 Jeffrey Emanuel
 
 ## 🔒 Security & Privacy Notes
 - Local-first: all analysis happens locally on your repo's `.beads/` SQLite/JSONL data and Git history; no network required for robots.
-- Exports run only when you ask for them. Project hooks are denied by default: report exports (`--export` / `--export-md`), direct Pages exports (`--export-pages`), graph exports (`--export-graph`), priority briefs (`--priority-brief`), and agent brief bundles (`--agent-brief`) require explicit `--trust-hooks` approval of the reviewed configuration digest. `--no-hooks` bypasses the hook pipeline entirely. Merely starting `bv` or running a robot analysis does not run export hooks.
+- Exports run only when you ask for them. Project hooks are denied by default: report exports (`--export` / `--export-md`), direct Pages exports (`--export-pages`), the interactive Pages wizard (`--pages`), graph exports (`--export-graph`), priority briefs (`--priority-brief`), and agent brief bundles (`--agent-brief`) require explicit `--trust-hooks` approval of the reviewed configuration digest. `--no-hooks` bypasses the hook pipeline entirely. Merely starting `bv` or running a robot analysis does not run export hooks.
 - Hooks inherit only the documented operating-system environment by default; every additional parent variable requires an invoking-user `--hook-env NAME` grant. Project YAML cannot restore ungranted values through environment expansion or aliases, even when their names do not look like credentials. Approved hooks still have your operating-system privileges; direct `argv` execution and filtering are not sandboxes, and configuration approval does not freeze scripts they invoke. See [Automation Hooks](#-automation-hooks).
 - Update checks are silent and tolerate network failures without impacting startup.
 

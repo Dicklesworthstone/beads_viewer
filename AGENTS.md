@@ -191,9 +191,9 @@ Cross-package integration tests live in the `tests/` directory.
 - `pkg/export/main_test.go`
 - `pkg/ui/main_test.go`
 
-When adding new browser-opening code, always check these env vars first:
+When adding new browser-opening code, always check these env vars first via `internal/env`:
 ```go
-if os.Getenv("BV_NO_BROWSER") != "" || os.Getenv("BV_TEST_MODE") != "" {
+if env.NoBrowser.IsSet() || env.TestMode.IsSet() {
     return nil
 }
 ```
@@ -236,7 +236,7 @@ go test -run TestSpecificName ./pkg/...
 | `pkg/loader` | JSONL parsing, bead loading, validation |
 | `pkg/ui` | TUI views, robot output formatting, lipgloss styling |
 | `pkg/watcher` | Filesystem watching, daemon mode, debouncing |
-| `pkg/hooks` | Git hooks integration |
+| `pkg/hooks` | Export lifecycle hooks (`.bv/hooks.yaml`, trust digests, bounded execution) |
 | `pkg/recipe` | Pre-filter recipes (actionable, high-impact) |
 | `pkg/drift` | Configuration drift detection |
 | `tests/e2e` | End-to-end CLI tests, robot output validation |
@@ -301,10 +301,10 @@ beads_viewer/
 │   ├── model/                      # Core data types (Bead, Dependency, etc.)
 │   ├── ui/                         # TUI views (bubbletea), lipgloss styling, robot output
 │   ├── watcher/                    # Filesystem watching, daemon mode, debouncing
-│   ├── hooks/                      # Git hooks integration
+│   ├── hooks/                      # Export lifecycle hooks (.bv/hooks.yaml)
 │   ├── recipe/                     # Pre-filter recipes (actionable, high-impact)
 │   ├── drift/                      # Configuration drift detection
-│   ├── agents/                     # Agent detection and session tracking
+│   ├── agents/                     # AGENTS.md blurb detection, verification, and injection
 │   ├── cass/                       # Cross-agent session search integration
 │   ├── baseline/                   # Baseline comparison utilities
 │   ├── metrics/                    # Internal metrics collection
@@ -556,7 +556,7 @@ Beads provides a lightweight, dependency-aware issue database and CLI (`br` - be
 
 ## bv — Graph-Aware Triage Engine
 
-bv is a graph-aware triage engine for Beads projects (`.beads/issues.jsonl` in current `br` and Dolt-backed `bd` workspaces, with `.beads/beads.jsonl` supported for legacy workspaces). It computes PageRank, betweenness, critical path, cycles, HITS, eigenvector, and k-core metrics deterministically.
+bv is a graph-aware triage engine for Beads projects (`.beads/beads.db` SQLite and `.beads/issues.jsonl` in current `br` and Dolt-backed `bd` workspaces, with `.beads/beads.jsonl` supported for legacy workspaces). It computes PageRank, betweenness, critical path, cycles, HITS, eigenvector, and k-core metrics deterministically.
 
 **Scope boundary:** bv handles *what to work on* (triage, priority, planning). For agent-to-agent coordination (messaging, work claiming, file reservations), use MCP Agent Mail.
 
@@ -647,8 +647,8 @@ live tracker route; inspect the suggested action's original ID and directory.
 bv --robot-triage | jq '.triage.quick_ref'                 # At-a-glance summary
 bv --robot-triage | jq '.triage.recommendations[0]'         # Top recommendation
 bv --robot-plan | jq '.plan.summary.highest_impact'        # Best unblock target
-bv --robot-insights | jq '.status'                         # Check metric readiness
-bv --robot-insights | jq '.Cycles'                         # Circular deps (must fix!)
+bv --robot-insights | jq '.status'                                    # Check metric readiness
+bv --robot-insights | jq '{status: .status.Cycles, cycles: .Cycles}'  # Circular deps + status (must fix!)
 ```
 
 ---

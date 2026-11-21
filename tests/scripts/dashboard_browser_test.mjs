@@ -1310,7 +1310,7 @@ async function journey(page, mobile) {
   // navigate via DOM delegation (no inline onclick/XSS) to the target issue.
   await waitFor(page, `!!document.querySelector('[x-ref="depGraph"] .node[data-bv-issue-id="browser-root"]')`, 'clickable Mermaid blocker node');
   await capture(page, 'mermaid');
-  await evaluate(page, `document.querySelector('[x-ref="depGraph"] .node[data-bv-issue-id="browser-root"]').dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))`);
+  await click(page, '[x-ref="depGraph"] .node[data-bv-issue-id="browser-root"]');
   await waitFor(page, `${app}.selectedIssue?.id === 'browser-root'`, 'Mermaid strict-mode node click navigates to browser-root');
   assert.equal(await evaluate(page, 'window.__unsafeDisplay || false'), false, 'Mermaid click keeps strict XSS safety');
   await key(page, 'Escape');

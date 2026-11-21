@@ -266,8 +266,8 @@ The E2E suite includes a few large-scale/stress scenarios guarded by `testing.Sh
 # Fast/CI-friendly run (skips stress cases)
 go test -short ./tests/e2e
 
-# Full run
-go test ./tests/e2e -timeout=45m
+# Full run (matches release_gate.sh stage 4 aggregate timeout)
+go test ./tests/e2e -timeout=30m
 ```
 
 The full package can exceed Go's default ten-minute package timeout. This
