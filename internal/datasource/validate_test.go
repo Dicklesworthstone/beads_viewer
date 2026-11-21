@@ -382,4 +382,18 @@ func TestRC37_DiscoverAndLoadFollowRedirectAndMetadataDatabase(t *testing.T) {
 	if err != nil || len(customLoaded.Issues) != 1 || customLoaded.Issues[0].ID != "CUST-1" {
 		t.Fatalf("LoadIssuesFromDir(custom metadata db) = (%+v, %v), want [CUST-1]", customLoaded.Issues, err)
 	}
+
+	// 3. Non-sqlite metadata.json backend must not discover custom database as SQLite.
+	if err := os.WriteFile(filepath.Join(customDir, "metadata.json"), []byte(`{"database":"tracker.sqlite","backend":"unknown-tracker"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	nonSQLiteSources, err := DiscoverSources(DiscoveryOptions{BeadsDir: customDir, SkipWorktreeSources: true, ValidateAfterDiscovery: true})
+	if err != nil {
+		t.Fatalf("DiscoverSources(non-sqlite metadata backend) failed: %v", err)
+	}
+	for _, src := range nonSQLiteSources {
+		if filepath.Clean(src.Path) == filepath.Clean(customDBPath) {
+			t.Fatalf("DiscoverSources(non-sqlite metadata backend) must not discover %s as SQLite: %+v", customDBPath, nonSQLiteSources)
+		}
+	}
 }

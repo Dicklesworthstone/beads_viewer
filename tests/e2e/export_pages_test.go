@@ -163,6 +163,7 @@ func main() {
 					t.Fatalf("build capability fixture: %v\n%s", err, out)
 				}
 				t.Setenv("PATH", filepath.Dir(executable)+string(os.PathListSeparator)+os.Getenv("PATH"))
+				staleStubTime := time.Now().Add(-time.Minute)
 				for _, name := range []string{"first.db", "second.db"} {
 					dbPath := filepath.Join(filepath.Dir(source), name)
 					fixtureDB, err := sql.Open("sqlite", dbPath)
@@ -174,6 +175,12 @@ func main() {
 						t.Fatal(err)
 					}
 					if err := fixtureDB.Close(); err != nil {
+						t.Fatal(err)
+					}
+					// Keep the empty SQLite target stubs older than issues.jsonl so
+					// smart source selection keeps reading issues.jsonl while
+					// metadata.json updates exercise live mutation-route reloads.
+					if err := os.Chtimes(dbPath, staleStubTime, staleStubTime); err != nil {
 						t.Fatal(err)
 					}
 				}
