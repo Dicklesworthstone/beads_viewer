@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/baseline"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/cass"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/drift"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/loader"
@@ -761,7 +762,15 @@ func (b *SnapshotBuilder) Build() *DataSnapshot {
 	semanticIDs, semanticDocs := buildSnapshotSearchDocuments(listItems, b.prevSnapshot, b.diff)
 
 	projectDir := b.resolvedProjectDir()
-	alerts, alertsCritical, alertsWarning, alertsInfo := computeAlertsForDir(issues, graphStats, b.analyzer, projectDir)
+	var snapAlertScope *baseline.BaselineScope
+	if b.recipe != nil && strings.TrimSpace(b.recipe.Name) != "" {
+		snapAlertScope = &baseline.BaselineScope{Recipe: strings.TrimSpace(b.recipe.Name)}
+	}
+	alerts, alertsCritical, alertsWarning, alertsInfo := computeAlertsWithOptions(issues, graphStats, b.analyzer, alertComputeOptions{
+		ProjectDir: projectDir,
+		BeadsPath:  b.beadsPath,
+		Scope:      snapAlertScope,
+	})
 	dataHash := b.dataHash
 	if dataHash == "" {
 		dataHash = analysis.ComputeDataHash(issues)
@@ -1588,7 +1597,15 @@ func (s *DataSnapshot) WithPhase2(stats *analysis.GraphStats, insights analysis.
 			}
 		}
 	}
-	alerts, alertsCritical, alertsWarning, alertsInfo := computeAlertsForDir(issuesClone, stats, analyzer, s.projectDir)
+	var phase2AlertScope *baseline.BaselineScope
+	if s.recipe != nil && strings.TrimSpace(s.recipe.Name) != "" {
+		phase2AlertScope = &baseline.BaselineScope{Recipe: strings.TrimSpace(s.recipe.Name)}
+	}
+	alerts, alertsCritical, alertsWarning, alertsInfo := computeAlertsWithOptions(issuesClone, stats, analyzer, alertComputeOptions{
+		ProjectDir: s.projectDir,
+		BeadsPath:  s.beadsPath,
+		Scope:      phase2AlertScope,
+	})
 
 	return &DataSnapshot{
 		// Clone mutable Phase 1 data so the new snapshot stays immutable even if

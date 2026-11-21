@@ -1062,6 +1062,20 @@ func (w *BackgroundWorker) SetRecipe(r *recipe.Recipe) {
 	}
 }
 
+// SetSourceReload updates the worker's reload closure thread-safely (e.g., to
+// attach single-repo SQLite/JSONL auto-discovery without restarting the worker).
+func (w *BackgroundWorker) SetSourceReload(reload func(context.Context) (SourceReloadResult, error)) {
+	if w == nil {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.state == WorkerStopped {
+		return
+	}
+	w.sourceReload = reload
+}
+
 func (w *BackgroundWorker) setRecipe(r *recipe.Recipe) (changed bool, shouldRefresh bool) {
 	if w == nil {
 		return false, false
@@ -1657,8 +1671,11 @@ func (w *BackgroundWorker) buildSnapshotResultContext(ctx context.Context, force
 		loadStart = time.Now()
 	}
 	loadErr := w.safeCompute("load", func() error {
-		if w.sourceReload != nil {
-			res, err := w.sourceReload(ctx)
+		w.mu.Lock()
+		sourceReload := w.sourceReload
+		w.mu.Unlock()
+		if sourceReload != nil {
+			res, err := sourceReload(ctx)
 			if err != nil {
 				return err
 			}

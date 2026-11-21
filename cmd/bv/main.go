@@ -5689,13 +5689,20 @@ func main() {
 			}
 			reloadPath, pathErr := filepath.Abs(*workspaceConfig)
 			reloadLabel, reloadRepo := *labelScope, *repoFilter
+			wsWatchers := newTUIExternalWatcherSet()
+			wsWatchers.Sync(tuiWorkspaceWatchPaths(robotDispatchContext, *workspaceConfig), "")
+			externalReloadCh, stopExternalWatchers = wsWatchers.ChangeCh(), wsWatchers.Stop
+			m.SetExternalWatcherStatusProvider(wsWatchers.Status)
 			m.SetSourceReload(func(ctx context.Context) (ui.SourceReloadResult, error) {
 				if pathErr != nil {
 					return ui.SourceReloadResult{}, fmt.Errorf("resolve workspace reload path: %w", pathErr)
 				}
-				return reloadWorkspaceForUI(ctx, reloadPath, reloadLabel, reloadRepo)
+				res, watchPaths, err := reloadWorkspaceForUIWithPaths(ctx, reloadPath, reloadLabel, reloadRepo)
+				if err == nil && len(watchPaths) > 0 {
+					wsWatchers.Sync(watchPaths, "")
+				}
+				return res, err
 			})
-			externalReloadCh, stopExternalWatchers = startExternalTUIWatchers(tuiWorkspaceWatchPaths(robotDispatchContext, *workspaceConfig), "")
 		} else if beadsPath != "" {
 			boundSource := singleSourceLoad.Source
 			reloadLabel, reloadRepo := *labelScope, *repoFilter
@@ -5709,18 +5716,37 @@ func main() {
 				if *labelScope == "" && *repoFilter == "" {
 					m.SetBackgroundAutoPromote(true)
 				}
-				externalReloadCh, stopExternalWatchers = startExternalTUIWatchers(tuiSingleRepoSiblingWatchPaths(robotDispatchContext, beadsPath), "")
+				extWatchers := newTUIExternalWatcherSet()
+				extWatchers.Sync(tuiSingleRepoSiblingWatchPaths(robotDispatchContext, beadsPath), "")
+				externalReloadCh, stopExternalWatchers = extWatchers.ChangeCh(), extWatchers.Stop
 				if externalReloadCh != nil {
 					m.DisableInternalWatcher()
+					m.SetExternalWatcherStatusProvider(extWatchers.Status)
 				}
 			} else {
+				watchPaths := []string{filepath.Join(filepath.Dir(beadsPath), loader.SprintsFileName)}
+				skipPath := ""
 				if *labelScope != "" || *repoFilter != "" {
+					// Explicit --db + scoped filter (background mode is disabled for scoped sessions above).
 					m.SetSourceReload(func(ctx context.Context) (ui.SourceReloadResult, error) {
 						return reloadSingleRepoForUIWithDegraded(ctx, boundSource, boundSourceDegraded, reloadLabel, reloadRepo)
 					})
+				} else if bgEnabled && !explicitDBPinned {
+					// BackgroundWorker watches beadsPath itself; attach auto-discovery loader so
+					// sibling SQLite/JSONL changes trigger a real freshest-source reload.
+					reloadDir := projectDir
+					m.SetBackgroundSourceReload(func(ctx context.Context) (ui.SourceReloadResult, error) {
+						return reloadSingleRepoAutoDiscoverForUI(ctx, reloadDir, boundSource, boundSourceDegraded, reloadLabel, reloadRepo)
+					})
+					watchPaths = tuiSingleRepoSiblingWatchPaths(robotDispatchContext, beadsPath)
+					skipPath = beadsPath
 				}
-				sprintWatchPath := filepath.Join(filepath.Dir(beadsPath), loader.SprintsFileName)
-				externalReloadCh, stopExternalWatchers = startExternalTUIWatchers([]string{sprintWatchPath}, "")
+				extWatchers := newTUIExternalWatcherSet()
+				extWatchers.Sync(watchPaths, skipPath)
+				externalReloadCh, stopExternalWatchers = extWatchers.ChangeCh(), extWatchers.Stop
+				if externalReloadCh != nil {
+					m.SetExternalWatcherStatusProvider(extWatchers.Status)
+				}
 			}
 		}
 
@@ -6242,23 +6268,29 @@ func scopeLoadedIssues(ctx RobotContext, r *recipe.Recipe) (RobotContext, error)
 // printing into the terminal while Bubble Tea is rendering. The recipe remains
 // a UI selection, so its picker can still reach all rows in the CLI scope.
 func reloadWorkspaceForUI(ctx context.Context, configPath, label, repo string) (ui.SourceReloadResult, error) {
+	res, _, err := reloadWorkspaceForUIWithPaths(ctx, configPath, label, repo)
+	return res, err
+}
+
+func reloadWorkspaceForUIWithPaths(ctx context.Context, configPath, label, repo string) (ui.SourceReloadResult, []string, error) {
 	if err := ctx.Err(); err != nil {
-		return ui.SourceReloadResult{}, err
+		return ui.SourceReloadResult{}, nil, err
 	}
 	config, err := workspace.LoadConfig(configPath)
 	if err != nil {
-		return ui.SourceReloadResult{}, fmt.Errorf("reload workspace config: %w", err)
+		return ui.SourceReloadResult{}, nil, fmt.Errorf("reload workspace config: %w", err)
 	}
 	aggregate := workspace.NewAggregateLoader(config, workspace.ResolveWorkspaceBaseDir(configPath))
 	aggregate.SetLogger(nil)
 	issues, results, err := aggregate.LoadAll(ctx)
 	if err != nil {
-		return ui.SourceReloadResult{}, fmt.Errorf("reload workspace: %w", err)
+		return ui.SourceReloadResult{}, nil, fmt.Errorf("reload workspace: %w", err)
 	}
 	if err := ctx.Err(); err != nil {
-		return ui.SourceReloadResult{}, err
+		return ui.SourceReloadResult{}, nil, err
 	}
 	authority := robotWorkspaceAuthority(results)
+	watchPaths := tuiWorkspaceWatchPaths(RobotContext{SourceAuthority: authority}, configPath)
 	var warnings, tombstoneIDs []string
 	for _, source := range authority.Sources {
 		if source.Error != "" {
@@ -6285,10 +6317,10 @@ func reloadWorkspaceForUI(ctx context.Context, configPath, label, repo string) (
 		Issues: issues, Readiness: readiness, LabelScope: label, Repo: repo,
 	}, nil)
 	if err != nil {
-		return ui.SourceReloadResult{}, err
+		return ui.SourceReloadResult{}, watchPaths, err
 	}
 	if err := ctx.Err(); err != nil {
-		return ui.SourceReloadResult{}, err
+		return ui.SourceReloadResult{}, watchPaths, err
 	}
 	summary := workspace.Summarize(results)
 	sprints, sprintErr := loadSprintsForContext(RobotContext{
@@ -6318,7 +6350,7 @@ func reloadWorkspaceForUI(ctx context.Context, configPath, label, repo string) (
 			RepoPrefixes: summary.RepoPrefixes,
 			Repos:        uiWorkspaceReposFromAuthority(authority),
 		},
-	}, nil
+	}, watchPaths, nil
 }
 
 func uiWorkspaceReposFromAuthority(authority *RobotSourceAuthority) []ui.WorkspaceRepoTarget {
@@ -6707,15 +6739,45 @@ func tuiSingleRepoSiblingWatchPaths(ctx RobotContext, primaryPath string) []stri
 	return paths
 }
 
-func startExternalTUIWatchers(paths []string, skipPath string) (<-chan struct{}, func()) {
+type tuiExternalWatcherSet struct {
+	mu       sync.Mutex
+	stopped  bool
+	changeCh chan struct{}
+	watchers map[string]*watcher.Watcher
+}
+
+func newTUIExternalWatcherSet() *tuiExternalWatcherSet {
+	return &tuiExternalWatcherSet{
+		changeCh: make(chan struct{}, 1),
+		watchers: make(map[string]*watcher.Watcher),
+	}
+}
+
+func (s *tuiExternalWatcherSet) notify() {
+	select {
+	case s.changeCh <- struct{}{}:
+	default:
+	}
+}
+
+func (s *tuiExternalWatcherSet) ChangeCh() <-chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.watchers) == 0 {
+		return nil
+	}
+	return s.changeCh
+}
+
+func (s *tuiExternalWatcherSet) Sync(paths []string, skipPath string) {
 	var skipAbs string
 	if skipPath != "" {
 		if abs, err := filepath.Abs(skipPath); err == nil {
 			skipAbs = abs
 		}
 	}
-	seen := make(map[string]bool, len(paths))
-	var unique []string
+	wanted := make(map[string]bool, len(paths))
+	var ordered []string
 	for _, raw := range paths {
 		if strings.TrimSpace(raw) == "" {
 			continue
@@ -6727,27 +6789,26 @@ func startExternalTUIWatchers(paths []string, skipPath string) (<-chan struct{},
 		if skipAbs != "" && abs == skipAbs {
 			continue
 		}
-		if !seen[abs] {
-			seen[abs] = true
-			unique = append(unique, abs)
+		if !wanted[abs] {
+			wanted[abs] = true
+			ordered = append(ordered, abs)
 		}
 	}
-	if len(unique) == 0 {
-		return nil, func() {}
+	sort.Strings(ordered)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stopped {
+		return
 	}
-	changeCh := make(chan struct{}, 1)
-	notify := func() {
-		select {
-		case changeCh <- struct{}{}:
-		default:
+	for _, path := range ordered {
+		if s.watchers[path] != nil {
+			continue
 		}
-	}
-	var watchers []*watcher.Watcher
-	for _, path := range unique {
 		w, err := watcher.NewWatcher(path,
 			watcher.WithDebounceDuration(200*time.Millisecond),
-			watcher.WithOnChange(notify),
-			watcher.WithOnError(func(error) { notify() }),
+			watcher.WithOnChange(s.notify),
+			watcher.WithOnError(func(error) { s.notify() }),
 		)
 		if err != nil {
 			continue
@@ -6755,20 +6816,63 @@ func startExternalTUIWatchers(paths []string, skipPath string) (<-chan struct{},
 		if err := w.Start(); err != nil {
 			continue
 		}
-		watchers = append(watchers, w)
+		s.watchers[path] = w
 	}
-	if len(watchers) == 0 {
+	for path, w := range s.watchers {
+		if !wanted[path] {
+			w.Stop()
+			delete(s.watchers, path)
+		}
+	}
+}
+
+func (s *tuiExternalWatcherSet) Status() ui.ExternalWatcherStatus {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var st ui.ExternalWatcherStatus
+	for _, w := range s.watchers {
+		if !w.IsPolling() {
+			continue
+		}
+		st.Polling = true
+		fsType := w.FilesystemType()
+		if fsType != watcher.FSTypeUnknown && fsType != watcher.FSTypeLocal && (st.Filesystem == watcher.FSTypeUnknown || st.Filesystem == watcher.FSTypeLocal) {
+			st.Filesystem = fsType
+		}
+		if iv := w.PollInterval(); iv > 0 && (st.PollInterval == 0 || iv < st.PollInterval) {
+			st.PollInterval = iv
+		}
+	}
+	return st
+}
+
+func (s *tuiExternalWatcherSet) Stop() {
+	s.mu.Lock()
+	if s.stopped {
+		s.mu.Unlock()
+		return
+	}
+	s.stopped = true
+	watchers := make([]*watcher.Watcher, 0, len(s.watchers))
+	for path, w := range s.watchers {
+		watchers = append(watchers, w)
+		delete(s.watchers, path)
+	}
+	s.mu.Unlock()
+	for _, w := range watchers {
+		w.Stop()
+	}
+}
+
+func startExternalTUIWatchers(paths []string, skipPath string) (<-chan struct{}, func()) {
+	set := newTUIExternalWatcherSet()
+	set.Sync(paths, skipPath)
+	ch := set.ChangeCh()
+	if ch == nil {
+		set.Stop()
 		return nil, func() {}
 	}
-	var stopOnce sync.Once
-	stop := func() {
-		stopOnce.Do(func() {
-			for _, w := range watchers {
-				w.Stop()
-			}
-		})
-	}
-	return changeCh, stop
+	return ch, set.Stop
 }
 
 func reloadSingleRepoForUI(ctx context.Context, source datasource.DataSource, label, repo string) (ui.SourceReloadResult, error) {

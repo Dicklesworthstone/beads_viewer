@@ -9999,3 +9999,50 @@ func TestRC37_CLIExclusivityOptionalFlagsWasmBoolAndExportInactiveE2E(t *testing
 		}
 	}
 }
+
+func TestWave23_TUIExternalWatcherSetDynamicSyncAndStatus(t *testing.T) {
+	dir := t.TempDir()
+	fileA := filepath.Join(dir, "a.jsonl")
+	fileB := filepath.Join(dir, "b.jsonl")
+	if err := os.WriteFile(fileA, []byte("{\"id\":\"A-1\"}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fileB, []byte("{\"id\":\"B-1\"}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("BV_FORCE_POLLING", "1")
+	t.Setenv("BV_POLL_INTERVAL", "150ms")
+
+	set := newTUIExternalWatcherSet()
+	defer set.Stop()
+
+	// Initial Sync watches fileA (skipping fileB).
+	set.Sync([]string{fileA, fileB}, fileB)
+	ch := set.ChangeCh()
+	if ch == nil {
+		t.Fatal("expected non-nil ChangeCh after watching fileA")
+	}
+	st := set.Status()
+	if !st.Polling || st.PollInterval != 150*time.Millisecond {
+		t.Fatalf("unexpected external watcher status: %+v", st)
+	}
+
+	// Dynamic Sync swaps fileA out for fileB; modifying fileB triggers ChangeCh.
+	set.Sync([]string{fileB}, "")
+	if err := os.WriteFile(fileB, []byte("{\"id\":\"B-1\"}\n{\"id\":\"B-2\"}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-ch:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for dynamic Sync fileB change notification")
+	}
+
+	// Idempotent Stop cleans up all watchers.
+	set.Stop()
+	set.Stop()
+	if got := set.Status(); got.Polling {
+		t.Fatalf("expected stopped watcher set to report Polling=false, got %+v", got)
+	}
+}

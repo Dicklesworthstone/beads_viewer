@@ -188,9 +188,25 @@ func (m *Model) renderSprintDashboard() string {
 
 	// At-risk items: the same four signals and .bv/drift.yaml thresholds
 	// --robot-burndown reports (analysis.DetectAtRisk), so the TUI and robot agree.
+	// Pass full m.issues with a candidate-scoped sprint copy so out-of-scope open
+	// blockers and parent epics resolve in DetectAtRisk's issueMap (matching --robot-burndown).
 	sb.WriteString(labelStyle.Render("At Risk:"))
 	sb.WriteString("\n")
-	atRisk := analysis.DetectAtRiskWithReadiness(scopedIssues, sprint, sprintReadiness, now, m.sprintAtRiskThresholds)
+	scopedSprint := *sprint
+	if len(scopedIssues) != len(m.issues) {
+		scopedSet := make(map[string]bool, len(scopedIssues))
+		for _, iss := range scopedIssues {
+			scopedSet[iss.ID] = true
+		}
+		scopedBeadIDs := make([]string, 0, len(sprint.BeadIDs))
+		for _, id := range sprint.BeadIDs {
+			if scopedSet[id] {
+				scopedBeadIDs = append(scopedBeadIDs, id)
+			}
+		}
+		scopedSprint.BeadIDs = scopedBeadIDs
+	}
+	atRisk := analysis.DetectAtRiskWithReadiness(m.issues, &scopedSprint, sprintReadiness, now, m.sprintAtRiskThresholds)
 	if len(atRisk) == 0 {
 		sb.WriteString(t.Renderer.NewStyle().Foreground(t.Open).Render("  ✓ No at-risk items"))
 		sb.WriteString("\n")

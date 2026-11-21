@@ -19,12 +19,15 @@ import (
 	"github.com/muesli/termenv"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/baseline"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/cass"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/correlation"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/drift"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/recipe"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/search"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/updater"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/watcher"
 )
 
 func TestMain(m *testing.M) {
@@ -1539,6 +1542,242 @@ func TestWave22_TUIRegressions(t *testing.T) {
 		}
 		if strings.Count(plainUM, "╰") < 4 {
 			t.Errorf("expected intact outer modal + 3 button bottom borders at 60x12:\n%s", plainUM)
+		}
+	})
+}
+
+func TestWave23_SprintAtRiskParity_AlertsParity_CassPrefetch_And_WatcherStatus(t *testing.T) {
+	now := time.Now().UTC()
+
+	// 1. Gap 1: Scoped Sprint View detects out-of-scope open blockers and parent epics
+	//    via full m.issues (matching --robot-burndown), never dropping them.
+	t.Run("sprint_at_risk_resolves_out_of_scope_blockers", func(t *testing.T) {
+		sprint := model.Sprint{
+			ID:        "sp-1",
+			Name:      "Sprint Scoped",
+			StartDate: now.AddDate(0, 0, -10),
+			EndDate:   now.AddDate(0, 0, 4),
+			BeadIDs:   []string{"IN-1", "OUT-SPRINT"},
+		}
+		stale := now.AddDate(0, 0, -8)
+		issues := []model.Issue{
+			{
+				ID:        "EXT-BLK",
+				Title:     "External open blocker",
+				Status:    model.StatusOpen,
+				Priority:  1,
+				IssueType: model.TypeTask,
+				CreatedAt: stale,
+				UpdatedAt: stale,
+			},
+			{
+				ID:        "IN-1",
+				Title:     "Scoped sprint item",
+				Status:    model.StatusOpen,
+				Priority:  1,
+				IssueType: model.TypeTask,
+				Labels:    []string{"team-a"},
+				CreatedAt: stale,
+				UpdatedAt: stale,
+				Dependencies: []*model.Dependency{
+					{IssueID: "IN-1", DependsOnID: "EXT-BLK", Type: model.DepBlocks},
+				},
+			},
+			{
+				ID:        "OUT-SPRINT",
+				Title:     "Out of scope sprint item",
+				Status:    model.StatusOpen,
+				Priority:  2,
+				IssueType: model.TypeTask,
+				CreatedAt: stale,
+				UpdatedAt: stale,
+			},
+		}
+		m := NewModel(issues, nil, "")
+		t.Cleanup(m.Stop)
+		m.width = 120
+		m.height = 40
+		m.candidateIDs = map[string]bool{"IN-1": true}
+		m.sprints = []model.Sprint{sprint}
+		m.selectedSprint = &m.sprints[0]
+
+		out := ansi.Strip(m.renderSprintDashboard())
+		if !strings.Contains(out, "IN-1") {
+			t.Fatalf("expected scoped sprint dashboard to include IN-1:\n%s", out)
+		}
+		if !strings.Contains(out, "At Risk") || !strings.Contains(out, "blocked_too_long") {
+			t.Fatalf("expected out-of-scope open blocker EXT-BLK to flag IN-1 as at-risk:\n%s", out)
+		}
+		if strings.Contains(out, "OUT-SPRINT") {
+			t.Fatalf("expected out-of-scope OUT-SPRINT to remain excluded from scoped sprint dashboard:\n%s", out)
+		}
+	})
+
+	// 2. Gap 2: TUI alerts skip mismatched unscoped baselines when scoped, and use ActiveBetweenness.
+	t.Run("tui_alerts_scope_and_active_betweenness_parity", func(t *testing.T) {
+		projDir := t.TempDir()
+		unscopedBL := baseline.NewForDir(
+			projDir,
+			baseline.GraphStats{NodeCount: 50, EdgeCount: 100, Density: 0.50, OpenCount: 40, ClosedCount: 10, BlockedCount: 20},
+			baseline.TopMetrics{
+				Betweenness: []baseline.MetricItem{{ID: "CLOSED-HUB", Value: 0.9}},
+			},
+			nil,
+			"unscoped baseline",
+		)
+		if err := unscopedBL.Save(baseline.DefaultPath(projDir)); err != nil {
+			t.Fatalf("save baseline: %v", err)
+		}
+		issues := []model.Issue{
+			{ID: "A", Title: "Open leaf", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now,
+				Dependencies: []*model.Dependency{{IssueID: "A", DependsOnID: "CLOSED-HUB", Type: model.DepBlocks}}},
+			{ID: "CLOSED-HUB", Title: "Closed hub", Status: model.StatusClosed, Priority: 1, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now,
+				Dependencies: []*model.Dependency{{IssueID: "CLOSED-HUB", DependsOnID: "B", Type: model.DepBlocks}}},
+			{ID: "B", Title: "Open root", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
+		}
+		analyzer := analysis.NewAnalyzer(issues)
+		stats := analyzer.AnalyzeWithConfig(analysis.FullAnalysisConfig())
+
+		// Scoped computeAlertsWithOptions must NOT fire false density/metric drift against unscoped baseline.
+		scopedAlerts, _, _, _ := computeAlertsWithOptions(issues, &stats, analyzer, alertComputeOptions{
+			ProjectDir:     projDir,
+			CandidateIDs:   map[string]bool{"A": true, "B": true},
+			Scope:          &baseline.BaselineScope{Label: "api"},
+			SkipSourceDiff: true,
+		})
+		for _, a := range scopedAlerts {
+			if a.Type == drift.AlertDensityGrowth || a.Type == drift.AlertPageRankChange || a.Type == drift.AlertBlockedIncrease {
+				t.Fatalf("scoped alerts must skip mismatched unscoped baseline, got unexpected alert: %+v", a)
+			}
+		}
+
+		// Unscoped computeAlertsWithOptions uses ActiveBetweenness (CLOSED-HUB is excluded, whereas raw Betweenness includes CLOSED-HUB > 0).
+		if stats.GetBetweennessScore("CLOSED-HUB") <= 0 {
+			t.Fatalf("negative control invalid: raw Betweenness(CLOSED-HUB) = %v, want > 0", stats.GetBetweennessScore("CLOSED-HUB"))
+		}
+		for _, item := range buildScopedBaselineMetricItems(stats.ActiveBetweenness(), 10, nil) {
+			if item.ID == "CLOSED-HUB" {
+				t.Fatalf("expected ActiveBetweenness to exclude CLOSED-HUB, got %+v", item)
+			}
+		}
+	})
+
+	// 3. Pass 3 #4 + Gap 6: SetSourceReload clears stale background status, and footer displays external polling badge.
+	t.Run("set_source_reload_clears_status_and_footer_shows_external_polling", func(t *testing.T) {
+		issues := []model.Issue{
+			{ID: "W-1", Title: "Watch item", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
+		}
+		m := NewModel(issues, nil, "")
+		t.Cleanup(m.Stop)
+		m.width = 120
+		m.height = 30
+		m.statusMsg = "Background mode enabled"
+		m.SetSourceReload(func(context.Context) (SourceReloadResult, error) {
+			return SourceReloadResult{Issues: issues}, nil
+		})
+		if m.statusMsg != "" {
+			t.Fatalf("SetSourceReload left stale statusMsg = %q", m.statusMsg)
+		}
+
+		m.SetExternalWatcherStatusProvider(func() ExternalWatcherStatus {
+			return ExternalWatcherStatus{
+				Polling:      true,
+				Filesystem:   watcher.FSTypeNFS,
+				PollInterval: 2 * time.Second,
+			}
+		})
+		footer := ansi.Strip(m.renderFooter())
+		if !strings.Contains(footer, "polling") {
+			t.Fatalf("expected footer to show external watcher polling badge, got: %q", footer)
+		}
+	})
+
+	// 4. Gap 5: Debounced CASS prefetch stays silent when unhealthy and populates cache/history when healthy.
+	t.Run("cass_debounced_prefetch_populates_session_badge", func(t *testing.T) {
+		binDir := t.TempDir()
+		workDir := t.TempDir()
+		cassScript := filepath.Join(binDir, "cass")
+		scriptBody := "#!/bin/sh\n" +
+			"if [ \"$1\" = \"health\" ]; then echo '{\"healthy\":true}'; exit 0; fi\n" +
+			"if [ \"$1\" = \"search\" ]; then\n" +
+			"  printf '{\"hits\":[{\"source_path\":\"/sessions/cs-1.jsonl\",\"line_number\":1,\"agent\":\"claude\",\"title\":\"Investigated CS-1 auth refresh\",\"content\":\"Fixed token refresh for CS-1\",\"workspace\":\"%s\",\"score\":0.92}],\"count\":1,\"total_matches\":1}\\n' \"$WORK_DIR\"\n" +
+			"  exit 0\n" +
+			"fi\n" +
+			"exit 1\n"
+		if err := os.WriteFile(cassScript, []byte(strings.ReplaceAll(scriptBody, "$WORK_DIR", workDir)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+		issues := []model.Issue{
+			{ID: "CS-1", Title: "Auth token refresh", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
+		}
+		m := NewModel(issues, nil, "")
+		t.Cleanup(m.Stop)
+		m.SetWorkDir(workDir)
+		m.width = 120
+		m.height = 30
+
+		// Unhealthy cass must never schedule prefetch.
+		m.cassStatus = cass.StatusNotInstalled
+		if cmd := m.scheduleCassPrefetch(); cmd != nil {
+			t.Fatal("expected nil prefetch cmd when cassStatus != StatusHealthy")
+		}
+
+		// Healthy cass schedules a debounced tick once per cursor bead.
+		m.cassStatus = cass.StatusHealthy
+		if cmd := m.scheduleCassPrefetch(); cmd == nil {
+			t.Fatal("expected non-nil debounced prefetch cmd when cassStatus == StatusHealthy")
+		}
+		if cmd := m.scheduleCassPrefetch(); cmd != nil {
+			t.Fatal("expected duplicate scheduleCassPrefetch for same bead to coalesce to nil")
+		}
+
+		// Pass 4 #7: If a modal blocks the tick during the 250ms debounce, cassPrefetchLastID
+		// must clear so returning to the same bead reschedules prefetch cleanly.
+		blockedGen := m.cassPrefetchGen
+		m.showHelp = true
+		updatedBlocked, blockedCmd := m.Update(cassPrefetchTickMsg{gen: blockedGen, beadID: "CS-1"})
+		m = updatedBlocked.(*Model)
+		if blockedCmd != nil {
+			t.Fatal("expected blocked cassPrefetchTickMsg to return nil cmd")
+		}
+		if m.cassPrefetchLastID != "" {
+			t.Fatalf("expected blocked cassPrefetchTickMsg to clear cassPrefetchLastID, got %q", m.cassPrefetchLastID)
+		}
+		m.showHelp = false
+		if cmd := m.scheduleCassPrefetch(); cmd == nil {
+			t.Fatal("expected scheduleCassPrefetch to retry after modal closes")
+		}
+
+		// Fire cassPrefetchTickMsg -> runs real correlator.Correlate -> returns cassPrefetchDoneMsg.
+		gen := m.cassPrefetchGen
+		updated, runCmd := m.Update(cassPrefetchTickMsg{gen: gen, beadID: "CS-1"})
+		outM := updated.(*Model)
+		if runCmd == nil {
+			t.Fatal("expected cassPrefetchTickMsg to return non-nil background correlation command")
+		}
+		doneMsg := runCmd()
+		updated2, _ := outM.Update(doneMsg)
+		outM = updated2.(*Model)
+		if got := outM.getCassSessionCount(); got != 1 {
+			t.Fatalf("getCassSessionCount() after real cass prefetch = %d, want 1", got)
+		}
+		if sessions := outM.historyView.GetSessionsForBead("CS-1"); len(sessions) != 1 {
+			t.Fatalf("historyView sessions for CS-1 = %d, want 1", len(sessions))
+		}
+
+		// Pass 4 #6: Quitting via ctrl+c with an uncached bead and healthy cass must return
+		// pure tea.Quit (never tea.Batch(tea.Quit, prefetchTick)).
+		mQuit := NewModel(issues, nil, "")
+		t.Cleanup(mQuit.Stop)
+		mQuit.cassStatus = cass.StatusHealthy
+		_, quitCmd := mQuit.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+		if quitCmd == nil {
+			t.Fatal("expected ctrl+c to return tea.Quit cmd")
+		}
+		if _, isQuit := quitCmd().(tea.QuitMsg); !isQuit {
+			t.Fatalf("expected ctrl+c cmd to emit tea.QuitMsg directly without cass prefetch batching, got %T", quitCmd())
 		}
 	})
 }

@@ -293,6 +293,24 @@ type SourceReloadResult struct {
 	ReloadDuration      time.Duration
 }
 
+// ExternalWatcherStatus summarizes live-reload polling/filesystem state from
+// CLI-managed external watchers (e.g., workspace mode or single-repo sibling
+// watchers when the internal watcher is disabled).
+type ExternalWatcherStatus struct {
+	Polling      bool
+	Filesystem   watcher.FilesystemType
+	PollInterval time.Duration
+}
+
+// SetExternalWatcherStatusProvider attaches a thread-safe provider queried by
+// the footer when neither BackgroundWorker nor the internal watcher is active.
+func (m *Model) SetExternalWatcherStatusProvider(provider func() ExternalWatcherStatus) {
+	if m == nil {
+		return
+	}
+	m.externalWatcherStatus = provider
+}
+
 // SetExplicitDB records whether the issue source was pinned via an explicit
 // --db flag or BEADS_DB override, preventing auto-promotion to JSONL background
 // file watching and scoping semantic index paths distinctly.
@@ -321,6 +339,9 @@ func (m *Model) SetSourceReload(reload func(context.Context) (SourceReloadResult
 		m.backgroundWorker.Stop()
 		m.backgroundWorker = nil
 	}
+	if m.statusMsg == "Background mode enabled" {
+		m.statusMsg = ""
+	}
 	m.snapshotInitPending = false
 	m.restoreBackgroundAfterEdit = false
 	m.pendingTrackerRefresh = nil
@@ -340,6 +361,20 @@ func (m *Model) SetBackgroundAutoPromote(allow bool) {
 		return
 	}
 	m.allowBackgroundAutoPromote = allow
+}
+
+// SetBackgroundSourceReload attaches an auto-discovery reload loader to an
+// active BackgroundWorker (e.g., under BV_BACKGROUND_MODE=1 with sibling
+// SQLite/JSONL watchers) without tearing down background mode.
+func (m *Model) SetBackgroundSourceReload(reload func(context.Context) (SourceReloadResult, error)) {
+	if m == nil {
+		return
+	}
+	m.sourceReload = reload
+	m.allowBackgroundAutoPromote = true
+	if m.backgroundWorker != nil {
+		m.backgroundWorker.SetSourceReload(reload)
+	}
 }
 
 func (m *Model) sourceReloadCmd() tea.Cmd {
@@ -2213,18 +2248,22 @@ type Model struct {
 	analyzer                 *analysis.Analyzer
 	analysis                 *analysis.GraphStats
 	phase2PreparationCancel  context.CancelFunc
-	candidateIDs             map[string]bool  // Owned selection; graph context remains in issues.
-	scopeLabelFilter         string           // Optional CLI --label filter for dynamic historical scoping.
-	scopeRepoFilter          string           // Optional CLI --repo filter for dynamic historical scoping.
-	authorityHash            string           // Full authority hash (including tombstones) for export provenance.
-	authorityIncomplete      bool             // True when authority is incomplete, historical, or warned.
-	sourceDegraded           bool             // True when discovery fell back to a stale/degraded source.
-	isExplicitDB             bool             // True when source was explicitly pinned via --db / BEADS_DB.
-	referenceNow             time.Time        // Optional pinned reference clock (e.g. --as-of).
-	asOfRevision             string           // Optional revision bound for correlation history (e.g. --as-of).
-	beadsPath                string           // Path to beads.jsonl for reloading
-	watcher                  *watcher.Watcher // File watcher for live reload
-	instanceLock             *instance.Lock   // Multi-instance coordination lock
+	candidateIDs             map[string]bool              // Owned selection; graph context remains in issues.
+	scopeLabelFilter         string                       // Optional CLI --label filter for dynamic historical scoping.
+	scopeRepoFilter          string                       // Optional CLI --repo filter for dynamic historical scoping.
+	authorityHash            string                       // Full authority hash (including tombstones) for export provenance.
+	authorityIncomplete      bool                         // True when authority is incomplete, historical, or warned.
+	sourceDegraded           bool                         // True when discovery fell back to a stale/degraded source.
+	isExplicitDB             bool                         // True when source was explicitly pinned via --db / BEADS_DB.
+	referenceNow             time.Time                    // Optional pinned reference clock (e.g. --as-of).
+	asOfRevision             string                       // Optional revision bound for correlation history (e.g. --as-of).
+	beadsPath                string                       // Path to beads.jsonl for reloading
+	watcher                  *watcher.Watcher             // File watcher for live reload
+	externalWatcherStatus    func() ExternalWatcherStatus // Optional polling/FS status for external CLI watchers
+	instanceLock             *instance.Lock               // Multi-instance coordination lock
+	cassPrefetchCancel       context.CancelFunc           // Cancels active debounced background cass lookup
+	cassPrefetchGen          uint64                       // Generation fence for debounced background cass lookup
+	cassPrefetchLastID       string                       // Last bead ID scheduled for debounced cass prefetch
 	advancedInsightsCache    *analysis.AdvancedInsights
 	advancedInsightsCacheKey advancedInsightsCacheKey
 	advancedInsightsComputes uint64
@@ -2491,6 +2530,7 @@ type Model struct {
 
 	// Last active non-modal view focus for modal Z-order restoration
 	savedViewFocus focus
+	quitting       bool
 }
 
 // labelCount is a simple label->count pair for display
@@ -3387,6 +3427,7 @@ func (m *Model) cancelHistoryLoad() {
 }
 
 func (m *Model) quitCommand() tea.Cmd {
+	m.quitting = true
 	m.cancelOwnedAnalysis()
 	m.cancelHistoryLoad()
 	m.cancelPhase2Preparation()
@@ -3788,7 +3829,25 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 	}
 
 	// Precompute drift/health alerts (bv-168)
-	alerts, alertsCritical, alertsWarning, alertsInfo := computeAlertsForDir(issues, graphStats, analyzer, workDir)
+	var initAlertScope *baseline.BaselineScope
+	if scopeLabelFilter != "" || scopeRepoFilter != "" || (activeRecipe != nil && strings.TrimSpace(activeRecipe.Name) != "") {
+		recipeName := ""
+		if activeRecipe != nil {
+			recipeName = strings.TrimSpace(activeRecipe.Name)
+		}
+		initAlertScope = &baseline.BaselineScope{
+			Label:  strings.TrimSpace(scopeLabelFilter),
+			Repo:   strings.TrimSpace(scopeRepoFilter),
+			Recipe: recipeName,
+		}
+	}
+	alerts, alertsCritical, alertsWarning, alertsInfo := computeAlertsWithOptions(issues, graphStats, analyzer, alertComputeOptions{
+		ProjectDir:     workDir,
+		BeadsPath:      beadsPath,
+		CandidateIDs:   candidateIDs,
+		Scope:          initAlertScope,
+		SkipSourceDiff: asOfRevision != "" || isGitRefSource || isExplicitDB,
+	})
 
 	// Load sprints and sprint at-risk thresholds from project config (bv-161, bv-apal.28)
 	var sprints []model.Sprint
@@ -3956,7 +4015,7 @@ func (m *Model) SetWorkDir(dir string) {
 		if driftCfg, err := drift.LoadConfig(m.workDir); err == nil && driftCfg != nil {
 			m.sprintAtRiskThresholds = driftCfg.AtRiskThresholds()
 		}
-		m.alerts, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlertsForDir(m.issues, m.analysis, m.analyzer, m.workDir)
+		m.alerts, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlertsWithOptions(m.issues, m.analysis, m.analyzer, m.alertOptions())
 		m.recomputeVisibleAlertCounts()
 	}
 }
@@ -4346,6 +4405,20 @@ func (m *Model) updateEmbeddedTextInput(msg embeddedTextInputMsg) tea.Cmd {
 }
 
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	modelOut, cmd := m.updateInternal(msg)
+	if outM, ok := modelOut.(*Model); ok && outM != nil && !outM.quitting && outM.cassStatus == cass.StatusHealthy {
+		if prefetchCmd := outM.scheduleCassPrefetch(); prefetchCmd != nil {
+			if cmd == nil {
+				cmd = prefetchCmd
+			} else {
+				cmd = tea.Batch(cmd, prefetchCmd)
+			}
+		}
+	}
+	return modelOut, cmd
+}
+
+func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	var cmds []tea.Cmd
 	defer func() {
@@ -5005,11 +5078,13 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		// Refresh alerts now that full Phase 2 metrics (cycles, etc.) are available
-		if msg.prepared != nil {
+		if msg.prepared != nil && m.candidateIDs == nil && !m.workspaceMode &&
+			m.scopeLabelFilter == "" && m.scopeRepoFilter == "" &&
+			m.activeRecipe == nil && !m.isExplicitDB && m.asOfRevision == "" && m.referenceNow.IsZero() {
 			m.alerts = msg.prepared.alerts
 			m.alertsCritical, m.alertsWarning, m.alertsInfo = msg.prepared.alertsCritical, msg.prepared.alertsWarning, msg.prepared.alertsInfo
 		} else {
-			m.alerts, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlertsForDir(m.issues, m.analysis, m.analyzer, m.workDir)
+			m.alerts, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlertsWithOptions(m.issues, m.analysis, m.analyzer, m.alertOptions())
 		}
 		m.recomputeVisibleAlertCounts()
 
@@ -5145,7 +5220,57 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.cassStatus == cass.StatusUnknown || m.cassDetector == msg.Detector {
 			m.cassStatus = msg.Status
 		}
+		if m.cassStatus == cass.StatusHealthy {
+			m.ensureCassCorrelator()
+		}
 		return m, tea.Batch(cmds...)
+
+	case cassPrefetchTickMsg:
+		if msg.gen != m.cassPrefetchGen || m.cassStatus != cass.StatusHealthy {
+			return m, nil
+		}
+		if m.cassRequest != nil || m.cassPrefetchBlocked() {
+			if m.cassPrefetchLastID == msg.beadID {
+				m.cassPrefetchLastID = ""
+			}
+			return m, nil
+		}
+		issuePtr := m.focusedIssueForSessions()
+		if issuePtr == nil || issuePtr.ID != msg.beadID {
+			if m.cassPrefetchLastID == msg.beadID {
+				m.cassPrefetchLastID = ""
+			}
+			return m, nil
+		}
+		m.ensureCassCorrelator()
+		if m.cassCorrelator == nil || m.cassCorrelator.GetCached(issuePtr.ID) != nil {
+			return m, nil
+		}
+		if m.cassPrefetchCancel != nil {
+			m.cassPrefetchCancel()
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), min(cassLookupBudget(), 3*time.Second))
+		m.cassPrefetchCancel = cancel
+		issue := issuePtr.Clone()
+		correlator := m.cassCorrelator
+		gen := msg.gen
+		return m, func() tea.Msg {
+			defer cancel()
+			if ctx.Err() != nil {
+				return cassPrefetchDoneMsg{gen: gen, beadID: issue.ID}
+			}
+			res := correlator.Correlate(ctx, &issue)
+			return cassPrefetchDoneMsg{gen: gen, beadID: issue.ID, result: res}
+		}
+
+	case cassPrefetchDoneMsg:
+		if msg.gen == m.cassPrefetchGen {
+			m.cassPrefetchCancel = nil
+			if len(msg.result.TopSessions) > 0 {
+				m.historyView.SetSessionsForBead(msg.beadID, msg.result.TopSessions)
+			}
+		}
+		return m, nil
 
 	case cassSessionsLoadedMsg:
 		if !m.cassLookupIsCurrent(msg.request) {
@@ -5411,14 +5536,17 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			clear(m.dismissedAlerts)
 		}
-		if m.candidateIDs != nil || !m.referenceNow.IsZero() {
-			m.alerts, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlertsForDir(m.issues, m.analysis, m.analyzer, m.workDir)
+		if m.candidateIDs != nil || !m.referenceNow.IsZero() || m.workspaceMode ||
+			m.scopeLabelFilter != "" || m.scopeRepoFilter != "" ||
+			m.activeRecipe != nil || m.isExplicitDB || m.asOfRevision != "" {
+			m.alerts, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlertsWithOptions(m.issues, m.analysis, m.analyzer, m.alertOptions())
 		} else {
 			m.alerts = msg.Snapshot.alerts
 			m.alertsCritical = msg.Snapshot.alertsCritical
 			m.alertsWarning = msg.Snapshot.alertsWarning
 			m.alertsInfo = msg.Snapshot.alertsInfo
 		}
+		m.cancelCassPrefetch()
 		m.recomputeVisibleAlertCounts()
 		m.showAlertsPanel = false
 
@@ -5780,9 +5908,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.backgroundWorker != nil && m.backgroundWorker.State() != WorkerStopped && msg.source == nil &&
 			(m.sourceReload == nil || m.allowBackgroundAutoPromote) {
 			m.reloadSprintsFromDisk(m.effectiveUnderlyingFocus())
-			if m.sourceReload != nil {
-				m.backgroundWorker.TriggerRefresh()
-			}
+			m.backgroundWorker.TriggerRefresh()
 			if m.watcher != nil {
 				cmds = append(cmds, WatchFileCmd(m.watcher))
 			}
@@ -6069,7 +6195,8 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if profileRefresh {
 			alertsStart = time.Now()
 		}
-		m.alerts, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlertsForDir(m.issues, m.analysis, m.analyzer, m.workDir)
+		m.alerts, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlertsWithOptions(m.issues, m.analysis, m.analyzer, m.alertOptions())
+		m.cancelCassPrefetch()
 		if profileRefresh {
 			recordTiming("alerts", time.Since(alertsStart))
 		}
@@ -11965,6 +12092,9 @@ func (m *Model) renderFooter() string {
 			polling = m.watcher.IsPolling()
 			fsType = m.watcher.FilesystemType()
 			pollInterval = m.watcher.PollInterval()
+		case m.externalWatcherStatus != nil:
+			st := m.externalWatcherStatus()
+			polling, fsType, pollInterval = st.Polling, st.Filesystem, st.PollInterval
 		}
 
 		if polling {
@@ -13845,8 +13975,12 @@ func (m *Model) EnableWorkspaceMode(info WorkspaceInfo) {
 		}
 	}
 
-	// Update delegate to show repo badges
+	// Update delegate to show repo badges and recompute workspace-scoped alerts
 	m.updateListDelegate()
+	if m.analysis != nil && m.analyzer != nil {
+		m.alerts, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlertsWithOptions(m.issues, m.analysis, m.analyzer, m.alertOptions())
+		m.recomputeVisibleAlertCounts()
+	}
 }
 
 // IsWorkspaceMode returns whether workspace mode is active
@@ -15319,7 +15453,86 @@ func (m *Model) cassLookupIsCurrent(request *cassSessionRequest) bool {
 	return issue != nil && issue.ID == request.beadID
 }
 
+type cassPrefetchTickMsg struct {
+	gen    uint64
+	beadID string
+}
+
+type cassPrefetchDoneMsg struct {
+	gen    uint64
+	beadID string
+	result cass.CorrelationResult
+}
+
+func (m *Model) ensureCassCorrelator() {
+	if m.cassDetector == nil {
+		m.cassDetector = cass.NewDetector()
+	}
+	if m.cassCorrelator == nil || m.cassWorkspace != m.workDir {
+		budget := cassLookupBudget()
+		searcher := cass.NewSearcherWithOptions(m.cassDetector, cass.WithSearchTimeout(max(budget, cass.DefaultSearchTimeout)))
+		m.cassCorrelator = cass.NewCorrelator(searcher, cass.NewCache(), m.workDir)
+		m.cassWorkspace = m.workDir
+	}
+	m.attachHistoryCassLookup()
+}
+
+func (m *Model) cassPrefetchBlocked() bool {
+	if m.showQuitConfirm || m.showHelp || m.showTutorial || m.showAgentPrompt || m.showUpdateModal ||
+		m.showAlertsPanel || m.showLabelHealthDetail || m.showLabelGraphAnalysis || m.showLabelDrilldown ||
+		m.showTimeTravelPrompt || m.showRecipePicker || m.showRepoPicker || m.showLabelPicker || m.showCassModal {
+		return true
+	}
+	switch m.focused {
+	case focusList:
+		return m.list.FilterState() == list.Filtering
+	case focusDetail:
+		return false
+	case focusHistory:
+		return m.historyView.IsSearchActive()
+	default:
+		return true
+	}
+}
+
+func (m *Model) cancelCassPrefetch() {
+	if m.cassPrefetchCancel != nil {
+		m.cassPrefetchCancel()
+		m.cassPrefetchCancel = nil
+	}
+	m.cassPrefetchGen++
+	m.cassPrefetchLastID = ""
+}
+
+func (m *Model) scheduleCassPrefetch() tea.Cmd {
+	if m.cassStatus != cass.StatusHealthy || m.cassRequest != nil || m.cassPrefetchBlocked() {
+		return nil
+	}
+	issuePtr := m.focusedIssueForSessions()
+	if issuePtr == nil || issuePtr.ID == "" {
+		return nil
+	}
+	if m.cassCorrelator != nil && m.cassCorrelator.GetCached(issuePtr.ID) != nil {
+		return nil
+	}
+	if m.cassPrefetchLastID == issuePtr.ID {
+		return nil
+	}
+	if m.cassPrefetchCancel != nil {
+		m.cassPrefetchCancel()
+		m.cassPrefetchCancel = nil
+	}
+	m.cassPrefetchGen++
+	gen := m.cassPrefetchGen
+	beadID := issuePtr.ID
+	m.cassPrefetchLastID = beadID
+	return tea.Tick(250*time.Millisecond, func(time.Time) tea.Msg {
+		return cassPrefetchTickMsg{gen: gen, beadID: beadID}
+	})
+}
+
 func (m *Model) cancelCassLookup() {
+	m.cancelCassPrefetch()
 	if request := m.cassRequest; request != nil {
 		request.cancel()
 		if m.statusMsg == request.status {
@@ -16514,15 +16727,97 @@ func computeAlerts(issues []model.Issue, stats *analysis.GraphStats, analyzer *a
 	return computeAlertsForDir(issues, stats, analyzer, "")
 }
 
+type alertComputeOptions struct {
+	ProjectDir     string
+	BeadsPath      string
+	CandidateIDs   map[string]bool
+	Scope          *baseline.BaselineScope
+	SkipSourceDiff bool
+}
+
+func (m *Model) alertOptions() alertComputeOptions {
+	if m == nil {
+		return alertComputeOptions{}
+	}
+	label := strings.TrimSpace(m.scopeLabelFilter)
+	repo := strings.TrimSpace(m.scopeRepoFilter)
+	recipeName := ""
+	if m.activeRecipe != nil {
+		recipeName = strings.TrimSpace(m.activeRecipe.Name)
+	}
+	var scope *baseline.BaselineScope
+	if label != "" || repo != "" || recipeName != "" || m.workspaceMode {
+		scope = &baseline.BaselineScope{
+			Label:     label,
+			Repo:      repo,
+			Recipe:    recipeName,
+			Workspace: m.workspaceMode,
+		}
+	}
+	return alertComputeOptions{
+		ProjectDir:     m.workDir,
+		BeadsPath:      m.beadsPath,
+		CandidateIDs:   m.candidateIDs,
+		Scope:          scope,
+		SkipSourceDiff: m.asOfRevision != "" || isHistoricalGitBeadsPath(m.beadsPath) || m.isExplicitDB || m.workspaceMode,
+	}
+}
+
+func detectLocalSourceDiffsForUI(beadsPath, projectDir string) []datasource.SourceDiff {
+	if beadsPath == "" || isHistoricalGitBeadsPath(beadsPath) {
+		return nil
+	}
+	if _, explicitFile, _ := datasource.ExplicitBeadsDBSource(); explicitFile {
+		return nil
+	}
+	beadsDir := filepath.Dir(beadsPath)
+	if beadsDir == "" || beadsDir == "." || loader.IsBDWorkspace(beadsDir) {
+		return nil
+	}
+	sources, err := datasource.DiscoverSources(datasource.DiscoveryOptions{
+		BeadsDir:               beadsDir,
+		RepoPath:               projectDir,
+		ValidateAfterDiscovery: true,
+		SkipWorktreeSources:    true,
+	})
+	if err != nil || len(sources) < 2 {
+		return nil
+	}
+	diffOpts := datasource.DefaultDiffOptions()
+	diffOpts.MaxDifferences = 0
+	diffs, err := datasource.CheckAllSourcesConsistent(sources, diffOpts)
+	if err != nil {
+		return nil
+	}
+	return diffs
+}
+
+func buildScopedBaselineMetricItems(scores map[string]float64, limit int, candidateIDs map[string]bool) []baseline.MetricItem {
+	if candidateIDs == nil {
+		return buildBaselineMetricItems(scores, limit)
+	}
+	filtered := make(map[string]float64, len(candidateIDs))
+	for id, val := range scores {
+		if candidateIDs[id] {
+			filtered[id] = val
+		}
+	}
+	return buildBaselineMetricItems(filtered, limit)
+}
+
 // computeAlertsForDir calculates drift alerts for the current issues against
 // <projectDir>/.bv/baseline.json (when present) and <projectDir>/.bv/drift.yaml,
 // falling back to CWD only when projectDir is empty.
 func computeAlertsForDir(issues []model.Issue, stats *analysis.GraphStats, analyzer *analysis.Analyzer, projectDir string) ([]drift.Alert, int, int, int) {
+	return computeAlertsWithOptions(issues, stats, analyzer, alertComputeOptions{ProjectDir: projectDir})
+}
+
+func computeAlertsWithOptions(issues []model.Issue, stats *analysis.GraphStats, analyzer *analysis.Analyzer, opts alertComputeOptions) ([]drift.Alert, int, int, int) {
 	if len(issues) == 0 || stats == nil || analyzer == nil {
 		return nil, 0, 0, 0
 	}
 
-	resolvedDir := strings.TrimSpace(projectDir)
+	resolvedDir := strings.TrimSpace(opts.ProjectDir)
 	if resolvedDir == "" {
 		resolvedDir, _ = os.Getwd()
 	}
@@ -16541,11 +16836,12 @@ func computeAlertsForDir(issues []model.Issue, stats *analysis.GraphStats, analy
 			openCount++
 		}
 	}
-	cycles := stats.Cycles()
+	cycles := filterDiffCyclesForCandidates(stats.Cycles(), opts.CandidateIDs)
+	scopedNodes, scopedEdges, scopedDensity := scopedGraphTotalsForSnapshot(issues, stats, opts.CandidateIDs)
 	curStats := baseline.GraphStats{
-		NodeCount:       stats.NodeCount,
-		EdgeCount:       stats.EdgeCount,
-		Density:         stats.Density,
+		NodeCount:       scopedNodes,
+		EdgeCount:       scopedEdges,
+		Density:         scopedDensity,
 		OpenCount:       openCount,
 		ClosedCount:     partition.Closed,
 		BlockedCount:    partition.Blocked,
@@ -16553,19 +16849,19 @@ func computeAlertsForDir(issues []model.Issue, stats *analysis.GraphStats, analy
 		ActionableCount: partition.Actionable,
 	}
 
-	bl := &baseline.Baseline{Stats: curStats}
-	cur := &baseline.Baseline{Stats: curStats, Cycles: cycles}
+	bl := &baseline.Baseline{Stats: curStats, Scope: opts.Scope}
+	cur := &baseline.Baseline{Stats: curStats, Cycles: cycles, Scope: opts.Scope}
 	if resolvedDir != "" {
 		baselinePath := baseline.DefaultPath(resolvedDir)
 		if baseline.Exists(baselinePath) {
 			if loaded, loadErr := baseline.Load(baselinePath); loadErr == nil && loaded != nil {
 				bl = loaded
 				cur.TopMetrics = baseline.TopMetrics{
-					PageRank:     buildBaselineMetricItems(stats.PageRank(), 10),
-					Betweenness:  buildBaselineMetricItems(stats.Betweenness(), 10),
-					CriticalPath: buildBaselineMetricItems(stats.CriticalPathScore(), 10),
-					Hubs:         buildBaselineMetricItems(stats.Hubs(), 10),
-					Authorities:  buildBaselineMetricItems(stats.Authorities(), 10),
+					PageRank:     buildScopedBaselineMetricItems(stats.PageRank(), 10, opts.CandidateIDs),
+					Betweenness:  buildScopedBaselineMetricItems(stats.ActiveBetweenness(), 10, opts.CandidateIDs),
+					CriticalPath: buildScopedBaselineMetricItems(stats.CriticalPathScore(), 10, opts.CandidateIDs),
+					Hubs:         buildScopedBaselineMetricItems(stats.Hubs(), 10, opts.CandidateIDs),
+					Authorities:  buildScopedBaselineMetricItems(stats.Authorities(), 10, opts.CandidateIDs),
 				}
 			}
 		}
@@ -16575,6 +16871,11 @@ func computeAlertsForDir(issues []model.Issue, stats *analysis.GraphStats, analy
 	calc.SetNow(analyzer.Now())
 	calc.SetIssues(issues)
 	calc.ReuseAnalyzer(analyzer)
+	if !opts.SkipSourceDiff && opts.BeadsPath != "" {
+		if diffs := detectLocalSourceDiffsForUI(opts.BeadsPath, resolvedDir); len(diffs) > 0 {
+			calc.SetSourceDiffs(diffs)
+		}
+	}
 	result := calc.Calculate()
 
 	critical, warning, info := 0, 0, 0
