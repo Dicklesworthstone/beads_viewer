@@ -1632,11 +1632,25 @@ func TestHistoryModel_NavigationEmptyList(t *testing.T) {
 	}
 	h := NewHistoryModel(emptyReport, theme)
 
-	// Should not panic
+	// Navigation on empty history keeps cursors at zero and returns empty selections
 	h.MoveUp()
 	h.MoveDown()
 	h.NextCommit()
 	h.PrevCommit()
+
+	if h.selectedBead != 0 || h.selectedCommit != 0 {
+		t.Fatalf("empty history cursors drifted: selectedBead=%d selectedCommit=%d", h.selectedBead, h.selectedCommit)
+	}
+	if id := h.SelectedBeadID(); id != "" {
+		t.Errorf("expected empty SelectedBeadID on empty history, got %q", id)
+	}
+	if commit := h.SelectedCommit(); commit != nil {
+		t.Errorf("expected nil SelectedCommit on empty history, got %+v", commit)
+	}
+	h.SetSize(100, 30)
+	if strings.TrimSpace(h.View()) == "" {
+		t.Error("expected empty history View() to render non-empty empty-state")
+	}
 }
 
 func TestHistoryModel_GitModeEmptyCommitList(t *testing.T) {

@@ -46,6 +46,9 @@ type MarkdownRenderer struct {
 // Prefer NewMarkdownRendererWithTheme for consistent styling with the bv Theme.
 func NewMarkdownRenderer(width int) *MarkdownRenderer {
 	isDark := lipgloss.HasDarkBackground()
+	if BVThemeOverride != "" {
+		isDark = BVThemeOverride == "dark"
+	}
 
 	var styleName string
 	if isDark {
@@ -71,7 +74,7 @@ func NewMarkdownRenderer(width int) *MarkdownRenderer {
 // NewMarkdownRendererWithTheme creates a markdown renderer using custom colors
 // that match the provided Theme for visual consistency.
 func NewMarkdownRendererWithTheme(width int, theme Theme) *MarkdownRenderer {
-	isDark := lipgloss.HasDarkBackground()
+	isDark := boardDarkMode(theme)
 	styleConfig := buildStyleFromTheme(theme, isDark)
 
 	renderer, err := glamour.NewTermRenderer(

@@ -556,6 +556,9 @@ func TestBuildHookEnvironmentSubprocess(t *testing.T) {
 				t.Fatal(err)
 			}
 			cmd := exec.Command(executable, "-test.run=^TestHookEnvironmentSubprocessProbe$")
+			if testing.CoverMode() != "" {
+				env = append(env, "GOCOVERDIR="+t.TempDir())
+			}
 			cmd.Env = env
 			output, err := cmd.CombinedOutput()
 			if err != nil {

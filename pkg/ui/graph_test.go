@@ -205,19 +205,23 @@ func TestGraphModelScrollBounds(t *testing.T) {
 
 	g := ui.NewGraphModel(issues, nil, theme)
 
-	// Scroll left from origin should stay at 0
+	// Scroll left from origin should stay clamped at 0
 	g.ScrollLeft()
 	g.ScrollLeft()
 	g.ScrollLeft()
-	// After View call, scrollX should be clamped to 0
 
-	// PageUp from origin should stay at 0
+	// PageUp from origin should stay clamped at 0
 	g.PageUp()
 	g.PageUp()
-	// After View call, scrollY should be clamped to 0
 
-	// View should not panic
-	_ = g.View(80, 24)
+	sel := g.SelectedIssue()
+	if sel == nil || sel.ID != "1" {
+		t.Fatalf("expected selection to stay on issue 1 after origin scrolling, got %v", sel)
+	}
+	plain := ansi.Strip(g.View(80, 24))
+	if !strings.Contains(plain, "1") || !strings.Contains(plain, "One") {
+		t.Errorf("graph view after clamped scrolling missing issue content:\n%s", plain)
+	}
 }
 
 // This must fail against the original empty ScrollLeft/ScrollRight methods:
@@ -444,8 +448,23 @@ func TestGraphModelViewRendering(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			g := ui.NewGraphModel(tt.issues, nil, theme)
-			// Should not panic
-			_ = g.View(tt.width, tt.height)
+			out := g.View(tt.width, tt.height)
+			if !utf8.ValidString(out) {
+				t.Fatalf("View(%d, %d) produced invalid UTF-8", tt.width, tt.height)
+			}
+			plain := ansi.Strip(out)
+			if strings.TrimSpace(plain) == "" {
+				t.Fatalf("View(%d, %d) returned empty output", tt.width, tt.height)
+			}
+			if len(tt.issues) == 0 {
+				if !strings.Contains(plain, "No issues") {
+					t.Errorf("empty graph should display empty-state message, got:\n%s", plain)
+				}
+				return
+			}
+			if !strings.Contains(plain, tt.issues[0].ID) {
+				t.Errorf("graph view missing primary issue ID %q:\n%s", tt.issues[0].ID, plain)
+			}
 		})
 	}
 }
@@ -727,12 +746,12 @@ func TestGraphModelExtremeWidths(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Should not panic
 			output := g.View(tt.width, tt.height)
-			if output == "" && g.TotalCount() > 0 {
-				// Empty output is acceptable for very small dimensions
-				// but log it for visibility
-				t.Logf("Empty output for %dx%d", tt.width, tt.height)
+			if !utf8.ValidString(output) {
+				t.Fatalf("View(%d, %d) emitted invalid UTF-8", tt.width, tt.height)
+			}
+			if tt.width >= 20 && tt.height >= 10 && strings.TrimSpace(ansi.Strip(output)) == "" {
+				t.Errorf("View(%d, %d) returned empty output for non-empty graph", tt.width, tt.height)
 			}
 		})
 	}

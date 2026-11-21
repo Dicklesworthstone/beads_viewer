@@ -1,19 +1,25 @@
 package ui
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/cass"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/correlation"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/recipe"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/search"
@@ -814,6 +820,406 @@ func TestFlowMatrix_RendersTransitiveCascade(t *testing.T) {
 	for _, want := range []string{"TRANSITIVE CASCADE", "Downstream waiting: 2 (2 levels)", "Top unblock: bv-root"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("FlowMatrixModel.View() missing %q:\n%s", want, view)
+		}
+	}
+}
+
+func TestRC38_BackgroundAutoPromotionAndSilentWorkerLogging(t *testing.T) {
+	// 1. Unset BV_WORKER_LOG_LEVEL must default to LogLevelNone and emit zero raw log.Printf stderr bytes.
+	t.Setenv("BV_WORKER_LOG_LEVEL", "")
+	if got := parseWorkerLogLevel(""); got != LogLevelNone {
+		t.Fatalf("parseWorkerLogLevel(\"\") = %v, want LogLevelNone", got)
+	}
+	var logBuf bytes.Buffer
+	origOut := log.Writer()
+	log.SetOutput(&logBuf)
+	t.Cleanup(func() { log.SetOutput(origOut) })
+
+	tmpDir := t.TempDir()
+	jsonlPath := filepath.Join(tmpDir, "issues.jsonl")
+	if err := os.WriteFile(jsonlPath, []byte(`{"id":"bg-1","title":"BG test","status":"open","priority":1,"issue_type":"task"}`+"\n"), 0o644); err != nil {
+		t.Fatalf("write jsonl: %v", err)
+	}
+	bw, err := NewBackgroundWorker(WorkerConfig{BeadsPath: jsonlPath, ProjectDir: tmpDir})
+	if err != nil {
+		t.Fatalf("NewBackgroundWorker: %v", err)
+	}
+	t.Cleanup(bw.Stop)
+	bw.logEvent(LogLevelWarn, "test_warning_should_be_silent", map[string]any{"k": "v"})
+	if logBuf.Len() != 0 {
+		t.Fatalf("expected zero raw log output when BV_WORKER_LOG_LEVEL unset, got %q", logBuf.String())
+	}
+
+	// 2. Single-repo SetSourceReload + SetBackgroundAutoPromote(true) promotes on slow reload (>=1s),
+	// while BV_BACKGROUND_MODE=0 blocks auto-promotion.
+	issues := []model.Issue{{ID: "bg-1", Title: "BG test", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask}}
+	loaderFn := func(ctx context.Context) (SourceReloadResult, error) {
+		return SourceReloadResult{Issues: issues, ReloadDuration: 1200 * time.Millisecond}, nil
+	}
+
+	t.Setenv("BV_BACKGROUND_MODE", "0")
+	mOptOut := NewModel(issues, nil, jsonlPath)
+	t.Cleanup(mOptOut.Stop)
+	mOptOut.SetSourceReload(loaderFn)
+	mOptOut.SetBackgroundAutoPromote(true)
+	resOptOut, _ := loaderFn(context.Background())
+	mOptOut.sourceReloadRequest = 1
+	updatedOptOut, _ := mOptOut.Update(FileChangedMsg{source: &resOptOut, sourceVersion: mOptOut.sourceVersion, request: 1})
+	mOptOut = updatedOptOut.(*Model)
+	if mOptOut.backgroundWorker != nil {
+		t.Fatal("BV_BACKGROUND_MODE=0 must prevent auto-promotion to BackgroundWorker")
+	}
+
+	t.Setenv("BV_BACKGROUND_MODE", "")
+	mPromote := NewModel(issues, nil, jsonlPath)
+	t.Cleanup(mPromote.Stop)
+	mPromote.SetSourceReload(loaderFn)
+	mPromote.SetBackgroundAutoPromote(true)
+	resPromote, _ := loaderFn(context.Background())
+	mPromote.sourceReloadRequest = 1
+	updatedPromote, _ := mPromote.Update(FileChangedMsg{source: &resPromote, sourceVersion: mPromote.sourceVersion, request: 1})
+	mPromote = updatedPromote.(*Model)
+	if mPromote.backgroundWorker == nil {
+		t.Fatalf("expected single-repo SetSourceReload + SetBackgroundAutoPromote(true) slow reload to promote; statusMsg=%q", mPromote.statusMsg)
+	}
+	if mPromote.backgroundWorker.sourceReload == nil {
+		t.Fatal("promoted BackgroundWorker did not inherit SourceReload callback")
+	}
+	if !strings.Contains(mPromote.statusMsg, "background mode auto-enabled") {
+		t.Errorf("expected statusMsg to mention auto-enabled background mode, got %q", mPromote.statusMsg)
+	}
+}
+
+func TestRC38_TimeTravelReopenedBadgeJumpAndSummary(t *testing.T) {
+	if got := DiffStatusReopened.Badge(); got != "[REOPENED]" {
+		t.Fatalf("DiffStatusReopened.Badge() = %q, want [REOPENED]", got)
+	}
+	issues := []model.Issue{
+		{ID: "TT-1", Title: "Unchanged", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask},
+		{ID: "TT-2", Title: "Reopened item", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeBug},
+	}
+	m := NewModel(issues, nil, "")
+	t.Cleanup(m.Stop)
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
+	m = updated.(*Model)
+
+	m.timeTravelMode = true
+	m.timeTravelSince = "HEAD~3"
+	m.timeTravelDensityDelta = 0.15
+	m.reopenedIssueIDs = map[string]bool{"TT-2": true}
+	m.timeTravelDiff = &analysis.SnapshotDiff{
+		ReopenedIssues: []model.Issue{issues[1]},
+		MetricDeltas:   analysis.MetricDeltas{CycleCount: -1},
+		Summary: analysis.DiffSummary{
+			IssuesAdded:    1,
+			IssuesClosed:   2,
+			IssuesModified: 3,
+			IssuesReopened: 1,
+			HealthTrend:    "improving",
+		},
+	}
+	m.rebuildListWithDiffInfo()
+
+	if got := m.getDiffStatus("TT-2"); got != DiffStatusReopened {
+		t.Fatalf("getDiffStatus(TT-2) = %v, want DiffStatusReopened", got)
+	}
+
+	// Jumping with 'n' must land on reopened issue TT-2.
+	m.selectListIndex(0)
+	m.jumpToChangedIssue(true)
+	if sel, ok := m.list.SelectedItem().(IssueItem); !ok || sel.Issue.ID != "TT-2" {
+		t.Fatalf("expected jumpToChangedIssue to select reopened issue TT-2, got %v", m.list.SelectedItem())
+	}
+
+	// Rendered list and footer (after clearing transient status message) must display
+	// [REOPENED], reopened count, and metric/health summary.
+	m.statusMsg = ""
+	fullView := ansi.Strip(m.View())
+	for _, want := range []string{"[REOPENED]", "↺1", "Δdens:+0.15", "Δcyc:-1", "[improving]"} {
+		if !strings.Contains(fullView, want) {
+			t.Errorf("Time-Travel View() missing %q:\n%s", want, fullView)
+		}
+	}
+}
+
+func TestRC38_HistoryMR10FilterCommutativityAuthorAndGitTotal(t *testing.T) {
+	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	report := &correlation.HistoryReport{
+		Histories: map[string]correlation.BeadHistory{
+			"B-1": {
+				BeadID: "B-1",
+				Title:  "Auth refactor",
+				Status: "open",
+				Commits: []correlation.CorrelatedCommit{
+					{SHA: "aaa1111", ShortSHA: "aaa1111", Message: "auth fix high", Author: "Alice", Timestamp: now, Confidence: 0.92},
+					{SHA: "bbb2222", ShortSHA: "bbb2222", Message: "auth tweak low", Author: "Alice", Timestamp: now.Add(-time.Hour), Confidence: 0.35},
+					{SHA: "ccc3333", ShortSHA: "ccc3333", Message: "auth docs bob", Author: "Bob", Timestamp: now.Add(-2 * time.Hour), Confidence: 0.90},
+				},
+			},
+			"B-2": {
+				BeadID: "B-2",
+				Title:  "Other task",
+				Status: "open",
+				Commits: []correlation.CorrelatedCommit{
+					{SHA: "ddd4444", ShortSHA: "ddd4444", Message: "misc low", Author: "Alice", Timestamp: now.Add(-3 * time.Hour), Confidence: 0.30},
+				},
+			},
+		},
+	}
+
+	theme := DefaultTheme(lipgloss.NewRenderer(nil))
+
+	// MR-10: Confidence filter + Search filter must commute and NEVER resurrect excluded low-confidence commits.
+	h1 := NewHistoryModel(report, theme)
+	h1.SetSize(120, 35)
+	h1.minConfidence = 0.80
+	h1.refreshAfterFilterChange()
+	h1.searchInput.SetValue("low")
+	h1.applySearchFilter()
+
+	h2 := NewHistoryModel(report, theme)
+	h2.SetSize(120, 35)
+	h2.searchInput.SetValue("low")
+	h2.applySearchFilter()
+	h2.minConfidence = 0.80
+	h2.refreshAfterFilterChange()
+
+	if len(h1.histories) != 0 || len(h2.histories) != 0 {
+		t.Fatalf("MR-10 violation: search 'low' with minConfidence=0.80 resurrected filtered commits: order1=%d order2=%d", len(h1.histories), len(h2.histories))
+	}
+
+	// Bead-mode Author filter must filter per-bead Commits strictly (Alice never sees Bob's commit).
+	hAuthor := NewHistoryModel(report, theme)
+	hAuthor.SetSize(120, 35)
+	hAuthor.SetAuthorFilter("Alice")
+	for _, bh := range hAuthor.histories {
+		for _, c := range bh.Commits {
+			if c.Author != "Alice" {
+				t.Fatalf("Bead-mode author filter leaked commit by %q into bead %s", c.Author, bh.BeadID)
+			}
+		}
+	}
+
+	// Git-mode filter bar must show true unfiltered commit count ("Showing 2 of 4 commits"), not 2 of 2.
+	hGit := NewHistoryModel(report, theme)
+	hGit.SetSize(120, 35)
+	hGit.ToggleViewMode() // Git mode
+	hGit.minConfidence = 0.80
+	hGit.refreshAfterFilterChange()
+	gitView := ansi.Strip(hGit.View())
+	if !strings.Contains(gitView, "Showing 2/4 commits") {
+		t.Errorf("Git mode should report true unfiltered total commits (Showing 2/4 commits), got:\n%s", gitView)
+	}
+}
+
+func TestRC38_TutorialScrollUnwedgeMouseAndFactualContent(t *testing.T) {
+	theme := DefaultTheme(lipgloss.NewRenderer(nil))
+	tm := NewTutorialModel(theme)
+	tm.SetSize(100, 20) // Small enough to require scrolling
+
+	// Jump to bottom with 'G' -> scrollOffset must equal real maxScrollOffset (never 9999),
+	// and a SINGLE 'k' keypress must immediately scroll upward.
+	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("G")})
+	atBottom := tm.scrollOffset
+	if atBottom <= 0 || atBottom >= 9999 {
+		t.Fatalf("expected realistic maxScrollOffset after 'G', got %d", atBottom)
+	}
+	tm, _ = tm.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("k")})
+	if tm.scrollOffset != atBottom-1 {
+		t.Fatalf("expected single 'k' after 'G' to scroll up immediately from %d to %d, got %d", atBottom, atBottom-1, tm.scrollOffset)
+	}
+
+	// Mouse wheel down/up must scroll TutorialModel.
+	tm.scrollOffset = 0
+	tm, _ = tm.Update(tea.MouseMsg{Button: tea.MouseButtonWheelDown})
+	if tm.scrollOffset <= 0 {
+		t.Fatalf("expected MouseButtonWheelDown to scroll tutorial down, got scrollOffset=%d", tm.scrollOffset)
+	}
+	afterDown := tm.scrollOffset
+	tm, _ = tm.Update(tea.MouseMsg{Button: tea.MouseButtonWheelUp})
+	if tm.scrollOffset >= afterDown {
+		t.Fatalf("expected MouseButtonWheelUp to scroll tutorial up from %d, got %d", afterDown, tm.scrollOffset)
+	}
+
+	// Verify all 5 factual tutorial_content.go fixes by rendering every tutorial page at full height.
+	tm.SetSize(120, 240)
+	var allContent strings.Builder
+	for i := range tm.pages {
+		tm.currentPage = i
+		tm.scrollOffset = 0
+		allContent.WriteString(ansi.Strip(tm.View()))
+		allContent.WriteString("\n")
+	}
+	text := allContent.String()
+	for _, forbidden := range []string{"Priority x Type", "14+ days", "s/f"} {
+		if strings.Contains(text, forbidden) {
+			t.Errorf("tutorial_content.go still contains debunked text %q", forbidden)
+		}
+	}
+	for _, required := range []string{"Depth × Triage Score", "30+ days", "outside /"} {
+		if !strings.Contains(text, required) {
+			t.Errorf("tutorial_content.go missing corrected documentation %q", required)
+		}
+	}
+}
+
+func TestRC38_ManualUpdateKeyDisclosureGuardAndModalFocus(t *testing.T) {
+	// 1. UpdateModal with no new version and no rollback must focus Cancel (1), not Update (0).
+	theme := DefaultTheme(lipgloss.NewRenderer(nil))
+	um := NewUpdateModal("", "", theme)
+	um.SetCanRollback(false)
+	if um.confirmFocus != 1 {
+		t.Fatalf("NewUpdateModal with empty tag and no rollback focused button %d, want 1 (Cancel)", um.confirmFocus)
+	}
+
+	// 2. StartupUpdateCheckMsg must NOT record disclosure when suppressed by an active error message.
+	cfgRoot := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", cfgRoot)
+	t.Setenv("BV_NO_SAVED_CONFIG", "")
+	issues := []model.Issue{{ID: "UP-1", Title: "Update test", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask}}
+	m := NewModel(issues, nil, "")
+	t.Cleanup(m.Stop)
+	m.statusMsg = "existing fatal error"
+	m.statusIsError = true
+	updated, _ := m.Update(StartupUpdateCheckMsg{})
+	m = updated.(*Model)
+	if !updater.StartupDisclosurePending() {
+		t.Fatal("StartupUpdateCheckMsg recorded disclosure even though an error status suppressed displaying it")
+	}
+	// Once clear, disclosure displays and records.
+	m.statusMsg = ""
+	m.statusIsError = false
+	updated, _ = m.Update(StartupUpdateCheckMsg{})
+	m = updated.(*Model)
+	if m.statusMsg != updater.StartupCheckDisclosure {
+		t.Fatalf("expected statusMsg == updater.StartupCheckDisclosure (%q), got %q", updater.StartupCheckDisclosure, m.statusMsg)
+	}
+	if updater.StartupDisclosurePending() {
+		t.Fatal("expected StartupDisclosurePending to become false after displaying disclosure")
+	}
+
+	// 3. Pressing 'U' when !updateAvailable triggers async manualUpdateCheckFunc instead of claiming latest.
+	origCheck := manualUpdateCheckFunc
+	t.Cleanup(func() { manualUpdateCheckFunc = origCheck })
+	called := false
+	manualUpdateCheckFunc = func() (string, string, error) {
+		called = true
+		return "v99.0.0", "https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v99.0.0", nil
+	}
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("U")})
+	m = updated.(*Model)
+	if cmd == nil {
+		t.Fatal("pressing 'U' when !updateAvailable must return async check command")
+	}
+	if m.statusMsg != "Checking for updates..." {
+		t.Fatalf("expected checking status message on 'U', got %q", m.statusMsg)
+	}
+	msg := cmd()
+	if !called {
+		t.Fatal("manual update check command did not invoke check function")
+	}
+	updated, _ = m.Update(msg)
+	m = updated.(*Model)
+	if !m.showUpdateModal || m.updateTag != "v99.0.0" {
+		t.Fatalf("expected manualUpdateCheckMsg with newer version to open UpdateModal for v99.0.0, show=%v tag=%q", m.showUpdateModal, m.updateTag)
+	}
+}
+
+func TestRC38_DisplayWidthUTF8ThemeModalsBoardCacheAndUnifiedHelp(t *testing.T) {
+	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	closedAt := now.Add(-24 * time.Hour)
+	issues := []model.Issue{
+		{ID: "DW-1", Title: "Core blocker", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, Labels: []string{"backend"}, CreatedAt: now.Add(-72 * time.Hour), UpdatedAt: now},
+		{ID: "DW-2", Title: "Dep blocked task", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, Labels: []string{"frontend"}, CreatedAt: now.Add(-48 * time.Hour), UpdatedAt: now, Dependencies: []*model.Dependency{{IssueID: "DW-2", DependsOnID: "DW-1", Type: model.DepBlocks}}},
+		{ID: "DW-3", Title: "Done work", Status: model.StatusClosed, Priority: 2, IssueType: model.TypeTask, Labels: []string{"backend"}, CreatedAt: now.Add(-96 * time.Hour), UpdatedAt: closedAt, ClosedAt: &closedAt},
+	}
+
+	m := NewModel(issues, nil, "")
+	t.Cleanup(m.Stop)
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 60, Height: 14})
+	m = updated.(*Model)
+
+	// 1. VelocityComparison UTF-8 safety across widths & RenderDebugView("velocity")
+	for _, w := range []int{40, 60, 80, 120} {
+		out := m.RenderDebugView("velocity", w, 24)
+		if strings.HasPrefix(out, "Unknown view:") {
+			t.Fatalf("RenderDebugView(\"velocity\") unsupported: %q", out)
+		}
+		if !utf8.ValidString(out) {
+			t.Fatalf("RenderDebugView(\"velocity\", %d, 24) emitted invalid UTF-8", w)
+		}
+		if strings.Contains(out, "─ stabl") && !strings.Contains(out, "─ stable") {
+			t.Fatalf("VelocityComparison truncated UTF-8 '─ stable' into '─ stabl' at width %d:\n%s", w, ansi.Strip(out))
+		}
+	}
+
+	// 2. Sprint view counts dependency-blocked DW-2 in ⛔ and preserves footer on 60x14
+	m.width = 60
+	m.height = 14
+	m.sprints = []model.Sprint{{ID: "sp-1", Name: "Sprint Alpha", StartDate: now.Add(-7 * 24 * time.Hour), EndDate: now.Add(7 * 24 * time.Hour), BeadIDs: []string{"DW-1", "DW-2", "DW-3"}}}
+	m.selectedSprint = &m.sprints[0]
+	sprintOut := ansi.Strip(m.renderSprintDashboard())
+	if !strings.Contains(sprintOut, "⛔1") {
+		t.Errorf("Sprint view should count dependency-blocked DW-2 as ⛔1, got:\n%s", sprintOut)
+	}
+	if !strings.Contains(sprintOut, "P/esc: close") {
+		t.Errorf("Sprint view on 60x14 dropped footer hint:\n%s", sprintOut)
+	}
+
+	// 3. Label modals & Cass modal at 60x14 fit within height 14 and preserve Esc footer
+	m.labelHealthDetail = &analysis.LabelHealth{Label: "backend", Health: 80, HealthLevel: analysis.HealthLevelHealthy, IssueCount: 2, OpenCount: 1, ClosedCount: 1}
+	lhView := ansi.Strip(m.renderLabelHealthDetail(*m.labelHealthDetail))
+	if lipgloss.Height(lhView) > 14 || !strings.Contains(lhView, "Press Esc to close") {
+		t.Errorf("renderLabelHealthDetail at 60x14 overflowed (h=%d) or dropped footer:\n%s", lipgloss.Height(lhView), lhView)
+	}
+	m.labelDrilldownLabel = "backend"
+	m.labelDrilldownIssues = issues
+	ldView := ansi.Strip(m.renderLabelDrilldown())
+	if lipgloss.Height(ldView) > 14 || !strings.Contains(ldView, "Press Esc to close") {
+		t.Errorf("renderLabelDrilldown at 60x14 overflowed (h=%d) or dropped footer:\n%s", lipgloss.Height(ldView), ldView)
+	}
+	m.labelGraphAnalysisResult = &LabelGraphAnalysisResult{
+		Label:    "backend",
+		Subgraph: analysis.LabelSubgraph{Label: "backend", IssueCount: 2, CoreCount: 2, IssueMap: map[string]model.Issue{"DW-1": issues[0], "DW-3": issues[2]}},
+	}
+	lgView := ansi.Strip(m.renderLabelGraphAnalysis())
+	if lipgloss.Height(lgView) > 14 || !strings.Contains(lgView, "Press Esc/q/g to close") {
+		t.Errorf("renderLabelGraphAnalysis at 60x14 overflowed (h=%d) or dropped footer:\n%s", lipgloss.Height(lgView), lgView)
+	}
+
+	// 4. BoardModel value-receiver View persists rendered detail markdown in shared detailCache
+	bm := NewBoardModel(issues, m.theme)
+	bm.ShowDetail()
+	_ = bm.View(160, 30)
+	firstRenders := bm.detailCache.renders
+	_ = bm.View(160, 30)
+	if bm.detailCache.renders != firstRenders {
+		t.Fatalf("BoardModel.View re-rendered detail markdown across unchanged frames: renders %d -> %d", firstRenders, bm.detailCache.renders)
+	}
+
+	// 5. ? Help Overlay driven by GetKeyBindingDocs covers ALL views + new registered bindings
+	m.width = 160
+	m.height = 80
+	helpLines, _ := m.buildHelpBodyLines()
+	helpText := ansi.Strip(strings.Join(helpLines, "\n"))
+	for _, wantSection := range []string{"Board View", "Actionable", "Flow Matrix", "Label Dashboard", "Attention View", "Velocity View", "Sprint View", "Split View", "History", "Status"} {
+		if !strings.Contains(helpText, wantSection) {
+			t.Errorf("Help overlay missing section %q from GetKeyBindingDocs()", wantSection)
+		}
+	}
+	for _, wantBinding := range []struct {
+		f   focus
+		key string
+	}{
+		{focusHistory, "g"},
+		{focusBoard, "0"},
+		{focusBoard, "$"},
+		{focusList, "tab"},
+		{focusList, "<"},
+		{focusList, ">"},
+	} {
+		if !m.keyRegistry.HasBinding(wantBinding.f, wantBinding.key) {
+			t.Errorf("keyRegistry missing binding (%v, %q)", wantBinding.f, wantBinding.key)
 		}
 	}
 }

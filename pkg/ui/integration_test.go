@@ -236,21 +236,25 @@ func TestViewTransitionFilterPreserved(t *testing.T) {
 // Edge Case Tests
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// TestViewTransitionEmptyIssues verifies view switching with no issues doesn't panic
+// TestViewTransitionEmptyIssues verifies view switching with no issues renders cleanly and settles in help
 func TestViewTransitionEmptyIssues(t *testing.T) {
 	m := ui.NewModel([]model.Issue{}, nil, "")
 	t.Cleanup(func() { m.Stop() })
+	newM, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	m = newM.(*ui.Model)
 
-	// Should not panic on any view transition
 	keys := []string{"E", "b", "g", "a", "i", "?"}
 	for _, k := range keys {
-		newM, _ := m.Update(integrationKeyMsg(k))
+		newM, _ = m.Update(integrationKeyMsg(k))
 		m = newM.(*ui.Model)
+		if m.View() == "" {
+			t.Fatalf("View() returned empty string after key %q on empty issue list", k)
+		}
 	}
 
-	// The final state will be help ('?' was last key)
-	// This test just verifies no panics occurred
-	// State checking is handled by other tests
+	if got := m.FocusState(); got != "help" {
+		t.Errorf("expected final focus state %q after '?', got %q", "help", got)
+	}
 }
 
 // TestViewTransitionEscBehavior verifies Esc behavior varies by view
@@ -379,31 +383,46 @@ func TestViewToggleExitBehavior(t *testing.T) {
 // Rapid Switching Stress Tests
 // ═══════════════════════════════════════════════════════════════════════════════
 
-// TestRapidViewSwitching verifies no panics during rapid view changes
+// TestRapidViewSwitching verifies invariants hold during rapid view changes
 func TestRapidViewSwitching(t *testing.T) {
 	issues := createTestIssues(50)
 	m := ui.NewModel(issues, nil, "")
 	t.Cleanup(func() { m.Stop() })
+	newM, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	m = newM.(*ui.Model)
 
 	keys := []string{"E", "b", "g", "a", "i", "E", "b", "g"}
 
 	// Perform 100 iterations of view switching
 	for i := 0; i < 100; i++ {
 		for _, k := range keys {
-			newM, _ := m.Update(integrationKeyMsg(k))
+			newM, _ = m.Update(integrationKeyMsg(k))
 			m = newM.(*ui.Model)
 		}
 	}
 
-	// Should end up somewhere without panic
-	// The final state depends on the toggle behavior
+	if m.FocusState() == "" {
+		t.Fatal("FocusState() empty after rapid view switching")
+	}
+	if m.View() == "" {
+		t.Fatal("View() empty after rapid view switching")
+	}
+	for i := 0; i < 4 && m.FocusState() != "list"; i++ {
+		newM, _ = m.Update(integrationSpecialKey(tea.KeyEsc))
+		m = newM.(*ui.Model)
+	}
+	if got := m.FocusState(); got != "list" {
+		t.Errorf("expected Esc unwinding to return to list after rapid switching, got %q", got)
+	}
 }
 
-// TestRapidViewSwitchingWithNavigation verifies navigation during rapid switches
+// TestRapidViewSwitchingWithNavigation verifies navigation and list recovery during rapid switches
 func TestRapidViewSwitchingWithNavigation(t *testing.T) {
 	issues := createTestIssues(50)
 	m := ui.NewModel(issues, nil, "")
 	t.Cleanup(func() { m.Stop() })
+	newM, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+	m = newM.(*ui.Model)
 
 	// Mix view switches with navigation
 	actions := []tea.KeyMsg{
@@ -420,12 +439,21 @@ func TestRapidViewSwitchingWithNavigation(t *testing.T) {
 
 	for i := 0; i < 50; i++ {
 		for _, k := range actions {
-			newM, _ := m.Update(k)
+			newM, _ = m.Update(k)
 			m = newM.(*ui.Model)
 		}
 	}
 
-	// Should complete without panic
+	if got := m.FocusState(); got != "list" {
+		t.Errorf("expected final focus state %q after navigation loop, got %q", "list", got)
+	}
+	if m.IsBoardView() || m.IsGraphView() || m.IsActionableView() {
+		t.Errorf("expected secondary view flags cleared after returning to list: board=%v graph=%v actionable=%v",
+			m.IsBoardView(), m.IsGraphView(), m.IsActionableView())
+	}
+	if m.View() == "" {
+		t.Error("View() returned empty output after rapid switching + navigation")
+	}
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

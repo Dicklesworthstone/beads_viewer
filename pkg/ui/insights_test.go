@@ -126,7 +126,7 @@ func TestInsightsModelPanelNavigation(t *testing.T) {
 	issueMap := createTestIssueMap()
 
 	m := ui.NewInsightsModel(ins, issueMap, theme)
-	m.SetSize(120, 40)
+	m.SetSize(160, 40) // Wide enough to include detail panel for calculation proof toggle
 
 	// Start on Bottlenecks panel (index 0)
 	id := m.SelectedIssueID()
@@ -198,7 +198,7 @@ func TestInsightsModelItemNavigation(t *testing.T) {
 	issueMap := createTestIssueMap()
 
 	m := ui.NewInsightsModel(ins, issueMap, theme)
-	m.SetSize(120, 40)
+	m.SetSize(160, 40) // Wide enough to include detail panel for calculation proof toggle
 
 	// Start on Bottlenecks panel, first item
 	id := m.SelectedIssueID()
@@ -256,7 +256,7 @@ func TestInsightsModelCyclesPanelNavigation(t *testing.T) {
 	issueMap := createTestIssueMap()
 
 	m := ui.NewInsightsModel(ins, issueMap, theme)
-	m.SetSize(120, 40)
+	m.SetSize(160, 40) // Wide enough to include detail panel for calculation proof toggle
 
 	// Navigate to Cycles panel (8 NextPanels from start)
 	for i := 0; i < 8; i++ {
@@ -291,25 +291,45 @@ func TestInsightsModelToggleFunctions(t *testing.T) {
 	issueMap := createTestIssueMap()
 
 	m := ui.NewInsightsModel(ins, issueMap, theme)
-	m.SetSize(120, 40)
+	m.SetSize(160, 40) // Wide enough to include detail panel for calculation proof toggle
 
-	// Toggle explanations - should not panic
+	baseView := ansi.Strip(m.View())
+	if strings.TrimSpace(baseView) == "" {
+		t.Fatal("initial InsightsModel.View() returned empty output")
+	}
+
+	// Toggle explanations changes rendered output and toggles back cleanly
 	m.ToggleExplanations()
-	_ = m.View()
+	expView := ansi.Strip(m.View())
+	if expView == baseView {
+		t.Error("ToggleExplanations() did not change rendered Insights view")
+	}
 	m.ToggleExplanations()
-	_ = m.View()
+	if got := ansi.Strip(m.View()); got != baseView {
+		t.Error("second ToggleExplanations() did not restore baseline Insights view")
+	}
 
-	// Toggle calculation - should not panic
+	// Toggle calculation proof changes rendered output and toggles back cleanly
 	m.ToggleCalculation()
-	_ = m.View()
+	calcView := ansi.Strip(m.View())
+	if calcView == baseView {
+		t.Error("ToggleCalculation() did not change rendered Insights view")
+	}
 	m.ToggleCalculation()
-	_ = m.View()
+	if got := ansi.Strip(m.View()); got != baseView {
+		t.Error("second ToggleCalculation() did not restore baseline Insights view")
+	}
 
-	// Toggle heatmap view (bv-95) - should not panic
+	// Toggle heatmap view (bv-95) changes rendered output and toggles back cleanly
 	m.ToggleHeatmap()
-	_ = m.View()
+	heatView := ansi.Strip(m.View())
+	if heatView == baseView {
+		t.Error("ToggleHeatmap() did not change rendered Insights view")
+	}
 	m.ToggleHeatmap()
-	_ = m.View()
+	if got := ansi.Strip(m.View()); got != baseView {
+		t.Error("second ToggleHeatmap() did not restore baseline Insights view")
+	}
 }
 
 // TestInsightsModelSetInsights verifies SetInsights updates data
@@ -319,7 +339,7 @@ func TestInsightsModelSetInsights(t *testing.T) {
 	issueMap := createTestIssueMap()
 
 	m := ui.NewInsightsModel(ins, issueMap, theme)
-	m.SetSize(120, 40)
+	m.SetSize(160, 40) // Wide enough to include detail panel for calculation proof toggle
 
 	// Verify initial data
 	id := m.SelectedIssueID()
@@ -364,25 +384,37 @@ func TestInsightsModelViewRendering(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			m := ui.NewInsightsModel(ins, issueMap, theme)
 			m.SetSize(tt.width, tt.height)
-			// Should not panic
-			_ = m.View()
+			plain := ansi.Strip(m.View())
+			if strings.TrimSpace(plain) == "" {
+				t.Fatalf("View() returned empty output at %dx%d", tt.width, tt.height)
+			}
+			if !strings.Contains(plain, "Bottleneck") && !strings.Contains(plain, "bottleneck-1") {
+				t.Errorf("Insights view at %dx%d missing Bottlenecks content:\n%s", tt.width, tt.height, plain)
+			}
 		})
 	}
 }
 
-// TestInsightsModelAllPanelsRender verifies all panel types render without panic
+// TestInsightsModelAllPanelsRender verifies all 10 panel types render distinct non-empty output
 func TestInsightsModelAllPanelsRender(t *testing.T) {
 	theme := createTheme()
 	ins := createTestInsights()
 	issueMap := createTestIssueMap()
 
 	m := ui.NewInsightsModel(ins, issueMap, theme)
-	m.SetSize(120, 40)
+	m.SetSize(160, 40) // Wide enough to include detail panel for calculation proof toggle
 
-	// Render each panel type
-	for i := 0; i < 6; i++ {
-		_ = m.View()
+	seenViews := make(map[string]int, int(ui.PanelCount))
+	for i := 0; i < int(ui.PanelCount); i++ {
+		plain := ansi.Strip(m.View())
+		if strings.TrimSpace(plain) == "" {
+			t.Fatalf("panel %d rendered empty output", i)
+		}
+		seenViews[m.View()]++
 		m.NextPanel()
+	}
+	if len(seenViews) != int(ui.PanelCount) {
+		t.Errorf("expected %d distinct rendered views across all panels, got %d", ui.PanelCount, len(seenViews))
 	}
 }
 
@@ -396,7 +428,7 @@ func TestInsightsModelEmptyCycles(t *testing.T) {
 	issueMap := createTestIssueMap()
 
 	m := ui.NewInsightsModel(ins, issueMap, theme)
-	m.SetSize(120, 40)
+	m.SetSize(160, 40) // Wide enough to include detail panel for calculation proof toggle
 
 	// Navigate to cycles panel
 	for i := 0; i < 5; i++ {
@@ -425,7 +457,7 @@ func TestInsightsModelMissingIssue(t *testing.T) {
 	issueMap := make(map[string]*model.Issue)
 
 	m := ui.NewInsightsModel(ins, issueMap, theme)
-	m.SetSize(120, 40)
+	m.SetSize(160, 40) // Wide enough to include detail panel for calculation proof toggle
 
 	// Should still return the ID even if issue not in map
 	id := m.SelectedIssueID()
@@ -499,11 +531,15 @@ func TestInsightsModelDetailPanel(t *testing.T) {
 	// Wide enough to show detail panel
 	m.SetSize(150, 40)
 
-	// Should not panic with full details
-	_ = m.View()
+	plain := ansi.Strip(m.View())
+	for _, want := range []string{"detailed-issue", "Detailed Issue Title", "detailed description", "testuser"} {
+		if !strings.Contains(plain, want) {
+			t.Errorf("Insights detail panel missing %q:\n%s", want, plain)
+		}
+	}
 }
 
-// TestInsightsModelCalculationProofAllPanels verifies calculation proof for each panel type
+// TestInsightsModelCalculationProofAllPanels verifies calculation proof renders across all 10 panel types
 func TestInsightsModelCalculationProofAllPanels(t *testing.T) {
 	theme := createTheme()
 	ins := createTestInsights()
@@ -512,11 +548,24 @@ func TestInsightsModelCalculationProofAllPanels(t *testing.T) {
 	m := ui.NewInsightsModel(ins, issueMap, theme)
 	// Wide enough to show detail panel with calculation proof
 	m.SetSize(180, 50)
+	withoutCalc := ansi.Strip(m.View())
+	m.ToggleCalculation()
+	withCalc := ansi.Strip(m.View())
+	if withCalc == withoutCalc {
+		t.Fatal("ToggleCalculation() did not render calculation proof in detail panel")
+	}
 
-	// Test each panel's calculation proof
-	for i := 0; i < 6; i++ {
-		_ = m.View()
+	seenViews := make(map[string]bool, int(ui.PanelCount))
+	for i := 0; i < int(ui.PanelCount); i++ {
+		plain := ansi.Strip(m.View())
+		if strings.TrimSpace(plain) == "" {
+			t.Fatalf("panel %d calculation-proof view returned empty output", i)
+		}
+		seenViews[plain] = true
 		m.NextPanel()
+	}
+	if len(seenViews) != int(ui.PanelCount) {
+		t.Errorf("expected %d distinct calculation-proof panel renders, got %d", ui.PanelCount, len(seenViews))
 	}
 }
 
@@ -537,15 +586,20 @@ func TestInsightsModelLongCycleChain(t *testing.T) {
 	}
 
 	m := ui.NewInsightsModel(ins, issueMap, theme)
-	m.SetSize(120, 40)
+	m.SetSize(160, 40) // Wide enough to include detail panel for calculation proof toggle
 
-	// Navigate to cycles panel
-	for i := 0; i < 5; i++ {
+	// Navigate directly to PanelCycles (index 8)
+	for i := 0; i < int(ui.PanelCycles); i++ {
 		m.NextPanel()
 	}
 
-	// View should not panic with long cycle
-	_ = m.View()
+	plain := ansi.Strip(m.View())
+	if strings.TrimSpace(plain) == "" {
+		t.Fatal("Cycles panel view returned empty output")
+	}
+	if !strings.Contains(plain, "Cycle") || !strings.Contains(plain, "a") {
+		t.Errorf("long cycle chain panel missing cycle content:\n%s", plain)
+	}
 }
 
 // TestInsightsModelScrolling verifies scrolling behavior with many items
@@ -571,16 +625,34 @@ func TestInsightsModelScrolling(t *testing.T) {
 	m := ui.NewInsightsModel(ins, issueMap, theme)
 	m.SetSize(120, 30) // Short height to trigger scrolling
 
-	// Navigate down through all items
+	firstID := m.SelectedIssueID()
+	if firstID != "A" {
+		t.Fatalf("expected initial selected ID A, got %q", firstID)
+	}
+	firstView := ansi.Strip(m.View())
+
+	// Navigate down through all items and verify selection reaches the end
 	for i := 0; i < 55; i++ {
 		m.MoveDown()
 		_ = m.View() // Scrolling happens during view
 	}
+	lastID := m.SelectedIssueID()
+	wantLast := bottlenecks[len(bottlenecks)-1].ID
+	if lastID != wantLast {
+		t.Errorf("expected scrolling down to clamp at last item %q, got %q", wantLast, lastID)
+	}
+	bottomView := ansi.Strip(m.View())
+	if bottomView == firstView {
+		t.Error("scrolling to bottom of 50-item panel did not update rendered viewport")
+	}
 
-	// Navigate back up
+	// Navigate back up and verify selection returns to the first item
 	for i := 0; i < 55; i++ {
 		m.MoveUp()
 		_ = m.View()
+	}
+	if got := m.SelectedIssueID(); got != firstID {
+		t.Errorf("expected scrolling back up to clamp at %q, got %q", firstID, got)
 	}
 }
 

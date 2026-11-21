@@ -99,7 +99,7 @@ func (m *Model) renderSprintDashboard() string {
 				closedBeads++
 				continue
 			}
-			isDepBlocked := sprintReadiness != nil && sprintReadiness.Blocked(iss.ID, now)
+			isDepBlocked := sprintReadiness != nil && len(sprintReadiness.Blockers(iss.ID)) > 0
 			switch {
 			case iss.Status == model.StatusBlocked || isDepBlocked:
 				blockedBeads++

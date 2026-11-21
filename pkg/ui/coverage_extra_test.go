@@ -1646,6 +1646,15 @@ func TestGraphPageDownAndScrollEmpty(t *testing.T) {
 	g.ScrollLeft() // no-op branches
 	g.ScrollRight()
 	g.ensureVisible()
+	if g.TotalCount() != 0 || g.SelectedIssue() != nil {
+		t.Fatalf("empty graph should remain empty: count=%d sel=%v", g.TotalCount(), g.SelectedIssue())
+	}
+	if g.scrollX != 0 || g.scrollY != 0 {
+		t.Fatalf("empty graph scroll offsets should stay 0, got (%d, %d)", g.scrollX, g.scrollY)
+	}
+	if view := g.View(80, 24); !strings.Contains(view, "No issues") {
+		t.Errorf("empty graph View() should show empty state, got:\n%s", view)
+	}
 }
 
 func TestRenderFooterErrorStatus(t *testing.T) {
@@ -2096,23 +2105,41 @@ func TestUpdateMouseAndResize(t *testing.T) {
 
 	// Window size
 	_, _ = m.Update(tea.WindowSizeMsg{Width: 140, Height: 40})
+	if m.width != 140 || m.height != 40 || !m.ready {
+		t.Fatalf("WindowSizeMsg did not update dimensions/ready: %dx%d ready=%v", m.width, m.height, m.ready)
+	}
 
-	// Mouse wheel up/down in list focus
+	// Mouse wheel down/up in list focus moves selection
 	m.focused = focusList
-	_, _ = m.Update(tea.MouseMsg{Button: tea.MouseButtonWheelUp})
 	_, _ = m.Update(tea.MouseMsg{Button: tea.MouseButtonWheelDown})
+	if m.list.Index() != 1 {
+		t.Fatalf("expected MouseButtonWheelDown in list to move index to 1, got %d", m.list.Index())
+	}
+	_, _ = m.Update(tea.MouseMsg{Button: tea.MouseButtonWheelUp})
+	if m.list.Index() != 0 {
+		t.Fatalf("expected MouseButtonWheelUp in list to move index back to 0, got %d", m.list.Index())
+	}
 
-	// Switch focus and scroll other components
-	m.focused = focusDetail
-	_, _ = m.Update(tea.MouseMsg{Button: tea.MouseButtonWheelDown})
-	m.focused = focusInsights
-	_, _ = m.Update(tea.MouseMsg{Button: tea.MouseButtonWheelUp})
-	m.focused = focusBoard
-	_, _ = m.Update(tea.MouseMsg{Button: tea.MouseButtonWheelUp})
-	m.focused = focusGraph
-	_, _ = m.Update(tea.MouseMsg{Button: tea.MouseButtonWheelDown})
-	m.focused = focusActionable
-	_, _ = m.Update(tea.MouseMsg{Button: tea.MouseButtonWheelUp})
+	// Switch focus and scroll other components, asserting focus and rendering stay valid
+	for _, tc := range []struct {
+		f   focus
+		btn tea.MouseButton
+	}{
+		{focusDetail, tea.MouseButtonWheelDown},
+		{focusInsights, tea.MouseButtonWheelUp},
+		{focusBoard, tea.MouseButtonWheelUp},
+		{focusGraph, tea.MouseButtonWheelDown},
+		{focusActionable, tea.MouseButtonWheelUp},
+	} {
+		m.focused = tc.f
+		_, _ = m.Update(tea.MouseMsg{Button: tc.btn})
+		if m.focused != tc.f {
+			t.Errorf("mouse wheel unexpectedly changed focus from %v to %v", tc.f, m.focused)
+		}
+		if strings.TrimSpace(m.View()) == "" {
+			t.Errorf("View() returned empty output after mouse wheel in focus %v", tc.f)
+		}
+	}
 }
 
 func TestOverlaysAndWorkspaceHelpers(t *testing.T) {

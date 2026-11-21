@@ -67,7 +67,7 @@ const (
 
 // StartupCheckDisclosure is the footer text shown the first time bv performs
 // its automatic release check, so the network access is never silent (#197).
-const StartupCheckDisclosure = "checked github.com for updates (BV_NO_UPDATE_CHECK=1 to disable)"
+const StartupCheckDisclosure = "Checked github.com for updates (BV_NO_UPDATE_CHECK=1 to disable)"
 
 // Preferences is the resolved update policy: defaults, then
 // ~/.config/bv/config.yaml `updates:` keys, then environment overrides.

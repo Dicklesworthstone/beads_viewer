@@ -423,8 +423,27 @@ func TestViewRendering(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			b := ui.NewBoardModel(tt.issues, theme)
-			// Should not panic
-			_ = b.View(tt.width, tt.height)
+			out := b.View(tt.width, tt.height)
+			plain := ansi.Strip(out)
+			if strings.TrimSpace(plain) == "" {
+				t.Fatalf("View(%d, %d) returned empty output", tt.width, tt.height)
+			}
+			if !strings.Contains(plain, "BOARD") {
+				t.Errorf("board output should render title bar, got:\n%s", plain)
+			}
+			if len(tt.issues) == 0 {
+				if !strings.Contains(plain, "(empty)") {
+					t.Errorf("empty board should display empty columns, got:\n%s", plain)
+				}
+				return
+			}
+			if tt.width >= 80 {
+				for _, iss := range tt.issues {
+					if !strings.Contains(plain, iss.ID) {
+						t.Errorf("board output missing issue ID %q:\n%s", iss.ID, plain)
+					}
+				}
+			}
 		})
 	}
 }
@@ -471,23 +490,24 @@ func TestBoardRichCardContent(t *testing.T) {
 
 	b := ui.NewBoardModel(issues, theme)
 
-	// Board should render without panic
-	output := b.View(160, 40)
-
-	// Basic sanity checks - output should contain issue IDs
-	if output == "" {
-		t.Error("Board view should not be empty")
+	output := ansi.Strip(b.View(160, 40))
+	for _, want := range []string{"A", "Foundation Task", "B", "Blocked Task", "C", "→2"} {
+		if !strings.Contains(output, want) {
+			t.Errorf("rich board output missing %q:\n%s", want, output)
+		}
 	}
 
-	// Test SetIssues rebuilds blocks index
+	// Test SetIssues rebuilds blocks index and preserves rich dependency badges
 	b.SetIssues(issues)
-	output2 := b.View(160, 40)
-	if output2 == "" {
-		t.Error("Board view after SetIssues should not be empty")
+	output2 := ansi.Strip(b.View(160, 40))
+	for _, want := range []string{"A", "B", "C", "→2"} {
+		if !strings.Contains(output2, want) {
+			t.Errorf("rich board output after SetIssues missing %q:\n%s", want, output2)
+		}
 	}
 }
 
-// TestBoardAgeColorCoding verifies age indicators show different colors (bv-1daf)
+// TestBoardAgeColorCoding verifies age indicators render distinct cards and ages (bv-1daf)
 func TestBoardAgeColorCoding(t *testing.T) {
 	theme := createTheme()
 
@@ -521,10 +541,14 @@ func TestBoardAgeColorCoding(t *testing.T) {
 
 	b := ui.NewBoardModel(issues, theme)
 
-	// Should render without panic with different age colors
-	output := b.View(160, 40)
-	if output == "" {
-		t.Error("Board view with age-colored issues should not be empty")
+	output := ansi.Strip(b.View(160, 40))
+	for _, want := range []string{"recent", "Recent Issue", "medium", "Medium Age", "stale", "Stale Issue"} {
+		if !strings.Contains(output, want) {
+			t.Errorf("age-coded board view missing %q:\n%s", want, output)
+		}
+	}
+	if !strings.Contains(output, "14d") && !strings.Contains(output, "2w") && !strings.Contains(output, "60d") && !strings.Contains(output, "2mo") {
+		t.Errorf("age-coded board view should display formatted card ages, got:\n%s", output)
 	}
 }
 
@@ -977,47 +1001,66 @@ func TestDetailPanelToggle(t *testing.T) {
 	}
 }
 
-// TestDetailPanelScroll verifies detail panel scrolling doesn't panic
+// TestDetailPanelScroll verifies detail panel scrolling moves content and clamps safely
 func TestDetailPanelScroll(t *testing.T) {
 	theme := createTheme()
+	var desc strings.Builder
+	for i := 1; i <= 40; i++ {
+		fmt.Fprintf(&desc, "Detail paragraph line %02d with enough text.\n\n", i)
+	}
 	issues := []model.Issue{{
 		ID:          "1",
 		Title:       "Test Issue",
-		Description: "Long description that spans multiple lines...",
+		Description: desc.String(),
 		Status:      model.StatusOpen,
 	}}
 	b := ui.NewBoardModel(issues, theme)
-
+	b.SetSize(160, 22)
 	b.ShowDetail()
 
-	// Force render to populate viewport
-	_ = b.View(160, 40)
+	topView := ansi.Strip(b.View(160, 22))
+	if !strings.Contains(topView, "DETAILS") {
+		t.Fatalf("expected DETAILS panel in wide view:\n%s", topView)
+	}
 
-	// Scroll operations should not panic
-	b.DetailScrollDown(3)
-	b.DetailScrollUp(3)
-	b.DetailScrollDown(100) // Over-scroll should be safe
-	b.DetailScrollUp(100)
+	b.DetailScrollDown(10)
+	scrolledView := ansi.Strip(b.View(160, 22))
+	if scrolledView == topView {
+		t.Fatal("DetailScrollDown(10) did not change rendered detail viewport")
+	}
+
+	b.DetailScrollDown(100) // Over-scroll clamps cleanly
+	bottomView := ansi.Strip(b.View(160, 22))
+	if !strings.Contains(bottomView, "DETAILS") {
+		t.Fatal("DETAILS panel header disappeared after over-scroll")
+	}
+
+	b.DetailScrollUp(100) // Scroll back to top
+	backTopView := ansi.Strip(b.View(160, 22))
+	if backTopView != topView {
+		t.Fatal("DetailScrollUp(100) did not return detail viewport to top")
+	}
 }
 
-// TestDetailPanelRenderWithWidth verifies detail panel appears at sufficient width
+// TestDetailPanelRenderWithWidth verifies detail panel appears only above the width threshold (>120)
 func TestDetailPanelRenderWithWidth(t *testing.T) {
 	theme := createTheme()
-	issues := []model.Issue{{ID: "1", Status: model.StatusOpen}}
+	issues := []model.Issue{{ID: "1", Title: "Width check", Status: model.StatusOpen}}
 	b := ui.NewBoardModel(issues, theme)
 
 	b.ShowDetail()
 
-	// At narrow width (80), detail panel shouldn't show
-	output80 := b.View(80, 30)
+	output80 := ansi.Strip(b.View(80, 30))
+	if strings.Contains(output80, "DETAILS") {
+		t.Errorf("detail panel should be hidden at width 80, got:\n%s", output80)
+	}
 
-	// At wide width (160), detail panel should show
-	output160 := b.View(160, 30)
-
-	// Wide output should be longer (includes detail panel)
-	// This is a heuristic - the exact behavior depends on implementation
-	if len(output160) < len(output80) {
-		t.Log("Note: Detail panel may not show at 160 width depending on implementation threshold")
+	output160 := ansi.Strip(b.View(160, 30))
+	if !strings.Contains(output160, "DETAILS") {
+		t.Errorf("detail panel should render at width 160, got:\n%s", output160)
+	}
+	if len(output160) <= len(output80) {
+		t.Errorf("expected wide view with detail panel (%d bytes) to exceed narrow view (%d bytes)", len(output160), len(output80))
 	}
 }
 

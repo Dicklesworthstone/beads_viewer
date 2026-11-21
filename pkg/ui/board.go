@@ -53,7 +53,8 @@ type BoardModel struct {
 	detailVP        viewport.Model
 	mdRenderer      *MarkdownRenderer
 	cardMdRenderer  *MarkdownRenderer
-	lastDetailID    string // Track which issue detail is currently rendered
+	detailCache     *boardDetailCache // Shared across value-receiver View() frames
+	lastDetailID    string            // Track which issue detail is currently rendered
 	lastDetailWidth int
 	lastViewWidth   int
 	lastViewHeight  int
@@ -77,6 +78,26 @@ type BoardModel struct {
 	// expandedCardID tracks which card is currently expanded inline
 	// Empty string means no card is expanded
 	expandedCardID string
+}
+
+// boardDetailCache shares rendered detail markdown across value-receiver View()
+// frames so repeated redraws of the same selected issue at the same width/theme
+// do not re-render Glamour markdown on every keypress.
+type boardDetailCache struct {
+	issueID  string
+	width    int
+	darkMode bool
+	rendered string
+	renders  int
+}
+
+func (b *BoardModel) invalidateDetailCache() {
+	b.lastDetailID = ""
+	if b.detailCache != nil {
+		b.detailCache.issueID = ""
+		b.detailCache.width = 0
+		b.detailCache.rendered = ""
+	}
 }
 
 // searchMatch holds info about a matching card (bv-yg39)
@@ -118,7 +139,7 @@ type ColumnStats struct {
 // SetReadiness attaches an optional ReadinessIndex for authoritative blocker checks.
 func (b *BoardModel) SetReadiness(r *model.ReadinessIndex) {
 	b.readiness = r
-	b.lastDetailID = ""
+	b.invalidateDetailCache()
 }
 
 // SetFullIssues attaches the full unscoped issue slice so downstream-unblock
@@ -140,7 +161,7 @@ func (b *BoardModel) SetFullIssues(all []model.Issue) {
 	if !b.fullBlocksReady {
 		b.rebuildBlocksIndex()
 	}
-	b.lastDetailID = ""
+	b.invalidateDetailCache()
 }
 
 // SetFullIssuesFromSnapshot attaches the snapshot's precomputed issue map and
@@ -162,7 +183,7 @@ func (b *BoardModel) SetFullIssuesFromSnapshot(s *DataSnapshot) {
 		b.blocksIndex = nil
 		b.fullBlocksReady = false
 	}
-	b.lastDetailID = ""
+	b.invalidateDetailCache()
 }
 
 func (b *BoardModel) rebuildBlocksIndex() {
@@ -222,7 +243,7 @@ func (b BoardModel) activeBlockingDeps(issue model.Issue) []*model.Dependency {
 func (b *BoardModel) SetReferenceTime(now time.Time) {
 	if !b.referenceNow.Equal(now) {
 		b.referenceNow = now
-		b.lastDetailID = ""
+		b.invalidateDetailCache()
 	}
 }
 
@@ -579,9 +600,9 @@ func (b *BoardModel) regroupIssues() {
 	}
 
 	b.updateActiveColumns()
-	b.CancelSearch()      // Clear stale search matches
-	b.lastDetailID = ""   // Force detail panel refresh
-	b.expandedCardID = "" // Clear expanded card on mode change
+	b.CancelSearch()          // Clear stale search matches
+	b.invalidateDetailCache() // Force detail panel refresh
+	b.expandedCardID = ""     // Clear expanded card on mode change
 }
 
 // getColumnHeaders returns the column header titles based on swimlane mode (bv-wjs0)
@@ -635,6 +656,7 @@ func NewBoardModel(issues []model.Issue, theme Theme) BoardModel {
 		detailVP:       viewport.New(40, 20),
 		mdRenderer:     mdRenderer,
 		cardMdRenderer: cardMdRenderer,
+		detailCache:    &boardDetailCache{},
 	}
 	b.updateActiveColumns()
 	return b
@@ -731,7 +753,7 @@ func (b *BoardModel) SetIssues(issues []model.Issue) {
 	}
 
 	// Reset detail panel cache to force refresh if same issue is selected
-	b.lastDetailID = ""
+	b.invalidateDetailCache()
 
 	// Sanitize selection to prevent out-of-bounds
 	for i := 0; i < 4; i++ {
@@ -799,7 +821,7 @@ func (b *BoardModel) SetSnapshot(s *DataSnapshot) {
 	b.issueMap = s.IssueMap
 
 	// Reset detail panel cache to force refresh if same issue is selected
-	b.lastDetailID = ""
+	b.invalidateDetailCache()
 
 	// Sanitize selection to prevent out-of-bounds
 	for i := 0; i < 4; i++ {
@@ -2217,25 +2239,39 @@ func (b *BoardModel) syncDetailContent() {
 	prevID := b.lastDetailID
 	prevYOffset := b.detailVP.YOffset
 	curWidth := max(b.detailVP.Width, 20)
+	wantDark := boardDarkMode(t)
 	issue := b.SelectedIssue()
 	if issue == nil {
-		if prevID != "_none_" || b.lastDetailWidth != curWidth {
-			b.lastDetailID = "_none_"
-			b.lastDetailWidth = curWidth
+		if prevID == "_none_" && b.lastDetailWidth == curWidth {
+			return
+		}
+		b.lastDetailID = "_none_"
+		b.lastDetailWidth = curWidth
+		var rendered string
+		if b.detailCache != nil && b.detailCache.issueID == "_none_" && b.detailCache.width == curWidth && b.detailCache.darkMode == wantDark {
+			rendered = b.detailCache.rendered
+		} else {
 			helpText := "## No Selection\n\nNavigate to a card with **h/l** and **j/k** to see details here.\n\nPress **Tab** to hide this panel."
-			rendered := helpText
+			rendered = helpText
 			if b.mdRenderer != nil {
 				if md, err := b.mdRenderer.Render(helpText); err == nil {
 					rendered = boardStripANSIForTheme(t, md)
 				}
 			}
-			b.detailVP.SetContent(rendered)
-			if prevID != "_none_" {
-				b.detailVP.GotoTop()
-			} else {
-				maxY := max(0, b.detailVP.TotalLineCount()-b.detailVP.Height)
-				b.detailVP.SetYOffset(min(prevYOffset, maxY))
+			if b.detailCache != nil {
+				b.detailCache.issueID = "_none_"
+				b.detailCache.width = curWidth
+				b.detailCache.darkMode = wantDark
+				b.detailCache.rendered = rendered
+				b.detailCache.renders++
 			}
+		}
+		b.detailVP.SetContent(rendered)
+		if prevID != "_none_" {
+			b.detailVP.GotoTop()
+		} else {
+			maxY := max(0, b.detailVP.TotalLineCount()-b.detailVP.Height)
+			b.detailVP.SetYOffset(min(prevYOffset, maxY))
 		}
 		return
 	}
@@ -2245,6 +2281,17 @@ func (b *BoardModel) syncDetailContent() {
 	}
 	b.lastDetailID = issue.ID
 	b.lastDetailWidth = curWidth
+
+	if b.detailCache != nil && b.detailCache.issueID == issue.ID && b.detailCache.width == curWidth && b.detailCache.darkMode == wantDark {
+		b.detailVP.SetContent(b.detailCache.rendered)
+		if prevID != issue.ID {
+			b.detailVP.GotoTop()
+		} else {
+			maxY := max(0, b.detailVP.TotalLineCount()-b.detailVP.Height)
+			b.detailVP.SetYOffset(min(prevYOffset, maxY))
+		}
+		return
+	}
 
 	var content strings.Builder
 
@@ -2327,6 +2374,13 @@ func (b *BoardModel) syncDetailContent() {
 			rendered = boardStripANSIForTheme(t, md)
 		}
 	}
+	if b.detailCache != nil {
+		b.detailCache.issueID = issue.ID
+		b.detailCache.width = curWidth
+		b.detailCache.darkMode = wantDark
+		b.detailCache.rendered = rendered
+		b.detailCache.renders++
+	}
 	b.detailVP.SetContent(rendered)
 	if prevID != issue.ID {
 		b.detailVP.GotoTop()
@@ -2357,6 +2411,7 @@ func boardDarkMode(t Theme) bool {
 func (b *BoardModel) SetTheme(theme Theme) {
 	b.theme = theme
 	b.lastDetailWidth = 0
+	b.invalidateDetailCache()
 	wantDark := boardDarkMode(theme)
 	w := 50
 	if b.mdRenderer != nil && b.mdRenderer.width > 0 {

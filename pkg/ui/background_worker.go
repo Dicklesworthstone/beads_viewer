@@ -1657,7 +1657,7 @@ func (w *BackgroundWorker) buildSnapshotResultContext(ctx context.Context, force
 			}
 			issues = res.Issues
 			authority = res.Authority
-			authorityHash = res.AuthorityHash
+			authorityHash = analysis.ComputeDataHash(issues)
 			if authority == nil {
 				authority = model.NewReadinessIndex(issues)
 			}

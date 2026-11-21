@@ -2615,25 +2615,42 @@ func TestWithPhase2_ConcurrentReadSafe(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 
-	// Reader goroutine - read from original concurrently
+	readerErr := make(chan error, 1)
+	initialReady := original.IsPhase2Ready()
+	var updated *DataSnapshot
+
+	// Reader goroutine - read from original concurrently and verify immutability
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 100; i++ {
-			_ = original.IsPhase2Ready()
-			_ = len(original.Issues)
-			if original.IssueMap != nil {
-				_ = len(original.IssueMap)
+			if original.IsPhase2Ready() != initialReady {
+				readerErr <- fmt.Errorf("original snapshot Phase2Ready mutated concurrently from %v", initialReady)
+				return
+			}
+			if len(original.Issues) != 2 || len(original.IssueMap) != 2 {
+				readerErr <- fmt.Errorf("original snapshot corrupted: issues=%d map=%d", len(original.Issues), len(original.IssueMap))
+				return
 			}
 		}
+		readerErr <- nil
 	}()
 
 	// Writer goroutine - create new snapshot
 	go func() {
 		defer wg.Done()
-		_ = original.WithPhase2(stats, ins, issues, analyzer)
+		updated = original.WithPhase2(stats, ins, issues, analyzer)
 	}()
 
 	wg.Wait()
+	if err := <-readerErr; err != nil {
+		t.Fatal(err)
+	}
+	if updated == nil || !updated.IsPhase2Ready() || len(updated.Issues) != 2 {
+		t.Fatalf("WithPhase2 returned invalid snapshot: %+v", updated)
+	}
+	if original.IsPhase2Ready() != initialReady {
+		t.Errorf("original snapshot Phase2Ready mutated from %v to %v", initialReady, original.IsPhase2Ready())
+	}
 }
 
 // TestWithPhase2_TriagePopulation verifies triage data is populated in new snapshot.
@@ -2655,12 +2672,18 @@ func TestWithPhase2_TriagePopulation(t *testing.T) {
 	ins := stats.GenerateInsights(len(issues))
 
 	newSnapshot := original.WithPhase2(stats, ins, issues, analyzer)
-
-	// Verify triage data is populated (not nil)
-	t.Logf("TriageScores: %d entries", len(newSnapshot.TriageScores))
-	t.Logf("BlockerSet: %d entries", len(newSnapshot.BlockerSet))
-	t.Logf("QuickWinSet: %d entries", len(newSnapshot.QuickWinSet))
-	t.Logf("UnblocksMap: %d entries", len(newSnapshot.UnblocksMap))
+	if newSnapshot == nil {
+		t.Fatal("WithPhase2 returned nil snapshot")
+	}
+	if len(newSnapshot.TriageScores) != len(issues) {
+		t.Errorf("expected TriageScores for all %d issues, got %d (%v)", len(issues), len(newSnapshot.TriageScores), newSnapshot.TriageScores)
+	}
+	if !newSnapshot.BlockerSet["A"] {
+		t.Errorf("expected A to be marked in BlockerSet, got %v", newSnapshot.BlockerSet)
+	}
+	if got := newSnapshot.UnblocksMap["A"]; len(got) != 1 || got[0] != "B" {
+		t.Errorf("expected UnblocksMap[A] == [B], got %v", got)
+	}
 }
 
 // TestWithPhase2_TreeDeepCopy verifies that tree structures are deep copied,

@@ -1002,11 +1002,14 @@ func TestDetectFilesystemType_EmptyPath(t *testing.T) {
 }
 
 func TestDetectFilesystemType_NonExistentPath(t *testing.T) {
-	// Should fall back to parent directory detection
+	// Must fall back to parent directory filesystem detection.
 	tmpDir := t.TempDir()
+	parentType := DetectFilesystemType(tmpDir)
 	nonExistent := filepath.Join(tmpDir, "does_not_exist.txt")
-	// Should not panic, should return some valid type
-	_ = DetectFilesystemType(nonExistent)
+	got := DetectFilesystemType(nonExistent)
+	if got != parentType {
+		t.Errorf("DetectFilesystemType(%q) = %v, want parent directory type %v", nonExistent, got, parentType)
+	}
 }
 
 func TestWatcher_EnvForcePoll(t *testing.T) {

@@ -513,7 +513,7 @@ func structuredTutorialPages() []StructuredTutorialPage {
 				KeyTable{Bindings: []KeyHint{
 					{Key: "h / l / Tab", Desc: "Switch metric panels"},
 					{Key: "e / x", Desc: "Toggle explanations / calculation proof"},
-					{Key: "m / H", Desc: "Toggle Depth x Triage Score heatmap"},
+					{Key: "m / H", Desc: "Toggle Depth × Triage Score heatmap"},
 					{Key: "< / >", Desc: "Widen / narrow detail pane"},
 					{Key: "Enter / Esc", Desc: "Jump to issue / return to list"},
 				}},

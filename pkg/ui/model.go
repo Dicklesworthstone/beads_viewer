@@ -322,6 +322,18 @@ func (m *Model) SetSourceReload(reload func(context.Context) (SourceReloadResult
 	m.sourceStaleReason = ""
 	m.sourceVersion++
 	m.sourceReload = reload
+	m.allowBackgroundAutoPromote = false
+}
+
+// SetBackgroundAutoPromote allows single-repo sessions configured with
+// SetSourceReload (e.g., auto-discovered SQLite/JSONL authority loaders) to
+// auto-promote into BackgroundWorker on slow reloads while keeping the same
+// source loader.
+func (m *Model) SetBackgroundAutoPromote(allow bool) {
+	if m == nil {
+		return
+	}
+	m.allowBackgroundAutoPromote = allow
 }
 
 func (m *Model) sourceReloadCmd() tea.Cmd {
@@ -990,6 +1002,24 @@ func CheckUpdateCmd() tea.Cmd {
 		}
 		tag, url, err := updater.CheckForUpdates()
 		return StartupUpdateCheckMsg{TagName: tag, URL: url, Err: err}
+	}
+}
+
+// manualUpdateCheckMsg reports completion of an explicit user-initiated update
+// check triggered by pressing 'U' when no cached update is known yet.
+type manualUpdateCheckMsg struct {
+	TagName string
+	URL     string
+	Err     error
+}
+
+// manualUpdateCheckFunc is a test hook defaulting to updater.CheckForUpdates.
+var manualUpdateCheckFunc = updater.CheckForUpdates
+
+func manualCheckUpdateCmd() tea.Cmd {
+	return func() tea.Msg {
+		tag, url, err := manualUpdateCheckFunc()
+		return manualUpdateCheckMsg{TagName: tag, URL: url, Err: err}
 	}
 }
 
@@ -2360,12 +2390,14 @@ type Model struct {
 	focusBeforeRepoPicker focus
 
 	// Time-travel mode
-	timeTravelMode   bool
-	timeTravelDiff   *analysis.SnapshotDiff
-	timeTravelSince  string
-	newIssueIDs      map[string]bool // Issues in diff.NewIssues
-	closedIssueIDs   map[string]bool // Issues in diff.ClosedIssues
-	modifiedIssueIDs map[string]bool // Issues in diff.ModifiedIssues
+	timeTravelMode         bool
+	timeTravelDiff         *analysis.SnapshotDiff
+	timeTravelSince        string
+	timeTravelDensityDelta float64
+	newIssueIDs            map[string]bool // Issues in diff.NewIssues
+	closedIssueIDs         map[string]bool // Issues in diff.ClosedIssues
+	modifiedIssueIDs       map[string]bool // Issues in diff.ModifiedIssues
+	reopenedIssueIDs       map[string]bool // Issues in diff.ReopenedIssues
 
 	// Time-travel input prompt
 	timeTravelInput      textinput.Model
@@ -2392,6 +2424,7 @@ type Model struct {
 	bdRefreshCancel            context.CancelFunc
 	bdRefreshRequest           uint64
 	restoreBackgroundAfterEdit bool
+	allowBackgroundAutoPromote bool
 
 	// Workspace mode state
 	workspaceMode        bool            // True when viewing multiple repos
@@ -2416,6 +2449,7 @@ type Model struct {
 	selectedSprint         *model.Sprint
 	isSprintView           bool
 	sprintViewText         string
+	sprintScroll           int
 	sprintAtRiskThresholds analysis.AtRiskThresholds
 
 	// AGENTS.md integration (bv-i8dk)
@@ -4443,10 +4477,10 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case StartupUpdateCheckMsg:
 		if updater.StartupDisclosurePending() {
 			if m.statusMsg == "" || !m.statusIsError {
-				m.statusMsg = "Checked github.com for updates (set BV_NO_UPDATE_CHECK=1 to disable)"
+				m.statusMsg = updater.StartupCheckDisclosure
 				m.statusIsError = false
+				_ = updater.RecordStartupDisclosure()
 			}
-			_ = updater.RecordStartupDisclosure()
 		}
 		if msg.Err != nil || !updater.IsNewerThanCurrent(msg.TagName) {
 			m.updateAvailable = false
@@ -4459,6 +4493,28 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.updateTag = msg.TagName
 		m.updateURL = msg.URL
 		m.refreshVisibleUpdateNotice()
+		return m, nil
+
+	case manualUpdateCheckMsg:
+		if msg.Err != nil {
+			m.statusMsg = fmt.Sprintf("Update check failed: %v", msg.Err)
+			m.statusIsError = true
+			return m, nil
+		}
+		if !updater.IsNewerThanCurrent(msg.TagName) {
+			m.updateAvailable = false
+			m.updateTag = ""
+			m.updateURL = ""
+			m.refreshVisibleUpdateNotice()
+			m.statusMsg = "No update available - you're running the latest version"
+			m.statusIsError = false
+			return m, nil
+		}
+		m.updateAvailable = true
+		m.updateTag = msg.TagName
+		m.updateURL = msg.URL
+		m.refreshVisibleUpdateNotice()
+		m.showSelfUpdateModal()
 		return m, nil
 
 	case UpdateMsg:
@@ -5207,9 +5263,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.timeTravelMode = false
 			m.timeTravelDiff = nil
 			m.timeTravelSince = ""
+			m.timeTravelDensityDelta = 0
 			m.newIssueIDs = nil
 			m.closedIssueIDs = nil
 			m.modifiedIssueIDs = nil
+			m.reopenedIssueIDs = nil
 			m.tree.SetReadOnly(m.beadsPath == "" || strings.HasPrefix(strings.TrimSpace(m.beadsPath), "git:"))
 		}
 
@@ -5705,18 +5763,24 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.sourceReloadCancel = nil
 		}
-		// File changed on disk - reload issues and recompute analysis.
-		if msg.source == nil && m.sourceReload != nil {
-			return m, m.sourceReloadCmd()
-		}
 		// In background mode the BackgroundWorker owns file watching and snapshot building,
-		// while external sidecar watchers (e.g. sprints.jsonl) still deliver FileChangedMsg.
-		if m.backgroundWorker != nil && m.backgroundWorker.State() != WorkerStopped && msg.source == nil {
+		// while external sidecar/sibling watchers (e.g. sprints.jsonl or SQLite WAL) still deliver FileChangedMsg.
+		// Only bypass sourceReloadCmd when no explicit sourceReload is set OR when this session
+		// explicitly opted into background auto-promotion (where BackgroundWorker owns sourceReload).
+		if m.backgroundWorker != nil && m.backgroundWorker.State() != WorkerStopped && msg.source == nil &&
+			(m.sourceReload == nil || m.allowBackgroundAutoPromote) {
 			m.reloadSprintsFromDisk(m.effectiveUnderlyingFocus())
+			if m.sourceReload != nil {
+				m.backgroundWorker.TriggerRefresh()
+			}
 			if m.watcher != nil {
 				cmds = append(cmds, WatchFileCmd(m.watcher))
 			}
 			return m, tea.Batch(cmds...)
+		}
+		// File changed on disk - reload issues and recompute analysis.
+		if msg.source == nil && m.sourceReload != nil {
+			return m, m.sourceReloadCmd()
 		}
 		if m.backgroundWorker != nil && m.backgroundWorker.State() == WorkerStopped {
 			m.backgroundWorker = nil
@@ -5752,9 +5816,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.timeTravelMode = false
 			m.timeTravelDiff = nil
 			m.timeTravelSince = ""
+			m.timeTravelDensityDelta = 0
 			m.newIssueIDs = nil
 			m.closedIssueIDs = nil
 			m.modifiedIssueIDs = nil
+			m.reopenedIssueIDs = nil
 			m.tree.SetReadOnly(m.beadsPath == "" || strings.HasPrefix(strings.TrimSpace(m.beadsPath), "git:"))
 		}
 
@@ -6200,9 +6266,11 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Auto-enable background mode after slow sync reloads (opt-out via BV_BACKGROUND_MODE=0).
 		autoEnabled := false
 		slowReload := reloadDuration >= time.Second
+		sourceCanPromote := m.sourceReload == nil || m.allowBackgroundAutoPromote || m.restoreBackgroundAfterEdit
+		pathCanPromote := m.beadsPath != "" && !isHistoricalGitBeadsPath(m.beadsPath) &&
+			(strings.HasSuffix(strings.ToLower(m.beadsPath), ".jsonl") || (m.allowBackgroundAutoPromote && m.sourceReload != nil))
 		canPromoteToBackground := !m.workspaceMode && !m.isExplicitDB && m.candidateIDs == nil &&
-			(m.sourceReload == nil || m.restoreBackgroundAfterEdit) &&
-			m.beadsPath != "" && !isHistoricalGitBeadsPath(m.beadsPath) && strings.HasSuffix(strings.ToLower(m.beadsPath), ".jsonl")
+			sourceCanPromote && pathCanPromote
 		if (slowReload || m.restoreBackgroundAfterEdit) && m.backgroundWorker == nil && canPromoteToBackground {
 			autoAllowed := true
 			if v := strings.TrimSpace(env.BackgroundMode.Get()); v != "" {
@@ -6216,6 +6284,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					BeadsPath:      m.beadsPath,
 					ProjectDir:     m.workDir,
 					SourceDegraded: m.sourceDegraded,
+					SourceReload:   m.sourceReload,
 					DebounceDelay:  200 * time.Millisecond,
 				})
 				if err == nil {
@@ -8029,8 +8098,7 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, m.showCassSessionModal()
 
 			case "U":
-				m.showSelfUpdateModal()
-				return m, nil
+				return m, m.triggerSelfUpdateAction()
 
 			case "y":
 				issuePtr, errMsg := m.selectedIssueForActionWithReason()
@@ -9778,8 +9846,8 @@ func (m *Model) handleListKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 		// Show cass session preview modal (bv-5bqh)
 		cmd = m.showCassSessionModal()
 	case "U":
-		// Show self-update modal (bv-182)
-		m.showSelfUpdateModal()
+		// Show self-update modal or trigger active update check (bv-182)
+		cmd = m.triggerSelfUpdateAction()
 	case "y":
 		// Copy ID to clipboard (consistent with board view - bv-yg39)
 		cmd = m.copyIssueIDByIDCmd(m.selectedIssueIDForEditor())
@@ -10814,105 +10882,66 @@ func (m *Model) buildHelpBodyLines() (bodyLines []string, availLines int) {
 		return panelStyle.Render(content.String())
 	}
 
-	// Define all sections
-	navSection := []struct{ key, desc string }{
-		{"j / ↓", "Move down"},
-		{"k / ↑", "Move up"},
-		{"G/end", "Go to last"},
-		{"Ctrl+d", "Page down"},
-		{"Ctrl+u", "Page up"},
-		{"Tab", "Switch focus"},
-		{"Enter", "View details"},
-		{"Esc", "Back / close"},
+	// Build panels dynamically from GetKeyBindingDocs() so every view and
+	// registered keybinding stays synchronized with pkg/ui/keybindings.go.
+	type shortcutRow struct{ key, desc string }
+	type categoryMeta struct {
+		title    string
+		icon     string
+		colorIdx int
+	}
+	categoryOrder := []string{
+		"Navigation", "Views", "Filters", "Actions", "Split View",
+		"Board", "Graph", "Tree", "Actionable", "Insights",
+		"History", "Flow", "Label", "Attention", "Velocity", "Sprint",
+	}
+	categoryMetaMap := map[string]categoryMeta{
+		"Navigation": {title: "Navigation", icon: "🧭", colorIdx: 0},
+		"Views":      {title: "Views", icon: "👁", colorIdx: 1},
+		"Filters":    {title: "Filters & Sort", icon: "🔍", colorIdx: 3},
+		"Actions":    {title: "Actions", icon: "⚡", colorIdx: 2},
+		"Split View": {title: "Split View", icon: "◫", colorIdx: 4},
+		"Board":      {title: "Board View", icon: "📋", colorIdx: 5},
+		"Graph":      {title: "Graph View", icon: "📊", colorIdx: 4},
+		"Tree":       {title: "Tree View", icon: "🌳", colorIdx: 3},
+		"Actionable": {title: "Actionable", icon: "🚀", colorIdx: 1},
+		"Insights":   {title: "Insights", icon: "💡", colorIdx: 5},
+		"History":    {title: "History", icon: "📜", colorIdx: 0},
+		"Flow":       {title: "Flow Matrix", icon: "🔀", colorIdx: 2},
+		"Label":      {title: "Label Dashboard", icon: "🏷", colorIdx: 3},
+		"Attention":  {title: "Attention View", icon: "🎯", colorIdx: 1},
+		"Velocity":   {title: "Velocity View", icon: "📈", colorIdx: 4},
+		"Sprint":     {title: "Sprint View", icon: "📅", colorIdx: 5},
 	}
 
-	viewsSection := []struct{ key, desc string }{
-		{"b", "Kanban board"},
-		{"g", "Graph view"},
-		{"E", "Tree view"},
-		{"i", "Insights"},
-		{"h", "History view"},
-		{"a", "Actionable"},
-		{"P", "Sprint view"},
-		{"f", "Flow matrix"},
-		{"[", "Label dashboard"},
-		{"]", "Attention view"},
-		{"\\", "Toggle split"},
+	grouped := make(map[string][]shortcutRow)
+	seenInCat := make(map[string]map[string]bool)
+	var extraCategories []string
+	knownCat := make(map[string]bool, len(categoryOrder))
+	for _, cat := range categoryOrder {
+		knownCat[cat] = true
 	}
-
-	globalSection := []struct{ key, desc string }{
-		{"?", "This help"},
-		{"~", "Context help"},
-		{"`", "Tutorial"},
-		{";", "Shortcuts bar"},
-		{"!", "Alerts panel"},
-		{"'", "Recipes"},
-		{"w", "Repo picker"},
-		{"q", "Back / Quit"},
-		{"Ctrl+c", "Force quit"},
+	for _, doc := range GetKeyBindingDocs() {
+		cat := doc.Category
+		if cat == "" {
+			cat = "Actions"
+		}
+		if !knownCat[cat] {
+			knownCat[cat] = true
+			extraCategories = append(extraCategories, cat)
+		}
+		if seenInCat[cat] == nil {
+			seenInCat[cat] = make(map[string]bool)
+		}
+		dedupeKey := doc.Key + "\x00" + doc.Desc
+		if seenInCat[cat][dedupeKey] {
+			continue
+		}
+		seenInCat[cat][dedupeKey] = true
+		grouped[cat] = append(grouped[cat], shortcutRow{key: doc.Key, desc: doc.Desc})
 	}
-
-	filterSection := []struct{ key, desc string }{
-		{"/", "Fuzzy search"},
-		{"Ctrl+S", "Semantic search"},
-		{"H", "Hybrid ranking"},
-		{"Alt+H", "Hybrid preset"},
-		{"o", "Open issues"},
-		{"c", "Closed issues"},
-		{"r", "Ready (unblocked)"},
-		{"l", "Filter by label"},
-		{"s", "Cycle sort"},
-		{"S", "Triage sort"},
-	}
-
-	graphSection := []struct{ key, desc string }{
-		{"hjkl", "Navigate nodes"},
-		{"H/L", "Scroll left/right"},
-		{"J/K", "Scroll up/down"},
-		{"PgUp/Dn", "Page nodes"},
-		{"Enter", "Jump to issue"},
-	}
-
-	treeSection := []struct{ key, desc string }{
-		{"j/k", "Navigate nodes"},
-		{"Enter/Space", "Expand/collapse"},
-		{"h/l", "Parent/child"},
-		{"o/X/Z", "Expand/collapse all"},
-		{"b/m", "Hierarchy/blocking"},
-		{"E/Esc", "Close tree"},
-	}
-
-	insightsSection := []struct{ key, desc string }{
-		{"h/l/Tab", "Switch panels"},
-		{"j/k", "Navigate items"},
-		{"e", "Explanations"},
-		{"x", "Calc details"},
-		{"m", "Toggle heatmap"},
-		{"Enter", "Jump to issue"},
-	}
-
-	historySection := []struct{ key, desc string }{
-		{"j/k", "Navigate beads"},
-		{"J/K", "Navigate commits"},
-		{"Tab", "Toggle focus"},
-		{"y", "Copy SHA"},
-		{"c", "Confidence filter"},
-		{"A", "Author filter"},
-	}
-
-	actionsSection := []struct{ key, desc string }{
-		{"p", "Priority hints"},
-		{"Ctrl+R", "Force refresh"},
-		{"F5", "Force refresh"},
-		{"t", "Time-travel"},
-		{"T", "Quick time-travel"},
-		{"x", "Export markdown"},
-		{"y", "Copy ID"},
-		{"C", "Copy to clipboard"},
-		{"O", "Open in editor"},
-		{"V", "Cass sessions"},
-		{"U", "Self-update"},
-	}
+	sort.Strings(extraCategories)
+	allCategories := append(categoryOrder, extraCategories...)
 
 	statusSection := []struct{ key, desc string }{
 		{"◌ metrics", "Phase 2 metrics computing"},
@@ -10924,19 +10953,34 @@ func (m *Model) buildHelpBodyLines() (bodyLines []string, availLines int) {
 		{"polling", "Live reload uses polling"},
 	}
 
-	// Build panels
-	panels := []string{
-		renderPanel("Navigation", "🧭", 0, navSection),
-		renderPanel("Views", "👁", 1, viewsSection),
-		renderPanel("Global", "🌐", 2, globalSection),
-		renderPanel("Filters & Sort", "🔍", 3, filterSection),
-		renderPanel("Graph View", "📊", 4, graphSection),
-		renderPanel("Tree View", "🌳", 3, treeSection),
-		renderPanel("Insights", "💡", 5, insightsSection),
-		renderPanel("Status", "🩺", 2, statusSection),
-		renderPanel("History", "📜", 0, historySection),
-		renderPanel("Actions", "⚡", 1, actionsSection),
+	var panels []string
+	for idx, cat := range allCategories {
+		rows := grouped[cat]
+		if len(rows) == 0 {
+			continue
+		}
+		// Compact consecutive synonym bindings within the same category (e.g., b/m
+		// sharing the same description, or Tree's o/X/Z expand/collapse trio).
+		var compact []struct{ key, desc string }
+		for i := 0; i < len(rows); i++ {
+			if cat == "Tree" && i+2 < len(rows) && rows[i].key == "o" && rows[i+1].key == "X" && rows[i+2].key == "Z" {
+				compact = append(compact, struct{ key, desc string }{key: "o/X/Z", desc: "Expand/collapse all"})
+				i += 2
+				continue
+			}
+			if len(compact) > 0 && compact[len(compact)-1].desc == rows[i].desc && len(compact[len(compact)-1].key)+1+len(rows[i].key) <= 10 {
+				compact[len(compact)-1].key += "/" + rows[i].key
+				continue
+			}
+			compact = append(compact, struct{ key, desc string }{key: rows[i].key, desc: rows[i].desc})
+		}
+		meta, ok := categoryMetaMap[cat]
+		if !ok {
+			meta = categoryMeta{title: cat, icon: "•", colorIdx: idx}
+		}
+		panels = append(panels, renderPanel(meta.title, meta.icon, meta.colorIdx, compact))
 	}
+	panels = append(panels, renderPanel("Status", "🩺", 2, statusSection))
 
 	// Arrange panels into columns
 	var columns []string
@@ -11047,11 +11091,73 @@ func (m *Model) renderHelpOverlay() string {
 	)
 }
 
+// renderClampedModal windows modal body lines to fit short/narrow terminals
+// (such as 60x14) while always preserving the styled footer line inside the box.
+func (m *Model) renderClampedModal(boxStyle lipgloss.Style, body, footer string) string {
+	placeWidth := max(m.width, 1)
+	placeHeight := max(m.height-1, 1)
+
+	vertPad := 1
+	horizPad := 2
+	if placeHeight <= 14 {
+		vertPad = 0
+	}
+	if placeWidth <= 64 {
+		horizPad = 1
+	}
+	boxStyle = boxStyle.Padding(vertPad, horizPad)
+
+	// Box chrome: border (2) + vertical padding (2*vertPad)
+	maxInnerHeight := max(placeHeight-2-(2*vertPad), 2)
+	maxInnerWidth := max(placeWidth-2-(2*horizPad), 16)
+
+	rawLines := strings.Split(strings.TrimRight(body, "\n"), "\n")
+	clampedBody := make([]string, 0, len(rawLines))
+	for _, line := range rawLines {
+		clampedBody = append(clampedBody, ansi.Truncate(line, maxInnerWidth, "…"))
+	}
+	footerLine := ansi.Truncate(footer, maxInnerWidth, "…")
+
+	// Reserve lines for footer (plus spacer when height allows).
+	var finalLines []string
+	if maxInnerHeight <= 2 {
+		if len(clampedBody) > 0 {
+			finalLines = append(finalLines, clampedBody[0])
+		}
+		finalLines = append(finalLines, footerLine)
+	} else {
+		bodyBudget := maxInnerHeight - 2 // spacer + footer
+		if len(clampedBody) > bodyBudget {
+			if bodyBudget >= 2 {
+				finalLines = append(finalLines, clampedBody[:bodyBudget-1]...)
+				finalLines = append(finalLines, m.theme.Renderer.NewStyle().Foreground(m.theme.Muted).Italic(true).Render("… (truncated)"))
+			} else {
+				finalLines = append(finalLines, clampedBody[:bodyBudget]...)
+			}
+		} else {
+			finalLines = append(finalLines, clampedBody...)
+		}
+		finalLines = append(finalLines, "", footerLine)
+	}
+
+	content := boxStyle.Render(strings.Join(finalLines, "\n"))
+	return lipgloss.Place(
+		placeWidth,
+		placeHeight,
+		lipgloss.Center,
+		lipgloss.Center,
+		content,
+	)
+}
+
 func (m *Model) renderLabelHealthDetail(lh analysis.LabelHealth) string {
 	t := m.theme
 	innerWidth := m.width - 10
 	if innerWidth < 20 {
 		innerWidth = 20
+	}
+	if innerWidth > 68 {
+		innerWidth = 68
 	}
 
 	// 1. Define styles first so closures can capture them
@@ -11168,17 +11274,8 @@ func (m *Model) renderLabelHealthDetail(lh analysis.LabelHealth) string {
 		}
 	}
 
-	sb.WriteString(t.Renderer.NewStyle().Foreground(t.Secondary).Italic(true).Render("Press Esc to close"))
-
-	content := boxStyle.Render(sb.String())
-
-	return lipgloss.Place(
-		m.width,
-		m.height-1,
-		lipgloss.Center,
-		lipgloss.Center,
-		content,
-	)
+	footer := t.Renderer.NewStyle().Foreground(t.Secondary).Italic(true).Render("Press Esc to close")
+	return m.renderClampedModal(boxStyle, sb.String(), footer)
 }
 
 // renderLabelDrilldown shows a compact drilldown for the selected label
@@ -11335,17 +11432,8 @@ func (m *Model) renderLabelDrilldown() string {
 		sb.WriteString("\n")
 	}
 
-	sb.WriteString(t.Renderer.NewStyle().Foreground(t.Secondary).Italic(true).Render("Press Esc to close • g for graph analysis"))
-
-	content := boxStyle.Render(sb.String())
-
-	return lipgloss.Place(
-		m.width,
-		m.height-1,
-		lipgloss.Center,
-		lipgloss.Center,
-		content,
-	)
+	footer := t.Renderer.NewStyle().Foreground(t.Secondary).Italic(true).Render("Press Esc to close • g for graph analysis")
+	return m.renderClampedModal(boxStyle, sb.String(), footer)
 }
 
 // renderLabelGraphAnalysis shows label-specific graph metrics (bv-109)
@@ -11486,18 +11574,8 @@ func (m *Model) renderLabelGraphAnalysis() string {
 		}
 	}
 
-	sb.WriteString("\n")
-	sb.WriteString(t.Renderer.NewStyle().Foreground(t.Secondary).Italic(true).Render("Press Esc/q/g to close"))
-
-	content := boxStyle.Render(sb.String())
-
-	return lipgloss.Place(
-		m.width,
-		m.height-1,
-		lipgloss.Center,
-		lipgloss.Center,
-		content,
-	)
+	footer := t.Renderer.NewStyle().Foreground(t.Secondary).Italic(true).Render("Press Esc/q/g to close")
+	return m.renderClampedModal(boxStyle, sb.String(), footer)
 }
 
 func (m *Model) renderFooter() string {
@@ -11673,8 +11751,17 @@ func (m *Model) renderFooter() string {
 			Background(ColorPrioHighBg).
 			Foreground(ColorWarning).
 			Padding(0, 1)
-		statsSection = timeTravelStyle.Render(fmt.Sprintf("⏱ %s: +%d ✅%d ~%d",
-			m.timeTravelSince, d.IssuesAdded, d.IssuesClosed, d.IssuesModified))
+		summaryText := fmt.Sprintf("⏱ %s: +%d ✓%d ~%d ↺%d",
+			m.timeTravelSince, d.IssuesAdded, d.IssuesClosed, d.IssuesModified, d.IssuesReopened)
+		if m.width >= 100 {
+			trend := d.HealthTrend
+			if trend == "" {
+				trend = "stable"
+			}
+			summaryText += fmt.Sprintf(" | Δdens:%+.2f Δcyc:%+d [%s]",
+				m.timeTravelDensityDelta, m.timeTravelDiff.MetricDeltas.CycleCount, trend)
+		}
+		statsSection = timeTravelStyle.Render(summaryText)
 	} else {
 		// Polished stats with mini indicators
 		statsStyle := lipgloss.NewStyle().
@@ -12031,7 +12118,7 @@ func (m *Model) renderFooter() string {
 	} else if m.focused == focusTree {
 		keyHints = append(keyHints, keyStyle.Render("j/k")+" nav", keyStyle.Render("⏎")+" expand", keyStyle.Render("b/m")+" mode", keyStyle.Render("E")+" close")
 	} else if m.isSprintView || m.focused == focusSprint {
-		keyHints = append(keyHints, keyStyle.Render("j/k")+" scroll", keyStyle.Render("⏎")+" jump", keyStyle.Render("P/esc")+" close")
+		keyHints = append(keyHints, keyStyle.Render("j/k")+" sprint", keyStyle.Render("ctrl+d/u")+" scroll", keyStyle.Render("⏎")+" jump", keyStyle.Render("P/esc")+" close")
 	} else if m.showVelocityComparison || m.focused == focusVelocityComparison {
 		keyHints = append(keyHints, keyStyle.Render("j/k")+" nav", keyStyle.Render("⏎")+" filter", keyStyle.Render("[/esc")+" back")
 	} else if m.focused == focusLabelDashboard {
@@ -12267,6 +12354,9 @@ func (m *Model) getDiffStatus(id string) DiffStatus {
 	}
 	if m.closedIssueIDs[id] {
 		return DiffStatusClosed
+	}
+	if m.reopenedIssueIDs[id] {
+		return DiffStatusReopened
 	}
 	if m.modifiedIssueIDs[id] {
 		return DiffStatusModified
@@ -14444,19 +14534,35 @@ func (m *Model) enterTimeTravelMode(revision string) {
 		m.closedIssueIDs[issue.ID] = true
 	}
 
+	m.reopenedIssueIDs = make(map[string]bool)
+	for _, issue := range diff.ReopenedIssues {
+		m.reopenedIssueIDs[issue.ID] = true
+	}
+
 	m.modifiedIssueIDs = make(map[string]bool)
 	for _, mod := range diff.ModifiedIssues {
 		m.modifiedIssueIDs[mod.IssueID] = true
 	}
 
+	var densityDelta float64
+	if fromSnapshot != nil && fromSnapshot.Stats != nil && toSnapshot != nil && toSnapshot.Stats != nil {
+		densityDelta = toSnapshot.Stats.Density - fromSnapshot.Stats.Density
+	}
+
 	m.timeTravelMode = true
 	m.timeTravelDiff = diff
 	m.timeTravelSince = revision
+	m.timeTravelDensityDelta = densityDelta
 	m.tree.SetReadOnly(true)
 
-	// Success feedback
-	m.statusMsg = fmt.Sprintf("⏱️ Time-travel: comparing with %s (+%d ✅%d ~%d)",
-		revision, diff.Summary.IssuesAdded, diff.Summary.IssuesClosed, diff.Summary.IssuesModified)
+	// Success feedback with full summary counts and graph/health deltas
+	healthTrend := diff.Summary.HealthTrend
+	if healthTrend == "" {
+		healthTrend = "stable"
+	}
+	m.statusMsg = fmt.Sprintf("⏱️ Time-travel: comparing with %s (+%d ✓%d ~%d ↺%d | Δdens:%+.2f Δcyc:%+d %s)",
+		revision, diff.Summary.IssuesAdded, diff.Summary.IssuesClosed, diff.Summary.IssuesModified, diff.Summary.IssuesReopened,
+		densityDelta, diff.MetricDeltas.CycleCount, healthTrend)
 	m.statusIsError = false
 
 	// Rebuild list items with diff info
@@ -14468,8 +14574,10 @@ func (m *Model) exitTimeTravelMode() {
 	m.timeTravelMode = false
 	m.timeTravelDiff = nil
 	m.timeTravelSince = ""
+	m.timeTravelDensityDelta = 0
 	m.newIssueIDs = nil
 	m.closedIssueIDs = nil
+	m.reopenedIssueIDs = nil
 	m.modifiedIssueIDs = nil
 	m.tree.SetReadOnly(m.beadsPath == "" || isHistoricalGitBeadsPath(m.beadsPath))
 
@@ -15172,6 +15280,20 @@ func (m *Model) cancelCassLookup() {
 		}
 		m.cassRequest = nil
 	}
+}
+
+// triggerSelfUpdateAction handles pressing 'U': when no update is cached yet
+// and no rollback backup exists, it kicks off an active async release check
+// instead of falsely claiming the current binary is the latest version.
+func (m *Model) triggerSelfUpdateAction() tea.Cmd {
+	canRollback := updater.CanRollback()
+	if (!m.updateAvailable || m.updateTag == "") && !canRollback {
+		m.statusMsg = "Checking for updates..."
+		m.statusIsError = false
+		return manualCheckUpdateCmd()
+	}
+	m.showSelfUpdateModal()
+	return nil
 }
 
 // showSelfUpdateModal shows the self-update modal (bv-182)
@@ -16959,6 +17081,12 @@ func (m *Model) RenderDebugView(viewName string, width, height int) string {
 		m.refreshLabelViews(focusLabelDashboard)
 		m.labelDashboard.SetSize(width, bodyHeight)
 		return m.labelDashboard.View()
+	case "velocity":
+		m.showVelocityComparison = true
+		m.focused = focusVelocityComparison
+		m.velocityComparison.SetDataAt(m.candidateScopedIssues(), m.analysisReferenceTime().UTC())
+		m.velocityComparison.SetSize(width, bodyHeight)
+		return m.velocityComparison.View()
 	default:
 		return "Unknown view: " + viewName
 	}

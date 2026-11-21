@@ -64,10 +64,12 @@ func TestDetectFilesystemType_LocalPath(t *testing.T) {
 	// Test with a real local path (temp directory)
 	tmpDir := t.TempDir()
 	fsType := detectFilesystemType(tmpDir)
-	// On a standard Linux system, temp dir should be local
-	if fsType != FSTypeLocal && fsType != FSTypeUnknown {
-		// Some CI environments might have unusual tmp filesystem setups
-		t.Logf("detected filesystem type: %v (may vary by environment)", fsType)
+	// On Linux, statfs on an existing temp directory must classify a concrete type (never Unknown).
+	if fsType == FSTypeUnknown {
+		t.Fatalf("detectFilesystemType(%q) = FSTypeUnknown, expected concrete Linux filesystem classification", tmpDir)
+	}
+	if fsType.String() == "" || fsType.String() == "unknown" {
+		t.Fatalf("detectFilesystemType(%q) returned invalid FilesystemType string %q", tmpDir, fsType.String())
 	}
 }
 

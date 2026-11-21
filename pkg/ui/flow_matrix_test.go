@@ -625,8 +625,14 @@ func TestFlowMatrixModelInvalidMatrix(t *testing.T) {
 	m.SetData(flow, nil)
 	m.SetSize(80, 24)
 
-	// Should handle gracefully without panic
-	_ = m.View()
+	// Should handle malformed matrix dimensions gracefully and still render a valid frame
+	view := m.View()
+	if strings.TrimSpace(view) == "" {
+		t.Fatal("View() returned empty output for malformed flow matrix")
+	}
+	if !strings.Contains(view, "FLOW") && !strings.Contains(view, "Flow") && !strings.Contains(view, "a") {
+		t.Errorf("expected malformed flow matrix view to render header or labels, got:\n%s", view)
+	}
 }
 
 func TestFlowMatrixModelEmptyOperations(t *testing.T) {

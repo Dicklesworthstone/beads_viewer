@@ -62,6 +62,9 @@ func TestExecutorBoundsOutputWithoutChangingExitStatus(t *testing.T) {
 					"BV_HOOK_OUTPUT_EXIT": strconv.Itoa(tc.exitCode),
 				},
 			}}}}
+			if testing.CoverMode() != "" {
+				config.Hooks.PreExport[0].Env["GOCOVERDIR"] = t.TempDir()
+			}
 			if tc.direct {
 				config.Hooks.PreExport[0].Command = ""
 				config.Hooks.PreExport[0].Argv = []string{executable, "-test.run=^TestHookOutputSubprocessProbe$"}

@@ -292,8 +292,8 @@ func GetKeyBindingDocs() []KeyBindingDoc {
 		{"L", "Scroll right", "Graph", "graph"},
 		{"J/K", "Scroll graph vertically", "Graph", "graph"},
 		{"space", "Expand/collapse dependency paths", "Graph", "graph"},
-		{"PgUp", "Previous 10 nodes", "Graph", "graph"},
-		{"PgDn", "Next 10 nodes", "Graph", "graph"},
+		{"PgUp", "Page nodes (prev 10)", "Graph", "graph"},
+		{"PgDn", "Page nodes (next 10)", "Graph", "graph"},
 
 		// Board View (b)
 		{"h", "Previous column", "Board", "board"},

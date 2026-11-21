@@ -197,10 +197,13 @@ func attentionColumnWidths(width int) []int {
 	if avail < 12 {
 		avail = 12
 	}
-	rankW := min(4, max(2, avail/10))
-	attnW := min(10, max(4, avail/5))
-	labelW := min(18, max(4, (avail-rankW-attnW)/2))
-	reasonW := max(4, avail-rankW-attnW-labelW)
+	// Preserve 18-cell label readability down to width 40 while shrinking rank,
+	// attention, and reason columns so total width stays <= width.
+	labelW := min(18, max(8, avail-13))
+	rem := max(avail-labelW, 6)
+	rankW := min(4, max(2, rem/4))
+	attnW := min(10, max(4, (rem-rankW)/2))
+	reasonW := max(2, rem-rankW-attnW)
 	return []int{rankW, labelW, attnW, reasonW}
 }
 

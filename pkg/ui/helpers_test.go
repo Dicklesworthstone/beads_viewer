@@ -29,8 +29,23 @@ func TestTruncateRunesHelper(t *testing.T) {
 	}
 
 	b := ui.NewBoardModel([]model.Issue{issue}, theme)
-	// View should not panic with Unicode content
-	_ = b.View(80, 24)
+	out := b.View(80, 24)
+	if out == "" {
+		t.Fatal("BoardModel.View returned empty string for Unicode title")
+	}
+	if strings.ToValidUTF8(out, "") != out {
+		t.Fatal("BoardModel.View produced invalid UTF-8 when truncating multi-byte Unicode title")
+	}
+	if !strings.Contains(out, "unico") || !strings.Contains(out, "日本語") {
+		t.Errorf("BoardModel.View(80, 24) missing expected Unicode prefix/ID:\n%s", out)
+	}
+	narrow := b.View(40, 24)
+	if strings.ToValidUTF8(narrow, "") != narrow {
+		t.Fatal("BoardModel.View(40, 24) produced invalid UTF-8 when truncating multi-byte Unicode title")
+	}
+	if !strings.Contains(narrow, "…") {
+		t.Errorf("expected narrow board card to truncate long Unicode title with ellipsis, got:\n%s", narrow)
+	}
 }
 
 // TestBuildDependencyTree tests the dependency tree building

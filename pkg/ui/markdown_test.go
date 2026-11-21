@@ -952,9 +952,24 @@ func TestMarkdownRenderer_SetWidthWithThemeInvalidWidth(t *testing.T) {
 }
 
 func TestMarkdownRenderer_IsDarkMode(t *testing.T) {
-	mr := NewMarkdownRenderer(80)
-	// Just verify it returns a boolean without panicking
-	_ = mr.IsDarkMode()
+	prev := BVThemeOverride
+	t.Cleanup(func() { BVThemeOverride = prev })
+
+	BVThemeOverride = "dark"
+	darkRenderer := lipgloss.NewRenderer(nil)
+	darkRenderer.SetHasDarkBackground(true)
+	mrDark := NewMarkdownRendererWithTheme(80, DefaultTheme(darkRenderer))
+	if !mrDark.IsDarkMode() {
+		t.Error("expected IsDarkMode()=true when theme override is dark")
+	}
+
+	BVThemeOverride = "light"
+	lightRenderer := lipgloss.NewRenderer(nil)
+	lightRenderer.SetHasDarkBackground(false)
+	mrLight := NewMarkdownRendererWithTheme(80, DefaultTheme(lightRenderer))
+	if mrLight.IsDarkMode() {
+		t.Error("expected IsDarkMode()=false when theme override is light")
+	}
 }
 
 func TestExtractHex(t *testing.T) {

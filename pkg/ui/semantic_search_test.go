@@ -497,13 +497,14 @@ func TestSemanticSearchFilterEmbedError(t *testing.T) {
 	idx.Upsert("id-1", search.ContentHash{}, []float32{1.0, 0.0, 0.0})
 	ss.SetIDs([]string{"id-1"})
 
-	targets := []string{"a"}
-	ranks := ss.Filter("query", targets)
+	targets := []string{"alpha task", "beta task"}
+	ranks := ss.Filter("alpha", targets)
 
-	// When embed returns wrong count, falls back to DefaultFilter
-	// DefaultFilter with a non-matching query may return empty
-	// The important thing is it doesn't panic
-	_ = ranks
+	// When embed returns wrong vector count, Filter must fall back to DefaultFilter
+	// and still match the literal text target rather than returning empty or panicking.
+	if len(ranks) != 1 || ranks[0].Index != 0 {
+		t.Fatalf("expected DefaultFilter fallback to match index 0 (%q), got %+v", targets[0], ranks)
+	}
 }
 
 // =============================================================================
@@ -1880,19 +1881,31 @@ func TestSemanticSearchConcurrentAccess(t *testing.T) {
 		done <- true
 	}()
 
-	// Reader goroutine
+	// Reader goroutine verifies snapshots are never torn
+	errCh := make(chan error, 1)
 	go func() {
 		for i := 0; i < 100; i++ {
-			_ = ss.Snapshot()
+			snap := ss.Snapshot()
+			if len(snap.IDs) != 0 && len(snap.IDs) != 2 {
+				errCh <- fmt.Errorf("torn snapshot IDs length: %d (%v)", len(snap.IDs), snap.IDs)
+				done <- true
+				return
+			}
 		}
+		errCh <- nil
 		done <- true
 	}()
 
 	// Wait for both goroutines
 	<-done
 	<-done
-
-	// If we get here without panic, the test passes
+	if err := <-errCh; err != nil {
+		t.Fatal(err)
+	}
+	finalSnap := ss.Snapshot()
+	if len(finalSnap.IDs) != 2 || finalSnap.IDs[0] != "id-1" || finalSnap.IDs[1] != "id-2" {
+		t.Fatalf("unexpected final snapshot IDs: %v", finalSnap.IDs)
+	}
 }
 
 func TestSemanticSearch_ReadOnlyAsOfBuildsInMemoryWithoutDiskWrite(t *testing.T) {
