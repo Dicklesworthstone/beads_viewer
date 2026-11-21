@@ -455,7 +455,9 @@ try:
             try:
                 scanner_info(govulncheck_bin)
                 govulncheck_status = f"pinned_v1.9.0 ({govulncheck_bin})"
-            except SystemExit:
+            # scanner_info reports identity mismatches through fail()
+            # (ValueError) and unreadable build info through `go version -m`.
+            except (ValueError, subprocess.CalledProcessError):
                 govulncheck_status = f"path_unpinned_will_install_v1.9.0 ({govulncheck_bin})"
         skip_helpers = []
         if not goreleaser_bin:

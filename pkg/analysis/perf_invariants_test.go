@@ -166,6 +166,80 @@ func TestBuildUnblocksMap_MatchesReference(t *testing.T) {
 	}
 }
 
+func TestBuildUnblocksMap_ParityWithComputeUnblocks_ParentChildAndScope(t *testing.T) {
+	now := time.Date(2026, time.November, 21, 12, 0, 0, 0, time.UTC)
+	future := now.Add(24 * time.Hour)
+	mkDep := func(issueID, dependsOnID string, typ model.DependencyType) *model.Dependency {
+		return &model.Dependency{IssueID: issueID, DependsOnID: dependsOnID, Type: typ}
+	}
+
+	fullIssues := []model.Issue{
+		{ID: "B1", Title: "Blocker 1", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 1},
+		{ID: "B2", Title: "Blocker 2", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 1},
+		{ID: "BDEF", Title: "Deferred Blocker", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 1, DeferUntil: &future},
+		{ID: "BCLOSED", Title: "Closed", Status: model.StatusClosed, IssueType: model.TypeTask, Priority: 1},
+		{ID: "P1", Title: "Parent blocked by B1", Status: model.StatusOpen, IssueType: model.TypeEpic, Priority: 1,
+			Dependencies: []*model.Dependency{mkDep("P1", "B1", model.DepBlocks)}},
+		{ID: "C1", Title: "Child of P1", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 2,
+			Dependencies: []*model.Dependency{mkDep("C1", "P1", model.DepParentChild)}},
+		{ID: "C2", Title: "Child of P1 also blocked by B2", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 2,
+			Dependencies: []*model.Dependency{mkDep("C2", "P1", model.DepParentChild), mkDep("C2", "B2", model.DepBlocks)}},
+		{ID: "GC1", Title: "Grandchild of P1", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 2,
+			Dependencies: []*model.Dependency{mkDep("GC1", "C1", model.DepParentChild)}},
+		{ID: "LEAF1", Title: "Direct dependent of B1", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 2,
+			Dependencies: []*model.Dependency{mkDep("LEAF1", "B1", model.DepBlocks)}},
+		{ID: "LEAFDEF", Title: "Deferred dependent of B1", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 2, DeferUntil: &future,
+			Dependencies: []*model.Dependency{mkDep("LEAFDEF", "B1", model.DepBlocks)}},
+		{ID: "LEAFPIN", Title: "Pinned dependent of B1", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 2, Pinned: true,
+			Dependencies: []*model.Dependency{mkDep("LEAFPIN", "B1", model.DepBlocks)}},
+		{ID: "SELF", Title: "Self cycle", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 2,
+			Dependencies: []*model.Dependency{mkDep("SELF", "SELF", model.DepBlocks)}},
+		{ID: "D1", Title: "Blocked by deferred BDEF", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 2,
+			Dependencies: []*model.Dependency{mkDep("D1", "BDEF", model.DepBlocks)}},
+		{ID: "MISS", Title: "Blocked by B1 and missing", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 2,
+			Dependencies: []*model.Dependency{mkDep("MISS", "B1", model.DepBlocks), mkDep("MISS", "NOPE", model.DepBlocks)}},
+	}
+
+	assertParity := func(t *testing.T, a *Analyzer) {
+		t.Helper()
+		a.SetNow(now)
+		got := buildUnblocksMap(NewTriageContext(a))
+		want := make(map[string][]string, len(a.issueMap))
+		for id, iss := range a.issueMap {
+			if isClosedLikeStatus(iss.Status) {
+				continue
+			}
+			u := a.computeUnblocks(id)
+			if len(u) == 0 {
+				want[id] = nil
+			} else {
+				want[id] = u
+			}
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("buildUnblocksMap != computeUnblocks\ngot:  %#v\nwant: %#v", got, want)
+		}
+	}
+
+	t.Run("full_graph", func(t *testing.T) {
+		assertParity(t, NewAnalyzer(fullIssues))
+	})
+
+	t.Run("scoped_with_external_parent", func(t *testing.T) {
+		// Drop P1 from the visible graph while retaining full readiness authority.
+		scoped := make([]model.Issue, 0, len(fullIssues)-1)
+		for _, iss := range fullIssues {
+			if iss.ID == "P1" {
+				continue
+			}
+			scoped = append(scoped, iss)
+		}
+		a := NewAnalyzer(scoped)
+		a.SetReadinessScope(model.NewReadinessIndex(fullIssues), nil)
+		assertParity(t, a)
+	})
+}
+
 func TestComputeProjectVelocity_BucketsAndEstimated(t *testing.T) {
 	now := time.Date(2025, time.December, 17, 12, 0, 0, 0, time.UTC)
 

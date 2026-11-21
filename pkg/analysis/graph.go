@@ -3870,42 +3870,105 @@ func (a *Analyzer) directUnlockFrontier(issueID string) []string {
 			sort.Strings(a.extParentLinked)
 		}
 
-		for id, nodeID := range a.idToNode {
-			seen := make(map[string]bool)
-			var queue []string
-			dependents := a.g.To(nodeID)
-			for dependents.Next() {
-				depID := a.nodeToID[dependents.Node().ID()]
-				if !seen[depID] {
-					seen[depID] = true
-					queue = append(queue, depID)
+		if cg, ok := a.g.(*compactDirectedGraph); ok && len(a.sortedIDs) == len(cg.nodes) {
+			nNodes := len(a.sortedIDs)
+			var childrenIdx [][]int
+			if len(a.childrenByParent) > 0 {
+				childrenIdx = make([][]int, nNodes)
+				for parentID, children := range a.childrenByParent {
+					if pNode, exists := a.idToNode[parentID]; exists && pNode >= 0 && int(pNode) < nNodes {
+						list := make([]int, 0, len(children))
+						for _, childID := range children {
+							if cNode, cExists := a.idToNode[childID]; cExists && cNode >= 0 && int(cNode) < nNodes {
+								list = append(list, int(cNode))
+							}
+						}
+						childrenIdx[int(pNode)] = list
+					}
 				}
 			}
-			for _, childID := range a.childrenByParent[id] {
-				if !seen[childID] {
-					seen[childID] = true
-					queue = append(queue, childID)
+			seenGen := make([]uint32, nNodes)
+			var gen uint32
+			queue := make([]int, 0, 16)
+			for idx := 0; idx < nNodes; idx++ {
+				gen++
+				queue = queue[:0]
+				for _, depNode := range cg.in[idx] {
+					d := int(depNode)
+					if seenGen[d] != gen {
+						seenGen[d] = gen
+						queue = append(queue, d)
+					}
 				}
+				if len(childrenIdx) > 0 {
+					for _, childIdx := range childrenIdx[idx] {
+						if seenGen[childIdx] != gen {
+							seenGen[childIdx] = gen
+							queue = append(queue, childIdx)
+						}
+					}
+					for head := 0; head < len(queue); head++ {
+						curr := queue[head]
+						for _, childIdx := range childrenIdx[curr] {
+							if seenGen[childIdx] != gen {
+								seenGen[childIdx] = gen
+								queue = append(queue, childIdx)
+							}
+						}
+					}
+				}
+				if len(queue) == 0 {
+					continue
+				}
+				out := make([]string, len(queue))
+				for k, candIdx := range queue {
+					out[k] = a.sortedIDs[candIdx]
+				}
+				if len(out) > 1 && len(childrenIdx) > 0 {
+					sort.Strings(out)
+				}
+				a.unlockFrontiers[a.sortedIDs[idx]] = out
 			}
-			for len(queue) > 0 {
-				curr := queue[0]
-				queue = queue[1:]
-				for _, childID := range a.childrenByParent[curr] {
+		} else {
+			for id, nodeID := range a.idToNode {
+				seen := make(map[string]bool)
+				var queue []string
+				dependents := a.g.To(nodeID)
+				for dependents.Next() {
+					depID := a.nodeToID[dependents.Node().ID()]
+					if !seen[depID] {
+						seen[depID] = true
+						queue = append(queue, depID)
+					}
+				}
+				for _, childID := range a.childrenByParent[id] {
 					if !seen[childID] {
 						seen[childID] = true
 						queue = append(queue, childID)
 					}
 				}
+				for len(queue) > 0 {
+					curr := queue[0]
+					queue = queue[1:]
+					for _, childID := range a.childrenByParent[curr] {
+						if !seen[childID] {
+							seen[childID] = true
+							queue = append(queue, childID)
+						}
+					}
+				}
+				if len(seen) == 0 {
+					continue
+				}
+				out := make([]string, 0, len(seen))
+				for candID := range seen {
+					out = append(out, candID)
+				}
+				if len(out) > 1 {
+					sort.Strings(out)
+				}
+				a.unlockFrontiers[id] = out
 			}
-			if len(seen) == 0 {
-				continue
-			}
-			out := make([]string, 0, len(seen))
-			for candID := range seen {
-				out = append(out, candID)
-			}
-			sort.Strings(out)
-			a.unlockFrontiers[id] = out
 		}
 	})
 	base := a.unlockFrontiers[issueID]

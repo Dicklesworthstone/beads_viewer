@@ -264,6 +264,22 @@ if grep -q 'Traceback' "$tmp/preflight-compiler-hint.log"; then
   cat "$tmp/preflight-compiler-hint.log"
   fail 'preflight compiler mismatch leaked Python Traceback'
 fi
+# An unpinned govulncheck earlier on PATH is only reported by preflight: the
+# audit stage installs its own pinned v1.9.0. It must not abort preflight.
+unpinned_scanner="$tmp/unpinned-scanner"
+mkdir -p "$unpinned_scanner"
+printf '#!/usr/bin/env bash\nexit 0\n' >"$unpinned_scanner/govulncheck"
+chmod +x "$unpinned_scanner/govulncheck"
+if ! env PATH="$unpinned_scanner:$PATH" FIXTURE_SCANNER_METADATA=old-version PWSH="$tmp/tools/pwsh-fixture" \
+    bash "$fixture/scripts/release_gate.sh" preflight >"$tmp/preflight-unpinned-scanner.log" 2>&1; then
+  cat "$tmp/preflight-unpinned-scanner.log"
+  fail 'preflight aborted on an unpinned govulncheck in PATH'
+fi
+if ! grep -q 'path_unpinned_will_install_v1.9.0' "$tmp/preflight-unpinned-scanner.log"; then
+  cat "$tmp/preflight-unpinned-scanner.log"
+  fail 'preflight did not report the unpinned govulncheck in PATH'
+fi
+echo 'ok: preflight reports an unpinned govulncheck in PATH instead of aborting'
 old_net="$(clone_fixture old-net)"
 (cd "$old_net" && go mod edit -require=golang.org/x/net@v0.59.0)
 reject old-net 'below the security floor' bash "$old_net/scripts/release_gate.sh" verify-toolchain

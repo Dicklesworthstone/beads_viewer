@@ -2,15 +2,18 @@
 
 All notable changes to **Beads Viewer (`bv`)** are documented here. Versions are listed newest-first, with GitHub Releases distinguished from tag-only versions.
 
-Scope window: this update verifies `v0.25.2..v0.26.0` (live SQLite tracker
-reliability, source-bound correlation and exports, TUI state preservation, and
-the October issue fixes) on top of the `v0.25.1..v0.25.2` audit (installer and
-terminal-layout fixes) and the `v0.25.0..v0.25.1` audit, which covered the
-September 14–16 graph, timeline, duplicate-detection and history-cache work and
-the September 17–29 source-selection, correlation, search, agent-file and
-layout fixes. The v0.26.0 release notes disclose one failed E2E stage and an
-ineligible receipt; that historical exception does not authorize a future
-release to bypass its complete clean-source gate.
+Scope window: this update covers `v0.26.0..v0.27.0` (Go 1.26.11 and `x/net`
+v0.63.0 security toolchain, 11-stage source+binary `govulncheck` release gate,
+Wave 18–21 reality-check fixes across analysis, correlation, TUI, WASM, and the
+46-command robot CLI, and refreshed Go dependencies) on top of `v0.25.2..v0.26.0`
+(live SQLite tracker reliability, source-bound correlation and exports, TUI
+state preservation, and the October issue fixes), `v0.25.1..v0.25.2` (installer
+and terminal-layout fixes), and `v0.25.0..v0.25.1` (September 14–16 graph,
+timeline, duplicate-detection and history-cache work and September 17–29
+source-selection, correlation, search, agent-file and layout fixes). The v0.26.0
+release notes disclose one failed E2E stage and an ineligible receipt; that
+historical exception does not authorize a future release to bypass its complete
+clean-source gate.
 Earlier entries are retained without a fresh historical audit. The recent entries
 are checked against Git diffs, tags, live GitHub Release metadata, Beads records,
 and release receipts; [research notes](CHANGELOG_RESEARCH.md) record coverage.
@@ -21,6 +24,7 @@ the latest tag, including installer changes usable with already released binarie
 
 | Version | Date | Publication | Orientation |
 |---|---|---|---|
+| [`v0.27.0`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.27.0) | 2026-11-21 | GitHub Release | Go 1.26.11 and `x/net` v0.63.0 security toolchain (#215), 11-stage source+binary `govulncheck` release gate, Wave 18–21 reality-check fixes across analysis/correlation/TUI/WASM/46-command robot CLI, and refreshed Go dependencies. |
 | [`v0.26.0`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.26.0) | 2026-11-02 | GitHub Release | Live SQLite trackers load from one consistent snapshot and recover from lost notifications and transient failures; correlation and exports stay on the selected source; TUI state survives refreshes; native deadlines and external references everywhere; GH #210–#214 and a #197 export fix. |
 | [`v0.25.2`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.25.2) | 2026-09-30 | GitHub Release | Every view and the footer stay inside the terminal; `install.sh` installs the release binary with only `jq`, and its Go `.pkg` fallback works and checks the download. |
 | [`v0.25.1`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.25.1) | 2026-09-29 | GitHub Release | Views laid out beside the shortcuts sidebar, restored time-travel export, tracker-source selection and correlation fixes, and the September graph/timeline work. |
@@ -35,20 +39,28 @@ the latest tag, including installer changes usable with already released binarie
 
 ---
 
-## Unreleased — v0.26.1 security-update candidate
+## v0.27.0 — 2026-11-21
 
-This section describes the proposed update after `v0.26.0`; it does not
-establish a published release or a passing release receipt.
+Security toolchain upgrade, 11-stage source+binary vulnerability release gate,
+refreshed Go dependencies, and full Wave 18–21 reality-check hardening across
+graph analysis, correlation, TUI, WASM, static Pages export, and the 46-command
+robot CLI.
 
 ### Security build dependencies and release checks
 
 - Address [#215](https://github.com/Dicklesworthstone/beads_viewer/issues/215)
   (`1774a69d`) and `GO-2026-6859` by requiring Go **1.26.11** (and `1.27.4` on
-  the Go 1.27 branch) and upgrading `golang.org/x/net`
-  from v0.59.0 to **v0.62.0**. Go's module resolver also selects `x/sync`
-  v0.24.0, `x/sys` v0.49.0, `x/term` v0.47.0 and `x/text` v0.43.0. Regenerate
-  the affected Go vendor sources and checksums so offline builds use those
-  versions.
+  the Go 1.27 branch) and upgrading `golang.org/x/net` from v0.59.0 to
+  **v0.63.0**, alongside `golang.org/x/image` v0.48.0, `x/sync` v0.25.0,
+  `x/sys` v0.50.0, `x/term` v0.48.0, `x/text` v0.44.0,
+  `github.com/charmbracelet/x/ansi` v0.11.10, `github.com/mattn/go-runewidth`
+  v0.0.31, `github.com/spf13/pflag` v1.1.0, `github.com/yuin/goldmark` v1.8.7,
+  and `github.com/aymanbagabas/go-udiff` v0.4.2. Regenerate the affected Go
+  vendor sources and checksums so offline builds use those versions.
+- Fix `scripts/release_gate.sh preflight` to report an unpinned `govulncheck`
+  binary earlier on `PATH` instead of aborting (`ValueError` /
+  `subprocess.CalledProcessError` handling with regression coverage in
+  `tests/scripts/release_gate_test.sh`).
 - Select the compiler explicitly from `go.mod` in the retained DSR/`act`
   workflow inputs, disable automatic switching in release builds, and reject
   a compiler that differs from the approved pin. The Nix package and shell

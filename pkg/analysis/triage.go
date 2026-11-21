@@ -1093,17 +1093,63 @@ func ComputeStaleness(history *correlation.HistoryReport, issues []model.Issue, 
 
 // buildUnblocksMap computes what each issue unblocks in a single completion step.
 func buildUnblocksMap(ctx *TriageContext) map[string][]string {
-	unblocksMap := make(map[string][]string, len(ctx.analyzer.issueMap))
+	a := ctx.analyzer
+	unblocksMap := make(map[string][]string, len(a.issueMap))
+	for id, issue := range a.issueMap {
+		if !isClosedLikeStatus(issue.Status) {
+			unblocksMap[id] = nil
+		}
+	}
 
-	for id, issue := range ctx.analyzer.issueMap {
-		if isClosedLikeStatus(issue.Status) {
+	readiness := a.Readiness()
+	now := a.now
+	var parentCands []string
+
+	// Iterate in canonical sorted ID order so non-parent unblocks slices are
+	// emitted already sorted without extra per-blocker sort passes.
+	for _, candID := range a.sortedIDs {
+		if !a.IsUnblockCandidate(candID) {
 			continue
 		}
-		unblocks := ctx.analyzer.computeUnblocks(id)
-		if len(unblocks) == 0 {
-			unblocksMap[id] = nil
-		} else {
-			unblocksMap[id] = unblocks
+		blockerID, ok, hasParent := readiness.SoleUnblockerIfNoParent(candID, now)
+		if hasParent {
+			parentCands = append(parentCands, candID)
+			continue
+		}
+		if !ok {
+			continue
+		}
+		if blocker, exists := a.issueMap[blockerID]; exists && !isClosedLikeStatus(blocker.Status) {
+			unblocksMap[blockerID] = append(unblocksMap[blockerID], candID)
+		}
+	}
+
+	if len(parentCands) > 0 {
+		parentCandSet := make(map[string]struct{}, len(parentCands))
+		for _, candID := range parentCands {
+			parentCandSet[candID] = struct{}{}
+		}
+		for id := range unblocksMap {
+			frontier := a.directUnlockFrontier(id)
+			if len(frontier) == 0 {
+				continue
+			}
+			added := false
+			for _, candID := range frontier {
+				if candID == id {
+					continue
+				}
+				if _, want := parentCandSet[candID]; !want {
+					continue
+				}
+				if a.isActionableAfterSingleCompletion(candID, id) {
+					unblocksMap[id] = append(unblocksMap[id], candID)
+					added = true
+				}
+			}
+			if added && len(unblocksMap[id]) > 1 {
+				sort.Strings(unblocksMap[id])
+			}
 		}
 	}
 
