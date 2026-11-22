@@ -500,8 +500,12 @@ func GenerateDailyBurndown(sprint *model.Sprint, issues []model.Issue, now time.
 	var points []model.BurndownPoint
 	totalIssues := len(issues)
 
-	for d := sprint.StartDate; !d.After(sprint.EndDate) && !d.After(now); d = d.AddDate(0, 0, 1) {
-		nextDay := d.AddDate(0, 0, 1)
+	for i := 0; ; i++ {
+		d := sprint.StartDate.AddDate(0, 0, i)
+		if d.After(sprint.EndDate) || d.After(now) {
+			break
+		}
+		nextDay := sprint.StartDate.AddDate(0, 0, i+1)
 		completed := 0
 
 		for _, iss := range issues {

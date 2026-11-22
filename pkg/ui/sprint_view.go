@@ -224,32 +224,36 @@ func (m *Model) renderSprintDashboardWithFocus(keepBeadVisible bool) string {
 		sb.WriteString(statusLabel)
 		sb.WriteString(valStyle.Render(" • " + projText))
 		sb.WriteString("\n")
-		if len(openSprintIssues) > 0 {
-			graham1 := analysis.ComputeGrahamBounds(openSprintIssues, m.issues, m.analysis, 1, now)
-			if graham1.TotalMinutes > 0 {
-				graham2 := analysis.ComputeGrahamBounds(openSprintIssues, m.issues, m.analysis, 2, now)
-				graham4 := analysis.ComputeGrahamBounds(openSprintIssues, m.issues, m.analysis, 4, now)
-				fmtRange := func(lo, hi float64) string {
-					if fmt.Sprintf("%.1f", lo) == fmt.Sprintf("%.1f", hi) {
-						return fmt.Sprintf("%.1fd", lo)
-					}
-					return fmt.Sprintf("%.1f–%.1fd", lo, hi)
-				}
-				sb.WriteString(labelStyle.Render("Capacity: "))
-				sb.WriteString(valStyle.Render(fmt.Sprintf("%s (crit %s) • 1a:%s 2a:%s 4a:%s",
-					formatEstimateDuration(graham1.TotalMinutes),
-					formatEstimateDuration(graham1.CriticalPathMinutes),
-					fmt.Sprintf("%.1fd", graham1.GrahamMinDays),
-					fmtRange(graham2.GrahamMinDays, graham2.GrahamMaxDays),
-					fmtRange(graham4.GrahamMinDays, graham4.GrahamMaxDays))))
-				sb.WriteString("\n")
-			}
-		}
-		sb.WriteString("\n")
 	} else {
 		sb.WriteString(valStyle.Render("  (insufficient data)"))
-		sb.WriteString("\n\n")
+		sb.WriteString("\n")
 	}
+	if len(openSprintIssues) > 0 {
+		velocityPool := m.issues
+		if len(scopedIssues) > 0 {
+			velocityPool = scopedIssues
+		}
+		graham1 := analysis.ComputeGrahamBounds(openSprintIssues, velocityPool, m.analysis, 1, now)
+		if graham1.TotalMinutes > 0 {
+			graham2 := analysis.ComputeGrahamBounds(openSprintIssues, velocityPool, m.analysis, 2, now)
+			graham4 := analysis.ComputeGrahamBounds(openSprintIssues, velocityPool, m.analysis, 4, now)
+			fmtRange := func(lo, hi float64) string {
+				if fmt.Sprintf("%.1f", lo) == fmt.Sprintf("%.1f", hi) {
+					return fmt.Sprintf("%.1fd", lo)
+				}
+				return fmt.Sprintf("%.1f–%.1fd", lo, hi)
+			}
+			sb.WriteString(labelStyle.Render("Capacity: "))
+			sb.WriteString(valStyle.Render(fmt.Sprintf("%s (crit %s) • 1a:%s 2a:%s 4a:%s",
+				formatEstimateDuration(graham1.TotalMinutes),
+				formatEstimateDuration(graham1.CriticalPathMinutes),
+				fmt.Sprintf("%.1fd", graham1.GrahamMinDays),
+				fmtRange(graham2.GrahamMinDays, graham2.GrahamMaxDays),
+				fmtRange(graham4.GrahamMinDays, graham4.GrahamMaxDays))))
+			sb.WriteString("\n")
+		}
+	}
+	sb.WriteString("\n")
 
 	// At-risk items: the same four signals and .bv/drift.yaml thresholds
 	// --robot-burndown reports (analysis.DetectAtRisk), so the TUI and robot agree.
