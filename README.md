@@ -4421,7 +4421,11 @@ bv has a comprehensive built-in help system:
 | **sprint** | `P` | Close sprint dashboard |
 |  | `j` | Next sprint |
 |  | `k` | Previous sprint |
-|  | `enter` | Jump to first sprint bead |
+|  | `tab` | Next sprint bead |
+|  | `shift+tab` | Previous sprint bead |
+|  | `n` | Next sprint bead |
+|  | `p` | Previous sprint bead |
+|  | `enter` | Jump to selected sprint bead |
 <!-- /bv:generated -->
 
 ---
