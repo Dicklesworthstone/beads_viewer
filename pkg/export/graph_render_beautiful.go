@@ -1936,6 +1936,10 @@ document.addEventListener('click', e => {
 let contextNode = null;
 function showContextMenu(node, event) {
     contextNode = node;
+    const whatIfItem = document.getElementById('ctx-whatif');
+    if (whatIfItem) {
+        whatIfItem.style.display = (node && isActiveNodeStatus(node.status)) ? '' : 'none';
+    }
     const menu = document.getElementById('context-menu');
     menu.style.left = '0px';
     menu.style.top = '0px';
@@ -1989,10 +1993,13 @@ async function copyContextField(value, fieldName) {
 }
 document.getElementById('ctx-focus').onclick = () => { if (contextNode) { Graph.centerAt(contextNode.x, contextNode.y, 500); Graph.zoom(3, 500); } hideContextMenu(); };
 document.getElementById('ctx-details').onclick = () => { if (contextNode) showHoverPanel(contextNode); hideContextMenu(); };
-document.getElementById('ctx-deps').onclick = () => { if (contextNode) highlightDependencies(contextNode, 'deps'); hideContextMenu(); };
-document.getElementById('ctx-dependents').onclick = () => { if (contextNode) highlightDependencies(contextNode, 'dependents'); hideContextMenu(); };
+document.getElementById('ctx-deps').onclick = () => { if (contextNode) { cancelPathFinder(); closeCycleInspector(); clearWhatIfSimulation(); highlightDependencies(contextNode, 'deps'); } hideContextMenu(); };
+document.getElementById('ctx-dependents').onclick = () => { if (contextNode) { cancelPathFinder(); closeCycleInspector(); clearWhatIfSimulation(); highlightDependencies(contextNode, 'dependents'); } hideContextMenu(); };
 document.getElementById('ctx-connected').onclick = () => {
     if (contextNode) {
+        cancelPathFinder();
+        closeCycleInspector();
+        clearWhatIfSimulation();
         highlightedNodes = getConnectedNodes(contextNode.id, 3);
         Graph.nodeColor(Graph.nodeColor());
         Graph.linkColor(Graph.linkColor());
@@ -2001,12 +2008,29 @@ document.getElementById('ctx-connected').onclick = () => {
     hideContextMenu();
 };
 document.getElementById('ctx-whatif').onclick = () => {
-    if (contextNode) runWhatIfSimulation(contextNode.id);
+    if (contextNode && isActiveNodeStatus(contextNode.status)) runWhatIfSimulation(contextNode.id);
     hideContextMenu();
 };
 
-// Pure-JS active-blocker What-If close cascade simulation (matching bv-graph-wasm)
+function cancelPathFinder() {
+    if (!pathFinderMode) return;
+    pathFinderMode = false;
+    pathStart = null;
+    const banner = document.getElementById('pathfinder-banner');
+    if (banner) banner.classList.remove('visible');
+    const btn = document.getElementById('btn-path');
+    if (btn) btn.classList.remove('active');
+}
+
+// Pure-JS active-blocker What-If close cascade simulation (matching readiness.go / viewer.js)
 let activeWhatIfId = null;
+function isWhatIfUnlockableNode(n) {
+    if (!n || !isActiveNodeStatus(n.status)) return false;
+    const st = String(n.status || '').trim().toLowerCase();
+    if (st === 'blocked' || st === 'deferred') return false;
+    if (n.is_deferred || n.is_template || n.pinned || n.ephemeral) return false;
+    return true;
+}
 function simulateWhatIfClose(targetId) {
     const activeNodes = new Map();
     DATA.nodes.forEach(n => {
@@ -2017,17 +2041,73 @@ function simulateWhatIfClose(targetId) {
     }
     const blockersByNode = new Map();
     const dependentsByBlocker = new Map();
+    const parentsByNode = new Map();
+    const unresolvableBlockers = new Set();
     activeNodes.forEach((_, id) => {
         blockersByNode.set(id, new Set());
         dependentsByBlocker.set(id, new Set());
+        parentsByNode.set(id, new Set());
     });
     DATA.links.forEach(l => {
-        if (l.type && l.type !== 'blocks' && l.type !== 'conditional-blocks' && l.type !== 'waits-for') return;
         const src = typeof l.source === 'object' ? l.source.id : l.source;
         const tgt = typeof l.target === 'object' ? l.target.id : l.target;
-        if (!activeNodes.has(src) || !activeNodes.has(tgt) || src === tgt) return;
+        if (!activeNodes.has(src) || !activeNodes.has(tgt)) return;
+        const ltype = l.type || 'blocks';
+        if (ltype === 'parent-child') {
+            if (src !== tgt) parentsByNode.get(src).add(tgt);
+            return;
+        }
+        if (ltype !== 'blocks' && ltype !== 'conditional-blocks' && ltype !== 'waits-for') return;
+        if (src === tgt) {
+            unresolvableBlockers.add(src);
+            return;
+        }
         blockersByNode.get(src).add(tgt);
         dependentsByBlocker.get(tgt).add(src);
+    });
+    // Account for external/filtered blockers recorded on n.blocked_by that aren't in activeNodes,
+    // and propagate blocking constraints inherited from parent-child ancestors.
+    activeNodes.forEach((n, id) => {
+        if (Array.isArray(n.blocked_by)) {
+            for (const bId of n.blocked_by) {
+                if (bId === id) {
+                    unresolvableBlockers.add(id);
+                } else if (activeNodes.has(bId)) {
+                    blockersByNode.get(id).add(bId);
+                    dependentsByBlocker.get(bId).add(id);
+                } else {
+                    const extNode = lookupStandaloneNode(bId);
+                    if (!extNode || isActiveNodeStatus(extNode.status)) {
+                        unresolvableBlockers.add(id);
+                    }
+                }
+            }
+        }
+    });
+    // Inherit ancestor blockers across parent-child chains (epics stay open while children work,
+    // so only blockers ON the ancestor block descendants, not the open ancestor itself).
+    activeNodes.forEach((_, id) => {
+        const visited = new Set([id]);
+        const stack = [...(parentsByNode.get(id) || [])];
+        while (stack.length > 0) {
+            const pId = stack.pop();
+            if (visited.has(pId)) continue;
+            visited.add(pId);
+            if (unresolvableBlockers.has(pId)) {
+                unresolvableBlockers.add(id);
+            }
+            for (const pb of (blockersByNode.get(pId) || [])) {
+                if (pb === id) {
+                    unresolvableBlockers.add(id);
+                } else {
+                    blockersByNode.get(id).add(pb);
+                    dependentsByBlocker.get(pb).add(id);
+                }
+            }
+            for (const gp of (parentsByNode.get(pId) || [])) {
+                stack.push(gp);
+            }
+        }
     });
     const remainingBlockers = new Map();
     blockersByNode.forEach((set, id) => remainingBlockers.set(id, set.size));
@@ -2039,7 +2119,9 @@ function simulateWhatIfClose(targetId) {
         const cur = queue.shift();
         const deps = dependentsByBlocker.get(cur) || new Set();
         for (const depId of deps) {
-            if (resolved.has(depId)) continue;
+            if (resolved.has(depId) || unresolvableBlockers.has(depId)) continue;
+            const depNode = activeNodes.get(depId);
+            if (!isWhatIfUnlockableNode(depNode)) continue;
             const rem = (remainingBlockers.get(depId) || 0) - 1;
             remainingBlockers.set(depId, rem);
             if (rem <= 0) {
@@ -2059,6 +2141,9 @@ function clearWhatIfSimulation() {
 }
 function runWhatIfSimulation(nodeId) {
     if (!nodeId) return;
+    const targetNode = lookupStandaloneNode(nodeId);
+    if (!targetNode || !isActiveNodeStatus(targetNode.status)) return;
+    cancelPathFinder();
     closeCycleInspector();
     const res = simulateWhatIfClose(nodeId);
     activeWhatIfId = nodeId;
@@ -2080,16 +2165,15 @@ function runWhatIfSimulation(nodeId) {
 }
 document.getElementById('btn-whatif-close').onclick = () => {
     clearWhatIfSimulation();
+    closeCycleInspector();
     activePathNodes = null;
     highlightedNodes = new Set();
-    closeCycleInspector();
-    clearWhatIfSimulation();
     Graph.nodeColor(Graph.nodeColor());
     Graph.linkColor(Graph.linkColor());
     Graph.linkWidth(Graph.linkWidth());
 };
 document.getElementById('btn-detail-whatif').onclick = () => {
-    if (selectedNode) runWhatIfSimulation(selectedNode.id);
+    if (selectedNode && isActiveNodeStatus(selectedNode.status)) runWhatIfSimulation(selectedNode.id);
 };
 
 // Cycle Inspector (uses exported DATA.cycles + DATA.cycle_breaks)
@@ -2104,24 +2188,29 @@ function closeCycleInspector() {
 function showCycleInspector(idx) {
     const cycles = Array.isArray(DATA.cycles) ? DATA.cycles : [];
     if (cycles.length === 0) return;
+    cancelPathFinder();
     clearWhatIfSimulation();
     activeCycleIndex = ((idx %% cycles.length) + cycles.length) %% cycles.length;
-    const cycle = cycles[activeCycleIndex];
-    const nodeSet = new Set(cycle);
+    const rawCycle = cycles[activeCycleIndex] || [];
+    const openCycle = (rawCycle.length > 1 && rawCycle[0] === rawCycle[rawCycle.length - 1])
+        ? rawCycle.slice(0, -1)
+        : rawCycle;
+    if (openCycle.length === 0) return;
+    const nodeSet = new Set(openCycle);
     activePathNodes = nodeSet;
     highlightedNodes = nodeSet;
     Graph.nodeColor(Graph.nodeColor());
     Graph.linkColor(Graph.linkColor());
     Graph.linkWidth(Graph.linkWidth());
     const cycleEdges = new Set();
-    for (let i = 0; i < cycle.length; i++) {
-        cycleEdges.add(cycle[i] + '\0' + cycle[(i + 1) %% cycle.length]);
+    for (let i = 0; i < openCycle.length; i++) {
+        cycleEdges.add(openCycle[i] + '\0' + openCycle[(i + 1) %% openCycle.length]);
     }
     const breakSug = (DATA.cycle_breaks || []).find(b => cycleEdges.has(b.from + '\0' + b.to));
     const banner = document.getElementById('cycle-banner');
     const textEl = document.getElementById('cycle-banner-text');
     if (banner && textEl) {
-        const pathStr = cycle.concat([cycle[0]]).join(' → ');
+        const pathStr = openCycle.concat([openCycle[0]]).join(' → ');
         textEl.textContent = '🔄 Cycle [' + (activeCycleIndex + 1) + '/' + cycles.length + ']: ' + pathStr +
             (breakSug ? ' · Cut: ' + breakSug.from + ' → ' + breakSug.to : '');
         banner.style.display = 'flex';

@@ -797,3 +797,129 @@ func TestGenerateInteractiveGraphHTML_SourceRepoSerializedAndFilterable(t *testi
 		t.Fatalf("graphNode.SourceRepo mismatch: %+v", repos)
 	}
 }
+
+func TestGenerateInteractiveGraphHTML_CyclesWhatIfTriageTabsAndMetadata(t *testing.T) {
+	est := 90
+	closedAt := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
+	issues := []model.Issue{
+		{
+			ID:               "C-1",
+			Title:            "Cycle Alpha",
+			Status:           model.StatusOpen,
+			Priority:         0,
+			IssueType:        model.TypeBug,
+			EstimatedMinutes: &est,
+			CreatedBy:        "alice",
+			Dependencies:     []*model.Dependency{{IssueID: "C-1", DependsOnID: "C-2", Type: model.DepBlocks}},
+		},
+		{
+			ID:           "C-2",
+			Title:        "Cycle Beta",
+			Status:       model.StatusOpen,
+			Priority:     1,
+			IssueType:    model.TypeTask,
+			Dependencies: []*model.Dependency{{IssueID: "C-2", DependsOnID: "C-1", Type: model.DepBlocks}},
+		},
+		{
+			ID:          "DONE-1",
+			Title:       "Shipped Foundation",
+			Status:      model.StatusClosed,
+			Priority:    2,
+			IssueType:   model.TypeChore,
+			ClosedAt:    &closedAt,
+			CloseReason: "Completed and verified in CI",
+		},
+	}
+	stats := analysis.NewAnalyzer(issues).AnalyzeWithConfig(analysis.FullAnalysisConfig())
+	triageData := analysis.ComputeTriage(issues)
+	triageData.Alerts = append(triageData.Alerts, analysis.Alert{
+		Type:     "cycle_detected",
+		Severity: "critical",
+		Message:  "Active 2-node cycle",
+		IssueID:  "C-1",
+	})
+	outPath := filepath.Join(t.TempDir(), "interactive_parity.html")
+	written, err := GenerateInteractiveGraphHTML(InteractiveGraphOptions{
+		Issues: issues,
+		Stats:  &stats,
+		Triage: &triageData,
+		Path:   outPath,
+	})
+	if err != nil {
+		t.Fatalf("GenerateInteractiveGraphHTML failed: %v", err)
+	}
+	raw, err := os.ReadFile(written)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	html := string(raw)
+
+	// Guard against unescaped % in fmt.Sprintf templates.
+	if strings.Contains(html, "%!(") {
+		t.Fatalf("rendered standalone HTML contains Go fmt.Sprintf formatting error marker %%!(")
+	}
+	// Strict CSP forbids inline event attributes.
+	if strings.Contains(html, "onclick=") {
+		t.Fatalf("rendered standalone HTML contains CSP-violating inline onclick= attribute")
+	}
+	for _, marker := range []string{
+		`id="btn-cycles"`,
+		`id="cycle-banner"`,
+		`id="ctx-whatif"`,
+		`id="btn-detail-whatif"`,
+		`id="whatif-banner"`,
+		`id="triage-tabs"`,
+		`function simulateWhatIfClose(`,
+		`function handleDagCycleError(`,
+	} {
+		if !strings.Contains(html, marker) {
+			t.Errorf("standalone interactive HTML missing required marker %q", marker)
+		}
+	}
+
+	const prefix = "const DATA = "
+	start := strings.Index(html, prefix)
+	if start < 0 {
+		t.Fatalf("missing DATA payload")
+	}
+	end := strings.Index(html[start+len(prefix):], ";\nconst STATUS_COLORS")
+	if end < 0 {
+		t.Fatalf("missing STATUS_COLORS terminator")
+	}
+	var payload struct {
+		Nodes       []graphNode `json:"nodes"`
+		Cycles      [][]string  `json:"cycles"`
+		CycleBreaks []struct {
+			From         string `json:"from"`
+			To           string `json:"to"`
+			CyclesBroken int    `json:"cycles_broken"`
+		} `json:"cycle_breaks"`
+	}
+	if err := json.Unmarshal([]byte(html[start+len(prefix):start+len(prefix)+end]), &payload); err != nil {
+		t.Fatalf("Unmarshal DATA JSON: %v", err)
+	}
+	if len(payload.Cycles) == 0 {
+		t.Fatalf("expected DATA.cycles to include C-1 <-> C-2 cycle, got empty")
+	}
+	if len(payload.Cycles[0]) != 2 {
+		t.Fatalf("expected open 2-node cycle [C-1, C-2] without duplicated closing node, got %v", payload.Cycles[0])
+	}
+	if len(payload.CycleBreaks) == 0 {
+		t.Fatalf("expected DATA.cycle_breaks to be non-empty for cyclic graph")
+	}
+	for _, cb := range payload.CycleBreaks {
+		if cb.From == cb.To {
+			t.Fatalf("DATA.cycle_breaks emitted phantom self-loop edge %s -> %s for 2-node cycle: %+v", cb.From, cb.To, payload.CycleBreaks)
+		}
+	}
+	byID := make(map[string]graphNode, len(payload.Nodes))
+	for _, n := range payload.Nodes {
+		byID[n.ID] = n
+	}
+	if byID["C-1"].EstimatedMinutes == nil || *byID["C-1"].EstimatedMinutes != 90 || byID["C-1"].CreatedBy != "alice" {
+		t.Fatalf("C-1 metadata mismatch: est=%v created_by=%q", byID["C-1"].EstimatedMinutes, byID["C-1"].CreatedBy)
+	}
+	if byID["DONE-1"].CloseReason != "Completed and verified in CI" {
+		t.Fatalf("DONE-1 close_reason mismatch: %q", byID["DONE-1"].CloseReason)
+	}
+}
