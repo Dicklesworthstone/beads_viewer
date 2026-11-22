@@ -1,12 +1,14 @@
 package ui
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/drift"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 	tea "github.com/charmbracelet/bubbletea"
@@ -853,10 +855,24 @@ func TestModel_ETAContextInvalidatesOnPhase2AndRepoScope(t *testing.T) {
 
 func TestAlertsPanel_TabSwitchesToHygieneSuggestionsAndSupportsJumpAndCopy(t *testing.T) {
 	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	workDir := t.TempDir()
+	beadsDir := filepath.Join(workDir, ".beads")
+	dbPath := filepath.Join(beadsDir, "beads.db")
+	mkOrigin := func(localID string) *model.IssueOrigin {
+		return &model.IssueOrigin{
+			LocalID:          localID,
+			WorkingDirectory: workDir,
+			TrackerDirectory: beadsDir,
+			Database:         dbPath,
+			Tracker:          "br",
+			Executable:       "br",
+			SupportsClaim:    true,
+		}
+	}
 	issues := []model.Issue{
-		{ID: "HYG-1", Title: "Fix OAuth login callback timeout failure in production", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeBug, CreatedAt: now, UpdatedAt: now},
-		{ID: "HYG-2", Title: "Fix OAuth login callback timeout failure in production", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeBug, CreatedAt: now, UpdatedAt: now},
-		{ID: "HYG-3", Title: "Unrelated observability metric cleanup", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
+		{ID: "HYG-1", Title: "Fix OAuth login callback timeout failure in production", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeBug, Origin: mkOrigin("HYG-1"), CreatedAt: now, UpdatedAt: now},
+		{ID: "HYG-2", Title: "Fix OAuth login callback timeout failure in production", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeBug, Origin: mkOrigin("HYG-2"), CreatedAt: now, UpdatedAt: now},
+		{ID: "HYG-3", Title: "Unrelated observability metric cleanup", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, Origin: mkOrigin("HYG-3"), CreatedAt: now, UpdatedAt: now},
 	}
 	m := NewModel(issues, nil, "")
 	t.Cleanup(m.Stop)
@@ -881,17 +897,54 @@ func TestAlertsPanel_TabSwitchesToHygieneSuggestionsAndSupportsJumpAndCopy(t *te
 	if len(sugs) == 0 {
 		t.Fatal("expected duplicate-title fixture to produce >=1 hygiene suggestion")
 	}
-	rendered := m.renderAlertsPanel()
+	if sugs[0].ActionCommand == "" {
+		t.Fatalf("expected Origin-bound duplicate suggestion to carry non-empty ActionCommand, got %+v", sugs[0])
+	}
+	rendered := ansi.Strip(m.renderAlertsPanel())
 	if !strings.Contains(rendered, "Suggestions") || !strings.Contains(rendered, sugs[0].TargetBead) {
 		t.Fatalf("expected Suggestions tab rendering to contain header and target bead %s:\n%s", sugs[0].TargetBead, rendered)
 	}
-	// Press 'c' -> attempts copy of ActionCommand (populates statusMsg when ActionCommand is present).
-	if sugs[0].ActionCommand != "" {
-		m = asModelPtr(t, must2(m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})))
-		if m.statusMsg == "" {
-			t.Fatal("expected pressing 'c' on a suggestion with ActionCommand to set statusMsg")
+	// Press 'c' -> dispatches async clipboard tea.Cmd and increments clipboardRequestID.
+	reqBefore := m.clipboardRequestID
+	nextModel, copyCmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	m = asModelPtr(t, nextModel)
+	if copyCmd == nil || m.clipboardRequestID <= reqBefore {
+		t.Fatalf("expected pressing 'c' on suggestion with ActionCommand %q to dispatch clipboard tea.Cmd and bump clipboardRequestID (%d -> %d)",
+			sugs[0].ActionCommand, reqBefore, m.clipboardRequestID)
+	}
+	// Verify compact 80x24 Suggestions tab with many long suggestions never clips footer 'Esc: close'.
+	m.width = 80
+	m.height = 24
+	longSugs := make([]analysis.Suggestion, 10)
+	for i := range longSugs {
+		longSugs[i] = analysis.Suggestion{
+			Type:          analysis.SuggestionPotentialDuplicate,
+			TargetBead:    fmt.Sprintf("LONG-%02d", i),
+			RelatedBead:   fmt.Sprintf("REL-%02d", i),
+			Summary:       "Very long potential duplicate summary that would wrap onto multiple rows without prefix-accurate truncation",
+			Reason:        "High Jaccard similarity across title and description tokens on compact terminals",
+			Confidence:    0.95,
+			ActionCommand: fmt.Sprintf("br update LONG-%02d --status=closed --reason='duplicate of REL-%02d'", i, i),
 		}
 	}
+	m.suggestionsCache = longSugs
+	m.suggestionsCacheLoaded = true
+	m.suggestionsCacheGen = m.semanticDataGeneration
+	m.suggestionsCacheScope = m.etaScopeKey()
+	for _, cursor := range []int{0, 5, 9} {
+		m.suggestionsCursor = cursor
+		compact := ansi.Strip(m.renderAlertsPanel())
+		if !strings.Contains(compact, "Esc: close") {
+			t.Fatalf("cursor=%d: 80x24 Suggestions tab clipped footer 'Esc: close':\n%s", cursor, compact)
+		}
+	}
+	// Restore real suggestion cache before Enter jump test.
+	m.suggestionsCacheLoaded = false
+	m.suggestionsCache = nil
+	m.width = 120
+	m.height = 36
+	m.suggestionsCursor = 0
+
 	// Press Enter -> closes panel and jumps to TargetBead.
 	targetID := sugs[0].TargetBead
 	m = asModelPtr(t, must2(m.Update(tea.KeyMsg{Type: tea.KeyEnter})))
@@ -1010,14 +1063,21 @@ func TestSprintView_GrahamCapacityAndCrossSurfaceMetadataMetrics(t *testing.T) {
 			t.Errorf("DetailPane for META-CLOSED missing %q:\n%s", want, closedDetail)
 		}
 	}
+	if strings.Contains(closedDetail, "Structural Metrics") {
+		t.Errorf("DetailPane for closed issue META-CLOSED must suppress active Structural Metrics:\n%s", closedDetail)
+	}
 
-	// 3. InsightsModel buildDetailMarkdown includes metadata and structural metrics.
+	// 3. InsightsModel buildDetailMarkdown includes metadata and active structural metrics (and suppresses them for closed issues).
 	ins := NewInsightsModel(m.analysis.GenerateInsights(10), m.issueMap, m.theme)
 	insMD := ins.buildDetailMarkdown("META-1")
 	for _, want := range []string{"**Repo:**", "core", "**Estimate:**", "2h", "**Created By:**", "architect", "**Structure:**", "K-Core", "Slack"} {
 		if !strings.Contains(insMD, want) {
 			t.Errorf("Insights detail markdown for META-1 missing %q:\n%s", want, insMD)
 		}
+	}
+	closedInsMD := ins.buildDetailMarkdown("META-CLOSED")
+	if strings.Contains(closedInsMD, "**Structure:**") {
+		t.Errorf("Insights detail markdown for closed issue META-CLOSED must suppress active **Structure:** line:\n%s", closedInsMD)
 	}
 
 	// 4. BoardModel syncDetailContent includes Estimate, Created By, Close Reason, Repo.
