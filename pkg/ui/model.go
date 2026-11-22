@@ -13749,7 +13749,44 @@ func (m *Model) updateViewportContent() {
 		sb.WriteString("\n")
 	}
 
-	// What-If Impact & ETA Forecast (open issues only)
+	// Search Scores (hybrid mode)
+	if m.semanticSearchEnabled && m.semanticHybridEnabled && issueItem.SearchScoreSet && m.list.FilterState() != list.Unfiltered {
+		sb.WriteString("### 🔎 Search Scores\n")
+		sb.WriteString(fmt.Sprintf("- **Hybrid Score:** %.3f\n", issueItem.SearchScore))
+		sb.WriteString(fmt.Sprintf("- **Text Score:** %.3f\n", issueItem.SearchTextScore))
+		if len(issueItem.SearchComponents) > 0 {
+			sb.WriteString("- **Components:**\n")
+			order := []string{"pagerank", "status", "impact", "priority", "recency"}
+			for _, key := range order {
+				if val, ok := issueItem.SearchComponents[key]; ok {
+					sb.WriteString(fmt.Sprintf("  - %s: %.3f\n", key, val))
+				}
+			}
+		}
+		sb.WriteString("\n")
+	}
+
+	// Graph Analysis (using thread-safe accessors)
+	pr := m.analysis.GetPageRankScore(item.ID)
+	bt := m.analysis.GetBetweennessScore(item.ID)
+	imp := m.analysis.GetCriticalPathScore(item.ID)
+	ev := m.analysis.GetEigenvectorScore(item.ID)
+	hub := m.analysis.GetHubScore(item.ID)
+	auth := m.analysis.GetAuthorityScore(item.ID)
+
+	sb.WriteString("### Graph Analysis\n")
+	sb.WriteString(fmt.Sprintf("- **Impact Depth**: %.0f (downstream chain length)\n", imp))
+	sb.WriteString(fmt.Sprintf("- **Centrality**: PR %.4f • BW %.4f • EV %.4f\n", pr, bt, ev))
+	sb.WriteString(fmt.Sprintf("- **Flow Role**: Hub %.4f • Authority %.4f\n\n", hub, auth))
+
+	// Description
+	if item.Description != "" {
+		sb.WriteString("### Description\n")
+		sb.WriteString(item.Description + "\n\n")
+	}
+
+	// What-If Impact & ETA Forecast (open issues only, placed below Description so
+	// primary issue prose remains above the fold on compact split-view terminals)
 	if !isClosedLikeStatus(item.Status) {
 		var whatIf *analysis.WhatIfResult
 		if m.analyzer != nil && m.analysis != nil {
@@ -13803,42 +13840,6 @@ func (m *Model) updateViewportContent() {
 			}
 			sb.WriteString("\n")
 		}
-	}
-
-	// Search Scores (hybrid mode)
-	if m.semanticSearchEnabled && m.semanticHybridEnabled && issueItem.SearchScoreSet && m.list.FilterState() != list.Unfiltered {
-		sb.WriteString("### 🔎 Search Scores\n")
-		sb.WriteString(fmt.Sprintf("- **Hybrid Score:** %.3f\n", issueItem.SearchScore))
-		sb.WriteString(fmt.Sprintf("- **Text Score:** %.3f\n", issueItem.SearchTextScore))
-		if len(issueItem.SearchComponents) > 0 {
-			sb.WriteString("- **Components:**\n")
-			order := []string{"pagerank", "status", "impact", "priority", "recency"}
-			for _, key := range order {
-				if val, ok := issueItem.SearchComponents[key]; ok {
-					sb.WriteString(fmt.Sprintf("  - %s: %.3f\n", key, val))
-				}
-			}
-		}
-		sb.WriteString("\n")
-	}
-
-	// Graph Analysis (using thread-safe accessors)
-	pr := m.analysis.GetPageRankScore(item.ID)
-	bt := m.analysis.GetBetweennessScore(item.ID)
-	imp := m.analysis.GetCriticalPathScore(item.ID)
-	ev := m.analysis.GetEigenvectorScore(item.ID)
-	hub := m.analysis.GetHubScore(item.ID)
-	auth := m.analysis.GetAuthorityScore(item.ID)
-
-	sb.WriteString("### Graph Analysis\n")
-	sb.WriteString(fmt.Sprintf("- **Impact Depth**: %.0f (downstream chain length)\n", imp))
-	sb.WriteString(fmt.Sprintf("- **Centrality**: PR %.4f • BW %.4f • EV %.4f\n", pr, bt, ev))
-	sb.WriteString(fmt.Sprintf("- **Flow Role**: Hub %.4f • Authority %.4f\n\n", hub, auth))
-
-	// Description
-	if item.Description != "" {
-		sb.WriteString("### Description\n")
-		sb.WriteString(item.Description + "\n\n")
 	}
 
 	// Design Notes
