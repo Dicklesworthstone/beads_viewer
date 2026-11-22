@@ -1415,6 +1415,17 @@ async function journey(page, mobile) {
     `${page.name}: graphDetailNode action buttons stay visible: ${JSON.stringify(detailHeaderLayout)}`);
   assert.ok(detailHeaderLayout.cone.right <= detailHeaderLayout.innerWidth + 1,
     `${page.name}: graphDetailNode action bar fits inside viewport width: ${JSON.stringify(detailHeaderLayout)}`);
+  // Also prove opening #graph-filter-hud popover does NOT displace right-hand layout controls off-screen (even at 360px mobile).
+  await click(page, '#graph-filter-toggle-btn');
+  await waitFor(page, `(${visible})(document.querySelector('#graph-filter-hud'))`, 'Graph Filter HUD popover opens cleanly');
+  const popoverLayout = await evaluate(page, `(() => {
+    const hud = document.querySelector('#graph-filter-hud')?.getBoundingClientRect();
+    const layoutBtn = [...document.querySelectorAll('button')].find(b => (${visible})(b) && b.textContent.includes('Heatmap'))?.getBoundingClientRect();
+    return { innerWidth: window.innerWidth, hudRight: hud?.right || 0, layoutRight: layoutBtn?.right || 0 };
+  })()`);
+  assert.ok(popoverLayout.hudRight <= popoverLayout.innerWidth + 1 && popoverLayout.layoutRight <= popoverLayout.innerWidth + 1,
+    `${page.name}: opening #graph-filter-hud keeps popover and right-hand controls within viewport: ${JSON.stringify(popoverLayout)}`);
+  await click(page, '#graph-filter-toggle-btn');
   await capture(page, 'graph');
   assert.ok(await evaluate(page, 'document.documentElement.scrollWidth <= innerWidth + 1'), 'no horizontal loss at viewport width');
   await send('Page.navigate', { url: origin + '/#/issue/browser-detail' }, page.session);
@@ -3380,24 +3391,35 @@ async function capabilitiesJourney(page) {
   assert.equal(wave23GraphAudit.overviewColsCached, true, 'PRAGMA table_info(issue_overview_mv) column set is cached per DB instance');
   assert.equal(wave23GraphAudit.listenersBound, true, 'graph document listeners guarded by _graphListenersBound');
 
-  // Wave 24 Graph Filter HUD: toggle panel, filter status=closed, verify live counts, reset!
+  // Wave 24 Graph Filter HUD: toggle panel, assert #graph-filter-repo hidden on single-repo, filter status=closed, verify re-entry resets store.filters, reset!
   await click(page, '#graph-filter-toggle-btn');
   await waitFor(page, `(${visible})(document.querySelector('#graph-filter-hud'))`, 'Graph Filter HUD opens');
+  assert.equal(await evaluate(page, `(${visible})(document.querySelector('#graph-filter-repo'))`), false, 'single-repo export hides #graph-filter-repo inside Graph Filter HUD');
   await evaluate(page, `(() => {
     const sel = document.getElementById('graph-filter-status');
     sel.value = 'closed';
     sel.dispatchEvent(new Event('change', { bubbles: true }));
   })()`);
   await waitFor(page, `${app}.graphVisibleTotal === 1 && ${app}.graphVisibleOpen === 0 && ${app}.graphVisibleClosed === 1`, 'Graph Filter HUD updates live visible node counts');
-  await click(page, '#graph-filter-clear');
-  await waitFor(page, `${app}.graphVisibleTotal === 6 && ${app}.graphVisibleOpen === 5 && ${app}.graphVisibleClosed === 1`, 'Graph Filter HUD Reset restores all graph nodes');
-  await click(page, '#graph-filter-toggle-btn');
+  // Navigating away from #/graph and back must reset store.filters in graph.js in lockstep with Alpine graphFilters!
+  await click(page, 'a[href="#/issues"]');
+  await waitFor(page, `${app}.view === 'issues'`, 'navigated to issues to test graph re-entry filter reset');
+  await click(page, 'a[href="#/graph"]');
+  await waitFor(page, `${app}.view === 'graph' && ${app}.forceGraphReady && !${app}.forceGraphLoading && ${app}.graphVisibleTotal === 6 && ${app}.forceGraphModule.getGraph().graphData().nodes.length === 6`, 'graph re-entry resets store.filters and renders all 6 nodes');
+  if (await evaluate(page, `${app}.graphFiltersOpen`)) {
+    await click(page, '#graph-filter-toggle-btn');
+  }
 
   // Toggle Cycle Navigator -> #graph-cycle-hud shows cycle counter AND recommended break edge!
   await evaluate(page, `${app}.forceGraphModule.toggleCycleNavigator()`);
   await waitFor(page, `${app}.cycleNavigatorActive && Boolean(${app}.currentCycleBreakEdge?.from) && (${visible})(document.querySelector('#graph-cycle-hud'))`, 'Cycle Navigator HUD shows recommended break edge');
   const breakEdge = await evaluate(page, `JSON.parse(JSON.stringify(${app}.currentCycleBreakEdge))`);
   assert.ok(breakEdge.from && breakEdge.to, `recommended cycle break edge populated: ${JSON.stringify(breakEdge)}`);
+  // Filtering out one endpoint hides currentCycleBreakEdge; clearing the filter restores it!
+  await evaluate(page, `${app}.forceGraphModule.setFilter('search', ${JSON.stringify(breakEdge.from)})`);
+  await waitFor(page, `${app}.cycleNavigatorActive && ${app}.currentCycleBreakEdge === null`, 'hiding break-edge endpoint clears currentCycleBreakEdge');
+  await evaluate(page, `${app}.forceGraphModule.clearFilters()`);
+  await waitFor(page, `${app}.cycleNavigatorActive && Boolean(${app}.currentCycleBreakEdge?.from)`, 'clearing graph filters restores currentCycleBreakEdge');
 
   // Dispatch bv-graph:nodeContextMenu with NaN & huge coordinates -> clamps safely; Escape closes ONLY context menu, keeping Cycle Navigator intact!
   await evaluate(page, `(() => {
@@ -3700,6 +3722,7 @@ async function standaloneGraphJourney(page) {
   assert.deepEqual(filterAudit.closedVisible, ['cap-closed-prereq']);
   assert.deepEqual(filterAudit.labelVisible, ['cap-hub-leaf']);
   assert.equal(filterAudit.visibleStatText, '1 visible');
+  assert.equal(await evaluate(page, `document.getElementById('filter-repo')?.style.display`), 'none', 'single-repo standalone HTML keeps #filter-repo hidden');
 
   // Verify selectNode -> addToRecent + #btn-recent + #btn-reset closing #recent-panel.
   const recentAndPathAudit = await evaluate(page, `(() => {

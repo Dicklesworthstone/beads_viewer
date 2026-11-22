@@ -351,6 +351,14 @@ class GraphStore {
         this.connectedNodes.clear();
         this.focusedPath = null;
         this.heatmapMode = false;
+        this.filters = {
+            status: null,
+            priority: null,
+            labels: [],
+            repo: null,
+            search: '',
+            showClosed: true
+        };
     }
 }
 
@@ -1399,7 +1407,7 @@ function computeMetrics(layout = null) {
         if (hasCycles && typeof activeGraph.cycleBreakSuggestions === 'function') {
             try {
                 const maxBreakCandidates = Math.max(100, typeof activeGraph.edgeCount === 'function' ? activeGraph.edgeCount() : 100);
-                const rawBreak = activeGraph.cycleBreakSuggestions(10, maxBreakCandidates);
+                const rawBreak = activeGraph.cycleBreakSuggestions(maxBreakCandidates, 100);
                 const list = rawBreak?.suggestions || rawBreak?.top_suggestions || [];
                 const resolved = [];
                 if (Array.isArray(list)) {
@@ -1897,7 +1905,7 @@ function buildActiveBlockingEdgeKeys() {
  */
 export function loadData(issues, dependencies, layout = null) {
     resetTimeTravel();
-    resetWhatIf();
+    resetWhatIf({ force: true });
     resetCriticalPath();
     resetCycleNavigator();
     resetDependencyCone();
@@ -2041,8 +2049,8 @@ function prepareGraphData(layout = null) {
         if (filters.repo && (issue.source_repo || '') !== filters.repo) return false;
 
         // Search filter
-        if (filters.search) {
-            const term = filters.search.toLowerCase();
+        const term = String(filters.search || '').trim().toLowerCase();
+        if (term) {
             const searchable = `${issue.id} ${issue.title} ${issue.description || ''} ${issue.source_repo || ''}`.toLowerCase();
             if (!searchable.includes(term)) return false;
         }
@@ -3016,7 +3024,7 @@ function showWhatIfSummary(sourceNodesInput, result, unblockedIds) {
 /**
  * Reset what-if visualization state
  */
-export function resetWhatIf() {
+export function resetWhatIf({ force = false } = {}) {
     for (const timer of whatIfState.unblockTimers) clearTimeout(timer);
     whatIfState.unblockTimers.clear();
     if (whatIfState.animationTimer) {
@@ -3025,7 +3033,12 @@ export function resetWhatIf() {
     }
 
     const wasActive = whatIfState.active || whatIfState.sourceNodes.length > 0 || whatIfState.unblockedNodes.size > 0;
-    if (!wasActive) return;
+    if (!wasActive) {
+        if (force) {
+            dispatchEvent('whatIfReset');
+        }
+        return;
+    }
 
     // Clear visual states
     const graphData = store.graph?.graphData();
@@ -3548,19 +3561,7 @@ export function highlightCriticalPath() {
 export function highlightCycles() {
     if (!store.metrics.cycles?.cycles) return;
 
-    cycleNavigatorState.active = false;
-    cycleNavigatorState.cycles = [];
-    cycleNavigatorState.currentIndex = 0;
-    cycleNavigatorState.highlightedCycleNodes.clear();
-    cycleNavigatorState.highlightedCycleEdges.clear();
-    cycleNavigatorState.suggestedBreakEdgeKey = null;
-    cycleNavigatorState.suggestedBreakEdge = null;
-    const graphData = store.graph?.graphData();
-    if (graphData?.nodes) {
-        graphData.nodes.forEach(node => {
-            delete node._cycleHighlight;
-        });
-    }
+    resetCycleNavigator();
     store.highlightedLinks.clear();
 
     const activeGraph = store.activeWasmGraph || store.wasmGraph;
@@ -4033,28 +4034,25 @@ function syncOverlaysAfterGraphRebuild(graphData) {
                 node._cycleHighlight = cycleNavigatorState.highlightedCycleNodes.has(node.id);
             });
             const prevBreakKey = cycleNavigatorState.suggestedBreakEdgeKey;
-            const prevBreak = cycleNavigatorState.suggestedBreakEdge;
-            if (prevBreak && (!nodeById.has(prevBreak.from) || !nodeById.has(prevBreak.to))) {
-                let nextBreak = null;
-                for (const suggestion of (store.metrics.cycleBreakSuggestions || [])) {
-                    if (cycleNavigatorState.highlightedCycleEdges.has(suggestion.edgeKey) &&
-                        nodeById.has(suggestion.from) && nodeById.has(suggestion.to)) {
-                        nextBreak = suggestion;
-                        break;
-                    }
+            let nextBreak = null;
+            for (const suggestion of (store.metrics.cycleBreakSuggestions || [])) {
+                if (cycleNavigatorState.highlightedCycleEdges.has(suggestion.edgeKey) &&
+                    nodeById.has(suggestion.from) && nodeById.has(suggestion.to)) {
+                    nextBreak = suggestion;
+                    break;
                 }
-                cycleNavigatorState.suggestedBreakEdge = nextBreak;
-                cycleNavigatorState.suggestedBreakEdgeKey = nextBreak ? nextBreak.edgeKey : null;
-                if (prevBreakKey !== cycleNavigatorState.suggestedBreakEdgeKey) {
-                    const cycle = cycleNavigatorState.cycles[cycleNavigatorState.currentIndex] || [];
-                    dispatchEvent('cycleHighlightChange', {
-                        currentIndex: cycleNavigatorState.currentIndex,
-                        cycleCount: cycleNavigatorState.cycles.length,
-                        cycle,
-                        cyclePath: formatCyclePath(cycle),
-                        suggestedBreakEdge: cycleNavigatorState.suggestedBreakEdge
-                    });
-                }
+            }
+            cycleNavigatorState.suggestedBreakEdge = nextBreak;
+            cycleNavigatorState.suggestedBreakEdgeKey = nextBreak ? nextBreak.edgeKey : null;
+            if (prevBreakKey !== cycleNavigatorState.suggestedBreakEdgeKey) {
+                const cycle = cycleNavigatorState.cycles[cycleNavigatorState.currentIndex] || [];
+                dispatchEvent('cycleHighlightChange', {
+                    currentIndex: cycleNavigatorState.currentIndex,
+                    cycleCount: cycleNavigatorState.cycles.length,
+                    cycle,
+                    cyclePath: formatCyclePath(cycle),
+                    suggestedBreakEdge: cycleNavigatorState.suggestedBreakEdge
+                });
             }
         }
     }
@@ -4119,6 +4117,9 @@ function countVisibleGraphNodes(graphData) {
 }
 
 export function setFilter(key, value) {
+    if (timeTravelState.active) {
+        stopTimeTravel();
+    }
     store.filters[key] = value;
     const graphData = prepareGraphData();
     store.graph.graphData(graphData);
@@ -4127,6 +4128,9 @@ export function setFilter(key, value) {
 }
 
 export function clearFilters() {
+    if (timeTravelState.active) {
+        stopTimeTravel();
+    }
     store.filters = {
         status: null,
         priority: null,
@@ -4164,7 +4168,7 @@ export function zoomToFit(padding = 50) {
 }
 
 export function resetView() {
-    resetWhatIf();
+    resetWhatIf({ force: true });
     resetCriticalPath();
     resetCycleNavigator();
     resetDependencyCone();

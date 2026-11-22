@@ -5659,6 +5659,12 @@ function beadsApp() {
 
         console.log(`[ForceGraph] Loading ${issues.length} issues, ${dependencies.length} dependencies`);
         this.graphFilters = { status: '', priority: '', label: '', repo: '', search: '', showClosed: true };
+        this.graphWhatIfActive = false;
+        this.graphWhatIfNodes = [];
+        this.graphWhatIfBatchIds = [];
+        this.graphWhatIfDirectUnblocks = 0;
+        this.graphWhatIfTransitiveUnblocks = 0;
+        this.graphWhatIfUnblockedIds = [];
         this.forceGraphModule.loadData(issues, dependencies, precomputedLayout);
         this.syncGraphVisibleCounts(this.forceGraphModule.getGraph?.()?.graphData?.()?.nodes || issues);
 

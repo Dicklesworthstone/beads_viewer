@@ -3255,17 +3255,18 @@ func TestGenerateReport_SourceRepoParityAcrossMarkdownHTMLAndCSV(t *testing.T) {
 		}
 	}
 
-	// HTML: Repo metadata row + group_by repo.
+	// HTML: Repo summary column + Repo metadata row + group_by repo.
 	htmlBytes, err := GenerateReport(issues, issues, ReportOptions{
 		Format:      "html",
 		GeneratedAt: now,
 		GroupBy:     "repo",
+		View:        recipe.ViewConfig{Columns: []string{"id", "title", "repo"}},
 	})
 	if err != nil {
 		t.Fatalf("GenerateReport(html): %v", err)
 	}
 	htmlStr := string(htmlBytes)
-	for _, want := range []string{"<tr><th>Repo</th><td>api</td></tr>", "<tr><th>Repo</th><td>web</td></tr>", "Default Repo"} {
+	for _, want := range []string{"<th>Repo</th>", "<tr><th>Repo</th><td>api</td></tr>", "<tr><th>Repo</th><td>web</td></tr>", "Default Repo"} {
 		if !strings.Contains(htmlStr, want) {
 			t.Fatalf("HTML report missing %q", want)
 		}

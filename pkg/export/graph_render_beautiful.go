@@ -1833,7 +1833,8 @@ function performSearch(query) {
                (n.notes || '').toLowerCase().includes(q) ||
                (n.acceptance_criteria || '').toLowerCase().includes(q) ||
                (n.labels || []).some(l => l.toLowerCase().includes(q)) ||
-               (n.assignee || '').toLowerCase().includes(q);
+               (n.assignee || '').toLowerCase().includes(q) ||
+               (n.source_repo || '').toLowerCase().includes(q);
     }).slice(0, 8);
 
     if (matches.length === 0) {

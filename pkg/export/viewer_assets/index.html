@@ -3593,7 +3593,7 @@
       <!-- Floating Control Panel -->
       <div class="absolute top-4 left-4 right-4 flex items-start justify-between pointer-events-none">
         <!-- Left controls -->
-        <div class="pointer-events-auto flex flex-col gap-2 md:gap-3">
+        <div class="pointer-events-auto flex flex-col items-start gap-2 md:gap-3">
           <!-- Back button - larger touch target on mobile -->
           <button @click="window.location.hash = '#/'"
                   class="flex items-center gap-2 px-3 py-2.5 md:px-4 md:py-2 bg-white dark:bg-gray-800 rounded-lg shadow-lg border border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700 active:bg-gray-100 dark:active:bg-gray-600 transition-colors min-h-[44px]">
@@ -3604,42 +3604,43 @@
             <span class="text-sm font-medium sm:hidden">Back</span>
           </button>
 
-          <!-- Stats & Filter Toggle overlay - live filtered node counts -->
-          <div class="bg-white/90 dark:bg-gray-800/90 backdrop-blur-sm rounded-lg shadow-lg border border-gray-200 dark:border-gray-700 p-2 md:p-3">
-            <div class="flex items-center justify-between gap-3 mb-1">
-              <div class="text-[10px] md:text-xs text-gray-500 dark:text-gray-400">
-                <span>Showing</span>
-                <span x-show="hasActiveGraphFilters && stats.total > 0"
-                      class="ml-1 font-mono font-semibold text-beads-600 dark:text-beads-400"
-                      x-text="graphVisibleTotal + '/' + stats.total"></span>
+          <!-- Stats & Filter Toggle overlay + non-displacing filter popover -->
+          <div class="relative">
+            <div class="bg-white/90 dark:bg-gray-800/90 backdrop-blur-sm rounded-lg shadow-lg border border-gray-200 dark:border-gray-700 p-2 md:p-3">
+              <div class="flex items-center justify-between gap-3 mb-1">
+                <div class="text-[10px] md:text-xs text-gray-500 dark:text-gray-400">
+                  <span>Showing</span>
+                  <span x-show="hasActiveGraphFilters && stats.total > 0"
+                        class="ml-1 font-mono font-semibold text-beads-600 dark:text-beads-400"
+                        x-text="graphVisibleTotal + '/' + stats.total"></span>
+                </div>
+                <button type="button"
+                        id="graph-filter-toggle-btn"
+                        @click="graphFiltersOpen = !graphFiltersOpen"
+                        :class="hasActiveGraphFilters ? 'bg-beads-100 dark:bg-beads-900/60 text-beads-700 dark:text-beads-200 border-beads-300 dark:border-beads-700' : 'bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-200 border-gray-200 dark:border-gray-600 hover:bg-gray-200 dark:hover:bg-gray-600'"
+                        class="inline-flex items-center gap-1 px-2 py-0.5 rounded border text-[11px] font-medium transition-colors"
+                        title="Filter visible graph nodes">
+                  <span>Filter</span>
+                  <span x-show="hasActiveGraphFilters" class="w-1.5 h-1.5 rounded-full bg-beads-500"></span>
+                </button>
               </div>
-              <button type="button"
-                      id="graph-filter-toggle-btn"
-                      @click="graphFiltersOpen = !graphFiltersOpen"
-                      :class="hasActiveGraphFilters ? 'bg-beads-100 dark:bg-beads-900/60 text-beads-700 dark:text-beads-200 border-beads-300 dark:border-beads-700' : 'bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-200 border-gray-200 dark:border-gray-600 hover:bg-gray-200 dark:hover:bg-gray-600'"
-                      class="inline-flex items-center gap-1 px-2 py-0.5 rounded border text-[11px] font-medium transition-colors"
-                      title="Filter visible graph nodes">
-                <span>Filter</span>
-                <span x-show="hasActiveGraphFilters" class="w-1.5 h-1.5 rounded-full bg-beads-500"></span>
-              </button>
+              <div class="flex items-center gap-2 md:gap-4">
+                <div class="flex items-center gap-1">
+                  <div class="w-2 h-2 rounded-full bg-green-500"></div>
+                  <span id="graph-visible-open" class="text-xs md:text-sm font-medium" x-text="(forceGraphReady ? graphVisibleOpen : (stats.open || 0)) + ' open'"></span>
+                </div>
+                <div class="flex items-center gap-1">
+                  <div class="w-2 h-2 rounded-full bg-gray-400"></div>
+                  <span id="graph-visible-closed" class="text-xs md:text-sm font-medium" x-text="(forceGraphReady ? graphVisibleClosed : (stats.closed || 0)) + ' closed'"></span>
+                </div>
+              </div>
             </div>
-            <div class="flex items-center gap-2 md:gap-4">
-              <div class="flex items-center gap-1">
-                <div class="w-2 h-2 rounded-full bg-green-500"></div>
-                <span id="graph-visible-open" class="text-xs md:text-sm font-medium" x-text="(forceGraphReady ? graphVisibleOpen : (stats.open || 0)) + ' open'"></span>
-              </div>
-              <div class="flex items-center gap-1">
-                <div class="w-2 h-2 rounded-full bg-gray-400"></div>
-                <span id="graph-visible-closed" class="text-xs md:text-sm font-medium" x-text="(forceGraphReady ? graphVisibleClosed : (stats.closed || 0)) + ' closed'"></span>
-              </div>
-            </div>
-          </div>
 
-          <!-- Compact Graph Filter HUD (drives forceGraphModule.setFilter / clearFilters) -->
-          <div x-show="graphFiltersOpen"
-               id="graph-filter-hud"
-               x-cloak
-               class="bg-white/95 dark:bg-gray-800/95 backdrop-blur-sm rounded-lg shadow-lg border border-gray-200 dark:border-gray-700 p-2.5 w-[240px] sm:w-[272px] space-y-2">
+            <!-- Compact Graph Filter HUD Popover (drives forceGraphModule.setFilter / clearFilters without shifting layout) -->
+            <div x-show="graphFiltersOpen"
+                 id="graph-filter-hud"
+                 x-cloak
+                 class="absolute top-full left-0 mt-2 z-20 bg-white/95 dark:bg-gray-800/95 backdrop-blur-sm rounded-lg shadow-xl border border-gray-200 dark:border-gray-700 p-2.5 w-[240px] sm:w-[272px] max-w-[calc(100vw-2rem)] space-y-2">
             <div class="flex items-center justify-between gap-2">
               <span class="text-[11px] font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">Graph Filters</span>
               <button x-show="hasActiveGraphFilters"
@@ -3714,6 +3715,7 @@
                      class="rounded border-gray-300 dark:border-gray-600 text-beads-600 focus:ring-beads-500">
               <span>Show closed issues</span>
             </label>
+            </div>
           </div>
 
           <!-- Active Dependency Cone HUD Pill -->

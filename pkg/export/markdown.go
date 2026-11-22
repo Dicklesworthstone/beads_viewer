@@ -1601,6 +1601,18 @@ func GenerateHTMLReport(issues []model.Issue, title string, opts ReportOptions) 
 					return "@" + html.EscapeString(clean)
 				},
 			}, true
+		case "repo", "source_repo":
+			return htmlCol{
+				key:    "source_repo",
+				header: "Repo",
+				render: func(i model.Issue) string {
+					clean := strings.TrimSpace(i.SourceRepo)
+					if clean == "" {
+						return "-"
+					}
+					return html.EscapeString(clean)
+				},
+			}, true
 		case "label", "labels", "tag", "tags":
 			return htmlCol{
 				key:    "labels",
