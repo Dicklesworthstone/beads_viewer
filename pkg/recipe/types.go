@@ -73,12 +73,13 @@ type ViewConfig struct {
 }
 
 // Presentation field names are shared by validation and the TUI renderer.
-var ViewColumns = []string{"id", "title", "status", "priority", "assignee", "created", "updated", "tags", "blockers"}
+var ViewColumns = []string{"id", "title", "status", "priority", "assignee", "created", "updated", "tags", "blockers", "repo"}
 var ViewMetrics = []string{"pagerank", "betweenness", "impact", "triage", "hub", "authority", "eigenvector", "kcore", "slack"}
 
 var viewColumnAliases = map[string]string{
-	"label":  "tags",
-	"labels": "tags",
+	"label":       "tags",
+	"labels":      "tags",
+	"source_repo": "repo",
 }
 
 // CanonicalViewColumn normalizes accepted column aliases (e.g. label/labels -> tags).
@@ -246,7 +247,7 @@ func (r *Recipe) Validate() error {
 	for _, value := range r.View.Columns {
 		canon, valid := CanonicalViewColumn(value)
 		if !valid {
-			problems = append(problems, fmt.Sprintf("view.columns %q must be one of %s (or label/labels)", value, strings.Join(ViewColumns, ", ")))
+			problems = append(problems, fmt.Sprintf("view.columns %q must be one of %s (or label/labels/source_repo)", value, strings.Join(ViewColumns, ", ")))
 		}
 		if seenCols[canon] {
 			problems = append(problems, fmt.Sprintf("view.columns repeats %q", value))
@@ -273,9 +274,9 @@ func (r *Recipe) Validate() error {
 	}
 	groupBy := strings.ToLower(strings.TrimSpace(r.View.GroupBy))
 	switch groupBy {
-	case "", "none", "status", "priority", "assignee", "tag", "tags", "label", "labels":
+	case "", "none", "status", "priority", "assignee", "tag", "tags", "label", "labels", "repo", "source_repo":
 	default:
-		problems = append(problems, fmt.Sprintf("view.group_by %q must be status, priority, assignee, tag, label or none", r.View.GroupBy))
+		problems = append(problems, fmt.Sprintf("view.group_by %q must be status, priority, assignee, tag, label, repo or none", r.View.GroupBy))
 	}
 	if r.View.Collapsed && (groupBy == "" || groupBy == "none") {
 		problems = append(problems, "view.collapsed requires view.group_by")

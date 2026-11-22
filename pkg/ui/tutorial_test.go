@@ -1454,13 +1454,13 @@ func TestTutorialTOC24RowWindowingAndContextHelpTreeSprintKeys(t *testing.T) {
 		t.Fatalf("tree context help retained 'o / O' $EDITOR trap:\n%s", treeView)
 	}
 
-	// Sprint context help ('~' on sprint) documents Enter -> "Jump to first sprint bead".
+	// Sprint context help ('~' on sprint) documents bead cursor & Enter jump.
 	sprintTut := newTestTutorialModel()
 	sprintTut.SetSize(110, 45)
 	sprintTut.SetContext("sprint")
 	sprintTut.SetContextMode(true)
 	sprintView := ansi.Strip(sprintTut.View())
-	if !strings.Contains(sprintView, "Enter") || !strings.Contains(sprintView, "Jump to first sprint bead") {
-		t.Fatalf("sprint context help missing Enter jump hint:\n%s", sprintView)
+	if !strings.Contains(sprintView, "Enter") || !strings.Contains(sprintView, "Jump to first sprint bead") || !strings.Contains(sprintView, "Tab / Shift+Tab") {
+		t.Fatalf("sprint context help missing Enter or bead cursor hint:\n%s", sprintView)
 	}
 }

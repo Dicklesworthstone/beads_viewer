@@ -14,6 +14,10 @@ import (
 
 // renderSprintDashboard renders the sprint view with progress, burndown, and at-risk items (bv-161)
 func (m *Model) renderSprintDashboard() string {
+	return m.renderSprintDashboardWithFocus(false)
+}
+
+func (m *Model) renderSprintDashboardWithFocus(keepBeadVisible bool) string {
 	t := m.theme
 	if m.selectedSprint == nil {
 		return "No sprint selected"
@@ -46,22 +50,10 @@ func (m *Model) renderSprintDashboard() string {
 
 	// Calculate days remaining
 	var daysRemaining int
-	var sprintDuration int
-	var daysPassed int
 	if !sprint.EndDate.IsZero() {
 		daysRemaining = int(sprint.EndDate.Sub(now).Hours() / 24)
 		if daysRemaining < 0 {
 			daysRemaining = 0
-		}
-		if !sprint.StartDate.IsZero() {
-			sprintDuration = int(sprint.EndDate.Sub(sprint.StartDate).Hours() / 24)
-			daysPassed = int(now.Sub(sprint.StartDate).Hours() / 24)
-			if daysPassed < 0 {
-				daysPassed = 0
-			}
-			if daysPassed > sprintDuration {
-				daysPassed = sprintDuration
-			}
 		}
 	}
 
@@ -92,6 +84,7 @@ func (m *Model) renderSprintDashboard() string {
 	}
 	var totalBeads, closedBeads, openBeads, blockedBeads, inProgressBeads int
 	var sprintIssues []model.Issue
+	var openSprintIssues []model.Issue
 	beadIDSet := make(map[string]bool)
 	for _, id := range sprint.BeadIDs {
 		beadIDSet[id] = true
@@ -104,6 +97,7 @@ func (m *Model) renderSprintDashboard() string {
 				closedBeads++
 				continue
 			}
+			openSprintIssues = append(openSprintIssues, iss)
 			isDepBlocked := sprintReadiness != nil && len(sprintReadiness.Blockers(iss.ID)) > 0
 			switch {
 			case iss.Status == model.StatusBlocked || isDepBlocked:
@@ -229,7 +223,29 @@ func (m *Model) renderSprintDashboard() string {
 		sb.WriteString(valStyle.Render(fmt.Sprintf("%.2f/day (ideal %.2f/day) • ", burndown.ActualBurnRate, burndown.IdealBurnRate)))
 		sb.WriteString(statusLabel)
 		sb.WriteString(valStyle.Render(" • " + projText))
-		sb.WriteString("\n\n")
+		sb.WriteString("\n")
+		if len(openSprintIssues) > 0 {
+			graham1 := analysis.ComputeGrahamBounds(openSprintIssues, m.issues, m.analysis, 1, now)
+			if graham1.TotalMinutes > 0 {
+				graham2 := analysis.ComputeGrahamBounds(openSprintIssues, m.issues, m.analysis, 2, now)
+				graham4 := analysis.ComputeGrahamBounds(openSprintIssues, m.issues, m.analysis, 4, now)
+				fmtRange := func(lo, hi float64) string {
+					if fmt.Sprintf("%.1f", lo) == fmt.Sprintf("%.1f", hi) {
+						return fmt.Sprintf("%.1fd", lo)
+					}
+					return fmt.Sprintf("%.1f–%.1fd", lo, hi)
+				}
+				sb.WriteString(labelStyle.Render("Capacity: "))
+				sb.WriteString(valStyle.Render(fmt.Sprintf("%s (crit %s) • 1a:%s 2a:%s 4a:%s",
+					formatEstimateDuration(graham1.TotalMinutes),
+					formatEstimateDuration(graham1.CriticalPathMinutes),
+					fmt.Sprintf("%.1fd", graham1.GrahamMinDays),
+					fmtRange(graham2.GrahamMinDays, graham2.GrahamMaxDays),
+					fmtRange(graham4.GrahamMinDays, graham4.GrahamMaxDays))))
+				sb.WriteString("\n")
+			}
+		}
+		sb.WriteString("\n")
 	} else {
 		sb.WriteString(valStyle.Render("  (insufficient data)"))
 		sb.WriteString("\n\n")
@@ -271,7 +287,8 @@ func (m *Model) renderSprintDashboard() string {
 				signals = append(signals, string(s))
 			}
 			sb.WriteString(t.Renderer.NewStyle().Foreground(t.Feature).Render(
-				fmt.Sprintf("  ⚠ %s - %s (%s)\n", item.ID, truncateStrSprint(item.Title, 30), strings.Join(signals, ", "))))
+				fmt.Sprintf("  ⚠ %s - %s (%s)", item.ID, truncateStrSprint(item.Title, 30), strings.Join(signals, ", "))))
+			sb.WriteString("\n")
 		}
 	}
 	sb.WriteString("\n")
@@ -279,6 +296,7 @@ func (m *Model) renderSprintDashboard() string {
 	// Sprint beads list with selectable bead cursor (Tab/Shift+Tab or n/p)
 	sb.WriteString(labelStyle.Render("Beads in Sprint:"))
 	sb.WriteString("\n")
+	selectedBeadLineIdx := -1
 	if len(sprintIssues) == 0 {
 		m.sprintBeadCursor = 0
 		sb.WriteString(valStyle.Render("  (none)"))
@@ -320,10 +338,12 @@ func (m *Model) renderSprintDashboard() string {
 			}
 			prefix := "  "
 			if i == m.sprintBeadCursor {
+				selectedBeadLineIdx = strings.Count(sb.String(), "\n")
 				prefix = "▸ "
 				statusStyle = statusStyle.Bold(true).Foreground(t.Primary)
 			}
-			sb.WriteString(statusStyle.Render(fmt.Sprintf("%s%s %s - %s\n", prefix, statusIcon, iss.ID, truncateStrSprint(iss.Title, 40))))
+			sb.WriteString(statusStyle.Render(fmt.Sprintf("%s%s %s - %s", prefix, statusIcon, iss.ID, truncateStrSprint(iss.Title, 40))))
+			sb.WriteString("\n")
 		}
 		if endIdx < len(sprintIssues) {
 			sb.WriteString(valStyle.Render(fmt.Sprintf("  … +%d more", len(sprintIssues)-endIdx)))
@@ -367,6 +387,13 @@ func (m *Model) renderSprintDashboard() string {
 	maxBodyLines := max(availInner-1-footerGap, 1)
 	if len(bodyLines) > maxBodyLines {
 		maxScroll := len(bodyLines) - maxBodyLines
+		if keepBeadVisible && selectedBeadLineIdx >= 0 {
+			if selectedBeadLineIdx < m.sprintScroll {
+				m.sprintScroll = selectedBeadLineIdx
+			} else if selectedBeadLineIdx >= m.sprintScroll+maxBodyLines {
+				m.sprintScroll = selectedBeadLineIdx - maxBodyLines + 1
+			}
+		}
 		if m.sprintScroll > maxScroll {
 			m.sprintScroll = maxScroll
 		}
@@ -539,15 +566,25 @@ func (m *Model) handleSprintKeys(msg tea.KeyMsg) *Model {
 		// Next bead in sprint
 		sprintIssues := m.sprintScopedIssues()
 		if len(sprintIssues) > 0 {
+			if m.sprintBeadCursor < 0 {
+				m.sprintBeadCursor = 0
+			} else if m.sprintBeadCursor >= len(sprintIssues) {
+				m.sprintBeadCursor = len(sprintIssues) - 1
+			}
 			m.sprintBeadCursor = (m.sprintBeadCursor + 1) % len(sprintIssues)
-			m.sprintViewText = m.renderSprintDashboard()
+			m.sprintViewText = m.renderSprintDashboardWithFocus(true)
 		}
 	case "shift+tab", "p":
 		// Previous bead in sprint
 		sprintIssues := m.sprintScopedIssues()
 		if len(sprintIssues) > 0 {
+			if m.sprintBeadCursor < 0 {
+				m.sprintBeadCursor = 0
+			} else if m.sprintBeadCursor >= len(sprintIssues) {
+				m.sprintBeadCursor = len(sprintIssues) - 1
+			}
 			m.sprintBeadCursor = (m.sprintBeadCursor - 1 + len(sprintIssues)) % len(sprintIssues)
-			m.sprintViewText = m.renderSprintDashboard()
+			m.sprintViewText = m.renderSprintDashboardWithFocus(true)
 		}
 	case "ctrl+d", "pgdown":
 		m.sprintScroll += 5
@@ -565,9 +602,12 @@ func (m *Model) handleSprintKeys(msg tea.KeyMsg) *Model {
 			return m
 		}
 		idx := m.sprintBeadCursor
-		if idx < 0 || idx >= len(sprintIssues) {
+		if idx < 0 {
 			idx = 0
+		} else if idx >= len(sprintIssues) {
+			idx = len(sprintIssues) - 1
 		}
+		m.sprintBeadCursor = idx
 		targetID := sprintIssues[idx].ID
 		if targetID == "" {
 			return m
@@ -588,4 +628,28 @@ func (m *Model) handleSprintKeys(msg tea.KeyMsg) *Model {
 		m.updateViewportContent()
 	}
 	return m
+}
+
+// formatEstimateDuration renders an integer minute estimate concisely (e.g., 45m, 2h, 2h30m, 1d 2h).
+func formatEstimateDuration(minutes int) string {
+	if minutes <= 0 {
+		return "0m"
+	}
+	if minutes < 60 {
+		return fmt.Sprintf("%dm", minutes)
+	}
+	hours := minutes / 60
+	remMin := minutes % 60
+	if hours < 24 {
+		if remMin == 0 {
+			return fmt.Sprintf("%dh", hours)
+		}
+		return fmt.Sprintf("%dh%dm", hours, remMin)
+	}
+	days := hours / 24
+	remHours := hours % 24
+	if remHours == 0 {
+		return fmt.Sprintf("%dd", days)
+	}
+	return fmt.Sprintf("%dd %dh", days, remHours)
 }

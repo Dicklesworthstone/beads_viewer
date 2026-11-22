@@ -1339,6 +1339,7 @@ func applyFeedbackWithRepoAndOptions(store *FeedbackStore, ctx context.Context, 
 	applied := &FeedbackApplied{}
 	rejectedPairs := make(map[string]map[string]bool)
 	pass1Rejected := make(map[string]map[string]bool)
+	pass1Ignored := make(map[string]map[string]bool)
 	recordReject := func(sha, beadID string) {
 		if sha == "" || beadID == "" {
 			return
@@ -1533,6 +1534,12 @@ func applyFeedbackWithRepoAndOptions(store *FeedbackStore, ctx context.Context, 
 				}
 			case FeedbackIgnore:
 				applied.Ignored++
+				if commitCanon != "" {
+					if pass1Ignored[commitCanon] == nil {
+						pass1Ignored[commitCanon] = make(map[string]bool)
+					}
+					pass1Ignored[commitCanon][beadID] = true
+				}
 			}
 			seen[commit.SHA] = true
 			if commitCanon != "" {
@@ -1609,8 +1616,9 @@ func applyFeedbackWithRepoAndOptions(store *FeedbackStore, ctx context.Context, 
 					seenByBead[beadID][canonicalSHA] = true
 					continue
 				}
-				if existingCanon.fb.Type == FeedbackIgnore && seenByBead[beadID][resolved.SHA] && applied.Ignored > 0 {
+				if existingCanon.fb.Type == FeedbackIgnore && pass1Ignored[resolved.SHA][beadID] && applied.Ignored > 0 {
 					applied.Ignored--
+					delete(pass1Ignored[resolved.SHA], beadID)
 				}
 				if existingCanon.fb.Type == FeedbackReject {
 					if rejectedPairs[resolved.SHA] != nil {
@@ -1626,6 +1634,10 @@ func applyFeedbackWithRepoAndOptions(store *FeedbackStore, ctx context.Context, 
 						delete(pass1Rejected[resolved.SHA], beadID)
 					}
 				}
+				if effectiveByPair[resolved.SHA] == nil {
+					effectiveByPair[resolved.SHA] = make(map[string]*canonicalFeedback)
+				}
+				effectiveByPair[resolved.SHA][beadID] = eff
 			} else if rejectedPairs[resolved.SHA][beadID] {
 				continue
 			}

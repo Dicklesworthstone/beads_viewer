@@ -825,10 +825,11 @@ func structuredTutorialPages() []StructuredTutorialPage {
 				Section{Title: "Data-driven sprint decisions (P)"},
 				Spacer{Lines: 1},
 				Section{Title: "Step 1: Open Sprint & Insights Views"},
-				Paragraph{Text: "Press P in List or Detail view to open the Sprint dashboard (j/k switches sprints, Enter jumps to first sprint bead, P/Esc/q returns to list), and press i for Insights."},
+				Paragraph{Text: "Press P in List or Detail view to open the Sprint dashboard (j/k switches sprints, Tab/Shift+Tab or n/p selects a sprint bead, Enter jumps to first sprint bead or highlighted bead, P/Esc/q returns to list), and press i for Insights."},
 				KeyTable{Bindings: []KeyHint{
 					{Key: "j / k", Desc: "Next / previous sprint"},
-					{Key: "Enter", Desc: "Jump to first sprint bead"},
+					{Key: "Tab / Shift+Tab / n / p", Desc: "Next / previous sprint bead"},
+					{Key: "Enter", Desc: "Jump to first sprint bead (or highlighted bead)"},
 					{Key: "P / Esc / q", Desc: "Return to list"},
 				}},
 				Spacer{Lines: 1},

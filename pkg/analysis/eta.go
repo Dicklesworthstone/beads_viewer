@@ -336,6 +336,9 @@ func estimateVelocityMinutesPerDayWithStats(issues []model.Issue, stats *GraphSt
 	bestV := 0.0
 	bestN := 0
 	for _, label := range labels {
+		if label == "" {
+			continue
+		}
 		rawV, n := velocityMinutesPerDayForLabelWithStats(issues, stats, label, since, now, medianMinutes)
 		if n == 0 || rawV <= 0 {
 			continue

@@ -249,7 +249,7 @@ func GetKeyBindingDocs() []KeyBindingDoc {
 		{"P", "Sprint dashboard", "Views", "list,detail"},
 		{"[", "Label dashboard", "Views", "list,detail"},
 		{"]", "Attention view", "Views", "list,detail"},
-		{"!", "Alerts panel", "Views", "list"},
+		{"!", "Alerts & hygiene suggestions panel (Tab switches)", "Views", "list"},
 		{"w", "Repo picker (workspace mode)", "Views", "list"},
 		{"?", "Help overlay", "Views", "all"},
 		{"`", "Interactive tutorial", "Views", "all"},

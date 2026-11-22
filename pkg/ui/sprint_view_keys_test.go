@@ -7,9 +7,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Dicklesworthstone/beads_viewer/pkg/drift"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 func TestHandleSprintKeys_Exit(t *testing.T) {
@@ -761,5 +763,274 @@ func TestSprintView_RealDailyBurndownVelocityAndBeadCursorJump(t *testing.T) {
 	sel, ok := m.list.SelectedItem().(IssueItem)
 	if !ok || sel.Issue.ID != wantTargetID {
 		t.Fatalf("expected Enter with cursor=2 to jump to %s (not index-0 %s), got %+v (ok=%v)", wantTargetID, displayed[0].ID, sel.Issue.ID, ok)
+	}
+}
+
+func TestSprintView_CompactTerminalKeepsBeadCursorVisibleAndResetsOnSetSprints(t *testing.T) {
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	issues := []model.Issue{
+		{ID: "SP-1", Title: "First Bead", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, UpdatedAt: now},
+		{ID: "SP-2", Title: "Second Bead", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, UpdatedAt: now},
+		{ID: "SP-3", Title: "Third Bead", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, UpdatedAt: now},
+	}
+	sprints := []model.Sprint{{
+		ID:        "sprint-compact",
+		Name:      "Compact Terminal Sprint",
+		StartDate: now.AddDate(0, 0, -5),
+		EndDate:   now.AddDate(0, 0, 5),
+		BeadIDs:   []string{"SP-1", "SP-2", "SP-3"},
+	}}
+	m := NewModel(issues, nil, "")
+	t.Cleanup(m.Stop)
+	m.referenceNow = now
+	m.width = 80
+	m.height = 18 // compact viewport where Beads in Sprint starts below the fold
+	m.SetSprints(sprints)
+	m.isSprintView = true
+	m.focused = focusSprint
+
+	// Pressing Tab must auto-scroll m.sprintScroll so the highlighted ▸ bead line is visible.
+	m = asModelPtr(t, must2(m.Update(tea.KeyMsg{Type: tea.KeyTab})))
+	if m.sprintBeadCursor != 1 {
+		t.Fatalf("expected sprintBeadCursor=1, got %d", m.sprintBeadCursor)
+	}
+	if !strings.Contains(m.sprintViewText, "▸ ") || m.sprintScroll == 0 {
+		t.Fatalf("expected Tab on compact 80x18 terminal to scroll ▸ bead into view (scroll=%d):\n%s", m.sprintScroll, m.sprintViewText)
+	}
+
+	// SetSprints must reset cursor and scroll.
+	m.SetSprints(sprints)
+	if m.sprintBeadCursor != 0 || m.sprintScroll != 0 {
+		t.Fatalf("expected SetSprints to reset sprintBeadCursor/sprintScroll to 0, got cursor=%d scroll=%d", m.sprintBeadCursor, m.sprintScroll)
+	}
+}
+
+func TestModel_ETAContextInvalidatesOnPhase2AndRepoScope(t *testing.T) {
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	closed := now.AddDate(0, 0, -3)
+	est60 := 60
+	est600 := 600
+	issues := []model.Issue{
+		{ID: "api-1", Title: "API closed", Status: model.StatusClosed, IssueType: model.TypeTask, SourceRepo: "api", EstimatedMinutes: &est60, ClosedAt: &closed, UpdatedAt: closed},
+		{ID: "api-2", Title: "API open", Status: model.StatusOpen, IssueType: model.TypeTask, SourceRepo: "api", EstimatedMinutes: &est60, UpdatedAt: now},
+		{ID: "web-1", Title: "Web closed", Status: model.StatusClosed, IssueType: model.TypeTask, SourceRepo: "web", EstimatedMinutes: &est600, ClosedAt: &closed, UpdatedAt: closed},
+		{ID: "web-2", Title: "Web open", Status: model.StatusOpen, IssueType: model.TypeTask, SourceRepo: "web", EstimatedMinutes: &est60, UpdatedAt: now},
+	}
+	m := NewModel(issues, nil, "")
+	t.Cleanup(m.Stop)
+	m.referenceNow = now
+	m.workspaceMode = true
+
+	ctxAll := m.etaContext()
+	if ctxAll == nil {
+		t.Fatal("expected non-nil ETAContext")
+	}
+	etaAll := ctxAll.EstimateForIssue(issues[1], 1)
+
+	// Narrow workspace activeRepos to "api" only: velocity must exclude web-1's 600m closure!
+	m.activeRepos = map[string]bool{"api": true}
+	ctxAPI := m.etaContext()
+	if ctxAPI == nil || ctxAPI == ctxAll {
+		t.Fatalf("expected ETAContext cache miss when activeRepos changes")
+	}
+	etaAPI := ctxAPI.EstimateForIssue(issues[1], 1)
+	if etaAPI.EstimatedDays <= etaAll.EstimatedDays {
+		t.Fatalf("expected api-only scope (60m/30d) to estimate longer than combined scope (660m/30d): api=%.2fd all=%.2fd",
+			etaAPI.EstimatedDays, etaAll.EstimatedDays)
+	}
+
+	// Ensure Phase 2 completion invalidates cached ETAContext even when stats pointer is unchanged.
+	m.activeRepos = nil
+	m.analysis.WaitForPhase2()
+	m.etaCtx = ctxAll
+	m.etaCtxStats = m.analysis
+	m.etaCtxPhase2Ready = false
+	ctxPhase2 := m.etaContext()
+	if ctxPhase2 == ctxAll {
+		t.Fatalf("expected ETAContext cache miss when Phase2Ready flips false->true on same stats pointer")
+	}
+}
+
+func TestAlertsPanel_TabSwitchesToHygieneSuggestionsAndSupportsJumpAndCopy(t *testing.T) {
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	issues := []model.Issue{
+		{ID: "HYG-1", Title: "Fix OAuth login callback timeout failure in production", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeBug, CreatedAt: now, UpdatedAt: now},
+		{ID: "HYG-2", Title: "Fix OAuth login callback timeout failure in production", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeBug, CreatedAt: now, UpdatedAt: now},
+		{ID: "HYG-3", Title: "Unrelated observability metric cleanup", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
+	}
+	m := NewModel(issues, nil, "")
+	t.Cleanup(m.Stop)
+	m.referenceNow = now
+	m.width = 120
+	m.height = 36
+	m.alerts = []drift.Alert{
+		{Type: drift.AlertStaleIssue, Severity: drift.SeverityWarning, IssueID: "HYG-3", Message: "Sample alert"},
+	}
+
+	// Open with '!' -> starts on Alerts tab (0).
+	m = asModelPtr(t, must2(m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("!")})))
+	if !m.showAlertsPanel || m.alertsTab != 0 {
+		t.Fatalf("expected '!' with active alert to open Alerts tab 0, got open=%v tab=%d", m.showAlertsPanel, m.alertsTab)
+	}
+	// Press Tab -> switches to Hygiene Suggestions tab (1).
+	m = asModelPtr(t, must2(m.Update(tea.KeyMsg{Type: tea.KeyTab})))
+	if m.alertsTab != 1 {
+		t.Fatalf("expected Tab to switch alerts panel to Suggestions tab 1, got %d", m.alertsTab)
+	}
+	sugs := m.activeScopedSuggestions()
+	if len(sugs) == 0 {
+		t.Fatal("expected duplicate-title fixture to produce >=1 hygiene suggestion")
+	}
+	rendered := m.renderAlertsPanel()
+	if !strings.Contains(rendered, "Suggestions") || !strings.Contains(rendered, sugs[0].TargetBead) {
+		t.Fatalf("expected Suggestions tab rendering to contain header and target bead %s:\n%s", sugs[0].TargetBead, rendered)
+	}
+	// Press 'c' -> attempts copy of ActionCommand (populates statusMsg when ActionCommand is present).
+	if sugs[0].ActionCommand != "" {
+		m = asModelPtr(t, must2(m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})))
+		if m.statusMsg == "" {
+			t.Fatal("expected pressing 'c' on a suggestion with ActionCommand to set statusMsg")
+		}
+	}
+	// Press Enter -> closes panel and jumps to TargetBead.
+	targetID := sugs[0].TargetBead
+	m = asModelPtr(t, must2(m.Update(tea.KeyMsg{Type: tea.KeyEnter})))
+	if m.showAlertsPanel {
+		t.Fatal("expected Enter on Suggestions tab to close overlay")
+	}
+	sel, ok := m.list.SelectedItem().(IssueItem)
+	if !ok || sel.Issue.ID != targetID {
+		t.Fatalf("expected Enter to jump to %s, got %+v (ok=%v)", targetID, sel.Issue.ID, ok)
+	}
+
+	// When 0 alerts remain but suggestions exist, '!' opens directly on Suggestions tab (1).
+	m.alerts = nil
+	m = asModelPtr(t, must2(m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("!")})))
+	if !m.showAlertsPanel || m.alertsTab != 1 {
+		t.Fatalf("expected '!' with 0 alerts and >0 suggestions to open directly on tab 1, got open=%v tab=%d", m.showAlertsPanel, m.alertsTab)
+	}
+}
+
+func TestSprintView_GrahamCapacityAndCrossSurfaceMetadataMetrics(t *testing.T) {
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	est120 := 120
+	est240 := 240
+	due := now.AddDate(0, 0, 3)
+	closedAt := now.AddDate(0, 0, -1)
+	issues := []model.Issue{
+		{
+			ID:               "META-1",
+			Title:            "Root Platform Migration",
+			Description:      "Primary description line",
+			Status:           model.StatusOpen,
+			Priority:         1,
+			IssueType:        model.TypeFeature,
+			SourceRepo:       "core",
+			EstimatedMinutes: &est120,
+			CreatedBy:        "architect",
+			DueDate:          &due,
+			CreatedAt:        now.AddDate(0, 0, -5),
+			UpdatedAt:        now,
+		},
+		{
+			ID:               "META-2",
+			Title:            "Bridge Service Rollout",
+			Status:           model.StatusOpen,
+			Priority:         1,
+			IssueType:        model.TypeTask,
+			SourceRepo:       "core",
+			EstimatedMinutes: &est240,
+			Dependencies:     []*model.Dependency{{IssueID: "META-2", DependsOnID: "META-1", Type: model.DepBlocks}},
+			CreatedAt:        now.AddDate(0, 0, -4),
+			UpdatedAt:        now,
+		},
+		{
+			ID:           "META-3",
+			Title:        "Downstream Consumer",
+			Status:       model.StatusOpen,
+			Priority:     2,
+			IssueType:    model.TypeTask,
+			Dependencies: []*model.Dependency{{IssueID: "META-3", DependsOnID: "META-2", Type: model.DepBlocks}},
+			CreatedAt:    now.AddDate(0, 0, -3),
+			UpdatedAt:    now,
+		},
+		{
+			ID:          "META-CLOSED",
+			Title:       "Retired Legacy Worker",
+			Status:      model.StatusClosed,
+			Priority:    3,
+			IssueType:   model.TypeChore,
+			SourceRepo:  "legacy",
+			CreatedBy:   "ops",
+			ClosedAt:    &closedAt,
+			CloseReason: "Replaced by META-1",
+			CreatedAt:   now.AddDate(0, 0, -10),
+			UpdatedAt:   closedAt,
+		},
+	}
+	sprints := []model.Sprint{{
+		ID:        "sp-cap",
+		Name:      "Capacity Sprint",
+		StartDate: now.AddDate(0, 0, -4),
+		EndDate:   now.AddDate(0, 0, 10),
+		BeadIDs:   []string{"META-1", "META-2", "META-3"},
+	}}
+	m := NewModel(issues, nil, "")
+	t.Cleanup(m.Stop)
+	m.referenceNow = now
+	m.width = 120
+	m.height = 44
+	m.analysis.WaitForPhase2()
+	m.SetSprints(sprints)
+	m.isSprintView = true
+
+	// 1. Sprint View renders Graham Capacity Bounds line.
+	sprintOut := m.renderSprintDashboard()
+	if !strings.Contains(sprintOut, "Capacity:") || !strings.Contains(sprintOut, "1a:") || !strings.Contains(sprintOut, "2a:") || !strings.Contains(sprintOut, "4a:") {
+		t.Fatalf("expected SprintView to render Graham Capacity Bounds line, got:\n%s", sprintOut)
+	}
+
+	// 2. DetailPane renders Estimate, Created By, Repo, and Structural Metrics.
+	m.isSprintView = false
+	m.viewport.Width = 100
+	m.viewport.Height = 120
+	m.selectListIssueByID("META-2")
+	m.updateViewportContent()
+	detailOut := ansi.Strip(m.viewport.View())
+	for _, want := range []string{"Repo:", "core", "Estimate:", "4h", "Structural Metrics", "K-Core: 1", "Slack: 0.0", "Articulation Point"} {
+		if !strings.Contains(detailOut, want) {
+			t.Errorf("DetailPane for META-2 missing %q:\n%s", want, detailOut)
+		}
+	}
+	m.selectListIssueByID("META-CLOSED")
+	m.updateViewportContent()
+	closedDetail := ansi.Strip(m.viewport.View())
+	for _, want := range []string{"Created By:", "ops", "Close Reason:", "Replaced by META-1", "Repo:", "legacy"} {
+		if !strings.Contains(closedDetail, want) {
+			t.Errorf("DetailPane for META-CLOSED missing %q:\n%s", want, closedDetail)
+		}
+	}
+
+	// 3. InsightsModel buildDetailMarkdown includes metadata and structural metrics.
+	ins := NewInsightsModel(m.analysis.GenerateInsights(10), m.issueMap, m.theme)
+	insMD := ins.buildDetailMarkdown("META-1")
+	for _, want := range []string{"**Repo:**", "core", "**Estimate:**", "2h", "**Created By:**", "architect", "**Structure:**", "K-Core", "Slack"} {
+		if !strings.Contains(insMD, want) {
+			t.Errorf("Insights detail markdown for META-1 missing %q:\n%s", want, insMD)
+		}
+	}
+
+	// 4. BoardModel syncDetailContent includes Estimate, Created By, Close Reason, Repo.
+	bm := NewBoardModel(issues, m.theme)
+	bm.showDetail = true
+	bm.JumpToColumn(ColClosed)
+	bm.detailVP.Width = 60
+	bm.detailVP.Height = 30
+	bm.syncDetailContent()
+	boardDetail := ansi.Strip(bm.detailVP.View())
+	for _, want := range []string{"legacy", "ops", "Replaced by META-1"} {
+		if !strings.Contains(boardDetail, want) {
+			t.Errorf("Board detail pane for META-CLOSED missing %q:\n%s", want, boardDetail)
+		}
 	}
 }

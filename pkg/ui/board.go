@@ -2312,6 +2312,21 @@ func (b *BoardModel) syncDetailContent() {
 	if issue.Assignee != "" {
 		content.WriteString(fmt.Sprintf("**Assignee:** @%s\n\n", issue.Assignee))
 	}
+	if strings.TrimSpace(issue.SourceRepo) != "" {
+		content.WriteString(fmt.Sprintf("**Repo:** `%s`\n\n", strings.TrimSpace(issue.SourceRepo)))
+	}
+	if issue.EstimatedMinutes != nil && *issue.EstimatedMinutes > 0 {
+		content.WriteString(fmt.Sprintf("**Estimate:** %s\n\n", formatEstimateDuration(*issue.EstimatedMinutes)))
+	}
+	if strings.TrimSpace(issue.CreatedBy) != "" {
+		content.WriteString(fmt.Sprintf("**Created By:** @%s\n\n", strings.TrimSpace(issue.CreatedBy)))
+	}
+	if issue.DueDate != nil {
+		content.WriteString(fmt.Sprintf("**Due:** %s\n\n", issue.DueDate.Format("2006-01-02")))
+	}
+	if strings.TrimSpace(issue.CloseReason) != "" {
+		content.WriteString(fmt.Sprintf("**Close Reason:** %s\n\n", strings.TrimSpace(issue.CloseReason)))
+	}
 
 	if len(issue.Labels) > 0 {
 		content.WriteString(fmt.Sprintf("**Labels:** %s\n\n", strings.Join(issue.Labels, ", ")))

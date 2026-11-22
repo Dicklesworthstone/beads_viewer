@@ -28,13 +28,13 @@ func TestPresentationValidation(t *testing.T) {
 			}
 		})
 	}
-	for _, group := range []string{"", "none", "status", "priority", "assignee", "tag", "tags", "label", "labels"} {
+	for _, group := range []string{"", "none", "status", "priority", "assignee", "tag", "tags", "label", "labels", "repo", "source_repo"} {
 		r := recipe.Recipe{View: recipe.ViewConfig{Columns: recipe.ViewColumns, GroupBy: group, TruncateTitle: 1}, Metrics: recipe.ViewMetrics}
 		if err := r.Validate(); err != nil {
 			t.Fatalf("valid presentation (%s): %v", group, err)
 		}
 	}
-	for _, colAlias := range []string{"label", "labels", "assignee"} {
+	for _, colAlias := range []string{"label", "labels", "assignee", "repo", "source_repo"} {
 		r := recipe.Recipe{
 			Sort: recipe.SortConfig{Field: "assignee"},
 			View: recipe.ViewConfig{Columns: []string{"id", colAlias}, GroupBy: "label"},

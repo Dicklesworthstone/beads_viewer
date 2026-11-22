@@ -369,9 +369,16 @@ func (d IssueDelegate) renderConfiguredRow(w io.Writer, m list.Model, index int,
 			}
 		}
 	}
+	hasRepoColumn := false
+	for _, rawColumn := range columns {
+		if canonical, ok := recipe.CanonicalViewColumn(rawColumn); ok && canonical == "repo" {
+			hasRepoColumn = true
+			break
+		}
+	}
 	fixedWidth := 2
 	repoCell := ""
-	if d.WorkspaceMode {
+	if d.WorkspaceMode && !hasRepoColumn {
 		trimmedRepo := strings.TrimSpace(item.RepoPrefix)
 		if trimmedRepo != "" {
 			repoCell = fmt.Sprintf("[%s]", strings.ToUpper(trimmedRepo))
@@ -411,6 +418,16 @@ func (d IssueDelegate) renderConfiguredRow(w io.Writer, m list.Model, index int,
 			values[n] = strings.Join(item.Issue.Labels, ",")
 		case "blockers":
 			values[n] = fmt.Sprintf("blockers:%d", d.BlockerCounts[item.Issue.ID])
+		case "repo":
+			repoVal := strings.TrimSpace(item.Issue.SourceRepo)
+			if repoVal == "" {
+				repoVal = strings.TrimSpace(item.RepoPrefix)
+			}
+			if repoVal != "" {
+				values[n] = repoVal
+			} else {
+				values[n] = "—"
+			}
 		}
 		if column != "title" {
 			values[n] = ansi.Truncate(values[n], max(4, width/3), "…")

@@ -8108,7 +8108,14 @@ func attachDriftAlertsToTriage(triage *analysis.TriageResult, ctx RobotContext, 
 	hasType := make(map[string]bool, len(triage.Alerts))
 	for _, existing := range triage.Alerts {
 		hasType[existing.Type] = true
-		seenTypeIssue[existing.Type+"\x00"+existing.IssueID] = true
+		if existing.IssueID != "" {
+			seenTypeIssue[existing.Type+"\x00"+existing.IssueID] = true
+		}
+		for _, id := range existing.IssueIDs {
+			if id != "" {
+				seenTypeIssue[existing.Type+"\x00"+id] = true
+			}
+		}
 		seenExact[existing.Type+"\x00"+existing.IssueID+"\x00"+strings.Join(existing.IssueIDs, ",")+"\x00"+existing.Message] = true
 	}
 
@@ -8140,7 +8147,14 @@ func attachDriftAlertsToTriage(triage *analysis.TriageResult, ctx RobotContext, 
 			continue
 		}
 		seenExact[exactKey] = true
-		seenTypeIssue[alertType+"\x00"+da.IssueID] = true
+		if da.IssueID != "" {
+			seenTypeIssue[alertType+"\x00"+da.IssueID] = true
+		}
+		for _, id := range mapped.IssueIDs {
+			if id != "" {
+				seenTypeIssue[alertType+"\x00"+id] = true
+			}
+		}
 		hasType[alertType] = true
 		triage.Alerts = append(triage.Alerts, mapped)
 	}

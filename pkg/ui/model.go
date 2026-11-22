@@ -348,6 +348,7 @@ func (m *Model) SetSourceReload(reload func(context.Context) (SourceReloadResult
 	if m.backgroundWorker != nil {
 		m.backgroundWorker.Stop()
 		m.backgroundWorker = nil
+		m.syncInternalWatchedPath()
 	}
 	if m.statusMsg == "Background mode enabled" {
 		m.statusMsg = ""
@@ -426,6 +427,7 @@ func (m *Model) startSourceReload() tea.Cmd {
 	}
 	if m.backgroundWorker != nil && m.backgroundWorker.State() == WorkerStopped {
 		m.backgroundWorker = nil
+		m.syncInternalWatchedPath()
 	}
 	if m.sourceReload != nil {
 		return m.sourceReloadCmd()
@@ -481,6 +483,7 @@ func (m *Model) reloadAfterEdit() tea.Cmd {
 	if m.backgroundWorker != nil {
 		m.backgroundWorker.Stop()
 		m.backgroundWorker = nil
+		m.syncInternalWatchedPath()
 		m.restoreBackgroundAfterEdit = true
 	}
 	if m.sourceReload != nil {
@@ -2492,12 +2495,18 @@ type Model struct {
 
 	// Alerts panel (bv-168)
 	alerts          []drift.Alert
-	alertsCritical  int
-	alertsWarning   int
-	alertsInfo      int
-	showAlertsPanel bool
-	alertsCursor    int
-	dismissedAlerts map[string]bool
+	alertsCritical         int
+	alertsWarning          int
+	alertsInfo             int
+	showAlertsPanel        bool
+	alertsTab              int // 0 = Alerts, 1 = Hygiene Suggestions
+	alertsCursor           int
+	suggestionsCursor      int
+	dismissedAlerts        map[string]bool
+	suggestionsCache       []analysis.Suggestion
+	suggestionsCacheGen    uint64
+	suggestionsCacheScope  string
+	suggestionsCacheLoaded bool
 
 	// Sprint view (bv-161)
 	sprints                []model.Sprint
@@ -2510,10 +2519,16 @@ type Model struct {
 	sprintAtRiskThresholds analysis.AtRiskThresholds
 
 	// Cached dataset-level ETA context (O(1+L) per-issue forecasts on cursor move)
-	etaCtx       *analysis.ETAContext
-	etaCtxStats  *analysis.GraphStats
-	etaCtxCount  int
-	etaCtxMinute int64
+	etaCtx            *analysis.ETAContext
+	etaCtxStats       *analysis.GraphStats
+	etaCtxPhase2Ready bool
+	etaCtxDataGen     uint64
+	etaCtxScopeKey    string
+	etaCtxCount       int
+	etaCtxMinute      int64
+
+	// Concurrently readable active internal watcher/worker path for external sibling watcher Sync.
+	internalWatchedPath *atomic.Pointer[string]
 
 	// AGENTS.md integration (bv-i8dk)
 	showAgentPrompt  bool
@@ -2731,6 +2746,9 @@ func (m *Model) beginSemanticDatasetUpdate() {
 	m.historyView.ClearSessionCache()
 	m.advancedInsightsCache = nil
 	m.advancedInsightsCacheKey = advancedInsightsCacheKey{}
+	m.etaCtx = nil
+	m.suggestionsCacheLoaded = false
+	m.suggestionsCache = nil
 	m.semanticDataGeneration++
 	m.invalidateSemanticFilter()
 	m.semanticIndexBuilding = false
@@ -2914,6 +2932,7 @@ func (m *Model) installBackgroundWorker(worker *BackgroundWorker) {
 	m.backgroundWorker = worker
 	m.lastWorkerGeneration = 0
 	m.lastAppliedSnapshotVer = 0
+	m.syncInternalWatchedPath()
 }
 
 func (m *Model) acceptWorkerGeneration(generation uint64) {
@@ -3494,6 +3513,8 @@ func (m *Model) SetSprints(sprints []model.Sprint) {
 		return
 	}
 	m.sprintsLoadedFromDisk = false
+	m.sprintScroll = 0
+	m.sprintBeadCursor = 0
 	if len(sprints) == 0 {
 		m.sprints = nil
 		m.selectedSprint = nil
@@ -3990,6 +4011,7 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 		sprints:                sprints,
 		sprintsLoadedFromDisk:  sprintsLoadedFromDisk,
 		sprintAtRiskThresholds: sprintAtRiskThresholds,
+		internalWatchedPath:    new(atomic.Pointer[string]),
 		// AGENTS.md integration (bv-i8dk) - workDir derived from beadsPath
 		workDir: workDir,
 		// Tutorial integration (bv-8y31)
@@ -4000,6 +4022,7 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 	}
 
 	m.installBackgroundWorker(backgroundWorker)
+	m.syncInternalWatchedPath()
 	m.registerKeyBindings()
 	m.attachHistoryCassLookup()
 	m.recomputeVisibleAlertCounts()
@@ -4575,6 +4598,7 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.backgroundWorker = nil
+		m.syncInternalWatchedPath()
 		if m.snapshotInitPending && m.snapshot == nil {
 			m.snapshotInitPending = false
 		}
@@ -5059,6 +5083,10 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Update UI components with Phase 2 insights
 		m.advancedInsightsCache = nil
 		m.advancedInsightsCacheKey = advancedInsightsCacheKey{}
+		m.etaCtx = nil
+		m.suggestionsCacheLoaded = false
+		m.suggestionsCache = nil
+		m.graphView.SetETAContext(m.etaContext())
 		bodyHeight := m.height - 1
 		if bodyHeight < 5 {
 			bodyHeight = 5
@@ -5184,6 +5212,10 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.snapshot.phase2Ready = true
 		m.advancedInsightsCache = nil
 		m.advancedInsightsCacheKey = advancedInsightsCacheKey{}
+		m.etaCtx = nil
+		m.suggestionsCacheLoaded = false
+		m.suggestionsCache = nil
+		m.graphView.SetETAContext(m.etaContext())
 		m.syncBoardReadinessAndFullIssues()
 		if m.effectiveUnderlyingFocus() == focusInsights || (m.workspaceMode && m.activeRepos != nil) {
 			m.rebuildInsightsPanel()
@@ -5917,10 +5949,12 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if w, wErr := watcher.NewWatcher(m.beadsPath, watcher.WithDebounceDuration(200*time.Millisecond)); wErr == nil {
 					if sErr := w.Start(); sErr == nil {
 						m.watcher = w
+						m.syncInternalWatchedPath()
 						return m, WatchFileCmd(m.watcher)
 					}
 				}
 			}
+			m.syncInternalWatchedPath()
 			return m, nil
 		}
 		if m.backgroundWorker != nil {
@@ -6066,6 +6100,7 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.watcher.Stop()
 						m.watcher = nil
 					}
+					m.syncInternalWatchedPath()
 				} else {
 					m.tree.SetBeadsDir(filepath.Dir(m.beadsPath))
 					m.tree.SetReadOnly(false)
@@ -6082,6 +6117,7 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 								}
 							}
 						}
+						m.syncInternalWatchedPath()
 					}
 				}
 			}
@@ -6902,7 +6938,7 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
-		// 10) Alerts panel modal (bv-168) — routed ABOVE focusAttention and all lower pickers/views
+		// 10) Alerts & Hygiene Suggestions panel modal (bv-168) — routed ABOVE focusAttention and all lower pickers/views
 		if m.showAlertsPanel {
 			activeAlerts := m.activeScopedAlerts()
 			s := msg.String()
@@ -6912,6 +6948,67 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if m.effectiveTutorialKeyBindings().IsContextHelp(msg) {
 				m.openContextTutorialFromFocus(m.focused)
+				return m, nil
+			}
+			if s == "tab" || s == "shift+tab" {
+				m.alertsTab = 1 - m.alertsTab
+				if m.alertsTab == 1 {
+					suggestions := m.activeScopedSuggestions()
+					if m.suggestionsCursor >= len(suggestions) {
+						m.suggestionsCursor = max(0, len(suggestions)-1)
+					}
+				} else if m.alertsCursor >= len(activeAlerts) {
+					m.alertsCursor = max(0, len(activeAlerts)-1)
+				}
+				return m, nil
+			}
+			if m.alertsTab == 1 {
+				suggestions := m.activeScopedSuggestions()
+				switch s {
+				case "j", "down":
+					if m.suggestionsCursor < len(suggestions)-1 {
+						m.suggestionsCursor++
+					}
+					return m, nil
+				case "k", "up":
+					if m.suggestionsCursor > 0 {
+						m.suggestionsCursor--
+					}
+					return m, nil
+				case "enter":
+					if m.suggestionsCursor >= 0 && m.suggestionsCursor < len(suggestions) {
+						issueID := suggestions[m.suggestionsCursor].TargetBead
+						if issueID != "" {
+							m.revealRecipeIssue(issueID)
+							m.selectListIssueByID(issueID)
+							m.resetUnderlyingViewToMainList()
+							m.focused = focusList
+							if m.isSplitView {
+								m.updateViewportContent()
+							}
+						}
+					}
+					m.showAlertsPanel = false
+					m.focused = m.restoreTopModalOrListFocus()
+					m.ensureActiveModalInputFocus()
+					return m, m.pendingSemanticFilterCmd()
+				case "c", "y":
+					if m.suggestionsCursor >= 0 && m.suggestionsCursor < len(suggestions) {
+						cmdText := strings.TrimSpace(suggestions[m.suggestionsCursor].ActionCommand)
+						if cmdText != "" {
+							m.clipboardRequestID++
+							return m, copyToClipboardStatusCmd(cmdText, fmt.Sprintf("📋 Copied command for %s", suggestions[m.suggestionsCursor].TargetBead), m.clipboardRequestID)
+						}
+						m.statusMsg = "No action command for this suggestion"
+						m.statusIsError = false
+					}
+					return m, nil
+				case "esc", "q", "!":
+					m.showAlertsPanel = false
+					m.focused = m.restoreTopModalOrListFocus()
+					m.ensureActiveModalInputFocus()
+					return m, nil
+				}
 				return m, nil
 			}
 			switch s {
@@ -7118,6 +7215,7 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 				(m.beadsPath == "" || isHistoricalGitBeadsPath(m.beadsPath)) && m.watcher == nil && m.sourceReload == nil {
 				if m.backgroundWorker != nil {
 					m.backgroundWorker = nil
+					m.syncInternalWatchedPath()
 				}
 				m.statusMsg = "Refresh unavailable"
 				m.statusIsError = true
@@ -8182,11 +8280,19 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 
 			case "!":
-				// Toggle alerts panel (bv-168)
-				// Only show if there are active alerts in current scope
+				// Toggle alerts & hygiene suggestions panel (bv-168)
+				if m.showAlertsPanel {
+					m.showAlertsPanel = false
+					return m, nil
+				}
 				if len(m.activeScopedAlerts()) > 0 {
-					m.showAlertsPanel = !m.showAlertsPanel
-					m.alertsCursor = 0 // Reset cursor when opening
+					m.showAlertsPanel = true
+					m.alertsTab = 0
+					m.alertsCursor = 0
+				} else if len(m.activeScopedSuggestions()) > 0 {
+					m.showAlertsPanel = true
+					m.alertsTab = 1
+					m.suggestionsCursor = 0
 				} else {
 					m.statusMsg = "No active alerts"
 					m.statusIsError = false
@@ -8340,6 +8446,19 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			if m.showAlertsPanel {
+				if m.alertsTab == 1 {
+					suggestions := m.activeScopedSuggestions()
+					if len(suggestions) == 0 {
+						m.suggestionsCursor = 0
+					} else if up {
+						if m.suggestionsCursor > 0 {
+							m.suggestionsCursor--
+						}
+					} else if m.suggestionsCursor < len(suggestions)-1 {
+						m.suggestionsCursor++
+					}
+					return m, nil
+				}
 				alerts := m.activeScopedAlerts()
 				if len(alerts) == 0 {
 					m.alertsCursor = 0
@@ -9776,6 +9895,9 @@ func (m *Model) handleRepoPickerKeys(msg tea.KeyMsg) *Model {
 			m.activeRepos = selected
 			m.statusMsg = fmt.Sprintf("Repo filter: %s", formatRepoList(sortedRepoKeys(selected), 3))
 		}
+		m.etaCtx = nil
+		m.suggestionsCacheLoaded = false
+		m.suggestionsCache = nil
 		m.statusIsError = false
 
 		// Apply filter to primary views and re-sync active secondary views
@@ -12670,6 +12792,9 @@ func (m *Model) hasActiveFilters() bool {
 func (m *Model) clearAllFilters() {
 	hadActiveRepos := m.workspaceMode && m.activeRepos != nil
 	m.activeRepos = nil
+	m.etaCtx = nil
+	m.suggestionsCacheLoaded = false
+	m.suggestionsCache = nil
 	m.currentFilter = "all"
 	m.setActiveRecipe(nil) // Clear any active recipe filter
 	m.clearListFuzzyFilter()
@@ -12770,6 +12895,14 @@ func (m *Model) recipeGroupKey(issue model.Issue) string {
 			return labels[0]
 		}
 		return "untagged"
+	case "repo", "source_repo":
+		if repo := strings.TrimSpace(issue.SourceRepo); repo != "" {
+			return repo
+		}
+		if repo := issueRepoKey(issue); repo != "" {
+			return repo
+		}
+		return "unassigned-repo"
 	}
 	return ""
 }
@@ -13679,6 +13812,18 @@ func (m *Model) updateViewportContent() {
 	if item.ExternalRef != nil && *item.ExternalRef != "" {
 		sb.WriteString(fmt.Sprintf("**External Ref:** `%s`\n\n", *item.ExternalRef))
 	}
+	if strings.TrimSpace(item.SourceRepo) != "" {
+		sb.WriteString(fmt.Sprintf("**Repo:** `%s`\n\n", strings.TrimSpace(item.SourceRepo)))
+	}
+	if item.EstimatedMinutes != nil && *item.EstimatedMinutes > 0 {
+		sb.WriteString(fmt.Sprintf("**Estimate:** %s\n\n", formatEstimateDuration(*item.EstimatedMinutes)))
+	}
+	if strings.TrimSpace(item.CreatedBy) != "" {
+		sb.WriteString(fmt.Sprintf("**Created By:** @%s\n\n", strings.TrimSpace(item.CreatedBy)))
+	}
+	if strings.TrimSpace(item.CloseReason) != "" {
+		sb.WriteString(fmt.Sprintf("**Close Reason:** %s\n\n", strings.TrimSpace(item.CloseReason)))
+	}
 
 	// Labels (bv-f103 fix: display labels in detail view)
 	if len(item.Labels) > 0 {
@@ -13839,6 +13984,34 @@ func (m *Model) updateViewportContent() {
 					confPct))
 			}
 			sb.WriteString("\n")
+		}
+	}
+
+	// Structural Graph Metrics (K-Core, Schedule Slack, Cut Vertex) — placed below
+	// Description so primary issue prose remains above the fold on compact terminals.
+	if m.analysis != nil && m.analysis.IsPhase2Ready() {
+		structParts := make([]string, 0, 3)
+		if coreMap := m.analysis.CoreNumber(); coreMap != nil {
+			if kcore, ok := coreMap[item.ID]; ok && kcore > 0 {
+				structParts = append(structParts, fmt.Sprintf("**K-Core:** `%d`", kcore))
+			}
+		}
+		if len(m.analysis.Cycles()) == 0 {
+			if slackMap := m.analysis.Slack(); slackMap != nil {
+				if sl, ok := slackMap[item.ID]; ok {
+					structParts = append(structParts, fmt.Sprintf("**Slack:** `%.1f`", sl))
+				}
+			}
+		}
+		for _, ap := range m.analysis.ArticulationPoints() {
+			if ap == item.ID {
+				structParts = append(structParts, "**Cut Vertex:** ⚠ Articulation Point")
+				break
+			}
+		}
+		if len(structParts) > 0 {
+			sb.WriteString("### 🧭 Structural Metrics\n")
+			sb.WriteString("- " + strings.Join(structParts, " • ") + "\n\n")
 		}
 	}
 
@@ -16536,6 +16709,33 @@ func (m *Model) DisableInternalWatcher() {
 		m.watcher.Stop()
 		m.watcher = nil
 	}
+	m.syncInternalWatchedPath()
+}
+
+func (m *Model) syncInternalWatchedPath() {
+	if m == nil || m.internalWatchedPath == nil {
+		return
+	}
+	var p string
+	if m.backgroundWorker != nil {
+		p = m.backgroundWorker.beadsPath
+	} else if m.watcher != nil {
+		p = m.watcher.Path()
+	}
+	m.internalWatchedPath.Store(&p)
+}
+
+// InternalWatchedPath returns the filesystem path currently watched internally
+// by the Model's BackgroundWorker or single-file Watcher, or "" if none.
+// Safe for concurrent calls from source-reload goroutines.
+func (m *Model) InternalWatchedPath() string {
+	if m == nil || m.internalWatchedPath == nil {
+		return ""
+	}
+	if ptr := m.internalWatchedPath.Load(); ptr != nil {
+		return *ptr
+	}
+	return ""
 }
 
 // Stop cleans up resources (file watcher, instance lock, background worker, etc.)
@@ -16574,10 +16774,13 @@ func (m *Model) Stop() {
 	}
 	if m.backgroundWorker != nil {
 		m.backgroundWorker.Stop()
+		m.backgroundWorker = nil
 	}
 	if m.watcher != nil {
 		m.watcher.Stop()
+		m.watcher = nil
 	}
+	m.syncInternalWatchedPath()
 	if m.instanceLock != nil {
 		m.instanceLock.Release()
 	}
@@ -17116,6 +17319,38 @@ func (m *Model) activeScopedAlerts() []drift.Alert {
 	return visible
 }
 
+// activeScopedSuggestions lazily computes and caches hygiene suggestions
+// (duplicates, missing dependencies, label recommendations, cycle warnings)
+// for the current dataset generation and repo/candidate scope.
+func (m *Model) activeScopedSuggestions() []analysis.Suggestion {
+	scopeKey := m.etaScopeKey()
+	if m.suggestionsCacheLoaded && m.suggestionsCacheGen == m.semanticDataGeneration && m.suggestionsCacheScope == scopeKey {
+		return m.suggestionsCache
+	}
+	scoped := m.candidateScopedIssues()
+	if len(scoped) == 0 {
+		m.suggestionsCache = nil
+		m.suggestionsCacheGen = m.semanticDataGeneration
+		m.suggestionsCacheScope = scopeKey
+		m.suggestionsCacheLoaded = true
+		return nil
+	}
+	cfg := analysis.DefaultSuggestAllConfig()
+	if len(scoped) < len(m.issues) || m.candidateIDs != nil {
+		cand := make(map[string]bool, len(scoped))
+		for _, iss := range scoped {
+			cand[iss.ID] = true
+		}
+		cfg.CandidateIDs = cand
+	}
+	set := analysis.GenerateAllSuggestionsAt(m.issues, cfg, "", m.analysisReferenceTime())
+	m.suggestionsCache = set.Suggestions
+	m.suggestionsCacheGen = m.semanticDataGeneration
+	m.suggestionsCacheScope = scopeKey
+	m.suggestionsCacheLoaded = true
+	return m.suggestionsCache
+}
+
 func (m *Model) footerCounts() (openCount, readyCount, blockedCount, closedCount int) {
 	if !m.workspaceMode || m.activeRepos == nil {
 		return m.countOpen, m.countReady, m.countBlocked, m.countClosed
@@ -17200,14 +17435,17 @@ func alertRenderedLineCount(a drift.Alert, selected bool, innerWidth int) int {
 	return lines
 }
 
-// renderAlertsPanel renders the alerts overlay panel
+// renderAlertsPanel renders the tabbed Alerts & Hygiene Suggestions overlay panel
 func (m *Model) renderAlertsPanel() string {
 	t := m.theme
 
 	boxWidth := max(24, min(80, m.width-4))
 	maxBoxHeight := max(10, m.height-4)
 	innerWidth := max(16, boxWidth-4)
-	footerText := "j/k: navigate • Enter: jump to issue • d: dismiss • Esc: close"
+	footerText := "Tab: suggest • j/k: nav • Enter: jump • d: dismiss • Esc: close"
+	if m.alertsTab == 1 {
+		footerText = "Tab: alerts • j/k: nav • Enter: jump • c: copy cmd • Esc: close"
+	}
 
 	boxStyle := t.Renderer.NewStyle().
 		Border(lipgloss.RoundedBorder()).
@@ -17223,10 +17461,100 @@ func (m *Model) renderAlertsPanel() string {
 
 	// Filter out dismissed and out-of-scope alerts
 	visibleAlerts := m.activeScopedAlerts()
+	var suggestions []analysis.Suggestion
+	if m.alertsTab == 1 || m.suggestionsCacheLoaded {
+		suggestions = m.activeScopedSuggestions()
+	}
 
 	var sb strings.Builder
-	sb.WriteString(titleStyle.Render("🔔 Alerts Panel"))
+	activeTabStyle := t.Renderer.NewStyle().Bold(true).Foreground(t.Primary)
+	inactiveTabStyle := t.Renderer.NewStyle().Foreground(t.Muted)
+	alertTabLabel := fmt.Sprintf("Alerts (%d)", len(visibleAlerts))
+	suggTabLabel := "Suggestions"
+	if m.suggestionsCacheLoaded || m.alertsTab == 1 {
+		suggTabLabel = fmt.Sprintf("Suggestions (%d)", len(suggestions))
+	}
+	if m.alertsTab == 1 {
+		sb.WriteString(titleStyle.Render("🔔 Alerts Panel  " + inactiveTabStyle.Render(alertTabLabel) + "  │  " + activeTabStyle.Render("["+suggTabLabel+"]")))
+	} else {
+		sb.WriteString(titleStyle.Render("🔔 Alerts Panel  " + activeTabStyle.Render("["+alertTabLabel+"]") + "  │  " + inactiveTabStyle.Render(suggTabLabel)))
+	}
 	sb.WriteString("\n\n")
+
+	if m.alertsTab == 1 {
+		if len(suggestions) == 0 {
+			sb.WriteString(t.Renderer.NewStyle().Foreground(ColorSuccess).Render("✓ No hygiene suggestions"))
+			sb.WriteString("\n\n")
+		} else {
+			summaryStyle := t.Renderer.NewStyle().Foreground(t.Secondary)
+			sb.WriteString(summaryStyle.Render(fmt.Sprintf("%d hygiene suggestion(s)", len(suggestions))))
+			sb.WriteString("\n\n")
+			totalS := len(suggestions)
+			cur := m.suggestionsCursor
+			if cur < 0 {
+				cur = 0
+			}
+			if cur >= totalS {
+				cur = totalS - 1
+			}
+			maxVisible := max(3, (maxBoxHeight-12)/2)
+			startIdx := 0
+			if cur >= maxVisible {
+				startIdx = cur - maxVisible + 1
+			}
+			endIdx := min(startIdx+maxVisible, totalS)
+			if startIdx > 0 {
+				sb.WriteString(t.Renderer.NewStyle().Foreground(t.Muted).Italic(true).Render(fmt.Sprintf("  ↑ %d more", startIdx)))
+				sb.WriteString("\n")
+			}
+			for i := startIdx; i < endIdx; i++ {
+				sg := suggestions[i]
+				selected := i == cur
+				cursor := "  "
+				if selected {
+					cursor = "▸ "
+				}
+				confPct := int(sg.Confidence*100 + 0.5)
+				line := fmt.Sprintf("%s[%s %d%%] %s", cursor, sg.Type, confPct, truncateRunesHelper(sg.Summary, max(16, innerWidth-26), "…"))
+				style := t.Renderer.NewStyle().Foreground(t.Secondary)
+				if sg.Confidence >= analysis.ConfidenceThresholdHigh {
+					style = t.Renderer.NewStyle().Foreground(t.Feature)
+				}
+				if selected {
+					style = style.Bold(true).Foreground(t.Primary)
+				}
+				sb.WriteString(style.Render(line))
+				sb.WriteString("\n")
+				if selected {
+					if sg.TargetBead != "" {
+						targetLine := fmt.Sprintf("     Bead: %s", sg.TargetBead)
+						if sg.RelatedBead != "" {
+							targetLine += fmt.Sprintf(" ↔ %s", sg.RelatedBead)
+						}
+						sb.WriteString(t.Renderer.NewStyle().Foreground(t.Muted).Italic(true).Render(targetLine))
+						sb.WriteString("\n")
+					}
+					if sg.Reason != "" {
+						sb.WriteString(t.Renderer.NewStyle().Foreground(t.Muted).Render("     " + truncateRunesHelper(sg.Reason, max(16, innerWidth-6), "…")))
+						sb.WriteString("\n")
+					}
+					if sg.ActionCommand != "" {
+						sb.WriteString(t.Renderer.NewStyle().Foreground(t.Open).Render("     Cmd (c to copy): " + truncateRunesHelper(sg.ActionCommand, max(16, innerWidth-22), "…")))
+						sb.WriteString("\n")
+					}
+				}
+			}
+			if endIdx < totalS {
+				sb.WriteString(t.Renderer.NewStyle().Foreground(t.Muted).Italic(true).Render(fmt.Sprintf("  ↓ %d more", totalS-endIdx)))
+				sb.WriteString("\n")
+			}
+		}
+
+		sb.WriteString("\n")
+		sb.WriteString(t.Renderer.NewStyle().Foreground(t.Muted).Italic(true).Render(footerText))
+		content := boxStyle.Render(sb.String())
+		return lipgloss.Place(m.width, m.height-1, lipgloss.Center, lipgloss.Center, content)
+	}
 
 	if len(visibleAlerts) == 0 {
 		sb.WriteString(t.Renderer.NewStyle().Foreground(ColorSuccess).Render("✓ No active alerts"))
@@ -17708,6 +18036,10 @@ func (m *Model) IsTutorialContextMode() bool {
 // clearing stale disk-loaded sprints when sprints.jsonl is deleted or emptied while preserving
 // purely in-memory sprints when no sprints.jsonl was ever loaded from disk.
 func (m *Model) reloadSprintsFromDisk(underlyingFocus focus) {
+	prevSprintID := ""
+	if m.selectedSprint != nil {
+		prevSprintID = m.selectedSprint.ID
+	}
 	sprintsReloaded := false
 	trimmedBeadsPath := strings.TrimSpace(m.beadsPath)
 	if trimmedBeadsPath != "" && !isHistoricalGitBeadsPath(trimmedBeadsPath) {
@@ -17718,6 +18050,8 @@ func (m *Model) reloadSprintsFromDisk(underlyingFocus focus) {
 				if len(loaded) == 0 {
 					m.sprints = nil
 					m.selectedSprint = nil
+					m.sprintScroll = 0
+					m.sprintBeadCursor = 0
 					if m.isSprintView || underlyingFocus == focusSprint {
 						m.sprintViewText = m.renderSprintDashboard()
 					}
@@ -17740,12 +18074,18 @@ func (m *Model) reloadSprintsFromDisk(underlyingFocus focus) {
 						idx := activeSprintIndex(m.sprints, m.analysisReferenceTime())
 						m.selectedSprint = &m.sprints[idx]
 					}
+					if m.selectedSprint == nil || m.selectedSprint.ID != prevSprintID {
+						m.sprintScroll = 0
+						m.sprintBeadCursor = 0
+					}
 					m.sprintViewText = m.renderSprintDashboard()
 				}
 			}
 		} else if os.IsNotExist(statErr) && m.sprintsLoadedFromDisk {
 			m.sprints = nil
 			m.selectedSprint = nil
+			m.sprintScroll = 0
+			m.sprintBeadCursor = 0
 			m.sprintsLoadedFromDisk = false
 			sprintsReloaded = true
 			if m.isSprintView || underlyingFocus == focusSprint {
@@ -17757,6 +18097,8 @@ func (m *Model) reloadSprintsFromDisk(underlyingFocus focus) {
 		if m.selectedSprint == nil && len(m.sprints) > 0 {
 			idx := activeSprintIndex(m.sprints, m.analysisReferenceTime())
 			m.selectedSprint = &m.sprints[idx]
+			m.sprintScroll = 0
+			m.sprintBeadCursor = 0
 		}
 		if m.selectedSprint != nil {
 			m.sprintViewText = m.renderSprintDashboard()
@@ -17764,24 +18106,55 @@ func (m *Model) reloadSprintsFromDisk(underlyingFocus focus) {
 	}
 }
 
-// etaContext returns a lazily cached dataset-level ETAContext for m.issues so
-// TUI Detail Pane and Graph View compute per-issue ETA forecasts in O(1+L)
-// without rescanning all N issues on every cursor move.
+func (m *Model) etaScopeKey() string {
+	var b strings.Builder
+	b.WriteString(m.scopeLabelFilter)
+	b.WriteByte('\x00')
+	b.WriteString(m.scopeRepoFilter)
+	b.WriteByte('\x00')
+	if m.candidateIDs != nil {
+		b.WriteString(strconv.Itoa(len(m.candidateIDs)))
+	}
+	b.WriteByte('\x00')
+	if m.workspaceMode && m.activeRepos != nil {
+		repos := sortedRepoKeys(m.activeRepos)
+		b.WriteString(strings.Join(repos, ","))
+	}
+	return b.String()
+}
+
+// etaContext returns a lazily cached dataset-level ETAContext for
+// m.candidateScopedIssues() so TUI Detail Pane and Graph View compute
+// per-issue ETA forecasts in O(1+L) without rescanning all N issues on every
+// cursor move, while invalidating on Phase 2 readiness, dataset reloads, and
+// workspace/label/repo scope changes.
 func (m *Model) etaContext() *analysis.ETAContext {
-	if len(m.issues) == 0 {
+	scoped := m.candidateScopedIssues()
+	if len(scoped) == 0 {
 		return nil
 	}
+	phase2Ready := m.analysis != nil && m.analysis.IsPhase2Ready()
+	scopeKey := m.etaScopeKey()
 	now := m.analysisReferenceTime()
 	nowBucket := now.Unix() / 60
-	if !m.referenceNow.IsZero() {
+	if !m.referenceNow.IsZero() || m.analyzer != nil {
 		nowBucket = now.UnixNano()
 	}
-	if m.etaCtx != nil && m.etaCtxStats == m.analysis && m.etaCtxCount == len(m.issues) && m.etaCtxMinute == nowBucket {
+	if m.etaCtx != nil &&
+		m.etaCtxStats == m.analysis &&
+		m.etaCtxPhase2Ready == phase2Ready &&
+		m.etaCtxDataGen == m.semanticDataGeneration &&
+		m.etaCtxScopeKey == scopeKey &&
+		m.etaCtxCount == len(scoped) &&
+		m.etaCtxMinute == nowBucket {
 		return m.etaCtx
 	}
-	m.etaCtx = analysis.NewETAContext(m.issues, m.analysis, now)
+	m.etaCtx = analysis.NewETAContext(scoped, m.analysis, now)
 	m.etaCtxStats = m.analysis
-	m.etaCtxCount = len(m.issues)
+	m.etaCtxPhase2Ready = phase2Ready
+	m.etaCtxDataGen = m.semanticDataGeneration
+	m.etaCtxScopeKey = scopeKey
+	m.etaCtxCount = len(scoped)
 	m.etaCtxMinute = nowBucket
 	return m.etaCtx
 }

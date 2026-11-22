@@ -1009,6 +1009,7 @@ func TestETAContext_BitIdenticalToEstimateETAForIssue(t *testing.T) {
 		{ID: "CL-2", Title: "Closed frontend", Status: model.StatusClosed, IssueType: model.TypeFeature, Labels: []string{"frontend"}, EstimatedMinutes: &est240, ClosedAt: &closed2, UpdatedAt: closed2},
 		{ID: "OP-1", Title: "Open backend", Status: model.StatusOpen, IssueType: model.TypeBug, Labels: []string{"backend", "frontend"}, EstimatedMinutes: &est120, UpdatedAt: now},
 		{ID: "OP-2", Title: "Open unlabeled", Status: model.StatusOpen, IssueType: model.TypeTask, UpdatedAt: now},
+		{ID: "OP-3", Title: "Open empty label element", Status: model.StatusOpen, IssueType: model.TypeTask, Labels: []string{"", "frontend"}, EstimatedMinutes: &est120, UpdatedAt: now},
 	}
 	an := NewAnalyzer(issues)
 	an.SetNow(now)

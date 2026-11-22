@@ -147,20 +147,23 @@ func TestIssueDelegate_RecipeColumnsAndWidth(t *testing.T) {
 	item.Issue.Title = "界界界界界 Alpha"
 	item.Issue.CreatedAt = time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
 	item.Issue.UpdatedAt = item.Issue.CreatedAt.Add(24 * time.Hour)
+	item.Issue.SourceRepo = "api"
 	want := map[string]string{
-		"id":       "view-1",
-		"title":    "界界…",
-		"status":   "open",
-		"priority": "P1",
-		"assignee": "@alice",
-		"created":  "2026-01-02",
-		"updated":  "2026-01-03",
-		"tags":     "one,two",
-		"label":    "one,two",
-		"labels":   "one,two",
-		"blockers": "blockers:2",
+		"id":          "view-1",
+		"title":       "界界…",
+		"status":      "open",
+		"priority":    "P1",
+		"assignee":    "@alice",
+		"created":     "2026-01-02",
+		"updated":     "2026-01-03",
+		"tags":        "one,two",
+		"label":       "one,two",
+		"labels":      "one,two",
+		"blockers":    "blockers:2",
+		"repo":        "api",
+		"source_repo": "api",
 	}
-	for _, column := range append(append([]string(nil), recipe.ViewColumns...), "label", "labels") {
+	for _, column := range append(append([]string(nil), recipe.ViewColumns...), "label", "labels", "source_repo") {
 		t.Run(column, func(t *testing.T) {
 			d := IssueDelegate{Theme: DefaultTheme(lipgloss.NewRenderer(nil)), Columns: []string{column}, TruncateTitle: 5, BlockerCounts: map[string]int{"view-1": 2}}
 			l := list.New([]list.Item{item}, d, 80, 10)

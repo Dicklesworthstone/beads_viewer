@@ -25,7 +25,7 @@
 |  | `P` | Sprint dashboard |
 |  | `[` | Label dashboard |
 |  | `]` | Attention view |
-| **list** | `!` | Alerts panel |
+| **list** | `!` | Alerts & hygiene suggestions panel (Tab switches) |
 |  | `w` | Repo picker (workspace mode) |
 | **all** | `?` | Help overlay |
 |  | `` ` `` | Interactive tutorial |

@@ -422,7 +422,7 @@ func (s *ShortcutsSidebar) hardcodedSections() []shortcutSection {
 				{"C", "Copy issue"},
 				{"O", "Open in $EDITOR"},
 				{"'", "Recipe picker"},
-				{"!", "Alerts panel"},
+				{"!", "Alerts/Suggestions"},
 				{"U", "Self-update"},
 				{"V", "Cass sessions"},
 			},

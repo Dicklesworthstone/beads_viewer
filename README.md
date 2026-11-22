@@ -2758,7 +2758,7 @@ When cass is available, press `V` in History to open the separate session modal 
 
 ## 📅 Sprint Dashboard: Burndown & Progress Tracking
 
-The **Sprint Dashboard** (`pkg/ui/sprint_view.go`) shows sprint progress, a simple burndown chart, at-risk items, and sprint beads, driven by `.beads/sprints.jsonl`. Historical scope changes are available through `--robot-burndown`, not this dashboard. Press `P` from the list or detail view to open it on the sprint active today (the status line says so when no sprints are defined); `j`/`k` step between sprints, `Ctrl+d`/`Ctrl+u` scroll, `Enter` jumps to the first sprint bead, and `P`, `Esc`, or `q` close it.
+The **Sprint Dashboard** (`pkg/ui/sprint_view.go`) shows sprint progress, a daily burndown chart, burn rates & completion projection, at-risk items, and selectable sprint beads, driven by `.beads/sprints.jsonl`. Historical scope changes are available through `--robot-burndown`, not this dashboard. Press `P` from the list or detail view to open it on the sprint active today (the status line says so when no sprints are defined); `j`/`k` step between sprints, `Tab`/`Shift+Tab` or `n`/`p` move the sprint bead cursor, `Ctrl+d`/`Ctrl+u` scroll, `Enter` jumps to the first sprint bead (or whichever sprint bead is highlighted), and `P`, `Esc`, or `q` close it.
 
 ### Dashboard Layout
 
@@ -2769,13 +2769,13 @@ The dashboard presents these sections in order:
 | Sprint header | Name, date range, days remaining |
 | Progress | Closed/total count, percentage, progress bar |
 | Status | Closed, in-progress, blocked, and other open counts |
-| Burndown | `·` linear ideal and `●` current remaining count |
+| Burndown | `·` linear ideal, `●` daily closure curve, burn velocity, On track/Behind status, and projected completion |
 | At Risk | Up to five flagged beads and their reasons |
-| Beads | Sprint issue rows |
+| Beads | Selectable sprint issue rows (`▸` cursor) |
 
 ### Burndown Calculation
 
-The TUI draws a linear ideal from the current sprint total and marks today's remaining count. The richer `--robot-burndown` output provides completion rates and historical scope changes:
+Both the TUI Sprint Dashboard and `--robot-burndown` compute daily actual closure points, ideal vs. actual burn rates, on-track status, and projected completion via `analysis.ComputeSprintBurndown`. The richer `--robot-burndown` output additionally provides historical scope-change events:
 
 1. **Ideal Burn Rate:** `Total Beads / Sprint Duration`
 2. **Actual Burn Rate:** `Closed Beads / Days Elapsed`
@@ -3336,7 +3336,7 @@ bv --robot-triage --format toon --stats           # Show JSON vs TOON token esti
 | `--export` | string | (empty) | Export a report using recipe defaults or explicit export options | Export & Reporting |
 | `--export-format` | string | (empty) | Report format: markdown, html, json, csv or mermaid | Export & Reporting |
 | `--export-graph` | string | (empty) | Export graph: .html for interactive, .png/.svg for static (auto-names if empty) | Export & Reporting |
-| `--export-group-by` | string | (empty) | Group exported issues by: status, priority, type, assignee, label, or none (overrides recipe view.group_by) | Export & Reporting |
+| `--export-group-by` | string | (empty) | Group exported issues by: status, priority, type, assignee, label, repo, or none (overrides recipe view.group_by) | Export & Reporting |
 | `--export-include-actions` | bool | `true` | Include recommended action plan in Markdown/HTML reports (explicit false overrides recipe) | Export & Reporting |
 | `--export-include-graph` | bool | `true` | Include dependency context in the report (explicit false overrides recipe) | Export & Reporting |
 | `--export-md` | string | (empty) | Export issues to a Markdown file (e.g., report.md) | Export & Reporting |
@@ -4299,7 +4299,7 @@ bv has a comprehensive built-in help system:
 |  | `P` | Sprint dashboard |
 |  | `[` | Label dashboard |
 |  | `]` | Attention view |
-| **list** | `!` | Alerts panel |
+| **list** | `!` | Alerts & hygiene suggestions panel (Tab switches) |
 |  | `w` | Repo picker (workspace mode) |
 | **all** | `?` | Help overlay |
 |  | `` ` `` | Interactive tutorial |

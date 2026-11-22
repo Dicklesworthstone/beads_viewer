@@ -2039,6 +2039,15 @@ func (m *InsightsModel) buildDetailMarkdown(selectedID string) string {
 	if issue.Assignee != "" {
 		meta("Assignee", "@"+issue.Assignee)
 	}
+	if strings.TrimSpace(issue.SourceRepo) != "" {
+		meta("Repo", fmt.Sprintf("`%s`", strings.TrimSpace(issue.SourceRepo)))
+	}
+	if issue.EstimatedMinutes != nil && *issue.EstimatedMinutes > 0 {
+		meta("Estimate", formatEstimateDuration(*issue.EstimatedMinutes))
+	}
+	if strings.TrimSpace(issue.CreatedBy) != "" {
+		meta("Created By", "@"+strings.TrimSpace(issue.CreatedBy))
+	}
 	meta("Created", issue.CreatedAt.Format("2006-01-02"))
 	if issue.DueDate != nil {
 		meta("Due", issue.DueDate.Format("2006-01-02"))
@@ -2051,6 +2060,9 @@ func (m *InsightsModel) buildDetailMarkdown(selectedID string) string {
 	// visible in the TUI instead of forcing it into the description (#172).
 	if issue.ExternalRef != nil && *issue.ExternalRef != "" {
 		meta("External Ref", fmt.Sprintf("`%s`", *issue.ExternalRef))
+	}
+	if strings.TrimSpace(issue.CloseReason) != "" {
+		meta("Close Reason", strings.TrimSpace(issue.CloseReason))
 	}
 	sb.WriteString("\n")
 
@@ -2075,7 +2087,32 @@ func (m *InsightsModel) buildDetailMarkdown(selectedID string) string {
 		sb.WriteString(fmt.Sprintf("- **Impact Depth:** `%.0f` _(downstream chain length)_\n", imp))
 		sb.WriteString(fmt.Sprintf("- **Centrality:** PR `%.4f` • BW `%.4f` • EV `%.4f`\n", pr, bt, ev))
 		sb.WriteString(fmt.Sprintf("- **Flow Role:** Hub `%.4f` • Auth `%.4f`\n", hub, auth))
-		sb.WriteString(fmt.Sprintf("- **Degree:** In `%d` ← → Out `%d`\n\n", stats.InDegree[selectedID], stats.OutDegree[selectedID]))
+		sb.WriteString(fmt.Sprintf("- **Degree:** In `%d` ← → Out `%d`\n", stats.InDegree[selectedID], stats.OutDegree[selectedID]))
+		if stats.IsPhase2Ready() {
+			structParts := make([]string, 0, 3)
+			if coreMap := stats.CoreNumber(); coreMap != nil {
+				if kcore, ok := coreMap[selectedID]; ok {
+					structParts = append(structParts, fmt.Sprintf("K-Core `%d`", kcore))
+				}
+			}
+			if len(stats.Cycles()) == 0 {
+				if slackMap := stats.Slack(); slackMap != nil {
+					if sl, ok := slackMap[selectedID]; ok {
+						structParts = append(structParts, fmt.Sprintf("Slack `%.1f`", sl))
+					}
+				}
+			}
+			for _, ap := range stats.ArticulationPoints() {
+				if ap == selectedID {
+					structParts = append(structParts, "⚠ Cut Vertex")
+					break
+				}
+			}
+			if len(structParts) > 0 {
+				sb.WriteString("- **Structure:** " + strings.Join(structParts, " • ") + "\n")
+			}
+		}
+		sb.WriteString("\n")
 	}
 
 	if advMD := m.renderAdvancedInsightsMD(); advMD != "" {
