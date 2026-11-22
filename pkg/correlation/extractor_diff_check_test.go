@@ -1092,4 +1092,54 @@ func TestWave22_Pass2ShortSHARejectIncrementalWindowAndMergeRejectedPairs(t *tes
 	if fpAfter := storeUpper.Fingerprint(); fpAfter == fpBefore {
 		t.Fatalf("FeedbackStore.Fingerprint() did not change when FeedbackAt advanced: %q", fpAfter)
 	}
+
+	// 6. Pass 5 #5 & #7: Fingerprint includes FeedbackBy/Reason AND Pass 1 canonicalizes
+	//    short/uppercase commit.SHA so an older short-SHA Confirm never overrides a newer full-SHA Reject.
+	sameTime := time.Date(2026, 11, 20, 10, 0, 0, 0, time.UTC)
+	storeFP1 := NewFeedbackStore(t.TempDir())
+	storeFP1.cache[feedbackKey{commitSHA: firstSHA, beadID: "bv-s1"}] = CorrelationFeedback{
+		CommitSHA: firstSHA, BeadID: "bv-s1", Type: FeedbackConfirm, FeedbackAt: sameTime, FeedbackBy: "alice", Reason: "r1",
+	}
+	storeFP2 := NewFeedbackStore(t.TempDir())
+	storeFP2.cache[feedbackKey{commitSHA: firstSHA, beadID: "bv-s1"}] = CorrelationFeedback{
+		CommitSHA: firstSHA, BeadID: "bv-s1", Type: FeedbackConfirm, FeedbackAt: sameTime, FeedbackBy: "bob", Reason: "r2",
+	}
+	if storeFP1.Fingerprint() == storeFP2.Fingerprint() {
+		t.Fatalf("FeedbackStore.Fingerprint() ignored FeedbackBy/Reason change: %q", storeFP1.Fingerprint())
+	}
+
+	storePass1 := NewFeedbackStore(t.TempDir())
+	storePass1.cache[feedbackKey{commitSHA: firstSHA[:8], beadID: "bv-s1"}] = CorrelationFeedback{
+		CommitSHA: firstSHA[:8], BeadID: "bv-s1", Type: FeedbackConfirm, FeedbackAt: sameTime, FeedbackBy: "alice",
+	}
+	storePass1.cache[feedbackKey{commitSHA: firstSHA, beadID: "bv-s1"}] = CorrelationFeedback{
+		CommitSHA: firstSHA, BeadID: "bv-s1", Type: FeedbackReject, FeedbackAt: sameTime.Add(time.Second), FeedbackBy: "bob",
+	}
+	shortHist := map[string]BeadHistory{
+		"bv-s1": {BeadID: "bv-s1", Commits: []CorrelatedCommit{{SHA: firstSHA[:8], BeadID: "bv-s1"}}},
+	}
+	appliedPass1, rejPass1 := applyFeedbackWithRepoAndOptions(storePass1, context.Background(), repo, shortHist, CorrelatorOptions{})
+	if len(shortHist["bv-s1"].Commits) != 0 || appliedPass1 == nil || appliedPass1.Rejected != 1 {
+		t.Fatalf("Pass 1 bypassed effectiveByPair for short commit.SHA: commits=%+v applied=%+v rej=%+v", shortHist["bv-s1"].Commits, appliedPass1, rejPass1)
+	}
+	if !rejPass1[firstSHA]["bv-s1"] {
+		t.Fatalf("Pass 1 did not record canonical rejected pair for %s: %+v", firstSHA, rejPass1)
+	}
+
+	// 7. Pass 5 #6: Pass 2 orphan-confirm tie-break against a newer Pass 1 Ignore for the same canonical SHA
+	//    must NOT re-inject the ignored commit, whereas a newer Pass 2 Confirm DOES override an older Ignore.
+	storePass2NewerIgnore := NewFeedbackStore(t.TempDir())
+	storePass2NewerIgnore.cache[feedbackKey{commitSHA: firstSHA[:8], beadID: "bv-s1"}] = CorrelationFeedback{
+		CommitSHA: firstSHA[:8], BeadID: "bv-s1", Type: FeedbackConfirm, FeedbackAt: sameTime, FeedbackBy: "alice",
+	}
+	storePass2NewerIgnore.cache[feedbackKey{commitSHA: firstSHA, beadID: "bv-s1"}] = CorrelationFeedback{
+		CommitSHA: firstSHA, BeadID: "bv-s1", Type: FeedbackIgnore, FeedbackAt: sameTime.Add(time.Second), FeedbackBy: "bob",
+	}
+	histIgnoreWins := map[string]BeadHistory{
+		"bv-s1": {BeadID: "bv-s1", Commits: []CorrelatedCommit{{SHA: firstSHA, BeadID: "bv-s1"}}},
+	}
+	appliedIgnoreWins, _ := applyFeedbackWithRepoAndOptions(storePass2NewerIgnore, context.Background(), repo, histIgnoreWins, CorrelatorOptions{})
+	if len(histIgnoreWins["bv-s1"].Commits) != 0 || appliedIgnoreWins == nil || appliedIgnoreWins.Ignored != 1 {
+		t.Fatalf("older short Confirm overrode newer full Ignore: commits=%+v applied=%+v", histIgnoreWins["bv-s1"].Commits, appliedIgnoreWins)
+	}
 }

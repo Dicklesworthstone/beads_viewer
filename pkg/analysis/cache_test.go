@@ -1945,3 +1945,51 @@ func TestWave22_Pass2SmallTriageExactFallbackAndAllClosedActiveDAGCacheHit(t *te
 		t.Fatalf("warm all-closed disk-cache hit leaked closed nodes: cp=%v slack=%v", c2.ActiveCriticalPathScore(), c2.ActiveSlack())
 	}
 }
+
+func TestWave24_ActiveDAGCacheKeyDistinguishesWantCPAndWantSlack(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "DAG-1", Title: "Root", Status: model.StatusOpen, IssueType: model.TypeTask},
+		{
+			ID: "DAG-2", Title: "Leaf", Status: model.StatusOpen, IssueType: model.TypeTask,
+			Dependencies: []*model.Dependency{{IssueID: "DAG-2", DependsOnID: "DAG-1", Type: model.DepBlocks}},
+		},
+	}
+
+	// First run requests only CriticalPath (wantCP=true, wantSlack=false).
+	cfgCPOnly := analysis.AnalysisConfig{
+		RunToCompletion:     true,
+		ComputeCriticalPath: true,
+		ComputeSlack:        false,
+	}
+	an := analysis.NewAnalyzer(issues)
+	sCPOnly := an.AnalyzeAsyncWithConfig(context.Background(), cfgCPOnly)
+	sCPOnly.WaitForPhase2()
+	if len(sCPOnly.ActiveCriticalPathScore()) != 2 {
+		t.Fatalf("expected 2 ActiveCriticalPathScore entries, got %v", sCPOnly.ActiveCriticalPathScore())
+	}
+	if len(sCPOnly.ActiveSlack()) != 0 {
+		t.Fatalf("expected nil/empty ActiveSlack when ComputeSlack=false, got %v", sCPOnly.ActiveSlack())
+	}
+
+	// Second run on the SAME analyzer requests both CriticalPath and Slack;
+	// activeDAGCacheKey must NOT collide with the CP-only cached entry.
+	cfgBoth := analysis.AnalysisConfig{
+		RunToCompletion:     true,
+		ComputeCriticalPath: true,
+		ComputeSlack:        true,
+	}
+	sBoth := an.AnalyzeAsyncWithConfig(context.Background(), cfgBoth)
+	sBoth.WaitForPhase2()
+	if len(sBoth.ActiveSlack()) != 2 {
+		t.Fatalf("activeDAGCacheKey collided between (wantCP=true,wantSlack=false) and (true,true): slack=%v", sBoth.ActiveSlack())
+	}
+
+	// All-closed graph with ComputeSlack=false must keep ActiveSlack nil/empty and ComputeCriticalPath=false keep ActiveCriticalPathScore nil/empty.
+	closedAt := time.Date(2026, 11, 20, 0, 0, 0, 0, time.UTC)
+	closedOnly := []model.Issue{{ID: "DAG-C1", Title: "Closed", Status: model.StatusClosed, IssueType: model.TypeTask, ClosedAt: &closedAt}}
+	sClosed := analysis.NewAnalyzer(closedOnly).AnalyzeAsyncWithConfig(context.Background(), cfgCPOnly)
+	sClosed.WaitForPhase2()
+	if sClosed.ActiveSlack() != nil && len(sClosed.ActiveSlack()) != 0 {
+		t.Fatalf("expected empty ActiveSlack on closed-only graph with ComputeSlack=false, got %v", sClosed.ActiveSlack())
+	}
+}

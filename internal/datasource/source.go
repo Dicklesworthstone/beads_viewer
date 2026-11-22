@@ -371,7 +371,10 @@ func discoverSQLiteSources(beadsDir string, opts DiscoveryOptions) ([]DataSource
 	addCandidate := func(p string) {
 		clean := filepath.Clean(p)
 		key := clean
-		if resolved, err := filepath.EvalSymlinks(clean); err == nil && resolved != "" {
+		if abs, err := filepath.Abs(clean); err == nil && abs != "" {
+			key = filepath.Clean(abs)
+		}
+		if resolved, err := filepath.EvalSymlinks(key); err == nil && resolved != "" {
 			key = filepath.Clean(resolved)
 		}
 		if !seen[clean] && !seen[key] {

@@ -1394,6 +1394,20 @@ func applyFeedbackWithRepoAndOptions(store *FeedbackStore, ctx context.Context, 
 			return 0
 		}
 	}
+	feedbackOutranks := func(cand CorrelationFeedback, candShort bool, prev CorrelationFeedback, prevShort bool) bool {
+		switch {
+		case cand.FeedbackAt.After(prev.FeedbackAt):
+			return true
+		case cand.FeedbackAt.Equal(prev.FeedbackAt):
+			if !candShort && prevShort {
+				return true
+			}
+			if candShort == prevShort && feedbackTypeRank(cand.Type) > feedbackTypeRank(prev.Type) {
+				return true
+			}
+		}
+		return false
+	}
 	type canonicalFeedback struct {
 		fb      CorrelationFeedback
 		isShort bool
@@ -1403,6 +1417,7 @@ func applyFeedbackWithRepoAndOptions(store *FeedbackStore, ctx context.Context, 
 	// short SHAs, and symbolic/long refs) so last-write-wins (latest FeedbackAt) works
 	// consistently across all SHA spellings for Reject, Confirm, and Ignore alike.
 	effectiveByPair := make(map[string]map[string]*canonicalFeedback)
+	canonicalByRaw := make(map[string]string, len(allFeedback))
 	for _, fb := range allFeedback {
 		rawSHA := strings.TrimSpace(fb.CommitSHA)
 		if rawSHA == "" || fb.BeadID == "" {
@@ -1415,6 +1430,8 @@ func applyFeedbackWithRepoAndOptions(store *FeedbackStore, ctx context.Context, 
 		} else if fullSHA := resolveCommitRef(rawSHA); fullSHA != "" {
 			canonicalSHA = fullSHA
 		}
+		canonicalByRaw[fb.CommitSHA] = canonicalSHA
+		canonicalByRaw[rawSHA] = canonicalSHA
 		if effectiveByPair[canonicalSHA] == nil {
 			effectiveByPair[canonicalSHA] = make(map[string]*canonicalFeedback)
 		}
@@ -1428,18 +1445,7 @@ func applyFeedbackWithRepoAndOptions(store *FeedbackStore, ctx context.Context, 
 			continue
 		}
 		prev.rawSHAs = append(prev.rawSHAs, fb.CommitSHA)
-		wins := false
-		switch {
-		case fb.FeedbackAt.After(prev.fb.FeedbackAt):
-			wins = true
-		case fb.FeedbackAt.Equal(prev.fb.FeedbackAt):
-			if !isShort && prev.isShort {
-				wins = true
-			} else if isShort == prev.isShort && feedbackTypeRank(fb.Type) > feedbackTypeRank(prev.fb.Type) {
-				wins = true
-			}
-		}
-		if wins {
+		if feedbackOutranks(fb, isShort, prev.fb, prev.isShort) {
 			prev.fb = fb
 			prev.isShort = isShort
 		}
@@ -1458,6 +1464,26 @@ func applyFeedbackWithRepoAndOptions(store *FeedbackStore, ctx context.Context, 
 		}
 	}
 
+	canonicalizeCommitSHA := func(sha string) string {
+		trimmed := strings.TrimSpace(sha)
+		if trimmed == "" {
+			return ""
+		}
+		if isHexSHA40(trimmed) {
+			return strings.ToLower(trimmed)
+		}
+		if mapped, ok := canonicalByRaw[sha]; ok && mapped != "" {
+			return mapped
+		}
+		if mapped, ok := canonicalByRaw[trimmed]; ok && mapped != "" {
+			return mapped
+		}
+		if fullSHA := resolveCommitRef(trimmed); fullSHA != "" {
+			return fullSHA
+		}
+		return trimmed
+	}
+
 	seenByBead := make(map[string]map[string]bool, len(histories))
 	for beadID, history := range histories {
 		seen := make(map[string]bool, len(history.Commits))
@@ -1468,25 +1494,24 @@ func applyFeedbackWithRepoAndOptions(store *FeedbackStore, ctx context.Context, 
 		kept := make([]CorrelatedCommit, 0, len(history.Commits))
 		changed := false
 		for _, commit := range history.Commits {
-			var (
-				fb CorrelationFeedback
-				ok bool
-			)
-			if eff := effectiveByPair[commit.SHA][beadID]; eff != nil {
-				fb = eff.fb
-				ok = true
-			} else {
-				fb, ok = store.Get(commit.SHA, beadID)
-			}
-			if !ok {
+			commitCanon := canonicalizeCommitSHA(commit.SHA)
+			eff := effectiveByPair[commitCanon][beadID]
+			if eff == nil {
 				seen[commit.SHA] = true
+				if commitCanon != "" {
+					seen[commitCanon] = true
+				}
 				kept = append(kept, commit)
 				continue
 			}
+			fb := eff.fb
 			switch fb.Type {
 			case FeedbackReject:
 				applied.Rejected++
 				recordReject(commit.SHA, beadID)
+				if commitCanon != "" {
+					recordReject(commitCanon, beadID)
+				}
 				changed = true
 				continue
 			case FeedbackConfirm:
@@ -1505,6 +1530,9 @@ func applyFeedbackWithRepoAndOptions(store *FeedbackStore, ctx context.Context, 
 				applied.Ignored++
 			}
 			seen[commit.SHA] = true
+			if commitCanon != "" {
+				seen[commitCanon] = true
+			}
 			kept = append(kept, commit)
 		}
 		if !changed {
@@ -1570,21 +1598,23 @@ func applyFeedbackWithRepoAndOptions(store *FeedbackStore, ctx context.Context, 
 			if err != nil {
 				continue
 			}
-			if rejectedPairs[resolved.SHA][beadID] {
-				continue
-			}
-			if seenByBead[beadID][resolved.SHA] {
-				// If canonical resolved.SHA already has an effective feedback entry
-				// (handled in Pass 1, e.g. a newer Ignore or Confirm), do not double-count
-				// or override it with a stale unresolved alias.
-				if effectiveByPair[resolved.SHA][beadID] != nil {
+			existingCanon := effectiveByPair[resolved.SHA][beadID]
+			if existingCanon != nil && existingCanon != eff {
+				if !feedbackOutranks(eff.fb, eff.isShort, existingCanon.fb, existingCanon.isShort) {
 					seenByBead[beadID][canonicalSHA] = true
 					continue
 				}
-				// Short-SHA confirm matched an existing commit whose SHA wasn't resolved earlier:
-				// upgrade in-place and always count applied.Confirmed (matching Pass 1).
+				if existingCanon.fb.Type == FeedbackIgnore && seenByBead[beadID][resolved.SHA] && applied.Ignored > 0 {
+					applied.Ignored--
+				}
+			} else if rejectedPairs[resolved.SHA][beadID] {
+				continue
+			}
+			if seenByBead[beadID][resolved.SHA] {
+				// Short-SHA / alias confirm matched an existing commit (or outranked an older
+				// Ignore): upgrade in-place and count applied.Confirmed (matching Pass 1).
 				for i := range history.Commits {
-					if history.Commits[i].SHA == resolved.SHA {
+					if canonicalizeCommitSHA(history.Commits[i].SHA) == resolved.SHA {
 						applied.Confirmed++
 						history.Commits[i].Confidence = 1.0
 						if !history.Commits[i].Confirmed {

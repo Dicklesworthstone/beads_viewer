@@ -548,4 +548,30 @@ func TestWave22_Pass2MetadataJSONHardening(t *testing.T) {
 			t.Fatalf("discoverSQLiteSources returned %d duplicate SQLite sources for symlinked beads.db: %+v", len(sources), sources)
 		}
 	}
+
+	// 5. Pass 5 #4: Relative beadsDir with metadata.json database="beads.db" must deduplicate cleanly.
+	relProj := t.TempDir()
+	relBeadsDir := filepath.Join(relProj, ".beads")
+	if err := os.MkdirAll(relBeadsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	createTestSQLiteDB(t, filepath.Join(relBeadsDir, "beads.db"))
+	if err := os.WriteFile(filepath.Join(relBeadsDir, "metadata.json"), []byte(`{"backend":"sqlite","database":"beads.db"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	origWD, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(relProj); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(origWD) })
+	relSources, err := discoverSQLiteSources(".beads", DiscoveryOptions{BeadsDir: ".beads"})
+	if err != nil {
+		t.Fatalf("discoverSQLiteSources on relative .beads: %v", err)
+	}
+	if len(relSources) != 1 {
+		t.Fatalf("discoverSQLiteSources returned %d duplicate SQLite sources for relative .beads: %+v", len(relSources), relSources)
+	}
 }

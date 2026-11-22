@@ -215,6 +215,10 @@ func (fs *FeedbackStore) Fingerprint() string {
 		h.Write([]byte(fb.Type))
 		h.Write([]byte{0})
 		h.Write([]byte(fb.FeedbackAt.UTC().Format(time.RFC3339Nano)))
+		h.Write([]byte{0})
+		h.Write([]byte(fb.FeedbackBy))
+		h.Write([]byte{0})
+		h.Write([]byte(fb.Reason))
 		h.Write([]byte{'\n'})
 	}
 	return hex.EncodeToString(h.Sum(nil))[:16]

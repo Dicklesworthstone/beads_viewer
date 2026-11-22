@@ -478,3 +478,45 @@ func TestDetectAtRiskWithReadiness_HonorsTombstoneIDsAndCrossRepoBlockers(t *tes
 		t.Fatalf("api:xrepo-gated detail = %q, want cross-repo blocker web:open-1", got[0].Detail)
 	}
 }
+
+func TestComputeSprintBurndown_DailyClosureCurveAndProjection(t *testing.T) {
+	start := time.Date(2026, 11, 10, 0, 0, 0, 0, time.UTC)
+	end := time.Date(2026, 11, 19, 0, 0, 0, 0, time.UTC) // 10 days total
+	now := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC) // day 5 elapsed
+	closedDay1 := time.Date(2026, 11, 10, 18, 0, 0, 0, time.UTC)
+	closedDay3 := time.Date(2026, 11, 12, 18, 0, 0, 0, time.UTC)
+
+	sprint := &model.Sprint{
+		ID:        "sp-curve",
+		Name:      "Curve Sprint",
+		StartDate: start,
+		EndDate:   end,
+		BeadIDs:   []string{"B1", "B2", "B3", "B4"},
+	}
+	issues := []model.Issue{
+		{ID: "B1", Status: model.StatusClosed, ClosedAt: &closedDay1},
+		{ID: "B2", Status: model.StatusClosed, ClosedAt: &closedDay3},
+		{ID: "B3", Status: model.StatusOpen},
+		{ID: "B4", Status: model.StatusOpen},
+	}
+
+	bd := ComputeSprintBurndown(sprint, issues, now)
+	if bd.TotalDays != 10 || bd.ElapsedDays != 5 || bd.RemainingDays != 5 {
+		t.Fatalf("days = (%d,%d,%d), want (10,5,5)", bd.TotalDays, bd.ElapsedDays, bd.RemainingDays)
+	}
+	if bd.TotalIssues != 4 || bd.CompletedIssues != 2 || bd.RemainingIssues != 2 {
+		t.Fatalf("counts = (%d,%d,%d), want (4,2,2)", bd.TotalIssues, bd.CompletedIssues, bd.RemainingIssues)
+	}
+	if len(bd.DailyPoints) != 5 {
+		t.Fatalf("expected 5 daily points, got %d: %+v", len(bd.DailyPoints), bd.DailyPoints)
+	}
+	wantRem := []int{3, 3, 2, 2, 2}
+	for i, want := range wantRem {
+		if bd.DailyPoints[i].Remaining != want {
+			t.Fatalf("day %d remaining = %d, want %d (all=%+v)", i, bd.DailyPoints[i].Remaining, want, bd.DailyPoints)
+		}
+	}
+	if bd.ProjectedComplete == nil || bd.ActualBurnRate <= 0 || bd.IdealBurnRate <= 0 {
+		t.Fatalf("expected positive burn rates and projected completion: %+v", bd)
+	}
+}

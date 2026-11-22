@@ -2194,6 +2194,17 @@ func (a *Analyzer) computeActiveSubgraphMetricsWithKey(activeIDs []string, activ
 // skipped/timed out or the active subgraph contains a cycle, the corresponding
 // boolean availability flag is false so callers never confuse missing map keys
 // with zero slack.
+func activeDAGCacheKey(activeHash string, status MetricStatus, wantCP, wantSlack bool) string {
+	cpFlag, slFlag := "0", "0"
+	if wantCP {
+		cpFlag = "1"
+	}
+	if wantSlack {
+		slFlag = "1"
+	}
+	return activeHash + "|" + status.Critical.State + "|" + status.Slack.State + "|" + cpFlag + "|" + slFlag
+}
+
 func (a *Analyzer) activeDAGMetrics(stats *GraphStats) (map[string]float64, map[string]float64, bool, bool) {
 	if a == nil || stats == nil {
 		return nil, nil, false, false
@@ -2221,7 +2232,7 @@ func (a *Analyzer) activeDAGMetrics(stats *GraphStats) (map[string]float64, map[
 		}
 		return cp, sl, wantCP && len(cp) > 0, wantSlack && len(sl) > 0
 	}
-	cacheKey := activeHash + "|" + status.Critical.State + "|" + status.Slack.State
+	cacheKey := activeDAGCacheKey(activeHash, status, wantCP, wantSlack)
 	stats.mu.RLock()
 	if stats.activeDAGKey == cacheKey {
 		hasCycle := stats.activeDAGHasCycle
@@ -2280,7 +2291,7 @@ func (a *Analyzer) computeActiveDAGMetricsWithKey(
 	if !wantCP && !wantSlack {
 		return "", nil, nil, false
 	}
-	cacheKey := activeHash + "|" + status.Critical.State + "|" + status.Slack.State
+	cacheKey := activeDAGCacheKey(activeHash, status, wantCP, wantSlack)
 	if len(activeIDs) == 0 {
 		var emptyCP, emptySl map[string]float64
 		if wantCP {
@@ -2313,7 +2324,14 @@ func (a *Analyzer) computeActiveDAGMetricsWithKey(
 		activeSorted = filtered
 	}
 	if len(activeSorted) == 0 {
-		return cacheKey, map[string]float64{}, map[string]float64{}, false
+		var emptyCP, emptySl map[string]float64
+		if wantCP {
+			emptyCP = map[string]float64{}
+		}
+		if wantSlack {
+			emptySl = map[string]float64{}
+		}
+		return cacheKey, emptyCP, emptySl, false
 	}
 
 	var cpOut map[string]float64
