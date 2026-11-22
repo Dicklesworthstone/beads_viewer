@@ -290,7 +290,7 @@ func (e *SQLiteExporter) insertIssues(db *sql.DB) error {
 		}
 		var dueDate *string
 		if issue.DueDate != nil {
-			s := issue.DueDate.Format(time.RFC3339)
+			s := issue.DueDate.UTC().Format(time.RFC3339)
 			dueDate = &s
 		}
 		var deferUntil *string
@@ -876,6 +876,7 @@ func (e *SQLiteExporter) insertMeta(db *sql.DB) error {
 		"has_hybrid_wasm":  strconv.FormatBool(e.hasHybridWasm),
 		"has_sprints":      strconv.FormatBool(e.Config.HasSprints),
 		"has_suggestions":  strconv.FormatBool(e.Config.HasSuggestions),
+		"has_history":      strconv.FormatBool(e.Config.HasHistory),
 	}
 
 	if e.gitHash != "" {
@@ -969,6 +970,7 @@ func (e *SQLiteExporter) writeRobotOutputs(bundle *Bundle, dataDir string) error
 		HasHybridWasm:  e.hasHybridWasm || bundleHasHybridWasm(bundle),
 		HasSprints:     e.Config.HasSprints,
 		HasSuggestions: e.Config.HasSuggestions,
+		HasHistory:     e.Config.HasHistory,
 	}
 	if err := e.writeRobotJSON(bundle, filepath.Join(dataDir, "meta.json"), meta); err != nil {
 		return fmt.Errorf("write meta.json: %w", err)

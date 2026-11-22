@@ -80,6 +80,7 @@ type ExportMeta struct {
 	HasHybridWasm  bool      `json:"has_hybrid_wasm"`
 	HasSprints     bool      `json:"has_sprints,omitempty"`
 	HasSuggestions bool      `json:"has_suggestions,omitempty"`
+	HasHistory     bool      `json:"has_history,omitempty"`
 }
 
 // SQLiteExportConfig configures the SQLite export process.
@@ -116,6 +117,8 @@ type SQLiteExportConfig struct {
 	HasSprints bool
 	// HasSuggestions records whether data/suggestions.json will be published alongside this bundle.
 	HasSuggestions bool
+	// HasHistory records whether data/history.json will be published alongside this bundle.
+	HasHistory bool
 }
 
 // DefaultSQLiteExportConfig returns sensible defaults for export configuration.
