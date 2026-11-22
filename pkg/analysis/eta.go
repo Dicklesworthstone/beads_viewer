@@ -37,6 +37,156 @@ func defaultVelocityMinutesPerDay(medianMinutes int) float64 {
 	return float64(DefaultEstimatedMinutes) / etaDefaultWeekDays
 }
 
+// ETAContext caches dataset-wide median estimated minutes and 30-day global
+// and per-label closure velocity buckets so interactive callers (such as the
+// TUI Detail Pane and Graph View) can forecast individual issues in
+// O(1 + len(issue.Labels)) per selection instead of rescanning all N issues.
+type ETAContext struct {
+	stats         *GraphStats
+	now           time.Time
+	medianMinutes int
+	globalVel     float64
+	globalSamples int
+	labelVel      map[string]float64
+	labelSamples  map[string]int
+}
+
+// NewETAContext precomputes dataset-level ETA statistics once for a snapshot.
+func NewETAContext(issues []model.Issue, stats *GraphStats, now time.Time) *ETAContext {
+	medianMinutes := computeMedianEstimatedMinutes(issues)
+	since := now.Add(-time.Duration(etaVelocityWindowDays) * 24 * time.Hour)
+	labelTotals := make(map[string]int)
+	labelSamples := make(map[string]int)
+	globalTotal := 0
+	globalSamples := 0
+
+	for _, iss := range issues {
+		closedAt, ok := resolveClosureTime(&iss, now)
+		if !ok || closedAt.Before(since) {
+			continue
+		}
+		minutes, _ := estimateComplexityMinutes(iss, stats, medianMinutes)
+		globalTotal += minutes
+		globalSamples++
+		seen := make(map[string]bool, len(iss.Labels))
+		for _, lbl := range iss.Labels {
+			norm := strings.ToLower(lbl)
+			if norm == "" || seen[norm] {
+				continue
+			}
+			seen[norm] = true
+			labelTotals[norm] += minutes
+			labelSamples[norm]++
+		}
+	}
+
+	globalVel := 0.0
+	if globalSamples > 0 {
+		globalVel = float64(globalTotal) / float64(etaVelocityWindowDays)
+	}
+	labelVel := make(map[string]float64, len(labelTotals))
+	for norm, total := range labelTotals {
+		if labelSamples[norm] > 0 {
+			labelVel[norm] = float64(total) / float64(etaVelocityWindowDays)
+		}
+	}
+
+	return &ETAContext{
+		stats:         stats,
+		now:           now,
+		medianMinutes: medianMinutes,
+		globalVel:     globalVel,
+		globalSamples: globalSamples,
+		labelVel:      labelVel,
+		labelSamples:  labelSamples,
+	}
+}
+
+// EstimateForIssue computes an ETAEstimate matching EstimateETAForIssue in
+// O(1 + len(issue.Labels)) time using precomputed dataset velocity buckets.
+func (c *ETAContext) EstimateForIssue(issue model.Issue, agents int) ETAEstimate {
+	if c == nil {
+		return ETAEstimate{}
+	}
+	if agents <= 0 {
+		agents = 1
+	}
+
+	complexityMinutes, complexityFactors := estimateComplexityMinutes(issue, c.stats, c.medianMinutes)
+
+	velocityPerDay := c.globalVel
+	velocitySamples := c.globalSamples
+	velocityFactors := []string{fmt.Sprintf("velocity: global (%d samples/30d)", c.globalSamples)}
+
+	if len(issue.Labels) > 0 {
+		bestLabel := ""
+		bestV := 0.0
+		bestN := 0
+		for _, label := range issue.Labels {
+			norm := strings.ToLower(label)
+			n := c.labelSamples[norm]
+			rawV := c.labelVel[norm]
+			if n == 0 || rawV <= 0 {
+				continue
+			}
+			priorV := rawV
+			if c.globalSamples > 0 && c.globalVel > 0 {
+				priorV = c.globalVel
+			}
+			nf := float64(n)
+			shrunkV := (nf*rawV + buehlmannStraubPriorWeight*priorV) / (nf + buehlmannStraubPriorWeight)
+			if bestV == 0 || shrunkV < bestV || (shrunkV == bestV && norm < strings.ToLower(bestLabel)) {
+				bestLabel = label
+				bestV = shrunkV
+				bestN = n
+			}
+		}
+		if bestV > 0 {
+			velocityPerDay = bestV
+			velocitySamples = bestN
+			velocityFactors = []string{fmt.Sprintf("velocity: label=%s (%.0f min/day, %d samples/30d)", bestLabel, bestV, bestN)}
+		}
+	}
+
+	if velocityPerDay <= 0 {
+		velocityPerDay = defaultVelocityMinutesPerDay(c.medianMinutes)
+		velocityFactors = append(velocityFactors, "velocity: no recent closures; using default")
+	}
+
+	capacityPerDay := velocityPerDay * float64(agents)
+	estimatedDays := float64(complexityMinutes) / capacityPerDay
+	if estimatedDays < 0 {
+		estimatedDays = 0
+	}
+
+	confidence := estimateETAConfidence(issue, velocitySamples)
+	deltaDays := max(0.5, estimatedDays*(1.0-confidence)*0.8)
+
+	eta := c.now.Add(durationDays(estimatedDays))
+	etaLow := c.now.Add(durationDays(max(0.0, estimatedDays-deltaDays)))
+	etaHigh := c.now.Add(durationDays(estimatedDays + deltaDays))
+
+	factors := append([]string{}, complexityFactors...)
+	factors = append(factors, velocityFactors...)
+	factors = append(factors, fmt.Sprintf("agents: %d", agents))
+	if len(factors) > 8 {
+		factors = factors[:8]
+	}
+
+	return ETAEstimate{
+		IssueID:               issue.ID,
+		EstimatedMinutes:      complexityMinutes,
+		EstimatedDays:         estimatedDays,
+		ETADate:               eta,
+		ETADateLow:            etaLow,
+		ETADateHigh:           etaHigh,
+		Confidence:            confidence,
+		VelocityMinutesPerDay: velocityPerDay,
+		Agents:                agents,
+		Factors:               factors,
+	}
+}
+
 // EstimateETAForIssue estimates an ETA for a single issue using:
 // - Complexity minutes: explicit estimate or median base, then type × depth × description-length multipliers for either base.
 // - Velocity minutes/day: derived from recent closures of issues sharing labels (fallback to global, then default).

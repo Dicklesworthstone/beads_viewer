@@ -398,7 +398,7 @@ func ComputeSprintBurndown(sprint *model.Sprint, sprintIssues []model.Issue, now
 	totalIssues := len(sprintIssues)
 	completedIssues := 0
 	for _, iss := range sprintIssues {
-		if iss.Status.IsClosed() {
+		if isClosedLikeStatus(iss.Status) {
 			completedIssues++
 		}
 	}
@@ -480,7 +480,7 @@ func GenerateDailyBurndown(sprint *model.Sprint, issues []model.Issue, now time.
 		completed := 0
 
 		for _, iss := range issues {
-			if !iss.Status.IsClosed() {
+			if !isClosedLikeStatus(iss.Status) {
 				continue
 			}
 			closedTime := time.Time{}
