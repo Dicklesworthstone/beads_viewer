@@ -1756,9 +1756,16 @@ func (w *BackgroundWorker) buildSnapshotResultContext(ctx context.Context, force
 	projectDir := w.projectDir
 	w.mu.RUnlock()
 
+	prevBeadsPath := ""
+	if prevSnapshot != nil {
+		prevBeadsPath = prevSnapshot.beadsPath
+		if prevBeadsPath == "" {
+			prevBeadsPath = w.beadsPath
+		}
+	}
 	loadMetadataUnchanged := prevSnapshot != nil &&
 		prevSnapshot.explicitProjectDir == projectDir &&
-		prevSnapshot.beadsPath == effectiveBeadsPath &&
+		prevBeadsPath == effectiveBeadsPath &&
 		prevSnapshot.skipSourceDiff == skipSourceDiff &&
 		prevSnapshot.AuthorityHash == authorityHash &&
 		prevSnapshot.AuthorityComplete == authorityComplete &&
