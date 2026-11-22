@@ -2759,6 +2759,41 @@ async function capabilitiesJourney(page) {
   assert.equal(wave25InsightsCheck.hasSprints, false, 'capabilities-fixture without sprints.jsonl keeps hasSprints=false');
   assert.equal(wave25InsightsCheck.sprintsNavVisible, false, 'Sprints nav link hidden when hasSprints=false');
 
+  // Wave 26: Label Intelligence & Cross-Label Flow (data/labels.json) + Global Backlog Capacity & Forecast (data/forecast.json) + B9-2 UTC date edge cases
+  const wave26InsightsCheck = await evaluate(page, `(() => {
+    const lblCard = document.getElementById('insights-label-intelligence');
+    const fcCard = document.getElementById('insights-forecast-suite');
+    const sortedLbls = ${app}.getSortedLabelIntelligence();
+    const flowEdges = ${app}.getCrossLabelFlowEdges();
+    return {
+      hasLabelsMeta: ${app}.meta?.has_labels === true || ${app}.meta?.has_labels === 'true',
+      hasLabels: ${app}.hasLabels,
+      lblCardVisible: Boolean(lblCard && (${visible})(lblCard)),
+      labelCount: sortedLbls.length,
+      flowEdgeCount: flowEdges.length,
+      hasForecastMeta: ${app}.meta?.has_forecast === true || ${app}.meta?.has_forecast === 'true',
+      hasForecast: ${app}.hasForecast,
+      fcCardVisible: Boolean(fcCard && (${visible})(fcCard)),
+      capOpenCount: ${app}.forecastData?.global_capacity?.open_count || 0,
+      capDays1a: Number(${app}.forecastData?.global_capacity?.days_1_agent || 0),
+      // B9-2 & B10-P2-7: non-UTC fixed offset ISO date preserves literal calendar day, Go zero time & impossible dates return ''
+      offsetDatePreserved: formatCalendarDateUTC('2026-03-08T00:00:00+02:00') === 'Mar 8, 2026',
+      zeroDateBlank: formatCalendarDateUTC('0001-01-01T00:00:00Z') === '',
+      impossibleDateBlank: formatCalendarDateUTC('2026-02-30') === '' && formatCalendarDateUTC('2026-13-01') === '' && formatCalendarDateUTC('2026-03-08foo') === '',
+    };
+  })()`);
+  assert.equal(wave26InsightsCheck.hasLabelsMeta, true, 'Wave 26 meta.has_labels=true');
+  assert.equal(wave26InsightsCheck.hasLabels, true, 'Wave 26 hasLabels=true');
+  assert.equal(wave26InsightsCheck.lblCardVisible, true, 'Wave 26 #insights-label-intelligence visible');
+  assert.ok(wave26InsightsCheck.labelCount >= 2, `Wave 26 label intelligence rows >= 2: ${JSON.stringify(wave26InsightsCheck)}`);
+  assert.equal(wave26InsightsCheck.hasForecastMeta, true, 'Wave 26 meta.has_forecast=true');
+  assert.equal(wave26InsightsCheck.hasForecast, true, 'Wave 26 hasForecast=true');
+  assert.equal(wave26InsightsCheck.fcCardVisible, true, 'Wave 26 #insights-forecast-suite visible even without sprints.jsonl');
+  assert.ok(wave26InsightsCheck.capOpenCount > 0 && wave26InsightsCheck.capDays1a > 0, `Wave 26 global capacity populated: ${JSON.stringify(wave26InsightsCheck)}`);
+  assert.equal(wave26InsightsCheck.offsetDatePreserved, true, 'B9-2 non-UTC fixed offset ISO date preserves literal calendar day');
+  assert.equal(wave26InsightsCheck.zeroDateBlank, true, 'B9-2 Go zero time formats as empty string');
+  assert.equal(wave26InsightsCheck.impossibleDateBlank, true, 'B10-P2-7 impossible/malformed ISO dates reject rollover and return empty string');
+
   // Wave 25: Issues quick filters (#filter-in-cycle-btn, #filter-articulation-btn), new sorts (pagerank/betweenness/due/estimate), and Detail Modal K-Core/Slack/Correlated Commits
   await click(page, 'a[href="#/issues"]');
   await waitFor(page, `${app}.view === 'issues'`, 'navigated to issues for Wave 25 quick filter and structural metric check');
@@ -2794,6 +2829,10 @@ async function capabilitiesJourney(page) {
       hasHistoryMeta: ${app}.meta?.has_history === true || ${app}.meta?.has_history === 'true',
       commitsLen: Array.isArray(commits) ? commits.length : -1,
       firstCommitHasShaAndMsg: Boolean(commits?.[0]?.short_sha && commits?.[0]?.message),
+      openHasETAPill: Boolean(${app}.formatETAPill(issue)),
+      closedSuppressesETAPill: ${app}.formatETAPill(closedIssue) === '',
+      rootChainOnBlocked: Boolean(computeRootBlockerChain('cap-auth-ui')?.isBlocked),
+      rootChainSuppressedOnClosed: computeRootBlockerChain('cap-closed-prereq') === null,
     };
   })()`);
   assert.deepEqual(wave25DetailMetrics, {
@@ -2805,7 +2844,11 @@ async function capabilitiesJourney(page) {
     hasHistoryMeta: true,
     commitsLen: wave25DetailMetrics.commitsLen >= 1 ? wave25DetailMetrics.commitsLen : 1,
     firstCommitHasShaAndMsg: true,
-  }, `Issues new sorts, active-only structural metrics, and non-empty correlated commits verified: ${JSON.stringify(wave25DetailMetrics)}`);
+    openHasETAPill: true,
+    closedSuppressesETAPill: true,
+    rootChainOnBlocked: true,
+    rootChainSuppressedOnClosed: true,
+  }, `Issues new sorts, active-only structural metrics, ETA pills, root blocker chain, and non-empty correlated commits verified: ${JSON.stringify(wave25DetailMetrics)}`);
 
   // Corpus-global MAX(blocks_count) hybrid impact normalization, [C-1] template/pinned hybrid status parity, & exact-ID substring search.
   await click(page, 'a[href="#/issues"]');
@@ -3990,6 +4033,38 @@ async function standaloneGraphJourney(page) {
     const alertsTabActive = document.querySelector('#triage-tabs .triage-tab-btn[data-tab="alerts"]')?.classList.contains('active');
     document.getElementById('btn-triage').click();
 
+    // Wave 26 B9-1: verify parent-child & withheld-status What-If accuracy on synthetic graph snapshot
+    const origNodes = DATA.nodes;
+    const origLinks = DATA.links;
+    let b91ParentChildOk = false;
+    try {
+      DATA.nodes = [
+        { id: 'X', title: 'Blocker', status: 'open', priority: 1 },
+        { id: 'P', title: 'Pinned Parent', status: 'pinned', priority: 1, blocked_by: ['X'] },
+        { id: 'C', title: 'Child of P', status: 'open', priority: 2, blocked_by: ['P'] },
+        { id: 'D', title: 'Draft dependent', status: 'draft', priority: 2, blocked_by: ['X'] },
+      ];
+      DATA.links = [
+        { source: 'P', target: 'X', type: 'blocks' },
+        { source: 'C', target: 'P', type: 'parent-child' },
+        { source: 'D', target: 'X', type: 'blocks' },
+      ];
+      const simX = simulateWhatIfClose('X');
+      const simP = simulateWhatIfClose('P');
+      const rbC = computeStandaloneRootBlockers('C');
+      b91ParentChildOk =
+        JSON.stringify(simX.direct) === JSON.stringify(['C']) &&
+        JSON.stringify(simP.direct) === JSON.stringify(['C']) &&
+        !simX.cascade.includes('P') &&
+        !simX.cascade.includes('D') &&
+        Boolean(rbC && rbC.roots.length === 1 && rbC.roots[0].id === 'X');
+    } finally {
+      DATA.nodes = origNodes;
+      DATA.links = origLinks;
+    }
+    const openNodeHasETA = DATA.nodes.some(n => isActiveNodeStatus(n.status) && n.eta_days != null && Boolean(n.eta_date));
+    const closedNodeNoETA = DATA.nodes.filter(n => !isActiveNodeStatus(n.status)).every(n => n.eta_days == null);
+
     return {
       cyclesCount,
       cycleBreaksCount,
@@ -4007,6 +4082,9 @@ async function standaloneGraphJourney(page) {
       triageOpen,
       tabKeys,
       alertsTabActive,
+      b91ParentChildOk,
+      openNodeHasETA,
+      closedNodeNoETA,
     };
   })()`);
   assert.equal(wave25StandaloneAudit.cyclesCount, 2, 'standalone HTML DATA.cycles exports both active cycles');
@@ -4027,6 +4105,9 @@ async function standaloneGraphJourney(page) {
   assert.equal(wave25StandaloneAudit.triageOpen, true, '#btn-triage opens #triage-panel');
   assert.deepEqual(wave25StandaloneAudit.tabKeys, ['recommendations', 'quick_wins', 'blockers', 'alerts'], '4-tab Triage panel renders Top/Quick Wins/Blockers/Alerts');
   assert.equal(wave25StandaloneAudit.alertsTabActive, true, 'clicking Alerts triage tab activates it');
+  assert.equal(wave25StandaloneAudit.b91ParentChildOk, true, 'Wave 26 B9-1/W26-3 standalone parent-child What-If & root blocker accuracy verified');
+  assert.equal(wave25StandaloneAudit.openNodeHasETA, true, 'Wave 26 W26-4 standalone open nodes carry ETA forecasts');
+  assert.equal(wave25StandaloneAudit.closedNodeNoETA, true, 'Wave 26 W26-4 standalone closed nodes suppress ETA forecasts');
 
   await capture(page, 'standalone-graph');
   clean(page);

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"time"
 
+	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
 
@@ -81,6 +82,8 @@ type ExportMeta struct {
 	HasSprints     bool      `json:"has_sprints,omitempty"`
 	HasSuggestions bool      `json:"has_suggestions,omitempty"`
 	HasHistory     bool      `json:"has_history,omitempty"`
+	HasLabels      bool      `json:"has_labels,omitempty"`
+	HasForecast    bool      `json:"has_forecast,omitempty"`
 }
 
 // SQLiteExportConfig configures the SQLite export process.
@@ -119,6 +122,14 @@ type SQLiteExportConfig struct {
 	HasSuggestions bool
 	// HasHistory records whether data/history.json will be published alongside this bundle.
 	HasHistory bool
+	// HasLabels records whether data/labels.json will be published alongside this bundle.
+	HasLabels bool
+	// HasForecast records whether data/forecast.json will be published alongside this bundle.
+	HasForecast bool
+	// ETAContext optionally supplies a velocity-calibrated ETA context computed over
+	// full-graph velocity issues + matching stats (preserving identical-units scaling
+	// when --pages-include-closed=false or scoped recipes omit closed issues).
+	ETAContext *analysis.ETAContext
 }
 
 // DefaultSQLiteExportConfig returns sensible defaults for export configuration.

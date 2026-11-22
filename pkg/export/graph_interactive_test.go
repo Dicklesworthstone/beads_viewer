@@ -922,4 +922,23 @@ func TestGenerateInteractiveGraphHTML_CyclesWhatIfTriageTabsAndMetadata(t *testi
 	if byID["DONE-1"].CloseReason != "Completed and verified in CI" {
 		t.Fatalf("DONE-1 close_reason mismatch: %q", byID["DONE-1"].CloseReason)
 	}
+	if byID["C-1"].ETADays == nil || *byID["C-1"].ETADays <= 0 || byID["C-1"].ETADate == "" {
+		t.Fatalf("Gap W26-4 regression: expected active node C-1 to carry ETA forecast, got days=%v date=%q", byID["C-1"].ETADays, byID["C-1"].ETADate)
+	}
+	if byID["DONE-1"].ETADays != nil || byID["DONE-1"].ETADate != "" || byID["DONE-1"].SuggestedPriority != nil {
+		t.Fatalf("Gap W26-4 regression: closed node DONE-1 must not carry ETA or priority hint: %+v", byID["DONE-1"])
+	}
+	for _, w26Marker := range []string{
+		`function buildStandaloneWhatIfModel()`,
+		`function createStandaloneDepsEvaluator(`,
+		`function computeStandaloneRootBlockers(`,
+		`id="docked-root-blockers"`,
+		`id="hover-root-blockers"`,
+		`ETA Forecast`,
+		`Priority Hint`,
+	} {
+		if !strings.Contains(html, w26Marker) {
+			t.Errorf("Wave 26 standalone HTML missing required marker %q", w26Marker)
+		}
+	}
 }

@@ -125,6 +125,9 @@ func createMetricsTables(tx *sql.Tx) error {
 			triage_score REAL DEFAULT 0,
 			blocks_count INTEGER DEFAULT 0,
 			blocked_by_count INTEGER DEFAULT 0,
+			eta_days REAL,
+			eta_date TEXT,
+			eta_confidence REAL,
 			FOREIGN KEY (issue_id) REFERENCES issues(id)
 		)
 	`
@@ -291,6 +294,9 @@ func CreateMaterializedViews(db *sql.DB) error {
 			COALESCE(m.eigenvector, 0) as eigenvector,
 			COALESCE(m.critical_path_depth, 0) as critical_path_depth,
 			COALESCE(m.triage_score, 0) as triage_score,
+			m.eta_days as eta_days,
+			m.eta_date as eta_date,
+			m.eta_confidence as eta_confidence,
 			COALESCE(m.blocks_count, (
 				SELECT COUNT(*)
 				FROM dependencies d

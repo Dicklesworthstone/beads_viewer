@@ -4055,11 +4055,16 @@ function syncOverlaysAfterGraphRebuild(graphData) {
     const nodeById = new Map(graphData.nodes.map(n => [n.id, n]));
 
     // Rebind or clear selectedNode so filtering out the selected node never
-    // leaves a stale drawer open or dims the entire visible graph to 30%.
+    // leaves a stale drawer open or dims the entire visible graph to 30%,
+    // while preserving active What-If / Critical Path / Cycle overlay highlight sets.
     if (store.selectedNode) {
         const rebound = nodeById.get(store.selectedNode.id);
         if (rebound) {
             store.selectedNode = rebound;
+        } else if (cycleNavigatorState.active || criticalPathState.active || whatIfState.active || dependencyConeState.active) {
+            store.selectedNode = null;
+            store.focusedPath = null;
+            dispatchEvent('selectionChange', { node: null });
         } else {
             clearSelection();
         }

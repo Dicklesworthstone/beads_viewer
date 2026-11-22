@@ -547,8 +547,8 @@ func (e *SQLiteExporter) activeBetweennessMap() map[string]float64 {
 func (e *SQLiteExporter) insertMetrics(db *sql.DB) error {
 	// Get triage scores if available (prefer AllScores so #11+ candidates retain scores)
 	triageScores := e.buildTriageScoresMap()
-	if e.Stats == nil && len(e.Metrics) == 0 && len(triageScores) == 0 {
-		return nil // No stats, precomputed metrics, or triage scores available
+	if e.Stats == nil && len(e.Metrics) == 0 && len(triageScores) == 0 && e.Config.ETAContext == nil {
+		return nil // No stats, precomputed metrics, triage scores, or ETA context available
 	}
 
 	tx, err := db.Begin()
@@ -558,13 +558,38 @@ func (e *SQLiteExporter) insertMetrics(db *sql.DB) error {
 	defer tx.Rollback()
 
 	stmt, err := tx.Prepare(`
-		INSERT INTO issue_metrics (issue_id, pagerank, betweenness, eigenvector, critical_path_depth, triage_score, blocks_count, blocked_by_count)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO issue_metrics (issue_id, pagerank, betweenness, eigenvector, critical_path_depth, triage_score, blocks_count, blocked_by_count, eta_days, eta_date, eta_confidence)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
 	}
 	defer stmt.Close()
+
+	// Resolve velocity-calibrated ETA context for active issues (preferring caller-supplied
+	// full-graph ETAContext so scoped/open-only exports retain historical velocity calibration).
+	etaCtx := e.Config.ETAContext
+	if etaCtx == nil && e.Stats != nil && len(e.Issues) > 0 {
+		valIssues := make([]model.Issue, 0, len(e.Issues))
+		for _, iss := range e.Issues {
+			if iss != nil {
+				valIssues = append(valIssues, *iss)
+			}
+		}
+		if len(valIssues) > 0 {
+			etaCtx = analysis.NewETAContext(valIssues, e.Stats, e.exportTimestamp())
+		}
+	}
+	etaColsFor := func(issue *model.Issue) (any, any, any) {
+		if etaCtx == nil || issue == nil || issue.Status.IsClosed() || issue.Status.IsTombstone() {
+			return nil, nil, nil
+		}
+		est := etaCtx.EstimateForIssue(*issue, 1)
+		if est.ETADate.IsZero() {
+			return nil, nil, nil
+		}
+		return est.EstimatedDays, est.ETADate.UTC().Format(time.RFC3339), est.Confidence
+	}
 
 	// Build status lookup so dep counts can ignore satisfied (closed/
 	// tombstoned) endpoints, and so dangling refs (an edge whose other
@@ -634,8 +659,9 @@ func (e *SQLiteExporter) insertMetrics(db *sql.DB) error {
 			score := triageScores[id]
 			blocks := blocksCount[id]
 			blockedBy := blockedByCount[id]
+			etaDays, etaDate, etaConf := etaColsFor(issue)
 
-			_, err := stmt.Exec(id, pr, bw, ev, cp, score, blocks, blockedBy)
+			_, err := stmt.Exec(id, pr, bw, ev, cp, score, blocks, blockedBy, etaDays, etaDate, etaConf)
 			if err != nil {
 				return fmt.Errorf("insert metrics for %s: %w", id, err)
 			}
@@ -668,8 +694,9 @@ func (e *SQLiteExporter) insertMetrics(db *sql.DB) error {
 					blockedBy = m.BlockedByCount
 				}
 			}
+			etaDays, etaDate, etaConf := etaColsFor(issue)
 
-			_, err := stmt.Exec(id, pr, bw, 0.0, cp, score, blocks, blockedBy)
+			_, err := stmt.Exec(id, pr, bw, 0.0, cp, score, blocks, blockedBy, etaDays, etaDate, etaConf)
 			if err != nil {
 				return fmt.Errorf("insert metrics for %s: %w", id, err)
 			}
@@ -701,7 +728,7 @@ func (e *SQLiteExporter) insertMetrics(db *sql.DB) error {
 				if blockedBy == 0 {
 					blockedBy = blockedByCount[id]
 				}
-				if _, err := stmt.Exec(id, m.PageRank, m.Betweenness, 0.0, m.CriticalPathDepth, score, blocks, blockedBy); err != nil {
+				if _, err := stmt.Exec(id, m.PageRank, m.Betweenness, 0.0, m.CriticalPathDepth, score, blocks, blockedBy, nil, nil, nil); err != nil {
 					return fmt.Errorf("insert metrics for %s: %w", id, err)
 				}
 			}
@@ -877,6 +904,8 @@ func (e *SQLiteExporter) insertMeta(db *sql.DB) error {
 		"has_sprints":      strconv.FormatBool(e.Config.HasSprints),
 		"has_suggestions":  strconv.FormatBool(e.Config.HasSuggestions),
 		"has_history":      strconv.FormatBool(e.Config.HasHistory),
+		"has_labels":       strconv.FormatBool(e.Config.HasLabels),
+		"has_forecast":     strconv.FormatBool(e.Config.HasForecast),
 	}
 
 	if e.gitHash != "" {
@@ -971,6 +1000,8 @@ func (e *SQLiteExporter) writeRobotOutputs(bundle *Bundle, dataDir string) error
 		HasSprints:     e.Config.HasSprints,
 		HasSuggestions: e.Config.HasSuggestions,
 		HasHistory:     e.Config.HasHistory,
+		HasLabels:      e.Config.HasLabels,
+		HasForecast:    e.Config.HasForecast,
 	}
 	if err := e.writeRobotJSON(bundle, filepath.Join(dataDir, "meta.json"), meta); err != nil {
 		return fmt.Errorf("write meta.json: %w", err)

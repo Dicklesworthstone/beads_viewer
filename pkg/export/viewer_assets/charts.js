@@ -1001,10 +1001,28 @@ function renderSprintBurndownChart(canvasId, sprint) {
     const dailyPoints = Array.isArray(bd.daily_points) ? bd.daily_points : [];
     const totalIssues = Number(bd.total_issues || 0);
 
+    const parseValidISODateParts = (raw) => {
+        if (!raw) return null;
+        const s = String(raw).trim();
+        const m = s.match(/^(\d{4})-(\d{2})-(\d{2})(?:$|[T\s])/);
+        if (!m) return null;
+        const y = Number(m[1]);
+        const mo = Number(m[2]);
+        const d = Number(m[3]);
+        if (y < 100 || mo < 1 || mo > 12 || d < 1 || d > 31) return null;
+        const dt = new Date(Date.UTC(y, mo - 1, d));
+        if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== mo - 1 || dt.getUTCDate() !== d) return null;
+        return { key: `${m[1]}-${m[2]}-${m[3]}`, date: dt };
+    };
     const dateKey = (raw) => {
         if (!raw) return '';
-        const d = new Date(raw);
-        if (Number.isNaN(d.getTime())) return String(raw).slice(0, 10);
+        const s = String(raw).trim();
+        if (/^\d{4}-\d{2}-\d{2}/.test(s)) {
+            const parsed = parseValidISODateParts(s);
+            return parsed ? parsed.key : '';
+        }
+        const d = new Date(s);
+        if (Number.isNaN(d.getTime()) || d.getUTCFullYear() < 100) return '';
         return d.toISOString().slice(0, 10);
     };
 
@@ -1098,8 +1116,21 @@ function formatDateKey(date) {
 }
 
 function formatDateLabel(dateStr) {
-    const date = new Date(dateStr);
-    if (Number.isNaN(date.getTime())) return String(dateStr || '');
+    if (!dateStr) return '';
+    const s = String(dateStr).trim();
+    if (/^\d{4}-\d{2}-\d{2}/.test(s)) {
+        const isoPrefix = s.match(/^(\d{4})-(\d{2})-(\d{2})(?:$|[T\s])/);
+        if (!isoPrefix) return '';
+        const y = Number(isoPrefix[1]);
+        const m = Number(isoPrefix[2]);
+        const d = Number(isoPrefix[3]);
+        if (y < 100 || m < 1 || m > 12 || d < 1 || d > 31) return '';
+        const utcDate = new Date(Date.UTC(y, m - 1, d));
+        if (utcDate.getUTCFullYear() !== y || utcDate.getUTCMonth() !== m - 1 || utcDate.getUTCDate() !== d) return '';
+        return utcDate.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' });
+    }
+    const date = new Date(s);
+    if (Number.isNaN(date.getTime()) || date.getUTCFullYear() < 100) return '';
     return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' });
 }
 

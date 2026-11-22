@@ -35,19 +35,24 @@ func resolveInteractiveExportTime(exportedAt time.Time) time.Time {
 
 // InteractiveGraphOptions configures HTML graph generation
 type InteractiveGraphOptions struct {
-	Issues        []model.Issue
-	Stats         *analysis.GraphStats
-	Readiness     *model.ReadinessIndex      // Full-source readiness index (preserved across recipe filters)
-	Triage        *analysis.TriageResult     // Full triage output for display
-	History       *correlation.HistoryReport // Git history correlation data
-	Title         string
-	DataHash      string
-	Path          string // Output path - if empty, auto-generates based on project
-	ProjectName   string // Project name for auto-naming
-	ExportedAt    time.Time
-	GitHash       string
-	WorkDir       string
-	RobotEnvelope map[string]json.RawMessage
+	Issues            []model.Issue
+	VelocityIssues    []model.Issue // Optional full-history issue set for velocity-calibrated ETA forecasts
+	Stats             *analysis.GraphStats
+	Readiness         *model.ReadinessIndex      // Full-source readiness index (preserved across recipe filters)
+	CandidateIDs      map[string]bool            // Optional candidate scope (suppresses priority hints for context-only neighbors)
+	UnblockIDs        map[string]bool            // Optional recipe unblock scope (preserves WhatIf/unblock priority signals)
+	Weights           *analysis.Weights          // Optional feedback-tuned scoring weights
+	ForceFullAnalysis bool                       // Honor --force-full-analysis when computing auxiliary ETA stats
+	Triage            *analysis.TriageResult     // Full triage output for display
+	History           *correlation.HistoryReport // Git history correlation data
+	Title             string
+	DataHash          string
+	Path              string // Output path - if empty, auto-generates based on project
+	ProjectName       string // Project name for auto-naming
+	ExportedAt        time.Time
+	GitHash           string
+	WorkDir           string
+	RobotEnvelope     map[string]json.RawMessage
 }
 
 // graphNode represents a node in the interactive graph with full bead data
@@ -73,11 +78,11 @@ type graphNode struct {
 	CreatedBy        string   `json:"created_by,omitempty"`
 	CloseReason      string   `json:"close_reason,omitempty"`
 	IsActionable     bool     `json:"is_actionable"`
-	DependencyState string   `json:"dependency_state"`
-	BlockerCount    int      `json:"blocker_count"`
-	IsTemplate      bool     `json:"is_template,omitempty"`
-	Pinned          bool     `json:"pinned,omitempty"`
-	Ephemeral       bool     `json:"ephemeral,omitempty"`
+	DependencyState  string   `json:"dependency_state"`
+	BlockerCount     int      `json:"blocker_count"`
+	IsTemplate       bool     `json:"is_template,omitempty"`
+	Pinned           bool     `json:"pinned,omitempty"`
+	Ephemeral        bool     `json:"ephemeral,omitempty"`
 
 	// Timestamps & external reference
 	CreatedAt   string `json:"created_at,omitempty"`
@@ -96,6 +101,14 @@ type graphNode struct {
 	CommitCount int                            `json:"commit_count,omitempty"`
 	LastAuthor  string                         `json:"last_author,omitempty"`
 	Commits     []correlation.CorrelatedCommit `json:"commits,omitempty"`
+
+	// Forecasts & priority hints (active issues only)
+	ETADays           *float64 `json:"eta_days,omitempty"`
+	ETADate           string   `json:"eta_date,omitempty"`
+	ETAConfidence     *float64 `json:"eta_confidence,omitempty"`
+	SuggestedPriority *int     `json:"suggested_priority,omitempty"`
+	PriorityDirection string   `json:"priority_direction,omitempty"`
+	PriorityReason    string   `json:"priority_reason,omitempty"`
 
 	// Graph metrics
 	PageRank        float64 `json:"pagerank"`
@@ -451,8 +464,67 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 	var articulation []string
 	var pageRankRank, betweennessRank map[string]int
 	var inDegree, outDegree map[string]int
+	var etaCtx *analysis.ETAContext
+	var priorityHints map[string]analysis.PriorityRecommendation
 
 	if opts.Stats != nil {
+		etaSource := opts.VelocityIssues
+		etaStats := opts.Stats
+		if len(etaSource) == 0 {
+			etaSource = opts.Issues
+		} else {
+			// Check whether etaSource contains any issue absent from opts.Issues (e.g., closed
+			// velocity samples or cross-scope history); when so, analyze the deduplicated union
+			// of etaSource and opts.Issues so numerator and denominator share identical units.
+			hasExtra := false
+			for _, iss := range etaSource {
+				if !issueMap[iss.ID] {
+					hasExtra = true
+					break
+				}
+			}
+			if hasExtra {
+				union := make([]model.Issue, 0, len(etaSource)+len(opts.Issues))
+				seen := make(map[string]bool, len(etaSource)+len(opts.Issues))
+				for _, iss := range etaSource {
+					if !seen[iss.ID] {
+						seen[iss.ID] = true
+						union = append(union, iss)
+					}
+				}
+				for _, iss := range opts.Issues {
+					if !seen[iss.ID] {
+						seen[iss.ID] = true
+						union = append(union, iss)
+					}
+				}
+				fullAn := analysis.NewAnalyzer(union)
+				fullAn.SetNow(exportTime)
+				fullAn.SetReadinessScope(readiness, nil)
+				if opts.ForceFullAnalysis {
+					fullCfg := analysis.FullAnalysisConfig()
+					fullAn.SetConfig(&fullCfg)
+				}
+				fullStats := fullAn.Analyze()
+				etaStats = &fullStats
+			}
+		}
+		etaCtx = analysis.NewETAContext(etaSource, etaStats, exportTime)
+		prioAn := analysis.NewAnalyzer(opts.Issues)
+		prioAn.SetNow(exportTime)
+		prioAn.SetReadinessScope(readiness, opts.CandidateIDs)
+		if opts.UnblockIDs != nil {
+			prioAn.SetUnblockScope(opts.UnblockIDs)
+		}
+		if opts.Weights != nil {
+			prioAn.SetWeights(*opts.Weights)
+		}
+		if recs := prioAn.GenerateRecommendationsFromStats(opts.Stats, analysis.DefaultThresholds()); len(recs) > 0 {
+			priorityHints = make(map[string]analysis.PriorityRecommendation, len(recs))
+			for _, rec := range recs {
+				priorityHints[rec.IssueID] = rec
+			}
+		}
 		pageRank = opts.Stats.PageRank()
 		betweenness = opts.Stats.Betweenness()
 		eigenvector = opts.Stats.Eigenvector()
@@ -580,11 +652,11 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 			CreatedBy:        iss.CreatedBy,
 			CloseReason:      iss.CloseReason,
 			IsActionable:     isActionable,
-			DependencyState: depState,
-			BlockerCount:    blockerCount,
-			IsTemplate:      iss.IsTemplate,
-			Pinned:          iss.Pinned,
-			Ephemeral:       iss.Ephemeral,
+			DependencyState:  depState,
+			BlockerCount:     blockerCount,
+			IsTemplate:       iss.IsTemplate,
+			Pinned:           iss.Pinned,
+			Ephemeral:        iss.Ephemeral,
 
 			// Timestamps & external reference
 			CreatedAt:   createdAt,
@@ -623,6 +695,25 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 			node.CoreNumber = 0
 			node.PageRankRank = 0
 			node.BetweennessRank = 0
+		} else {
+			if etaCtx != nil {
+				est := etaCtx.EstimateForIssue(iss, 1)
+				if !est.ETADate.IsZero() {
+					days := est.EstimatedDays
+					conf := est.Confidence
+					node.ETADays = &days
+					node.ETADate = est.ETADate.UTC().Format("2006-01-02")
+					node.ETAConfidence = &conf
+				}
+			}
+			if hint, ok := priorityHints[iss.ID]; ok && hint.SuggestedPriority != iss.Priority {
+				sug := hint.SuggestedPriority
+				node.SuggestedPriority = &sug
+				node.PriorityDirection = hint.Direction
+				if len(hint.Reasoning) > 0 {
+					node.PriorityReason = hint.Reasoning[0]
+				}
+			}
 		}
 		if slackAvailable && isActiveIssue(iss.ID) {
 			if s, ok := slack[iss.ID]; ok {

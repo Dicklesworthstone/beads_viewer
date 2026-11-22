@@ -528,6 +528,8 @@ function cleanupWasm() {
     GRAPH_STATE.ready = false;
     GRAPH_STATE.nodeMap = null;
   }
+  GRAPH_STATE._issueMetricsCache = null;
+  ROOT_BLOCKERS_CACHE = null;
 
   console.log(`[WASM Memory] Cleanup complete. Tracked: ${WASM_ALLOCATIONS.trackCount}, Freed: ${WASM_ALLOCATIONS.freedCount}`);
 }
@@ -1107,6 +1109,7 @@ function buildCompanionWhatIfGraph(wasmModule, resolvedIds, blockingDeps) {
   const openParents = Array.from({ length: realCount }, () => []);
   const openChildren = Array.from({ length: realCount }, () => []);
   const hasDirectMissingParent = new Uint8Array(realCount);
+  const isKnownIssue = new Uint8Array(realCount);
   const baseClosed = new Uint8Array(realCount);
   const lifecycleReady = new Uint8Array(realCount);
   let hasParentChild = false;
@@ -1222,11 +1225,14 @@ function buildCompanionWhatIfGraph(wasmModule, resolvedIds, blockingDeps) {
   for (let idx = 0; idx < realCount; idx++) {
     const id = baseGraph.nodeId(idx);
     if (!id) continue;
+    const issue = knownIssues.get(id);
+    if (issue) {
+      isKnownIssue[idx] = 1;
+    }
     if (resolvedIds.has(id)) {
       baseClosed[idx] = 1;
       continue;
     }
-    const issue = knownIssues.get(id);
     if (!issue) {
       wg.addEdge(idx, ensureSentinel());
       continue;
@@ -1252,6 +1258,7 @@ function buildCompanionWhatIfGraph(wasmModule, resolvedIds, blockingDeps) {
   GRAPH_STATE.whatIfModel = {
     realCount,
     hasParentChild,
+    isKnownIssue,
     baseClosed,
     lifecycleReady,
     hasDirectMissingParent,
@@ -1416,6 +1423,285 @@ function simulateWhatIfCloseIndices(model, targetIndices) {
     cascade_ids: cascadeIds,
     parallel_gain: Math.max(0, unblockedIds.length - 1),
   };
+}
+
+function getIssueSummaryRow(issueId) {
+  if (!issueId || !DB_STATE.db) return null;
+  const rows = execQuery(`SELECT id, title, status, priority FROM issue_overview_mv WHERE id = ? LIMIT 1`, [issueId]);
+  return rows[0] || null;
+}
+
+/**
+ * Compute transitive upstream open blockers and actionable root blockers
+ * ("Start Here") for a single open issue, respecting parent-child inheritance
+ * and cycle detection without any extra network fetch.
+ */
+function computeRootBlockerChain(issueId) {
+  if (!issueId) return null;
+  const targetIssue = getIssueSummaryRow(issueId);
+  if (!targetIssue) return null;
+  const targetStatus = String(targetIssue.status || '').toLowerCase();
+  if (targetStatus === 'closed' || targetStatus === 'tombstone') return null;
+
+  // Fast path: reuse GRAPH_STATE.whatIfModel when WASM graph is ready
+  const model = GRAPH_STATE.whatIfModel;
+  const baseGraph = GRAPH_STATE.graph;
+  const nodeMap = GRAPH_STATE.nodeMap;
+  if (model && baseGraph && nodeMap && nodeMap.has(issueId)) {
+    const startIdx = nodeMap.get(issueId);
+    if (startIdx >= model.realCount || model.baseClosed[startIdx]) return null;
+    const depsOk = createWhatIfDepsEvaluator(model, model.baseClosed);
+    const openBlockersOf = idx => {
+      const out = [];
+      const seen = new Set();
+      for (const bIdx of (model.directBlockers[idx] || [])) {
+        if (!model.baseClosed[bIdx] && !seen.has(bIdx)) {
+          seen.add(bIdx);
+          out.push(bIdx);
+        }
+      }
+      for (const pIdx of (model.openParents[idx] || [])) {
+        if (!model.baseClosed[pIdx] && !depsOk(pIdx) && !seen.has(pIdx)) {
+          seen.add(pIdx);
+          out.push(pIdx);
+        }
+      }
+      return out;
+    };
+
+    const firstHop = openBlockersOf(startIdx);
+    if (firstHop.length === 0) return null;
+
+    const minDepth = new Map();
+    const queue = [];
+    for (const bIdx of firstHop) {
+      if (bIdx === startIdx) continue;
+      if (!minDepth.has(bIdx)) {
+        minDepth.set(bIdx, 1);
+        queue.push(bIdx);
+      }
+    }
+    const roots = [];
+    const seenRoot = new Set();
+    let maxDepth = 0;
+    for (let head = 0; head < queue.length; head++) {
+      const u = queue[head];
+      const d = minDepth.get(u);
+      if (d > maxDepth) maxDepth = d;
+      const next = openBlockersOf(u);
+      if (next.length === 0 && !model.hasDirectMissingParent[u]) {
+        if (!seenRoot.has(u)) {
+          seenRoot.add(u);
+          const id = baseGraph.nodeId(u);
+          const iss = id ? getIssueSummaryRow(id) : null;
+          // Omit missing/filtered external blockers rather than fabricating open P2 chips.
+          if (id && iss) {
+            roots.push({
+              id,
+              title: iss.title || id,
+              status: iss.status || 'open',
+              priority: typeof iss.priority === 'number' ? iss.priority : 2,
+              depth: d,
+              actionable: Boolean(model.lifecycleReady[u]),
+              blocksCount: model.directDependents[u]?.length || 0,
+            });
+          }
+        }
+      } else {
+        for (const nxt of next) {
+          if (nxt !== startIdx && !minDepth.has(nxt)) {
+            minDepth.set(nxt, d + 1);
+            queue.push(nxt);
+          }
+        }
+      }
+    }
+
+    let hasCycle = firstHop.includes(startIdx);
+    const cycleIds = [];
+    if (!hasCycle) {
+      const visitState = new Uint8Array(model.realCount);
+      const dfs = u => {
+        visitState[u] = 1;
+        for (const nxt of openBlockersOf(u)) {
+          if (nxt === startIdx || visitState[nxt] === 1) {
+            hasCycle = true;
+            const cid = baseGraph.nodeId(nxt);
+            if (cid && !cycleIds.includes(cid)) cycleIds.push(cid);
+            return;
+          }
+          if (visitState[nxt] === 0 && minDepth.has(nxt)) {
+            dfs(nxt);
+            if (hasCycle) return;
+          }
+        }
+        visitState[u] = 2;
+      };
+      for (const bIdx of firstHop) {
+        if (visitState[bIdx] === 0 && minDepth.has(bIdx)) dfs(bIdx);
+        if (hasCycle) break;
+      }
+    }
+
+    roots.sort((a, b) =>
+      (Number(b.actionable) - Number(a.actionable)) ||
+      (a.priority - b.priority) ||
+      (a.depth - b.depth) ||
+      String(a.id).localeCompare(String(b.id))
+    );
+    return {
+      isBlocked: true,
+      chainLength: minDepth.size,
+      maxDepth,
+      roots,
+      hasCycle,
+      cycleIds,
+    };
+  }
+
+  // Fallback path when WASM graph/whatIfModel is unavailable: inspect SQLite graph directly
+  if (!DB_STATE.db) return null;
+  const { issues, dependencies } = getGraphViewData();
+  const resolvedIds = getResolvedIssueIDs();
+  const issueById = new Map();
+  for (const iss of (issues || [])) {
+    if (iss?.id) issueById.set(iss.id, iss);
+  }
+  const directBlockers = new Map();
+  const openParents = new Map();
+  const unresolvable = new Set();
+  for (const dep of (dependencies || [])) {
+    const src = dep?.issue_id;
+    const tgt = dep?.depends_on_id;
+    const dtype = String(dep?.type || 'blocks');
+    if (!src || !tgt || resolvedIds.has(src)) continue;
+    if (dtype === 'parent-child') {
+      if (src === tgt) {
+        unresolvable.add(src);
+      } else if (!resolvedIds.has(tgt)) {
+        if (issueById.has(tgt)) {
+          if (!openParents.has(src)) openParents.set(src, []);
+          openParents.get(src).push(tgt);
+        } else {
+          unresolvable.add(src);
+        }
+      }
+      continue;
+    }
+    if (dtype !== 'blocks' && dtype !== 'conditional-blocks' && dtype !== 'waits-for') continue;
+    if (!resolvedIds.has(tgt)) {
+      if (src === tgt || !issueById.has(tgt)) {
+        unresolvable.add(src);
+      } else {
+        if (!directBlockers.has(src)) directBlockers.set(src, []);
+        directBlockers.get(src).push(tgt);
+      }
+    }
+  }
+  const depsOkMemo = new Map();
+  const depsOkVisiting = new Set();
+  const fallbackDepsOk = id => {
+    if (resolvedIds.has(id)) return true;
+    if (unresolvable.has(id)) return false;
+    if (depsOkMemo.has(id)) return depsOkMemo.get(id);
+    if (depsOkVisiting.has(id)) return false;
+    depsOkVisiting.add(id);
+    let ok = (directBlockers.get(id) || []).length === 0;
+    if (ok) {
+      for (const p of (openParents.get(id) || [])) {
+        if (!fallbackDepsOk(p)) { ok = false; break; }
+      }
+    }
+    depsOkVisiting.delete(id);
+    depsOkMemo.set(id, ok);
+    return ok;
+  };
+  const openBlockersOf = id => {
+    const out = [];
+    const seen = new Set();
+    for (const b of (directBlockers.get(id) || [])) {
+      if (!seen.has(b)) { seen.add(b); out.push(b); }
+    }
+    for (const p of (openParents.get(id) || [])) {
+      if (!fallbackDepsOk(p) && !seen.has(p)) { seen.add(p); out.push(p); }
+    }
+    return out;
+  };
+  const firstHop = openBlockersOf(issueId);
+  if (firstHop.length === 0) return null;
+  const refNowMs = getReferenceNowMs();
+  const minDepth = new Map();
+  const queue = [];
+  for (const b of firstHop) {
+    if (b !== issueId && !minDepth.has(b)) {
+      minDepth.set(b, 1);
+      queue.push(b);
+    }
+  }
+  const roots = [];
+  const seenRoot = new Set();
+  let maxDepth = 0;
+  for (let head = 0; head < queue.length; head++) {
+    const u = queue[head];
+    const d = minDepth.get(u);
+    if (d > maxDepth) maxDepth = d;
+    const next = openBlockersOf(u);
+    if (next.length === 0 && !unresolvable.has(u)) {
+      if (!seenRoot.has(u)) {
+        seenRoot.add(u);
+        const iss = issueById.get(u);
+        if (iss) {
+          roots.push({
+            id: u,
+            title: iss.title || u,
+            status: iss.status || 'open',
+            priority: typeof iss.priority === 'number' ? iss.priority : 2,
+            depth: d,
+            actionable: !isIssueLifecycleWithheld(iss, refNowMs),
+            blocksCount: 0,
+          });
+        }
+      }
+    } else {
+      for (const nxt of next) {
+        if (nxt !== issueId && !minDepth.has(nxt)) {
+          minDepth.set(nxt, d + 1);
+          queue.push(nxt);
+        }
+      }
+    }
+  }
+  let hasCycle = firstHop.includes(issueId);
+  const cycleIds = [];
+  if (!hasCycle) {
+    const state = new Map();
+    const dfs = u => {
+      state.set(u, 1);
+      for (const nxt of openBlockersOf(u)) {
+        if (nxt === issueId || state.get(nxt) === 1) {
+          hasCycle = true;
+          if (!cycleIds.includes(nxt)) cycleIds.push(nxt);
+          return;
+        }
+        if (!state.has(nxt) && minDepth.has(nxt)) {
+          dfs(nxt);
+          if (hasCycle) return;
+        }
+      }
+      state.set(u, 2);
+    };
+    for (const b of firstHop) {
+      if (!state.has(b) && minDepth.has(b)) dfs(b);
+      if (hasCycle) break;
+    }
+  }
+  roots.sort((a, b) =>
+    (Number(b.actionable) - Number(a.actionable)) ||
+    (a.priority - b.priority) ||
+    (a.depth - b.depth) ||
+    String(a.id).localeCompare(String(b.id))
+  );
+  return { isBlocked: true, chainLength: minDepth.size, maxDepth, roots, hasCycle, cycleIds };
 }
 
 /** Return 1 for resolved nodes (closed or tombstone), 0 for unresolved nodes. */
@@ -2322,10 +2608,13 @@ function queryIssues(filters = {}, sort = 'priority', limit = 50, offset = 0) {
     'pagerank': 'COALESCE(pagerank, 0) DESC, priority ASC',
     'betweenness': 'COALESCE(betweenness, 0) DESC, priority ASC',
     'due': mvCols.has('due_date')
-      ? "CASE WHEN due_date IS NULL OR due_date = '' THEN 1 ELSE 0 END ASC, julianday(due_date) ASC, priority ASC"
+      ? 'CASE WHEN julianday(due_date) IS NULL THEN 1 ELSE 0 END ASC, julianday(due_date) ASC, priority ASC'
       : 'priority ASC',
     'estimate': mvCols.has('estimated_minutes')
       ? 'CASE WHEN estimated_minutes IS NULL OR estimated_minutes <= 0 THEN 1 ELSE 0 END ASC, estimated_minutes ASC, priority ASC'
+      : 'priority ASC',
+    'eta': mvCols.has('eta_days')
+      ? 'CASE WHEN eta_days IS NULL THEN 1 ELSE 0 END ASC, eta_days ASC, priority ASC'
       : 'priority ASC',
     'created': 'created_at DESC',
     'title': 'title ASC',
@@ -2639,6 +2928,12 @@ function getGraphViewData() {
     'critical_path_depth',
     'in_cycle',
     'source_repo',
+    'triage_score',
+    'estimated_minutes',
+    'due_date',
+    'eta_days',
+    'eta_date',
+    'eta_confidence',
   ].filter(c => mvCols.has(c));
   const extraSelect = extraCols.length > 0 ? `, ${extraCols.join(', ')}` : '';
   const issues = execQuery(`
@@ -2667,6 +2962,12 @@ function getGraphViewData() {
     betweenness: Number.isFinite(Number(row.betweenness)) ? Number(row.betweenness) : 0,
     eigenvector: Number.isFinite(Number(row.eigenvector)) ? Number(row.eigenvector) : 0,
     critical_path_depth: Number.isFinite(Number(row.critical_path_depth)) ? Number(row.critical_path_depth) : 0,
+    triage_score: row.triage_score != null && Number.isFinite(Number(row.triage_score)) ? Number(row.triage_score) : null,
+    estimated_minutes: row.estimated_minutes != null && Number(row.estimated_minutes) > 0 ? Number(row.estimated_minutes) : null,
+    due_date: row.due_date || null,
+    eta_days: row.eta_days != null && Number.isFinite(Number(row.eta_days)) ? Number(row.eta_days) : null,
+    eta_date: row.eta_date || null,
+    eta_confidence: row.eta_confidence != null && Number.isFinite(Number(row.eta_confidence)) ? Number(row.eta_confidence) : null,
     in_cycle: Boolean(row.in_cycle),
     // Pre-computed active-blocker / active-dependent counts from the
     // materialized view (which excludes closed/tombstoned endpoints).
@@ -4496,8 +4797,25 @@ function formatDate(isoString) {
 function formatCalendarDateUTC(isoString) {
   if (!isoString) return '';
   try {
-    const date = new Date(isoString);
-    if (Number.isNaN(date.getTime())) return String(isoString);
+    const s = String(isoString).trim();
+    if (/^\d{4}-\d{2}-\d{2}/.test(s)) {
+      const isoPrefix = s.match(/^(\d{4})-(\d{2})-(\d{2})(?:$|[T\s](?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z|[+-](?:[01]\d|2[0-3]):?[0-5]\d)?$)/);
+      if (!isoPrefix) return '';
+      const y = Number(isoPrefix[1]);
+      const m = Number(isoPrefix[2]);
+      const d = Number(isoPrefix[3]);
+      if (y < 100 || m < 1 || m > 12 || d < 1 || d > 31) return '';
+      const utcDate = new Date(Date.UTC(y, m - 1, d));
+      if (utcDate.getUTCFullYear() !== y || utcDate.getUTCMonth() !== m - 1 || utcDate.getUTCDate() !== d) return '';
+      return utcDate.toLocaleDateString('en-US', {
+        year: 'numeric',
+        month: 'short',
+        day: 'numeric',
+        timeZone: 'UTC',
+      });
+    }
+    const date = new Date(s);
+    if (Number.isNaN(date.getTime()) || date.getUTCFullYear() < 100) return '';
     return date.toLocaleDateString('en-US', {
       year: 'numeric',
       month: 'short',
@@ -4991,6 +5309,15 @@ function beadsApp() {
     suggestionsData: null,
     hasSuggestions: false,
     suggestionsTypeFilter: 'all',
+
+    // Label Intelligence & Cross-Label Flow (data/labels.json, gated on meta.has_labels)
+    labelsData: null,
+    hasLabels: false,
+    labelSortBy: 'attention', // 'attention' | 'health' | 'blocked' | 'open'
+
+    // Backlog Capacity & Priority Misalignment forecasts (data/forecast.json, gated on meta.has_forecast)
+    forecastData: null,
+    hasForecast: false,
 
     // Loaded git correlation history (populated when data/history.json loads)
     historyData: null,
@@ -5519,47 +5846,87 @@ function beadsApp() {
           console.log('[Viewer] No triage.json found (optional for insights)');
         }
 
-        // Load optional sprints.json only when meta.has_sprints is true (zero 404s when absent)
+        // Load optional exported JSON artifacts concurrently (strictly gated on meta.has_*
+        // for zero 404s when absent, with a shared 3s timeout so slow/stalled hosts never block init).
+        const optionalFetchOpts = () => (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function')
+          ? { signal: AbortSignal.timeout(3000) }
+          : undefined;
+        const optTasks = [];
         if (this.meta?.has_sprints === true || this.meta?.has_sprints === 'true') {
-          try {
-            const sprintsResp = await fetch(`./data/sprints.json?_t=${Date.now()}`);
-            if (sprintsResp.ok) {
-              this.sprintsData = await sprintsResp.json();
-              const list = Array.isArray(this.sprintsData?.sprints) ? this.sprintsData.sprints : [];
-              this.hasSprints = list.length > 0;
-              if (this.hasSprints) {
-                this.selectedSprintId = this.sprintsData.active_sprint_id || list[0].id || '';
+          optTasks.push((async () => {
+            try {
+              const sprintsResp = await fetch(`./data/sprints.json?_t=${Date.now()}`, optionalFetchOpts());
+              if (sprintsResp.ok) {
+                this.sprintsData = await sprintsResp.json();
+                const list = Array.isArray(this.sprintsData?.sprints) ? this.sprintsData.sprints : [];
+                this.hasSprints = list.length > 0;
+                if (this.hasSprints) {
+                  this.selectedSprintId = this.sprintsData.active_sprint_id || list[0].id || '';
+                }
               }
+            } catch (sprintsErr) {
+              console.log('[Viewer] Optional sprints.json unavailable:', sprintsErr);
             }
-          } catch (sprintsErr) {
-            console.log('[Viewer] Optional sprints.json unavailable:', sprintsErr);
-          }
+          })());
         }
-
-        // Load optional suggestions.json only when meta.has_suggestions is true (zero 404s when absent)
         if (this.meta?.has_suggestions === true || this.meta?.has_suggestions === 'true') {
-          try {
-            const sugResp = await fetch(`./data/suggestions.json?_t=${Date.now()}`);
-            if (sugResp.ok) {
-              this.suggestionsData = await sugResp.json();
-              this.hasSuggestions = Array.isArray(this.suggestionsData?.suggestions) && this.suggestionsData.suggestions.length > 0;
+          optTasks.push((async () => {
+            try {
+              const sugResp = await fetch(`./data/suggestions.json?_t=${Date.now()}`, optionalFetchOpts());
+              if (sugResp.ok) {
+                this.suggestionsData = await sugResp.json();
+                this.hasSuggestions = Array.isArray(this.suggestionsData?.suggestions) && this.suggestionsData.suggestions.length > 0;
+              }
+            } catch (sugErr) {
+              console.log('[Viewer] Optional suggestions.json unavailable:', sugErr);
             }
-          } catch (sugErr) {
-            console.log('[Viewer] Optional suggestions.json unavailable:', sugErr);
-          }
+          })());
         }
-
-        // Load optional history.json when meta.has_history is true so Issue Detail Modal
-        // Correlated Commits work immediately on every view (zero 404s when absent).
-        if (this.meta?.has_history === true || this.meta?.has_history === 'true') {
-          try {
-            const histResp = await fetch(`./data/history.json?_t=${Date.now()}`);
-            if (histResp.ok) {
-              this.historyData = await histResp.json();
+        if (this.meta?.has_labels === true || this.meta?.has_labels === 'true') {
+          optTasks.push((async () => {
+            try {
+              const lblResp = await fetch(`./data/labels.json?_t=${Date.now()}`, optionalFetchOpts());
+              if (lblResp.ok) {
+                this.labelsData = await lblResp.json();
+                this.hasLabels = Array.isArray(this.labelsData?.labels) && this.labelsData.labels.length > 0;
+              }
+            } catch (lblErr) {
+              console.log('[Viewer] Optional labels.json unavailable:', lblErr);
             }
-          } catch (histErr) {
-            console.log('[Viewer] Optional history.json unavailable:', histErr);
-          }
+          })());
+        }
+        if (this.meta?.has_forecast === true || this.meta?.has_forecast === 'true') {
+          optTasks.push((async () => {
+            try {
+              const fcResp = await fetch(`./data/forecast.json?_t=${Date.now()}`, optionalFetchOpts());
+              if (fcResp.ok) {
+                this.forecastData = await fcResp.json();
+                this.hasForecast = Boolean(
+                  this.forecastData && (
+                    this.forecastData.global_capacity ||
+                    (Array.isArray(this.forecastData.priority_recommendations) && this.forecastData.priority_recommendations.length > 0)
+                  )
+                );
+              }
+            } catch (fcErr) {
+              console.log('[Viewer] Optional forecast.json unavailable:', fcErr);
+            }
+          })());
+        }
+        if (this.meta?.has_history === true || this.meta?.has_history === 'true') {
+          optTasks.push((async () => {
+            try {
+              const histResp = await fetch(`./data/history.json?_t=${Date.now()}`, optionalFetchOpts());
+              if (histResp.ok) {
+                this.historyData = await histResp.json();
+              }
+            } catch (histErr) {
+              console.log('[Viewer] Optional history.json unavailable:', histErr);
+            }
+          })());
+        }
+        if (optTasks.length > 0) {
+          await Promise.allSettled(optTasks);
         }
 
         this.loading = false;
@@ -6421,6 +6788,89 @@ function beadsApp() {
       navigateToIssue(id);
     },
 
+    getSelectedIssueRootBlockers() {
+      const id = this.selectedIssue?.id;
+      if (!id) return null;
+      return getCachedRootBlockerChain(id);
+    },
+
+    getGraphDetailRootBlockers() {
+      const id = this.graphDetailNode?.id;
+      if (!id) return null;
+      return getCachedRootBlockerChain(id);
+    },
+
+    focusOrShowGraphNode(nodeId) {
+      if (!nodeId) return;
+      const g = this.forceGraphModule?.getGraph?.();
+      const nodes = g?.graphData?.()?.nodes;
+      if (Array.isArray(nodes) && nodes.some(n => n.id === nodeId) && typeof this.forceGraphModule?.focusNode === 'function') {
+        this.forceGraphModule.focusNode(nodeId);
+        return;
+      }
+      this.showIssue(nodeId);
+    },
+
+    isActiveNodeStatus(status) {
+      const st = String(status || '').trim().toLowerCase();
+      return st !== 'closed' && st !== 'tombstone';
+    },
+
+    formatETAPillCompact(issue) {
+      if (!issue || !this.isActiveNodeStatus(issue.status)) return '';
+      if (issue.eta_days == null || !Number.isFinite(Number(issue.eta_days)) || !issue.eta_date) return '';
+      if (!formatCalendarDateUTC(issue.eta_date)) return '';
+      return `~${Number(issue.eta_days).toFixed(1)}d`;
+    },
+
+    getSortedLabelIntelligence() {
+      const raw = Array.isArray(this.labelsData?.labels) ? this.labelsData.labels : [];
+      if (!raw.length) return [];
+      const list = [...raw];
+      const mode = this.labelSortBy || 'attention';
+      list.sort((a, b) => {
+        if (mode === 'health') {
+          return (Number(a.health ?? 100) - Number(b.health ?? 100)) || String(a.label).localeCompare(String(b.label));
+        }
+        if (mode === 'blocked') {
+          return (Number(b.blocked_count ?? 0) - Number(a.blocked_count ?? 0)) || (Number(a.health ?? 100) - Number(b.health ?? 100)) || String(a.label).localeCompare(String(b.label));
+        }
+        if (mode === 'open') {
+          return (Number(b.open_count ?? 0) - Number(a.open_count ?? 0)) || String(a.label).localeCompare(String(b.label));
+        }
+        // default: attention rank / score
+        const ra = Number(a.attention_rank || 0);
+        const rb = Number(b.attention_rank || 0);
+        if (ra > 0 && rb > 0 && ra !== rb) return ra - rb;
+        return (Number(b.attention_score ?? 0) - Number(a.attention_score ?? 0)) || (Number(a.health ?? 100) - Number(b.health ?? 100)) || String(a.label).localeCompare(String(b.label));
+      });
+      return list.slice(0, 12);
+    },
+
+    getCrossLabelFlowEdges() {
+      const deps = Array.isArray(this.labelsData?.flow?.dependencies) ? this.labelsData.flow.dependencies : [];
+      return [...deps]
+        .sort((a, b) => (Number(b.issue_count || 0) - Number(a.issue_count || 0)) || String(a.from_label || '').localeCompare(String(b.from_label || '')))
+        .slice(0, 10);
+    },
+
+    getIssuePriorityHint(id) {
+      if (!id) return null;
+      const recs = Array.isArray(this.forecastData?.priority_recommendations) ? this.forecastData.priority_recommendations : [];
+      return recs.find(r => r && r.issue_id === id) || null;
+    },
+
+    formatETAPill(issue) {
+      if (!issue) return '';
+      const st = String(issue.status || '').toLowerCase();
+      if (st === 'closed' || st === 'tombstone') return '';
+      if (issue.eta_days == null || !Number.isFinite(Number(issue.eta_days)) || !issue.eta_date) return '';
+      const dateStr = formatCalendarDateUTC(issue.eta_date);
+      if (!dateStr) return '';
+      const confPct = Math.round(Number(issue.eta_confidence ?? 0) * 100);
+      return `~${Number(issue.eta_days).toFixed(1)}d · ${dateStr} (${confPct}%)`;
+    },
+
     /**
      * Close issue detail (navigates back)
      */
@@ -6433,6 +6883,7 @@ function beadsApp() {
       this.selectedIssue = null;
       this.showDepGraph = false;
       this.whatIfResult = null;
+      ROOT_BLOCKERS_CACHE = null;
 
       // Navigate back
       const currentView = this.view;

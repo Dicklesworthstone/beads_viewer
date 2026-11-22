@@ -798,6 +798,10 @@ func generateUltimateHTMLWithTime(title, dataHash, graphDataJSON string, nodeCou
                     <div class="hover-section-title">Metadata</div>
                     <div class="hover-meta" id="docked-meta"></div>
                 </div>
+                <div id="docked-root-blockers" class="hover-section" style="display:none;">
+                    <div class="hover-section-title" id="docked-root-blockers-title">🎯 Start Here: Root Blockers</div>
+                    <div class="hover-deps" id="docked-root-blockers-list"></div>
+                </div>
                 <div id="docked-blocked-by" class="hover-section" style="display:none;">
                     <div class="hover-section-title">Blocked By</div>
                     <div class="hover-deps" id="docked-blocked-by-list"></div>
@@ -876,6 +880,10 @@ func generateUltimateHTMLWithTime(title, dataHash, graphDataJSON string, nodeCou
                 <div class="hover-section">
                     <div class="hover-section-title">Metadata</div>
                     <div class="hover-meta" id="hover-meta"></div>
+                </div>
+                <div id="hover-root-blockers" class="hover-section" style="display:none;">
+                    <div class="hover-section-title" id="hover-root-blockers-title">🎯 Start Here: Root Blockers</div>
+                    <div class="hover-deps" id="hover-root-blockers-list"></div>
                 </div>
                 <div id="hover-blocked-by" class="hover-section" style="display:none;">
                     <div class="hover-section-title">Blocked By</div>
@@ -1664,6 +1672,18 @@ function populatePanelContent(prefix, node) {
     addMeta('Assignee', node.assignee);
     addMeta('Repo', node.source_repo);
     addMeta('Estimate', formatEstimate(node.estimated_minutes));
+    if (isActiveNodeStatus(node.status) && node.eta_days != null && node.eta_date) {
+        const etaDaysNum = Number(node.eta_days);
+        const etaConfPct = Math.round(Number(node.eta_confidence ?? 0) * 100);
+        if (isFinite(etaDaysNum)) {
+            addMeta('ETA Forecast', '~' + etaDaysNum.toFixed(1) + 'd (' + node.eta_date + ' · ' + etaConfPct + '%% conf)');
+        }
+    }
+    if (isActiveNodeStatus(node.status) && node.suggested_priority != null && node.suggested_priority !== node.priority) {
+        const arrow = node.priority_direction === 'increase' ? '↑ ' : '↓ ';
+        const reasonPart = node.priority_reason ? (' · ' + node.priority_reason) : '';
+        addMeta('Priority Hint', arrow + 'P' + node.priority + ' → P' + node.suggested_priority + reasonPart);
+    }
     addMeta('Created By', node.created_by);
     addMeta('Created', node.created_at);
     addMeta('Updated', node.updated_at);
@@ -1675,6 +1695,33 @@ function populatePanelContent(prefix, node) {
     if (node.last_author) addMeta('Last Author', node.last_author);
     if (node.commit_count > 0) addMeta('Commits', String(node.commit_count));
     if (DATA.git_range) addMeta('Git Range', DATA.git_range);
+
+    // Root Blockers ("Start Here") for blocked active issues
+    const rootBlkSection = document.getElementById(prefix + 'root-blockers');
+    const rootBlkTitle = document.getElementById(prefix + 'root-blockers-title');
+    const rootBlkList = document.getElementById(prefix + 'root-blockers-list');
+    if (rootBlkSection && rootBlkList) {
+        const rbInfo = computeStandaloneRootBlockers(node.id);
+        if (rbInfo && (rbInfo.roots.length > 0 || rbInfo.hasCycle)) {
+            rootBlkSection.style.display = 'block';
+            if (rootBlkTitle) {
+                rootBlkTitle.textContent = '🎯 Start Here: Root Blockers' + (rbInfo.chainLength > 0 ? (' (' + rbInfo.chainLength + ' upstream)') : '');
+            }
+            const chips = rbInfo.roots.slice(0, 8).map(r => {
+                const depthSuffix = r.depth > 1 ? (' · d' + r.depth) : '';
+                const actPrefix = r.actionable ? '▶ ' : '';
+                const titleAttr = escapeHTML((r.title || r.id) + ' (P' + (r.priority ?? 2) + ', ' + (r.actionable ? 'actionable' : r.status) + ')');
+                return '<span class="hover-dep-chip" data-id="' + escapeHTML(r.id) + '" title="' + titleAttr + '">' + actPrefix + escapeHTML(r.id) + escapeHTML(depthSuffix) + '</span>';
+            });
+            if (rbInfo.hasCycle) {
+                chips.push('<span class="badge badge-blocked" title="Dependency cycle prevents full unblocking">⚠ cycle</span>');
+            }
+            rootBlkList.innerHTML = chips.join('');
+        } else {
+            rootBlkSection.style.display = 'none';
+            rootBlkList.innerHTML = '';
+        }
+    }
 
     // Blocked By
     const blockedBySection = document.getElementById(prefix + 'blocked-by');
@@ -1848,6 +1895,7 @@ function clearSelection() {
     document.getElementById('no-selection').style.display = 'block';
     Graph.nodeColor(Graph.nodeColor());
     Graph.linkColor(Graph.linkColor());
+    Graph.linkWidth(Graph.linkWidth());
 }
 
 // Full-text search
@@ -2000,9 +2048,12 @@ document.getElementById('ctx-connected').onclick = () => {
         cancelPathFinder();
         closeCycleInspector();
         clearWhatIfSimulation();
-        highlightedNodes = getConnectedNodes(contextNode.id, 3);
+        const connected = getConnectedNodes(contextNode.id, 3);
+        activePathNodes = connected;
+        highlightedNodes = connected;
         Graph.nodeColor(Graph.nodeColor());
         Graph.linkColor(Graph.linkColor());
+        Graph.linkWidth(Graph.linkWidth());
         showToast(highlightedNodes.size + ' connected nodes highlighted');
     }
     hideContextMenu();
@@ -2025,36 +2076,52 @@ function cancelPathFinder() {
 // Pure-JS active-blocker What-If close cascade simulation (matching readiness.go / viewer.js)
 let activeWhatIfId = null;
 function isWhatIfUnlockableNode(n) {
-    if (!n || !isActiveNodeStatus(n.status)) return false;
+    if (!n) return false;
     const st = String(n.status || '').trim().toLowerCase();
-    if (st === 'blocked' || st === 'deferred') return false;
-    if (n.is_deferred || n.is_template || n.pinned || n.ephemeral) return false;
-    return true;
+    if (st !== 'open' && st !== 'in_progress') return false;
+    return !isNodeWithheldFromReady(n);
 }
-function simulateWhatIfClose(targetId) {
+let _standaloneWhatIfCache = null;
+function buildStandaloneWhatIfModel() {
+    if (_standaloneWhatIfCache &&
+        _standaloneWhatIfCache.nodesRef === DATA.nodes &&
+        _standaloneWhatIfCache.linksRef === DATA.links &&
+        _standaloneWhatIfCache.nodesLen === DATA.nodes.length &&
+        _standaloneWhatIfCache.linksLen === DATA.links.length) {
+        return _standaloneWhatIfCache.model;
+    }
+    const allNodes = new Map();
     const activeNodes = new Map();
     DATA.nodes.forEach(n => {
+        if (!n || !n.id) return;
+        allNodes.set(n.id, n);
         if (isActiveNodeStatus(n.status)) activeNodes.set(n.id, n);
     });
-    if (!activeNodes.has(targetId)) {
-        return { direct: [], transitive: [], cascade: [] };
-    }
-    const blockersByNode = new Map();
-    const dependentsByBlocker = new Map();
-    const parentsByNode = new Map();
+    const directBlockers = new Map();
+    const directDependents = new Map();
+    const openParents = new Map();
+    const openChildren = new Map();
     const unresolvableBlockers = new Set();
     activeNodes.forEach((_, id) => {
-        blockersByNode.set(id, new Set());
-        dependentsByBlocker.set(id, new Set());
-        parentsByNode.set(id, new Set());
+        directBlockers.set(id, new Set());
+        directDependents.set(id, new Set());
+        openParents.set(id, new Set());
+        openChildren.set(id, new Set());
     });
     DATA.links.forEach(l => {
         const src = typeof l.source === 'object' ? l.source.id : l.source;
         const tgt = typeof l.target === 'object' ? l.target.id : l.target;
-        if (!activeNodes.has(src) || !activeNodes.has(tgt)) return;
+        if (!activeNodes.has(src)) return;
         const ltype = l.type || 'blocks';
         if (ltype === 'parent-child') {
-            if (src !== tgt) parentsByNode.get(src).add(tgt);
+            if (src === tgt) {
+                unresolvableBlockers.add(src);
+            } else if (activeNodes.has(tgt)) {
+                openParents.get(src).add(tgt);
+                openChildren.get(tgt).add(src);
+            } else if (!allNodes.has(tgt)) {
+                unresolvableBlockers.add(src);
+            }
             return;
         }
         if (ltype !== 'blocks' && ltype !== 'conditional-blocks' && ltype !== 'waits-for') return;
@@ -2062,21 +2129,32 @@ function simulateWhatIfClose(targetId) {
             unresolvableBlockers.add(src);
             return;
         }
-        blockersByNode.get(src).add(tgt);
-        dependentsByBlocker.get(tgt).add(src);
+        if (activeNodes.has(tgt)) {
+            directBlockers.get(src).add(tgt);
+            directDependents.get(tgt).add(src);
+        } else {
+            const extNode = allNodes.get(tgt);
+            if (!extNode || isActiveNodeStatus(extNode.status)) {
+                unresolvableBlockers.add(src);
+            }
+        }
     });
-    // Account for external/filtered blockers recorded on n.blocked_by that aren't in activeNodes,
-    // and propagate blocking constraints inherited from parent-child ancestors.
+    // Include exported n.blocked_by blockers (excluding parent-child parents whose blockers
+    // are evaluated dynamically via openParents so closing a parent or its blocker matches readiness.go).
     activeNodes.forEach((n, id) => {
+        const parents = openParents.get(id);
         if (Array.isArray(n.blocked_by)) {
             for (const bId of n.blocked_by) {
                 if (bId === id) {
                     unresolvableBlockers.add(id);
+                } else if (parents && parents.has(bId)) {
+                    // Inherited via openParents; do not flatten parent itself into directBlockers.
+                    continue;
                 } else if (activeNodes.has(bId)) {
-                    blockersByNode.get(id).add(bId);
-                    dependentsByBlocker.get(bId).add(id);
+                    directBlockers.get(id).add(bId);
+                    directDependents.get(bId).add(id);
                 } else {
-                    const extNode = lookupStandaloneNode(bId);
+                    const extNode = allNodes.get(bId);
                     if (!extNode || isActiveNodeStatus(extNode.status)) {
                         unresolvableBlockers.add(id);
                     }
@@ -2084,55 +2162,194 @@ function simulateWhatIfClose(targetId) {
             }
         }
     });
-    // Inherit ancestor blockers across parent-child chains (epics stay open while children work,
-    // so only blockers ON the ancestor block descendants, not the open ancestor itself).
-    activeNodes.forEach((_, id) => {
-        const visited = new Set([id]);
-        const stack = [...(parentsByNode.get(id) || [])];
-        while (stack.length > 0) {
-            const pId = stack.pop();
-            if (visited.has(pId)) continue;
-            visited.add(pId);
-            if (unresolvableBlockers.has(pId)) {
-                unresolvableBlockers.add(id);
-            }
-            for (const pb of (blockersByNode.get(pId) || [])) {
-                if (pb === id) {
-                    unresolvableBlockers.add(id);
-                } else {
-                    blockersByNode.get(id).add(pb);
-                    dependentsByBlocker.get(pb).add(id);
+    const model = { allNodes, activeNodes, directBlockers, directDependents, openParents, openChildren, unresolvableBlockers };
+    _standaloneWhatIfCache = {
+        nodesRef: DATA.nodes,
+        linksRef: DATA.links,
+        nodesLen: DATA.nodes.length,
+        linksLen: DATA.links.length,
+        model,
+    };
+    return model;
+}
+function createStandaloneDepsEvaluator(model, simClosed) {
+    const memo = new Map(); // id -> boolean
+    const visiting = new Set();
+    function check(cur) {
+        if (simClosed.has(cur)) return { ok: true, cyclic: false };
+        if (memo.has(cur)) return { ok: memo.get(cur), cyclic: false };
+        if (visiting.has(cur)) return { ok: false, cyclic: true };
+        visiting.add(cur);
+        let ok = true;
+        let cyclic = false;
+        if (model.unresolvableBlockers.has(cur)) {
+            ok = false;
+        } else {
+            for (const bId of (model.directBlockers.get(cur) || [])) {
+                if (!simClosed.has(bId)) {
+                    ok = false;
+                    break;
                 }
             }
-            for (const gp of (parentsByNode.get(pId) || [])) {
-                stack.push(gp);
+            if (ok) {
+                for (const pId of (model.openParents.get(cur) || [])) {
+                    if (simClosed.has(pId)) continue; // Closing parent stops inheritance (readiness.go)
+                    const res = check(pId);
+                    if (res.cyclic) cyclic = true;
+                    if (!res.ok) {
+                        ok = false;
+                        break;
+                    }
+                }
             }
         }
+        visiting.delete(cur);
+        if (!cyclic) memo.set(cur, ok);
+        return { ok, cyclic };
+    }
+    return id => check(id).ok;
+}
+function simulateWhatIfClose(targetId) {
+    const model = buildStandaloneWhatIfModel();
+    if (!model.activeNodes.has(targetId)) {
+        return { direct: [], transitive: [], cascade: [] };
+    }
+    const baseClosed = new Set();
+    const beforeDepsOk = createStandaloneDepsEvaluator(model, baseClosed);
+    const beforeReady = new Set();
+    model.activeNodes.forEach((n, id) => {
+        if (isWhatIfUnlockableNode(n) && beforeDepsOk(id)) beforeReady.add(id);
     });
-    const remainingBlockers = new Map();
-    blockersByNode.forEach((set, id) => remainingBlockers.set(id, set.size));
-    const resolved = new Set([targetId]);
+    const simClosed = new Set([targetId]);
+    const afterDepsOk = createStandaloneDepsEvaluator(model, simClosed);
     const direct = [];
-    const cascade = [];
-    const queue = [targetId];
+    model.activeNodes.forEach((n, id) => {
+        if (!simClosed.has(id) && !beforeReady.has(id) && isWhatIfUnlockableNode(n) && afterDepsOk(id)) {
+            direct.push(id);
+        }
+    });
+    direct.sort();
+    const visited = new Set(direct);
+    const cascade = [...direct];
+    const queue = [...direct];
     while (queue.length > 0) {
-        const cur = queue.shift();
-        const deps = dependentsByBlocker.get(cur) || new Set();
-        for (const depId of deps) {
-            if (resolved.has(depId) || unresolvableBlockers.has(depId)) continue;
-            const depNode = activeNodes.get(depId);
-            if (!isWhatIfUnlockableNode(depNode)) continue;
-            const rem = (remainingBlockers.get(depId) || 0) - 1;
-            remainingBlockers.set(depId, rem);
-            if (rem <= 0) {
-                resolved.add(depId);
-                cascade.push(depId);
-                if (cur === targetId) direct.push(depId);
-                queue.push(depId);
+        const v = queue.shift();
+        simClosed.add(v);
+        const candSeen = new Set();
+        const expandQueue = [];
+        const candidates = [];
+        const enqueueCandidate = x => {
+            if (candSeen.has(x)) return;
+            candSeen.add(x);
+            candidates.push(x);
+            if (!simClosed.has(x)) expandQueue.push(x);
+        };
+        for (const d of (model.directDependents.get(v) || [])) enqueueCandidate(d);
+        for (const c of (model.openChildren.get(v) || [])) enqueueCandidate(c);
+        while (expandQueue.length > 0) {
+            const p = expandQueue.shift();
+            for (const c of (model.openChildren.get(p) || [])) enqueueCandidate(c);
+        }
+        if (candidates.length === 0) continue;
+        candidates.sort();
+        const stepDepsOk = createStandaloneDepsEvaluator(model, simClosed);
+        for (const w of candidates) {
+            if (!visited.has(w) && !simClosed.has(w) && isWhatIfUnlockableNode(model.activeNodes.get(w)) && stepDepsOk(w)) {
+                visited.add(w);
+                cascade.push(w);
+                queue.push(w);
             }
         }
     }
     return { direct, transitive: cascade, cascade };
+}
+function computeStandaloneRootBlockers(targetId) {
+    const model = buildStandaloneWhatIfModel();
+    const targetNode = model.activeNodes.get(targetId);
+    if (!targetNode) return null;
+    const depsOk = createStandaloneDepsEvaluator(model, new Set());
+    const openBlockersOf = id => {
+        const out = [];
+        const seen = new Set();
+        for (const bId of (model.directBlockers.get(id) || [])) {
+            if (!seen.has(bId)) { seen.add(bId); out.push(bId); }
+        }
+        for (const pId of (model.openParents.get(id) || [])) {
+            if (!depsOk(pId) && !seen.has(pId)) { seen.add(pId); out.push(pId); }
+        }
+        return out;
+    };
+    const firstHop = openBlockersOf(targetId);
+    if (firstHop.length === 0) return null;
+    const minDepth = new Map();
+    const queue = [];
+    for (const b of firstHop) {
+        if (b === targetId) continue;
+        if (!minDepth.has(b)) {
+            minDepth.set(b, 1);
+            queue.push(b);
+        }
+    }
+    const roots = [];
+    const seenRoot = new Set();
+    let maxDepth = 0;
+    for (let head = 0; head < queue.length; head++) {
+        const u = queue[head];
+        const d = minDepth.get(u);
+        if (d > maxDepth) maxDepth = d;
+        const next = openBlockersOf(u);
+        if (next.length === 0 && !model.unresolvableBlockers.has(u)) {
+            if (!seenRoot.has(u)) {
+                seenRoot.add(u);
+                const n = model.activeNodes.get(u);
+                roots.push({
+                    id: u,
+                    title: n?.title || u,
+                    status: n?.status || 'open',
+                    priority: typeof n?.priority === 'number' ? n.priority : 2,
+                    depth: d,
+                    actionable: isWhatIfUnlockableNode(n),
+                });
+            }
+        } else {
+            for (const nxt of next) {
+                if (nxt !== targetId && !minDepth.has(nxt)) {
+                    minDepth.set(nxt, d + 1);
+                    queue.push(nxt);
+                }
+            }
+        }
+    }
+    // Cycle check across reachable upstream blockers
+    let hasCycle = firstHop.includes(targetId);
+    if (!hasCycle) {
+        const state = new Map(); // 1=visiting, 2=done
+        const dfs = u => {
+            state.set(u, 1);
+            for (const nxt of openBlockersOf(u)) {
+                if (nxt === targetId || state.get(nxt) === 1) {
+                    hasCycle = true;
+                    return;
+                }
+                if (!state.has(nxt) && minDepth.has(nxt)) {
+                    dfs(nxt);
+                    if (hasCycle) return;
+                }
+            }
+            state.set(u, 2);
+        };
+        for (const b of firstHop) {
+            if (!state.has(b) && minDepth.has(b)) dfs(b);
+            if (hasCycle) break;
+        }
+    }
+    roots.sort((a, b) =>
+        (Number(b.actionable) - Number(a.actionable)) ||
+        (a.priority - b.priority) ||
+        (a.depth - b.depth) ||
+        String(a.id).localeCompare(String(b.id))
+    );
+    return { isBlocked: true, chainLength: minDepth.size, maxDepth, roots, hasCycle };
 }
 function clearWhatIfSimulation() {
     activeWhatIfId = null;
@@ -2259,8 +2476,15 @@ document.getElementById('ctx-copy-description').onclick = () => {
 };
 document.getElementById('ctx-path').onclick = () => {
     if (contextNode) {
+        closeCycleInspector();
+        clearWhatIfSimulation();
         pathFinderMode = true;
         pathStart = contextNode.id;
+        activePathNodes = new Set([contextNode.id]);
+        highlightedNodes = new Set([contextNode.id]);
+        Graph.nodeColor(Graph.nodeColor());
+        Graph.linkColor(Graph.linkColor());
+        Graph.linkWidth(Graph.linkWidth());
         document.getElementById('btn-path').classList.add('active');
         updatePathfinderBanner('🔗 Path Finder: Start ' + contextNode.id + ' — click destination node (Esc to cancel)');
         showToast('Start node: ' + contextNode.id + ' — click destination node');
@@ -2287,6 +2511,7 @@ function handleNodeClick(d) {
             highlightedNodes = new Set([d.id]);
             Graph.nodeColor(Graph.nodeColor());
             Graph.linkColor(Graph.linkColor());
+            Graph.linkWidth(Graph.linkWidth());
             updatePathfinderBanner('🔗 Path Finder: Start ' + d.id + ' — click destination node (Esc to cancel)');
             showToast('Start node: ' + d.id + ' — click destination node');
             return;
@@ -2305,6 +2530,7 @@ function handleNodeClick(d) {
             highlightedNodes = new Set();
             Graph.nodeColor(Graph.nodeColor());
             Graph.linkColor(Graph.linkColor());
+            Graph.linkWidth(Graph.linkWidth());
             updatePathfinderBanner('🔗 No path between ' + startId + ' and ' + d.id + ' — click start node (Esc to cancel)');
             showToast('No path found between ' + startId + ' and ' + d.id);
         }
@@ -2326,6 +2552,7 @@ function highlightDependencies(node, type) {
     highlightedNodes = connected;
     Graph.nodeColor(Graph.nodeColor());
     Graph.linkColor(Graph.linkColor());
+    Graph.linkWidth(Graph.linkWidth());
     updateVisibleCount();
     showToast(connected.size + ' nodes shown');
 }
@@ -2661,10 +2888,16 @@ function togglePathFinder() {
         Graph.nodeColor(computeNodeColor).linkColor(Graph.linkColor()).linkWidth(Graph.linkWidth());
     } else if (selectedNode) {
         pathStart = selectedNode.id;
+        activePathNodes = new Set([selectedNode.id]);
+        highlightedNodes = new Set([selectedNode.id]);
+        Graph.nodeColor(computeNodeColor).linkColor(Graph.linkColor()).linkWidth(Graph.linkWidth());
         updatePathfinderBanner('🔗 Path Finder: Start ' + selectedNode.id + ' — click destination node (Esc to cancel)');
         showToast('Start node: ' + selectedNode.id + ' — click destination node');
     } else {
         pathStart = null;
+        activePathNodes = null;
+        highlightedNodes = new Set();
+        Graph.nodeColor(computeNodeColor).linkColor(Graph.linkColor()).linkWidth(Graph.linkWidth());
         updatePathfinderBanner('🔗 Path Finder: Click start node (Esc to cancel)');
         showToast('Path Finder: click start node');
     }

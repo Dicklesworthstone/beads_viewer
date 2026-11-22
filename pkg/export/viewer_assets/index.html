@@ -3053,15 +3053,155 @@
                   <p class="font-medium text-gray-800 dark:text-gray-200" x-text="sug.summary"></p>
                   <p x-show="sug.reason" class="text-[11px] text-gray-500 dark:text-gray-400" x-text="sug.reason"></p>
                 </div>
-                <div x-show="sug.action_command" class="shrink-0 flex items-center gap-1.5">
+                <div x-show="sug.action_command" class="min-w-0 max-w-full flex items-center gap-1.5">
                   <button type="button"
                           @click="copySuggestionCommand(sug.action_command)"
-                          class="px-2.5 py-1 rounded-lg bg-emerald-100 dark:bg-emerald-900/40 text-emerald-800 dark:text-emerald-200 hover:bg-emerald-200 dark:hover:bg-emerald-800/60 font-mono text-[11px] transition-colors max-w-[260px] truncate"
+                          class="px-2.5 py-1 rounded-lg bg-emerald-100 dark:bg-emerald-900/40 text-emerald-800 dark:text-emerald-200 hover:bg-emerald-200 dark:hover:bg-emerald-800/60 font-mono text-[11px] transition-colors max-w-full sm:max-w-[260px] truncate"
                           :title="'Copy command: ' + sug.action_command"
                           x-text="'📋 ' + sug.action_command"></button>
                 </div>
               </div>
             </template>
+          </div>
+        </div>
+
+        <!-- Label Intelligence & Cross-Label Flow (data/labels.json, gated on meta.has_labels) -->
+        <div x-show="hasLabels"
+             id="insights-label-intelligence"
+             class="bg-white dark:bg-gray-800 rounded-2xl border border-indigo-200 dark:border-indigo-800/50 overflow-hidden mb-6 animate-fade-in-up" style="animation-delay: 325ms;">
+          <div class="px-4 py-3 bg-gradient-to-r from-indigo-50 to-sky-50 dark:from-indigo-900/20 dark:to-sky-900/20 border-b border-indigo-100 dark:border-indigo-800/50">
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <div class="flex items-center gap-2 min-w-0">
+                <span class="text-xl">🏷️</span>
+                <div class="min-w-0">
+                  <h3 class="text-sm font-bold text-indigo-900 dark:text-indigo-200">Label Health &amp; Cross-Label Flow</h3>
+                  <p class="text-xs text-indigo-700/80 dark:text-indigo-300/80"
+                     x-text="(labelsData?.total_labels || 0) + ' labels · ' + (labelsData?.healthy_count || 0) + ' healthy · ' + (labelsData?.warning_count || 0) + ' warning · ' + (labelsData?.critical_count || 0) + ' critical'"></p>
+                </div>
+              </div>
+              <div class="flex flex-wrap items-center gap-1 text-[11px]">
+                <template x-for="opt in [{k:'attention',l:'Attention'},{k:'health',l:'Health'},{k:'blocked',l:'Blocked'},{k:'open',l:'Open'}]" :key="opt.k">
+                  <button type="button"
+                          @click="labelSortBy = opt.k"
+                          :class="labelSortBy === opt.k ? 'bg-indigo-600 text-white' : 'bg-white/80 dark:bg-gray-800 text-gray-600 dark:text-gray-300 hover:bg-indigo-100 dark:hover:bg-indigo-900/40'"
+                          class="px-2 py-0.5 rounded-md font-medium transition-colors"
+                          x-text="opt.l"></button>
+                </template>
+              </div>
+            </div>
+          </div>
+          <div class="p-4 space-y-4">
+            <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+              <template x-for="lbl in getSortedLabelIntelligence()" :key="lbl.label">
+                <button type="button"
+                        @click="navigateToIssuesWithFilter({ labels: [lbl.label] })"
+                        class="text-left p-3 rounded-xl border border-gray-200 dark:border-gray-700 bg-gray-50/70 dark:bg-gray-900/40 hover:border-indigo-400 dark:hover:border-indigo-500 transition-colors min-w-0">
+                  <div class="flex items-center justify-between gap-2 mb-1.5">
+                    <span class="font-mono text-xs font-semibold text-indigo-700 dark:text-indigo-300 truncate" x-text="lbl.label"></span>
+                    <span class="px-1.5 py-0.5 rounded text-[10px] font-bold shrink-0"
+                          :class="lbl.health_level === 'healthy' ? 'bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300' : (lbl.health_level === 'warning' ? 'bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-300' : 'bg-red-100 dark:bg-red-900/40 text-red-700 dark:text-red-300')"
+                          x-text="'H ' + lbl.health"></span>
+                  </div>
+                  <div class="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-gray-600 dark:text-gray-400 font-mono">
+                    <span x-text="lbl.open_count + ' open'"></span>
+                    <span x-show="lbl.blocked_count > 0" class="text-amber-600 dark:text-amber-400" x-text="lbl.blocked_count + ' blk'"></span>
+                    <span x-show="lbl.closed_last_7_days > 0" class="text-emerald-600 dark:text-emerald-400" x-text="'+' + lbl.closed_last_7_days + '/7d'"></span>
+                    <span x-show="lbl.stale_count > 0" class="text-red-500 dark:text-red-400" x-text="lbl.stale_count + ' stale'"></span>
+                    <span x-show="lbl.attention_rank > 0" class="text-indigo-600 dark:text-indigo-400" x-text="'Att #' + lbl.attention_rank"></span>
+                  </div>
+                </button>
+              </template>
+            </div>
+            <!-- Cross-Label Bottleneck Flow -->
+            <div x-show="getCrossLabelFlowEdges().length > 0" class="pt-3 border-t border-gray-200 dark:border-gray-700">
+              <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
+                <span class="text-xs font-semibold text-gray-600 dark:text-gray-300 uppercase tracking-wider">Cross-Label Blocking Flow</span>
+                <span class="text-[11px] font-mono text-gray-500 dark:text-gray-400"
+                      x-text="(labelsData?.flow?.total_cross_label_deps || 0) + ' inter-label deps'"></span>
+              </div>
+              <div class="flex flex-wrap gap-2">
+                <template x-for="edge in getCrossLabelFlowEdges()" :key="edge.from_label + '->' + edge.to_label">
+                  <button type="button"
+                          @click="navigateToIssuesWithFilter({ labels: [edge.from_label] })"
+                          class="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg text-xs font-mono bg-indigo-50 dark:bg-indigo-900/30 text-indigo-800 dark:text-indigo-200 border border-indigo-200 dark:border-indigo-800/60 hover:bg-indigo-100 dark:hover:bg-indigo-900/50 transition-colors max-w-full">
+                    <span class="truncate" x-text="edge.from_label"></span>
+                    <span class="text-gray-400 shrink-0">→</span>
+                    <span class="truncate" x-text="edge.to_label"></span>
+                    <span class="px-1.5 py-0.5 rounded bg-indigo-200/70 dark:bg-indigo-800/70 text-[10px] font-bold shrink-0" x-text="edge.issue_count"></span>
+                  </button>
+                </template>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Global Backlog Capacity & Priority Misalignment (data/forecast.json, gated on meta.has_forecast) -->
+        <div x-show="hasForecast"
+             id="insights-forecast-suite"
+             class="space-y-4 mb-6 animate-fade-in-up" style="animation-delay: 340ms;">
+          <!-- Global Backlog Capacity (works even without sprints.jsonl) -->
+          <div x-show="forecastData?.global_capacity"
+               class="bg-gradient-to-r from-teal-50 to-cyan-50 dark:from-teal-950/30 dark:to-cyan-950/30 rounded-2xl border border-teal-200 dark:border-teal-800/60 p-4">
+            <div class="flex flex-wrap items-center justify-between gap-3 mb-2">
+              <div class="min-w-0">
+                <h3 class="text-sm font-bold text-teal-900 dark:text-teal-200">⚡ Global Backlog Capacity (Graham Bounds)</h3>
+                <p class="text-xs text-teal-700/80 dark:text-teal-300/80"
+                   x-text="(forecastData?.global_capacity?.open_count || 0) + ' open beads · ' + Math.round(forecastData?.global_capacity?.parallelizable_pct || 0) + '% parallelizable'"></p>
+              </div>
+              <div class="flex flex-wrap items-center gap-3 text-xs font-mono text-teal-800 dark:text-teal-200">
+                <span>Work: <strong x-text="formatEstimatedMinutes(forecastData?.global_capacity?.total_minutes || 0)"></strong></span>
+                <span>Crit Path: <strong x-text="formatEstimatedMinutes(forecastData?.global_capacity?.critical_path_minutes || 0)"></strong></span>
+                <span>1a: <strong x-text="(forecastData?.global_capacity?.days_1_agent || 0).toFixed(1) + 'd'"></strong></span>
+                <span>2a: <strong x-text="(forecastData?.global_capacity?.days_2_agents_min || 0).toFixed(1) + '–' + (forecastData?.global_capacity?.days_2_agents_max || 0).toFixed(1) + 'd'"></strong></span>
+                <span>4a: <strong x-text="(forecastData?.global_capacity?.days_4_agents_min || 0).toFixed(1) + '–' + (forecastData?.global_capacity?.days_4_agents_max || 0).toFixed(1) + 'd'"></strong></span>
+              </div>
+            </div>
+            <div x-show="(forecastData?.global_capacity?.critical_path_ids?.length || 0) > 0" class="flex flex-wrap items-center gap-1.5 pt-2 border-t border-teal-200/70 dark:border-teal-800/40">
+              <span class="text-[11px] font-semibold text-teal-800 dark:text-teal-300">Critical Chain:</span>
+              <template x-for="cid in (forecastData?.global_capacity?.critical_path_ids || [])" :key="'cap-cp-' + cid">
+                <button type="button"
+                        @click="showIssue(cid)"
+                        class="px-2 py-0.5 text-[11px] font-mono rounded bg-white/80 dark:bg-teal-900/50 text-teal-800 dark:text-teal-200 border border-teal-200 dark:border-teal-700 hover:bg-teal-100 dark:hover:bg-teal-800/60 transition-colors max-w-full truncate"
+                        x-text="cid"></button>
+              </template>
+            </div>
+          </div>
+
+          <!-- Priority Misalignment Recommendations -->
+          <div x-show="(forecastData?.priority_recommendations?.length || 0) > 0"
+               class="bg-white dark:bg-gray-800 rounded-2xl border border-amber-200 dark:border-amber-800/50 overflow-hidden">
+            <div class="px-4 py-3 bg-gradient-to-r from-amber-50 to-orange-50 dark:from-amber-900/20 dark:to-orange-900/20 border-b border-amber-100 dark:border-amber-800/50 flex flex-wrap items-center justify-between gap-2">
+              <div class="flex items-center gap-2">
+                <span class="text-xl">⚖️</span>
+                <div>
+                  <h3 class="text-sm font-bold text-amber-900 dark:text-amber-200">Priority Misalignment Alerts</h3>
+                  <p class="text-xs text-amber-700/80 dark:text-amber-300/80">Issues whose graph impact disagrees with their assigned priority</p>
+                </div>
+              </div>
+              <span class="text-xs font-mono px-2 py-0.5 rounded-full bg-amber-100 dark:bg-amber-900/50 text-amber-800 dark:text-amber-200"
+                    x-text="(forecastData?.priority_recommendations?.length || 0) + ' suggested'"></span>
+            </div>
+            <div class="divide-y divide-gray-100 dark:divide-gray-700/60">
+              <template x-for="pr in (forecastData?.priority_recommendations || []).slice(0, 8)" :key="'pr-' + pr.issue_id">
+                <button type="button"
+                        @click="showIssue(pr.issue_id)"
+                        class="w-full text-left px-4 py-2.5 hover:bg-amber-50/50 dark:hover:bg-amber-900/20 transition-colors flex flex-wrap items-center justify-between gap-2">
+                  <div class="min-w-0 flex-1">
+                    <div class="flex flex-wrap items-center gap-2">
+                      <span class="font-mono text-xs font-semibold text-beads-600 dark:text-beads-400" x-text="pr.issue_id"></span>
+                      <span class="text-xs font-medium text-gray-800 dark:text-gray-200 truncate" x-text="pr.title"></span>
+                    </div>
+                    <p x-show="pr.reasoning && pr.reasoning.length > 0" class="text-[11px] text-gray-500 dark:text-gray-400 truncate mt-0.5" x-text="pr.reasoning?.[0] || ''"></p>
+                  </div>
+                  <div class="flex items-center gap-2 shrink-0 text-xs font-mono">
+                    <span class="px-2 py-0.5 rounded font-bold"
+                          :class="pr.direction === 'increase' ? 'bg-red-100 dark:bg-red-900/40 text-red-700 dark:text-red-300' : 'bg-sky-100 dark:bg-sky-900/40 text-sky-700 dark:text-sky-300'"
+                          x-text="(pr.direction === 'increase' ? '↑ ' : '↓ ') + 'P' + pr.current_priority + ' → P' + pr.suggested_priority"></span>
+                    <span class="text-[10px] text-gray-500 dark:text-gray-400" x-text="Math.round((pr.confidence || 0) * 100) + '%'"></span>
+                  </div>
+                </button>
+              </template>
+            </div>
           </div>
         </div>
 
@@ -3603,7 +3743,7 @@
                      :class="(activeSprint.at_risk?.length || 0) > 0 ? 'text-amber-600 dark:text-amber-400' : 'text-emerald-600 dark:text-emerald-400'"
                      x-text="activeSprint.at_risk?.length || 0"></div>
                 <div class="text-xs text-gray-500 dark:text-gray-400 mt-1"
-                     x-text="activeSprint.burndown?.projected_complete ? ('Projected ' + formatCalendarDateUTC(activeSprint.burndown.projected_complete)) : 'Status: ' + (activeSprint.status || 'active')"></div>
+                     x-text="formatCalendarDateUTC(activeSprint.burndown?.projected_complete) ? ('Projected ' + formatCalendarDateUTC(activeSprint.burndown.projected_complete)) : 'Status: ' + (activeSprint.status || 'active')"></div>
               </div>
             </div>
 
@@ -3629,7 +3769,7 @@
               <div class="flex flex-wrap items-center justify-between gap-2 mb-3">
                 <h3 class="text-sm font-semibold text-gray-900 dark:text-white">Ideal vs Actual Burndown</h3>
                 <span class="text-xs text-gray-500 dark:text-gray-400 font-mono"
-                      x-text="formatCalendarDateUTC(activeSprint.start_date) + ' → ' + formatCalendarDateUTC(activeSprint.end_date)"></span>
+                      x-text="[formatCalendarDateUTC(activeSprint.start_date), formatCalendarDateUTC(activeSprint.end_date)].filter(Boolean).join(' → ')"></span>
               </div>
               <div class="relative h-64 sm:h-72 w-full max-w-full overflow-hidden">
                 <canvas id="sprint-burndown-chart" class="max-w-full"></canvas>
@@ -4473,6 +4613,15 @@
                             class="px-2 py-0.5 text-xs font-semibold rounded-full bg-rose-100 dark:bg-rose-900/50 text-rose-700 dark:text-rose-300 border border-rose-200 dark:border-rose-800">
                         ↻ In Cycle
                       </span>
+                      <span x-show="formatETAPill(selectedIssue)"
+                            data-eta-pill
+                            class="px-2 py-0.5 text-xs font-mono font-medium rounded-full bg-teal-100 dark:bg-teal-900/40 text-teal-800 dark:text-teal-200 border border-teal-200 dark:border-teal-800"
+                            x-text="'⏱ ' + formatETAPill(selectedIssue)"></span>
+                      <span x-show="getIssuePriorityHint(selectedIssue.id)"
+                            data-priority-hint-pill
+                            :title="(getIssuePriorityHint(selectedIssue.id)?.reasoning || []).join(' · ')"
+                            class="px-2 py-0.5 text-xs font-mono font-semibold rounded-full bg-amber-100 dark:bg-amber-900/40 text-amber-800 dark:text-amber-200 border border-amber-200 dark:border-amber-800"
+                            x-text="getIssuePriorityHint(selectedIssue.id) ? ((getIssuePriorityHint(selectedIssue.id).direction === 'increase' ? '↑ ' : '↓ ') + 'Suggest P' + getIssuePriorityHint(selectedIssue.id).suggested_priority) : ''"></span>
                       <span x-show="(selectedIssue.comment_count || (selectedIssue.comments && selectedIssue.comments.length) || 0) > 0"
                             class="px-2 py-0.5 text-xs font-medium rounded-full bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300">
                         💬 <span x-text="selectedIssue.comment_count || (selectedIssue.comments ? selectedIssue.comments.length : 0)"></span>
@@ -4743,6 +4892,34 @@
                     <span x-text="showDepGraph ? 'Hide Graph' : 'Show Graph'"></span>
                   </button>
                 </div>
+
+                <!-- Transitive Root-Blocker Chain ("Start Here") -->
+                <template x-if="getSelectedIssueRootBlockers()?.isBlocked && (getSelectedIssueRootBlockers()?.roots?.length > 0 || getSelectedIssueRootBlockers()?.hasCycle)">
+                  <div class="mb-4 p-3 rounded-xl bg-amber-50/80 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800/60" data-root-blockers-panel>
+                    <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
+                      <span class="text-[11px] font-semibold text-amber-900 dark:text-amber-200 uppercase tracking-wider">🎯 Start Here — Root Blocker(s) to Clear First</span>
+                      <span class="text-[11px] font-mono text-amber-700 dark:text-amber-300"
+                            x-text="(getSelectedIssueRootBlockers()?.chainLength || 0) + ' upstream blocker(s)' + ((getSelectedIssueRootBlockers()?.maxDepth || 0) > 1 ? (' · depth ' + getSelectedIssueRootBlockers().maxDepth) : '')"></span>
+                    </div>
+                    <div class="flex flex-wrap gap-1.5">
+                      <template x-for="rb in (getSelectedIssueRootBlockers()?.roots || []).slice(0, 8)" :key="'rb-' + rb.id">
+                        <button type="button"
+                                @click="showIssue(rb.id)"
+                                :title="rb.title + ' (P' + rb.priority + ' · ' + (rb.actionable ? 'actionable now' : rb.status) + ')'"
+                                class="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-mono rounded-lg border transition-colors max-w-full min-w-0"
+                                :class="rb.actionable ? 'bg-emerald-50 dark:bg-emerald-900/30 border-emerald-300 dark:border-emerald-700 text-emerald-800 dark:text-emerald-200 hover:bg-emerald-100 dark:hover:bg-emerald-900/50' : 'bg-amber-100/70 dark:bg-amber-900/30 border-amber-300 dark:border-amber-700 text-amber-800 dark:text-amber-200 hover:bg-amber-200/70 dark:hover:bg-amber-900/50'">
+                          <span class="shrink-0" x-text="rb.actionable ? '▶' : '•'"></span>
+                          <span class="truncate" x-text="rb.id"></span>
+                          <span class="text-[10px] opacity-80 shrink-0" x-text="'P' + rb.priority + (rb.depth > 1 ? (' · d' + rb.depth) : '')"></span>
+                        </button>
+                      </template>
+                      <span x-show="getSelectedIssueRootBlockers()?.hasCycle"
+                            class="inline-flex items-center px-2 py-1 text-xs font-medium rounded-lg bg-red-100 dark:bg-red-900/40 text-red-700 dark:text-red-300">
+                        ⚠ Dependency cycle detected
+                      </span>
+                    </div>
+                  </div>
+                </template>
 
                 <!-- Category 1: Blocking / Blocked By -->
                 <div x-show="(selectedIssue.dependencyGroups?.blockedBy?.length > 0) || (selectedIssue.dependencyGroups?.blocks?.length > 0) || selectedIssue.blocked_by_ids || selectedIssue.blocks_ids"
