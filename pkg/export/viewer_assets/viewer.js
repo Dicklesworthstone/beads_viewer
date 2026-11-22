@@ -2196,6 +2196,42 @@ function buildFilterClauses(filters = {}, tableAlias = '') {
     }
   }
 
+  // In-cycle filter
+  if (filters.inCycle === true || filters.inCycle === 'true') {
+    const cycleIds = Array.isArray(filters.cycleIds)
+      ? filters.cycleIds
+      : [...new Set((getCycleInfo()?.cycles || []).flat())];
+    if (cycleIds.length === 0) {
+      clauses.push('1 = 0');
+    } else {
+      clauses.push(`${col('id')} IN (${cycleIds.map(() => '?').join(',')})`);
+      params.push(...cycleIds);
+    }
+  }
+
+  // Articulation point (cut vertex) filter
+  if (filters.articulation === true || filters.articulation === 'true') {
+    const artIds = Array.isArray(filters.articulationIds)
+      ? filters.articulationIds
+      : (getArticulationPoints() || []).map(a => a?.id || a).filter(Boolean);
+    if (artIds.length === 0) {
+      clauses.push('1 = 0');
+    } else {
+      clauses.push(`${col('id')} IN (${artIds.map(() => '?').join(',')})`);
+      params.push(...artIds);
+    }
+  }
+
+  // Overdue filter (open issues whose due_date precedes reference snapshot clock)
+  if (filters.overdue === true || filters.overdue === 'true') {
+    if (getOverviewColumnSet().has('due_date')) {
+      clauses.push(`${col('due_date')} IS NOT NULL AND ${col('due_date')} <> '' AND LOWER(${col('status')}) NOT IN ('closed', 'tombstone') AND ${col('due_date')} < ?`);
+      params.push(new Date(getReferenceNowMs()).toISOString());
+    } else {
+      clauses.push('1 = 0');
+    }
+  }
+
   // Label filter (JSON array contains; exact json_each match with Go-escaped case-sensitive INSTR fallback)
   if (filters.labels?.length) {
     const labels = Array.isArray(filters.labels) ? filters.labels : [filters.labels];
@@ -2275,12 +2311,21 @@ function queryIssues(filters = {}, sort = 'priority', limit = 50, offset = 0) {
     sql += ` WHERE ${clauses.join(' AND ')}`;
   }
 
-  // Sorting
+  // Sorting (strictly whitelisted ORDER BY expressions)
+  const mvCols = getOverviewColumnSet();
   const sortMap = {
     'priority': 'priority ASC, COALESCE(triage_score, 0) DESC',
     'updated': 'updated_at DESC',
     'score': 'COALESCE(triage_score, 0) DESC',
     'blocks': 'blocks_count DESC',
+    'pagerank': 'COALESCE(pagerank, 0) DESC, priority ASC',
+    'betweenness': 'COALESCE(betweenness, 0) DESC, priority ASC',
+    'due': mvCols.has('due_date')
+      ? "CASE WHEN due_date IS NULL OR due_date = '' THEN 1 ELSE 0 END ASC, due_date ASC, priority ASC"
+      : 'priority ASC',
+    'estimate': mvCols.has('estimated_minutes')
+      ? 'CASE WHEN estimated_minutes IS NULL OR estimated_minutes <= 0 THEN 1 ELSE 0 END ASC, estimated_minutes ASC, priority ASC'
+      : 'priority ASC',
     'created': 'created_at DESC',
     'title': 'title ASC',
     'id': 'id ASC',
@@ -2448,6 +2493,36 @@ function getIssue(id) {
     );
     issue.in_cycle = Boolean(issue.in_cycle || isIssueInCycle(id));
     issue.is_overdue = isIssueOverdue(issue);
+    issue.kcore = null;
+    issue.slack = null;
+    issue.slack_available = false;
+    issue.is_articulation_point = false;
+    if (GRAPH_STATE.ready && GRAPH_STATE.graph) {
+      try {
+        const g = GRAPH_STATE.activeGraph || GRAPH_STATE.graph;
+        const nMap = GRAPH_STATE.activeNodeMap || GRAPH_STATE.nodeMap;
+        const idx = nMap?.get(id);
+        if (idx !== undefined) {
+          if (typeof g.kcore === 'function') {
+            const kc = g.kcore();
+            if (kc && idx < kc.length) issue.kcore = Number(kc[idx]);
+          }
+          if (typeof g.hasCycles === 'function' && !g.hasCycles() && typeof g.slack === 'function') {
+            const sl = g.slack();
+            if (sl && idx < sl.length && Number.isFinite(Number(sl[idx]))) {
+              issue.slack = Number(sl[idx]);
+              issue.slack_available = true;
+            }
+          }
+          if (typeof g.articulationPoints === 'function') {
+            const aps = Array.from(g.articulationPoints() || []);
+            issue.is_articulation_point = aps.includes(idx);
+          }
+        }
+      } catch {
+        // Keep defaults if optional WASM metrics unavailable
+      }
+    }
   }
   return issue;
 }
@@ -4028,6 +4103,15 @@ function filtersToURL(filters = {}, sort = 'priority', searchQuery = '', searchM
   if (filters.criticalPath === true || filters.criticalPath === 'true') {
     params.set('critical', 'true');
   }
+  if (filters.inCycle === true || filters.inCycle === 'true') {
+    params.set('cycle', 'true');
+  }
+  if (filters.overdue === true || filters.overdue === 'true') {
+    params.set('overdue', 'true');
+  }
+  if (filters.articulation === true || filters.articulation === 'true') {
+    params.set('cutvertex', 'true');
+  }
 
   if (searchQuery) {
     params.set('q', searchQuery);
@@ -4114,6 +4198,18 @@ function filtersFromURL() {
   if (criticalParam === 'true' || criticalParam === '1') {
     filters.criticalPath = true;
   }
+  const cycleParam = params.get('cycle');
+  if (cycleParam === 'true' || cycleParam === '1') {
+    filters.inCycle = true;
+  }
+  const overdueParam = params.get('overdue');
+  if (overdueParam === 'true' || overdueParam === '1') {
+    filters.overdue = true;
+  }
+  const cutVertexParam = params.get('cutvertex');
+  if (cutVertexParam === 'true' || cutVertexParam === '1') {
+    filters.articulation = true;
+  }
 
   const rawMode = params.get('mode') || 'text';
   const searchMode = VALID_SEARCH_MODES.has(rawMode) ? rawMode : 'text';
@@ -4156,10 +4252,11 @@ const ROUTES = [
   { pattern: '/issues', view: 'issues' },
   { pattern: '/issue/:id', view: 'issue' },
   { pattern: '/insights', view: 'insights' },
+  { pattern: '/sprints', view: 'sprints' },
   { pattern: '/graph', view: 'graph' },
 ];
 
-const DIRECT_VIEW_ROUTES = new Set(['issues', 'insights', 'graph']);
+const DIRECT_VIEW_ROUTES = new Set(['issues', 'insights', 'sprints', 'graph']);
 
 /**
  * Resolve a static view from the final URL path segment.
@@ -4674,6 +4771,9 @@ function beadsApp() {
       hasBlockers: null, // true/false/null
       isBlocking: null,  // true/false/null
       criticalPath: false, // Filter to critical path issues
+      inCycle: false,      // Filter to dependency cycle issues
+      overdue: false,      // Filter to overdue open issues
+      articulation: false, // Filter to articulation point (cut vertex) issues
     },
     sort: 'priority',
     searchQuery: '',
@@ -4797,6 +4897,19 @@ function beadsApp() {
     copiedCommandText: '',
     showTriageJson: false, // Modal for raw JSON view
 
+    // Sprints & Burndown data (data/sprints.json, gated on meta.has_sprints)
+    sprintsData: null,
+    hasSprints: false,
+    selectedSprintId: '',
+
+    // Hygiene suggestions (data/suggestions.json, gated on meta.has_suggestions)
+    suggestionsData: null,
+    hasSuggestions: false,
+    suggestionsTypeFilter: 'all',
+
+    // Loaded git correlation history (populated when data/history.json loads)
+    historyData: null,
+
     syncModalOpenBodyClass() {
       const hasModal = !!(this.selectedIssue || (this.view === 'graph' && this.graphDetailNode));
       if (hasModal) {
@@ -4830,17 +4943,23 @@ function beadsApp() {
       this.$watch('selectedIssue', updateBodyScrollLock);
       this.$watch('graphDetailNode', updateBodyScrollLock);
 
-      // Scroll to top on view change, hide stray graph tooltips, and guard direct view transitions
+      // Scroll to top on view change, hide stray graph tooltips/popovers/timers, and guard direct view transitions
       this.$watch('view', (newView, oldView) => {
         if (newView !== 'graph') {
           if (this.graphDetailNode) {
             this.graphDetailNode = null;
+          }
+          if (this.graphFiltersOpen) {
+            this.graphFiltersOpen = false;
           }
           if (this.graphContextMenu?.open) {
             this.graphContextMenu = { open: false, x: 0, y: 0, node: null };
           }
           if (oldView === 'graph') {
             this.forceGraphModule?.hideTooltip?.();
+            this.forceGraphModule?.resetWhatIf?.({ force: true });
+            this.forceGraphModule?.resetCriticalPath?.();
+            this.forceGraphModule?.stopTimeTravel?.();
           }
           this.syncModalOpenBodyClass();
         }
@@ -4867,7 +4986,7 @@ function beadsApp() {
         }
       });
 
-      // Close coarse-pointer / click-opened .metric-tooltip cards and graph context menu when clicking outside
+      // Close coarse-pointer / click-opened .metric-tooltip cards, graph filter popover, and graph context menu when clicking outside
       document.addEventListener('click', (e) => {
         if (!e.target?.closest?.('.metric-tooltip-trigger')) {
           document.querySelectorAll('.metric-tooltip.tooltip-visible').forEach(el => el.classList.remove('tooltip-visible'));
@@ -4876,14 +4995,20 @@ function beadsApp() {
         if (this.graphContextMenu?.open && !e.target?.closest?.('#graph-context-menu')) {
           this.graphContextMenu = { open: false, x: 0, y: 0, node: null };
         }
+        if (this.graphFiltersOpen && !e.target?.closest?.('#graph-filter-hud, #graph-filter-toggle-btn')) {
+          this.graphFiltersOpen = false;
+        }
       });
 
-      // Dismiss graph context menu on right-click outside the menu, canvas pan/wheel, or window resize
-      document.addEventListener('contextmenu', (e) => {
+      // Dismiss graph context menu on right-click outside the menu, touch/pointer pan, wheel, or window resize
+      const dismissGraphContextMenuOnOutsidePointer = (e) => {
         if (this.graphContextMenu?.open && !e.target?.closest?.('#graph-context-menu')) {
           this.graphContextMenu = { open: false, x: 0, y: 0, node: null };
         }
-      }, true);
+      };
+      document.addEventListener('pointerdown', dismissGraphContextMenuOnOutsidePointer, true);
+      document.addEventListener('touchstart', dismissGraphContextMenuOnOutsidePointer, { capture: true, passive: true });
+      document.addEventListener('contextmenu', dismissGraphContextMenuOnOutsidePointer, true);
       document.addEventListener('wheel', (e) => {
         if (this.graphContextMenu?.open && !e.target?.closest?.('#graph-context-menu')) {
           this.graphContextMenu = { open: false, x: 0, y: 0, node: null };
@@ -4917,12 +5042,18 @@ function beadsApp() {
         }, 5000);
       });
 
-      // Capture-phase Escape closes the graph node context menu without leaking to graph.js or detail pane
+      // Capture-phase Escape closes the graph node context menu or filter HUD popover without leaking to graph.js or detail pane
       window.addEventListener('keydown', (e) => {
         if (e.key === 'Escape' && this.graphContextMenu?.open) {
           e.preventDefault();
           e.stopImmediatePropagation();
           this.graphContextMenu = { open: false, x: 0, y: 0, node: null };
+          return;
+        }
+        if (e.key === 'Escape' && this.graphFiltersOpen) {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+          this.graphFiltersOpen = false;
         }
       }, true);
 
@@ -5297,6 +5428,39 @@ function beadsApp() {
           console.log('[Viewer] No triage.json found (optional for insights)');
         }
 
+        // Load optional sprints.json only when meta.has_sprints is true (zero 404s when absent)
+        if (this.meta?.has_sprints === true || this.meta?.has_sprints === 'true') {
+          try {
+            const sprintsResp = await fetch(`./data/sprints.json?_t=${Date.now()}`);
+            if (sprintsResp.ok) {
+              this.sprintsData = await sprintsResp.json();
+              const list = Array.isArray(this.sprintsData?.sprints) ? this.sprintsData.sprints : [];
+              this.hasSprints = list.length > 0;
+              if (this.hasSprints) {
+                this.selectedSprintId = this.sprintsData.active_sprint_id || list[0].id || '';
+                if (this.view === 'sprints') {
+                  this.$nextTick(() => this.renderSelectedSprintChart());
+                }
+              }
+            }
+          } catch (sprintsErr) {
+            console.log('[Viewer] Optional sprints.json unavailable:', sprintsErr);
+          }
+        }
+
+        // Load optional suggestions.json only when meta.has_suggestions is true (zero 404s when absent)
+        if (this.meta?.has_suggestions === true || this.meta?.has_suggestions === 'true') {
+          try {
+            const sugResp = await fetch(`./data/suggestions.json?_t=${Date.now()}`);
+            if (sugResp.ok) {
+              this.suggestionsData = await sugResp.json();
+              this.hasSuggestions = Array.isArray(this.suggestionsData?.suggestions) && this.suggestionsData.suggestions.length > 0;
+            }
+          } catch (sugErr) {
+            console.log('[Viewer] Optional suggestions.json unavailable:', sugErr);
+          }
+        }
+
         this.loading = false;
       } catch (err) {
         console.error('Init failed:', err);
@@ -5349,7 +5513,11 @@ function beadsApp() {
               }
             }
             this.whatIfResult = null;
-            this.selectedIssue = getIssue(route.params.id);
+            const resolvedIssue = getIssue(route.params.id);
+            this.selectedIssue = resolvedIssue;
+            if (!resolvedIssue) {
+              showToast(`Issue ${route.params.id} is excluded from this filtered export`, 'warning');
+            }
             // Update nav list from current issues
             if (this.issues.length) {
               this.issueNavList = this.issues.map(i => i.id);
@@ -5378,6 +5546,9 @@ function beadsApp() {
             hasBlockers: null,
             isBlocking: null,
             criticalPath: false,
+            inCycle: false,
+            overdue: false,
+            articulation: false,
             ...urlState.filters,
           };
           if (this.filters.criticalPath && this.graphReady) {
@@ -5400,6 +5571,14 @@ function beadsApp() {
           this.selectedIssue = null;
           this.graphDetailNode = null;
           this.syncModalOpenBodyClass();
+          break;
+
+        case 'sprints':
+          this.view = 'sprints';
+          this.selectedIssue = null;
+          this.graphDetailNode = null;
+          this.syncModalOpenBodyClass();
+          this.$nextTick(() => this.renderSelectedSprintChart());
           break;
 
         case 'graph':
@@ -5551,6 +5730,12 @@ function beadsApp() {
                 showClosed: detail.filters.showClosed !== false,
               };
             }
+            if (this.graphSearchResult?.id) {
+              const visibleNodes = this.forceGraphModule?.getGraph?.()?.graphData?.()?.nodes || [];
+              if (!visibleNodes.some(n => n.id === this.graphSearchResult.id)) {
+                this.graphSearchResult = null;
+              }
+            }
           });
           document.addEventListener('bv-graph:selectionChange', (e) => {
             if (e.detail?.node) {
@@ -5659,6 +5844,9 @@ function beadsApp() {
 
         console.log(`[ForceGraph] Loading ${issues.length} issues, ${dependencies.length} dependencies`);
         this.graphFilters = { status: '', priority: '', label: '', repo: '', search: '', showClosed: true };
+        this.graphFiltersOpen = false;
+        this.graphHeatmapActive = false;
+        this.currentPreset = 'force';
         this.graphWhatIfActive = false;
         this.graphWhatIfNodes = [];
         this.graphWhatIfBatchIds = [];
@@ -5680,6 +5868,7 @@ function beadsApp() {
           });
           if (historyResp.ok) {
             const historyData = await historyResp.json();
+            this.historyData = historyData;
             if (historyData?.commits?.length > 0 && this.forceGraphModule.initTimeTravel) {
               const ready = this.forceGraphModule.initTimeTravel(historyData);
               this.timeTravelAvailable = Boolean(ready ?? true);
@@ -5785,7 +5974,8 @@ function beadsApp() {
 
       const found = graphData.nodes.find(n =>
         (n.id && n.id.toLowerCase().includes(q)) ||
-        (n.title && n.title.toLowerCase().includes(q))
+        (n.title && n.title.toLowerCase().includes(q)) ||
+        (n.sourceRepo && n.sourceRepo.toLowerCase().includes(q))
       );
 
       if (found && typeof found.x === 'number' && typeof found.y === 'number') {
@@ -5812,6 +6002,12 @@ function beadsApp() {
       };
       if (filters.criticalPath) {
         filters.criticalPathIds = this.criticalPathData?.path || getCriticalPathSequence()?.path || [];
+      }
+      if (filters.inCycle) {
+        filters.cycleIds = [...new Set((this.cycleInfo?.cycles || getCycleInfo()?.cycles || []).flat())];
+      }
+      if (filters.articulation) {
+        filters.articulationIds = (this.articulationPoints || getArticulationPoints() || []).map(a => a?.id || a).filter(Boolean);
       }
 
       if (this.searchQuery) {
@@ -5873,6 +6069,9 @@ function beadsApp() {
         hasBlockers: overrides.hasBlockers === true || overrides.hasBlockers === false ? overrides.hasBlockers : null,
         isBlocking: overrides.isBlocking === true ? true : null,
         criticalPath: Boolean(overrides.criticalPath),
+        inCycle: Boolean(overrides.inCycle),
+        overdue: Boolean(overrides.overdue),
+        articulation: Boolean(overrides.articulation),
       };
       this.filters = nextFilters;
       if (!nextFilters.criticalPath) {
@@ -5933,7 +6132,13 @@ function beadsApp() {
 
     applyGraphFilter(key, value) {
       if (!this.forceGraphModule?.setFilter || !this.forceGraphReady) return;
-      this.graphFilters = { ...this.graphFilters, [key]: value };
+      const next = { ...this.graphFilters, [key]: value };
+      if (key === 'status' && value === 'closed') {
+        next.showClosed = true;
+      } else if (key === 'showClosed' && !value && next.status === 'closed') {
+        next.status = '';
+      }
+      this.graphFilters = next;
       switch (key) {
         case 'status':
           this.forceGraphModule.setFilter('status', value || null);
@@ -5979,6 +6184,9 @@ function beadsApp() {
         hasBlockers: null,
         isBlocking: null,
         criticalPath: false,
+        inCycle: false,
+        overdue: false,
+        articulation: false,
       };
       this.showCriticalPath = false;
       this.criticalPathData = null;
@@ -6002,6 +6210,9 @@ function beadsApp() {
              this.filters.hasBlockers !== null ||
              this.filters.isBlocking !== null ||
              Boolean(this.filters.criticalPath) ||
+             Boolean(this.filters.inCycle) ||
+             Boolean(this.filters.overdue) ||
+             Boolean(this.filters.articulation) ||
              this.searchQuery;
     },
 
@@ -6098,6 +6309,11 @@ function beadsApp() {
      * Show issue detail (navigates to issue route)
      */
     showIssue(id) {
+      if (!id) return;
+      if (!getIssue(id)) {
+        showToast(`Issue ${id} is excluded from this filtered export`, 'warning');
+        return;
+      }
       navigateToIssue(id);
     },
 
@@ -6382,6 +6598,9 @@ function beadsApp() {
       if (this.showDepGraph && this.selectedIssue) {
         this.renderDepGraph();
       }
+      if (this.view === 'sprints' && this.activeSprint) {
+        this.$nextTick(() => this.renderSelectedSprintChart());
+      }
     },
 
     // ========================================================================
@@ -6574,7 +6793,8 @@ function beadsApp() {
      * Ensure graph view is active and ForceGraph is initialized
      */
     async initForceGraph() {
-      if (this.view !== 'graph') {
+      const switchedView = this.view !== 'graph';
+      if (switchedView) {
         this.view = 'graph';
         this.selectedIssue = null;
         if (window.location.hash !== '#/graph') {
@@ -6588,6 +6808,11 @@ function beadsApp() {
         }
       } else if (!this.forceGraphReady || !this.forceGraphModule) {
         await this.initForceGraphView();
+      } else if (switchedView) {
+        this.graphFiltersOpen = false;
+        if (this.hasActiveGraphFilters) {
+          this.clearGraphFilters();
+        }
       }
       return Boolean(this.forceGraphReady && this.forceGraphModule);
     },
@@ -6812,6 +7037,12 @@ function beadsApp() {
     getTriageAlerts() {
       const raw = this.triageData?.alerts ?? this.triageData?.triage?.alerts;
       if (!Array.isArray(raw)) return [];
+      const sevRank = (sev) => {
+        if (sev === 'critical' || sev === 'error') return 0;
+        if (sev === 'warning') return 1;
+        if (sev === 'info') return 2;
+        return 3;
+      };
       return raw.map((item, idx) => {
         if (typeof item === 'string') {
           return {
@@ -6820,15 +7051,31 @@ function beadsApp() {
             type: 'alert',
             message: item,
             issue_id: null,
+            issue_ids: [],
+            _idx: idx,
           };
         }
+        const primaryId = item?.issue_id || item?.bead_id || null;
+        const idSet = new Set();
+        if (primaryId) idSet.add(String(primaryId));
+        if (Array.isArray(item?.issue_ids)) {
+          for (const id of item.issue_ids) {
+            if (id) idSet.add(String(id));
+          }
+        }
+        const issueIds = [...idSet];
         return {
-          key: item?.id || `${item?.type || 'alert'}-${item?.issue_id || idx}-${idx}`,
+          key: item?.id || `${item?.type || 'alert'}-${primaryId || issueIds[0] || idx}-${idx}`,
           severity: String(item?.severity || 'warning').toLowerCase(),
           type: item?.type || item?.kind || 'alert',
           message: item?.message || item?.summary || item?.description || String(item?.type || 'Alert'),
-          issue_id: item?.issue_id || item?.bead_id || null,
+          issue_id: issueIds[0] || null,
+          issue_ids: issueIds,
+          _idx: idx,
         };
+      }).sort((a, b) => {
+        const diff = sevRank(a.severity) - sevRank(b.severity);
+        return diff !== 0 ? diff : a._idx - b._idx;
       });
     },
 
@@ -6856,6 +7103,71 @@ function beadsApp() {
     getTriageRecommendations() {
       const raw = this.triageData?.recommendations ?? this.triageData?.triage?.recommendations;
       return Array.isArray(raw) ? raw : [];
+    },
+
+    get activeSprint() {
+      const list = Array.isArray(this.sprintsData?.sprints) ? this.sprintsData.sprints : [];
+      if (list.length === 0) return null;
+      return list.find(s => s.id === this.selectedSprintId) || list[0];
+    },
+
+    selectSprint(id) {
+      if (!id) return;
+      this.selectedSprintId = id;
+      this.$nextTick(() => this.renderSelectedSprintChart());
+    },
+
+    renderSelectedSprintChart() {
+      const sprint = this.activeSprint;
+      if (!sprint || !window.bvCharts?.renderSprintBurndownChart) return;
+      window.bvCharts.renderSprintBurndownChart('sprint-burndown-chart', sprint);
+    },
+
+    get suggestionTypeCounts() {
+      const list = Array.isArray(this.suggestionsData?.suggestions) ? this.suggestionsData.suggestions : [];
+      const counts = { all: list.length, potential_duplicate: 0, missing_dependency: 0, label_suggestion: 0, cycle_warning: 0 };
+      for (const s of list) {
+        if (s?.type && Object.prototype.hasOwnProperty.call(counts, s.type)) {
+          counts[s.type]++;
+        }
+      }
+      return counts;
+    },
+
+    get filteredSuggestions() {
+      const list = Array.isArray(this.suggestionsData?.suggestions) ? this.suggestionsData.suggestions : [];
+      if (!this.suggestionsTypeFilter || this.suggestionsTypeFilter === 'all') {
+        return list;
+      }
+      return list.filter(s => s?.type === this.suggestionsTypeFilter);
+    },
+
+    async copySuggestionCommand(cmd) {
+      if (!cmd) return;
+      try {
+        if (navigator.clipboard && window.isSecureContext) {
+          await navigator.clipboard.writeText(cmd);
+        } else {
+          const ta = document.createElement('textarea');
+          ta.value = cmd;
+          ta.setAttribute('readonly', '');
+          ta.style.position = 'fixed';
+          ta.style.opacity = '0';
+          document.body.appendChild(ta);
+          ta.select();
+          document.execCommand('copy');
+          ta.remove();
+        }
+        showToast('Copied command: ' + cmd, 'success');
+      } catch {
+        showToast('Could not copy command', 'warning');
+      }
+    },
+
+    getIssueCommits(id) {
+      if (!id || !this.historyData?.histories) return [];
+      const h = this.historyData.histories[id];
+      return Array.isArray(h?.commits) ? h.commits : [];
     },
 
     getTriageRecommendationsByTrack() {

@@ -874,6 +874,8 @@ func (e *SQLiteExporter) insertMeta(db *sql.DB) error {
 		"schema_version":   fmt.Sprintf("%d", SchemaVersion),
 		"readiness_at":     e.exportTimestamp().Format(time.RFC3339Nano),
 		"has_hybrid_wasm":  strconv.FormatBool(e.hasHybridWasm),
+		"has_sprints":      strconv.FormatBool(e.Config.HasSprints),
+		"has_suggestions":  strconv.FormatBool(e.Config.HasSuggestions),
 	}
 
 	if e.gitHash != "" {
@@ -958,13 +960,15 @@ func (e *SQLiteExporter) writeRobotOutputs(bundle *Bundle, dataDir string) error
 
 	// Write export metadata
 	meta := ExportMeta{
-		Version:       "1.0.0",
-		GeneratedAt:   e.exportTimestamp(),
-		GitCommit:     e.gitHash,
-		IssueCount:    len(e.Issues),
-		DepCount:      len(e.Deps),
-		Title:         e.Config.Title,
-		HasHybridWasm: e.hasHybridWasm || bundleHasHybridWasm(bundle),
+		Version:        "1.0.0",
+		GeneratedAt:    e.exportTimestamp(),
+		GitCommit:      e.gitHash,
+		IssueCount:     len(e.Issues),
+		DepCount:       len(e.Deps),
+		Title:          e.Config.Title,
+		HasHybridWasm:  e.hasHybridWasm || bundleHasHybridWasm(bundle),
+		HasSprints:     e.Config.HasSprints,
+		HasSuggestions: e.Config.HasSuggestions,
 	}
 	if err := e.writeRobotJSON(bundle, filepath.Join(dataDir, "meta.json"), meta); err != nil {
 		return fmt.Errorf("write meta.json: %w", err)

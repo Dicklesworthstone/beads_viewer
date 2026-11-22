@@ -983,6 +983,112 @@ function updateHeatmap() {
     renderHeatmap();
 }
 
+/**
+ * Render an ideal-vs-actual sprint burndown line chart on canvasId using Chart.js.
+ */
+function renderSprintBurndownChart(canvasId, sprint) {
+    if (typeof Chart === 'undefined' || !sprint) return null;
+    const canvas = document.getElementById(canvasId);
+    if (!canvas) return null;
+
+    const existing = Chart.getChart(canvas);
+    if (existing) {
+        existing.destroy();
+    }
+
+    const bd = sprint.burndown || {};
+    const idealLine = Array.isArray(bd.ideal_line) ? bd.ideal_line : [];
+    const dailyPoints = Array.isArray(bd.daily_points) ? bd.daily_points : [];
+    const totalIssues = Number(bd.total_issues || 0);
+
+    const dateKey = (raw) => {
+        if (!raw) return '';
+        const d = new Date(raw);
+        if (Number.isNaN(d.getTime())) return String(raw).slice(0, 10);
+        return d.toISOString().slice(0, 10);
+    };
+
+    const labels = [];
+    const dateSet = new Set();
+    for (const pt of idealLine) {
+        const k = dateKey(pt.date);
+        if (k && !dateSet.has(k)) { dateSet.add(k); labels.push(k); }
+    }
+    for (const pt of dailyPoints) {
+        const k = dateKey(pt.date);
+        if (k && !dateSet.has(k)) { dateSet.add(k); labels.push(k); }
+    }
+    labels.sort();
+
+    if (labels.length === 0) {
+        return null;
+    }
+
+    const idealByDate = new Map(idealLine.map(pt => [dateKey(pt.date), Number(pt.remaining)]));
+    const actualByDate = new Map(dailyPoints.map(pt => [dateKey(pt.date), Number(pt.remaining)]));
+
+    const idealSeries = labels.map(d => (idealByDate.has(d) ? idealByDate.get(d) : null));
+    const actualSeries = labels.map(d => (actualByDate.has(d) ? actualByDate.get(d) : null));
+
+    const isDark = document.documentElement.classList.contains('dark');
+    const textColor = isDark ? '#d1d5db' : '#374151';
+    const gridColor = isDark ? 'rgba(75, 85, 99, 0.3)' : 'rgba(209, 213, 219, 0.6)';
+
+    return new Chart(canvas.getContext('2d'), {
+        type: 'line',
+        data: {
+            labels: labels.map(formatDateLabel),
+            datasets: [
+                {
+                    label: 'Ideal Remaining',
+                    data: idealSeries,
+                    borderColor: isDark ? '#94a3b8' : '#64748b',
+                    borderDash: [6, 4],
+                    borderWidth: 2,
+                    pointRadius: 0,
+                    tension: 0,
+                    spanGaps: true,
+                    fill: false,
+                },
+                {
+                    label: 'Actual Remaining',
+                    data: actualSeries,
+                    borderColor: bd.on_track === false ? '#ef4444' : '#6366f1',
+                    backgroundColor: bd.on_track === false ? 'rgba(239, 68, 68, 0.12)' : 'rgba(99, 102, 241, 0.14)',
+                    borderWidth: 2.5,
+                    pointRadius: 3,
+                    pointHoverRadius: 5,
+                    tension: 0.15,
+                    spanGaps: false,
+                    fill: true,
+                },
+            ],
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            interaction: { mode: 'index', intersect: false },
+            plugins: {
+                legend: {
+                    labels: { color: textColor, usePointStyle: true, boxWidth: 8 },
+                },
+            },
+            scales: {
+                x: {
+                    ticks: { color: textColor, maxTicksLimit: 10 },
+                    grid: { color: gridColor },
+                },
+                y: {
+                    beginAtZero: true,
+                    suggestedMax: Math.max(totalIssues, 1),
+                    ticks: { color: textColor, precision: 0 },
+                    grid: { color: gridColor },
+                },
+            },
+        },
+    });
+}
+
 // ============================================================================
 // UTILITIES
 // ============================================================================
@@ -1041,6 +1147,7 @@ if (typeof window !== 'undefined') {
         destroy: destroyCharts,
         applyTheme: applyTheme,
         renderHeatmapChart: renderHeatmap,
+        renderSprintBurndownChart: renderSprintBurndownChart,
         computeBurndownData: computeBurndownData,
         computeLabelMatrix: computeLabelMatrix,
         CHART_THEME: CHART_THEME

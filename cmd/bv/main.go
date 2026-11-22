@@ -1804,7 +1804,7 @@ func main() {
 	exportFile := flag.String("export-md", "", "Export issues to a Markdown file (e.g., report.md)")
 	exportReport := flag.String("export", "", "Export a report using recipe defaults or explicit export options")
 	exportFormat := flag.String("export-format", "", "Report format: markdown, html, json, csv or mermaid")
-	exportGroupBy := flag.String("export-group-by", "", "Group exported issues by: status, priority, type, assignee, label, or none (overrides recipe view.group_by)")
+	exportGroupBy := flag.String("export-group-by", "", "Group exported issues by: status, priority, type, assignee, label, repo, or none (overrides recipe view.group_by)")
 	exportIncludeGraph := flag.Bool("export-include-graph", true, "Include dependency context in the report (explicit false overrides recipe)")
 	exportIncludeActions := flag.Bool("export-include-actions", true, "Include recommended action plan in Markdown/HTML reports (explicit false overrides recipe)")
 	exportTemplate := flag.String("export-template", "", "Explicitly authorize a Markdown template path; explicit empty disables a recipe template")
@@ -2160,7 +2160,7 @@ func main() {
 		enumRules := []enumFlagRule{
 			{name: "graph-format", allowed: []string{"json", "dot", "mermaid"}},
 			{name: "script-format", allowed: []string{"bash", "fish", "zsh"}},
-			{name: "export-group-by", allowed: []string{"status", "priority", "type", "issue_type", "assignee", "label", "labels", "tag", "tags", "none"}},
+			{name: "export-group-by", allowed: []string{"status", "priority", "type", "issue_type", "assignee", "label", "labels", "tag", "tags", "repo", "source_repo", "none"}},
 		}
 		primaryRobotCommandGroups := cliPrimaryRobotCommandGroups()
 		if err := validateModifierFlags(flag.CommandLine, modifierRules); err != nil {
@@ -4078,6 +4078,20 @@ func main() {
 					exporter.SetGitHash(commit)
 				}
 
+				// Precompute optional sprints & hygiene suggestions artifacts before ExportBundle
+				// so beads.sqlite3 and data/meta.json accurately record has_sprints / has_suggestions
+				// (preventing 404 fetches in static bundles when absent).
+				sprintsJSON, sprintCount, sprintsErr := buildExportSprintsPayload(exportContext, projectDir, exportIssues, exportNow)
+				if sprintsErr != nil {
+					fmt.Printf("  → Warning: failed to build sprints data: %v\n", sprintsErr)
+				}
+				suggestionsJSON, suggestionCount, suggestionsErr := buildExportSuggestionsPayload(exportContext, exportIssues, exportContext.DataHash, exportNow)
+				if suggestionsErr != nil {
+					fmt.Printf("  → Warning: failed to build hygiene suggestions: %v\n", suggestionsErr)
+				}
+				exporter.Config.HasSprints = sprintCount > 0 && len(sprintsJSON) > 0
+				exporter.Config.HasSuggestions = suggestionCount > 0 && len(suggestionsJSON) > 0
+
 				// Prepare optional WASM scorer assets before ExportBundle so
 				// beads.sqlite3 and data/meta.json accurately record has_hybrid_wasm.
 				if err := prepareBundleWasmAssets(bundle, projectDir, *noHooks); err != nil {
@@ -4088,6 +4102,20 @@ func main() {
 				fmt.Println("  → Writing database and JSON files...")
 				if err := exporter.ExportBundle(bundle); err != nil {
 					return fmt.Errorf("exporting: %w", err)
+				}
+				if exporter.Config.HasSprints {
+					if err := bundle.WriteFile("data/sprints.json", sprintsJSON, 0644); err != nil {
+						fmt.Printf("  → Warning: failed to write sprints.json: %v\n", err)
+					} else {
+						fmt.Printf("  → sprints.json (%d sprints)\n", sprintCount)
+					}
+				}
+				if exporter.Config.HasSuggestions {
+					if err := bundle.WriteFile("data/suggestions.json", suggestionsJSON, 0644); err != nil {
+						fmt.Printf("  → Warning: failed to write suggestions.json: %v\n", err)
+					} else {
+						fmt.Printf("  → suggestions.json (%d suggestions)\n", suggestionCount)
+					}
 				}
 
 				// Generate README.md with project stats (useful for GitHub Pages deployment)
@@ -5715,15 +5743,25 @@ func main() {
 			bgEnabled := bgModeVal == "1" || bgModeVal == "true" || bgModeVal == "yes" || bgModeVal == "on"
 			if !explicitDBPinned && !bgEnabled {
 				reloadDir := projectDir
+				extWatchers := newTUIExternalWatcherSet()
+				var syncMu sync.Mutex
 				m.SetSourceReload(func(ctx context.Context) (ui.SourceReloadResult, error) {
-					return reloadSingleRepoAutoDiscoverForUI(ctx, reloadDir, boundSource, boundSourceDegraded, reloadLabel, reloadRepo)
+					res, err := reloadSingleRepoAutoDiscoverForUI(ctx, reloadDir, boundSource, boundSourceDegraded, reloadLabel, reloadRepo)
+					if err == nil && res.SourcePath != "" {
+						syncMu.Lock()
+						extWatchers.Sync(tuiSingleRepoSiblingWatchPaths(robotDispatchContext, res.SourcePath), m.InternalWatchedPath())
+						syncMu.Unlock()
+					}
+					return res, err
 				})
 				if *labelScope == "" && *repoFilter == "" {
 					m.SetBackgroundAutoPromote(true)
 				}
-				extWatchers := newTUIExternalWatcherSet()
+				syncMu.Lock()
 				extWatchers.Sync(tuiSingleRepoSiblingWatchPaths(robotDispatchContext, beadsPath), "")
-				if extWatchers.HasWatchers() {
+				hasWatchers := extWatchers.HasWatchers()
+				syncMu.Unlock()
+				if hasWatchers {
 					externalReloadCh, stopExternalWatchers = extWatchers.ChangeCh(), extWatchers.Stop
 					m.DisableInternalWatcher()
 					m.SetExternalWatcherStatusProvider(extWatchers.Status)
@@ -5742,28 +5780,20 @@ func main() {
 				} else if bgEnabled && !explicitDBPinned {
 					// BackgroundWorker watches beadsPath itself; attach auto-discovery loader so
 					// sibling SQLite/JSONL changes trigger a real freshest-source reload and
-					// dynamically sync sibling watchers if the active source switches.
+					// dynamically sync sibling watchers on every reload against the live internal watcher.
 					reloadDir := projectDir
-					initialBeadsPath := beadsPath
 					var syncMu sync.Mutex
-					lastSyncedPath := initialBeadsPath
 					m.SetBackgroundSourceReload(func(ctx context.Context) (ui.SourceReloadResult, error) {
 						res, err := reloadSingleRepoAutoDiscoverForUI(ctx, reloadDir, boundSource, boundSourceDegraded, reloadLabel, reloadRepo)
 						if err == nil && res.SourcePath != "" {
 							syncMu.Lock()
-							changed := res.SourcePath != lastSyncedPath
-							if changed {
-								lastSyncedPath = res.SourcePath
-							}
+							extWatchers.Sync(tuiSingleRepoSiblingWatchPaths(robotDispatchContext, res.SourcePath), m.InternalWatchedPath())
 							syncMu.Unlock()
-							if changed {
-								extWatchers.Sync(tuiSingleRepoSiblingWatchPaths(robotDispatchContext, res.SourcePath), initialBeadsPath)
-							}
 						}
 						return res, err
 					})
 					watchPaths = tuiSingleRepoSiblingWatchPaths(robotDispatchContext, beadsPath)
-					skipPath = beadsPath
+					skipPath = m.InternalWatchedPath()
 				}
 				extWatchers.Sync(watchPaths, skipPath)
 				if extWatchers.HasWatchers() || (bgEnabled && !explicitDBPinned) {
@@ -8174,6 +8204,19 @@ func runPagesWizard(beadsPath string, dispatchCtx RobotContext, activeRecipe *re
 		}
 	}
 
+	// Precompute optional sprints & hygiene suggestions artifacts before ExportBundle
+	// so beads.sqlite3 and data/meta.json accurately record has_sprints / has_suggestions.
+	wizardSprintsJSON, wizardSprintCount, wizardSprintsErr := buildExportSprintsPayload(driftCtx, wizardProjectDir, exportIssues, wizardNow)
+	if wizardSprintsErr != nil {
+		fmt.Printf("  -> Warning: failed to build sprints data: %v\n", wizardSprintsErr)
+	}
+	wizardSuggestionsJSON, wizardSuggestionCount, wizardSuggestionsErr := buildExportSuggestionsPayload(driftCtx, exportIssues, driftCtx.DataHash, wizardNow)
+	if wizardSuggestionsErr != nil {
+		fmt.Printf("  -> Warning: failed to build hygiene suggestions: %v\n", wizardSuggestionsErr)
+	}
+	exporter.Config.HasSprints = wizardSprintCount > 0 && len(wizardSprintsJSON) > 0
+	exporter.Config.HasSuggestions = wizardSuggestionCount > 0 && len(wizardSuggestionsJSON) > 0
+
 	// Prepare optional WASM scorer assets before ExportBundle so
 	// beads.sqlite3 and data/meta.json accurately record has_hybrid_wasm.
 	if err := prepareBundleWasmAssets(bundle, wizardProjectDir, noHooks); err != nil {
@@ -8184,6 +8227,20 @@ func runPagesWizard(beadsPath string, dispatchCtx RobotContext, activeRecipe *re
 	fmt.Println("  -> Writing database and JSON files...")
 	if err := exporter.ExportBundle(bundle); err != nil {
 		return fmt.Errorf("export failed: %w", err)
+	}
+	if exporter.Config.HasSprints {
+		if err := bundle.WriteFile("data/sprints.json", wizardSprintsJSON, 0644); err != nil {
+			fmt.Printf("  -> Warning: failed to write sprints.json: %v\n", err)
+		} else {
+			fmt.Printf("  -> sprints.json (%d sprints)\n", wizardSprintCount)
+		}
+	}
+	if exporter.Config.HasSuggestions {
+		if err := bundle.WriteFile("data/suggestions.json", wizardSuggestionsJSON, 0644); err != nil {
+			fmt.Printf("  -> Warning: failed to write suggestions.json: %v\n", err)
+		} else {
+			fmt.Printf("  -> suggestions.json (%d suggestions)\n", wizardSuggestionCount)
+		}
 	}
 
 	// Generate README.md with project stats (for GitHub Pages)
@@ -12969,4 +13026,206 @@ func mustGetwd() string {
 		return "."
 	}
 	return wd
+}
+
+type exportSprintBead struct {
+	ID               string `json:"id"`
+	Title            string `json:"title"`
+	Status           string `json:"status"`
+	Priority         int    `json:"priority"`
+	IssueType        string `json:"issue_type"`
+	Assignee         string `json:"assignee,omitempty"`
+	EstimatedMinutes *int   `json:"estimated_minutes,omitempty"`
+	IsBlocked        bool   `json:"is_blocked"`
+}
+
+type exportSprintCapacity struct {
+	TotalMinutes        int     `json:"total_minutes"`
+	CriticalPathMinutes int     `json:"critical_path_minutes"`
+	Days1Agent          float64 `json:"days_1_agent"`
+	Days2AgentsMin      float64 `json:"days_2_agents_min"`
+	Days2AgentsMax      float64 `json:"days_2_agents_max"`
+	Days4AgentsMin      float64 `json:"days_4_agents_min"`
+	Days4AgentsMax      float64 `json:"days_4_agents_max"`
+}
+
+type exportSprintEntry struct {
+	ID        string                  `json:"id"`
+	Name      string                  `json:"name"`
+	StartDate time.Time               `json:"start_date"`
+	EndDate   time.Time               `json:"end_date"`
+	Status    string                  `json:"status"`
+	IsActive  bool                    `json:"is_active"`
+	Burndown  analysis.SprintBurndown `json:"burndown"`
+	AtRisk    []analysis.AtRiskItem   `json:"at_risk"`
+	Capacity  *exportSprintCapacity   `json:"capacity,omitempty"`
+	Beads     []exportSprintBead      `json:"beads"`
+}
+
+type exportSprintsDocument struct {
+	GeneratedAt    time.Time           `json:"generated_at"`
+	ActiveSprintID string              `json:"active_sprint_id,omitempty"`
+	SprintCount    int                 `json:"sprint_count"`
+	Sprints        []exportSprintEntry `json:"sprints"`
+}
+
+func buildExportSprintsPayload(ctx RobotContext, workDir string, exportIssues []model.Issue, now time.Time) ([]byte, int, error) {
+	sprints, err := loadSprintsForContext(ctx, workDir)
+	if err != nil || len(sprints) == 0 {
+		return nil, 0, err
+	}
+	atRiskThresholds := analysis.DefaultAtRiskThresholds()
+	if driftCfg, cfgErr := drift.LoadConfig(workDir); cfgErr == nil && driftCfg != nil {
+		atRiskThresholds = driftCfg.AtRiskThresholds()
+	}
+
+	issueByID := make(map[string]model.Issue, len(exportIssues))
+	for _, iss := range exportIssues {
+		issueByID[iss.ID] = iss
+	}
+	graphIssues := ctx.GraphIssues()
+	if len(graphIssues) == 0 {
+		graphIssues = exportIssues
+	}
+	readiness := ctx.Readiness
+	if readiness == nil {
+		readiness = model.NewReadinessIndex(graphIssues)
+	}
+
+	entries := make([]exportSprintEntry, 0, len(sprints))
+	activeSprintID := ""
+	for i := range sprints {
+		sp := sprints[i]
+		var sprintIssues []model.Issue
+		var openSprintIssues []model.Issue
+		scopedBeadIDs := make([]string, 0, len(sp.BeadIDs))
+		beads := make([]exportSprintBead, 0, len(sp.BeadIDs))
+		seenID := make(map[string]bool, len(sp.BeadIDs))
+		for _, id := range sp.BeadIDs {
+			if seenID[id] {
+				continue
+			}
+			iss, ok := issueByID[id]
+			if !ok {
+				continue
+			}
+			seenID[id] = true
+			scopedBeadIDs = append(scopedBeadIDs, id)
+			sprintIssues = append(sprintIssues, iss)
+			isClosed := iss.Status.IsClosed() || iss.Status.IsTombstone()
+			if !isClosed {
+				openSprintIssues = append(openSprintIssues, iss)
+			}
+			isBlocked := !isClosed && (iss.Status == model.StatusBlocked || len(readiness.Blockers(iss.ID)) > 0)
+			beads = append(beads, exportSprintBead{
+				ID:               iss.ID,
+				Title:            iss.Title,
+				Status:           string(iss.Status),
+				Priority:         iss.Priority,
+				IssueType:        string(iss.IssueType),
+				Assignee:         iss.Assignee,
+				EstimatedMinutes: iss.EstimatedMinutes,
+				IsBlocked:        isBlocked,
+			})
+		}
+		scopedSprint := sp
+		scopedSprint.BeadIDs = scopedBeadIDs
+		burndown := analysis.ComputeSprintBurndown(&scopedSprint, sprintIssues, now)
+		atRisk := analysis.DetectAtRiskWithReadiness(graphIssues, &scopedSprint, readiness, now, atRiskThresholds)
+		if atRisk == nil {
+			atRisk = []analysis.AtRiskItem{}
+		}
+		var capInfo *exportSprintCapacity
+		if len(openSprintIssues) > 0 {
+			g1 := analysis.ComputeGrahamBounds(openSprintIssues, graphIssues, nil, 1, now)
+			if g1.TotalMinutes > 0 {
+				g2 := analysis.ComputeGrahamBounds(openSprintIssues, graphIssues, nil, 2, now)
+				g4 := analysis.ComputeGrahamBounds(openSprintIssues, graphIssues, nil, 4, now)
+				capInfo = &exportSprintCapacity{
+					TotalMinutes:        g1.TotalMinutes,
+					CriticalPathMinutes: g1.CriticalPathMinutes,
+					Days1Agent:          g1.GrahamMinDays,
+					Days2AgentsMin:      g2.GrahamMinDays,
+					Days2AgentsMax:      g2.GrahamMaxDays,
+					Days4AgentsMin:      g4.GrahamMinDays,
+					Days4AgentsMax:      g4.GrahamMaxDays,
+				}
+			}
+		}
+		isActive := sp.IsActiveAt(now)
+		if activeSprintID == "" && isActive {
+			activeSprintID = sp.ID
+		}
+		status := "active"
+		if !sp.StartDate.IsZero() && now.Before(sp.StartDate) {
+			status = "upcoming"
+		} else if !sp.EndDate.IsZero() && now.After(sp.EndDate) {
+			status = "completed"
+		}
+		entries = append(entries, exportSprintEntry{
+			ID:        sp.ID,
+			Name:      sp.Name,
+			StartDate: sp.StartDate,
+			EndDate:   sp.EndDate,
+			Status:    status,
+			IsActive:  isActive,
+			Burndown:  burndown,
+			AtRisk:    atRisk,
+			Capacity:  capInfo,
+			Beads:     beads,
+		})
+	}
+	if activeSprintID == "" && len(entries) > 0 {
+		activeSprintID = entries[0].ID
+	}
+
+	doc := exportSprintsDocument{
+		GeneratedAt:    now.UTC(),
+		ActiveSprintID: activeSprintID,
+		SprintCount:    len(entries),
+		Sprints:        entries,
+	}
+	wrapped, err := withEnvelope(ctx.Envelope(), doc)
+	if err != nil {
+		return nil, 0, err
+	}
+	raw, err := json.MarshalIndent(wrapped, "", "  ")
+	if err != nil {
+		return nil, 0, err
+	}
+	return raw, len(entries), nil
+}
+
+func buildExportSuggestionsPayload(ctx RobotContext, exportIssues []model.Issue, dataHash string, now time.Time) ([]byte, int, error) {
+	graphIssues := ctx.GraphIssues()
+	if len(graphIssues) == 0 {
+		graphIssues = exportIssues
+	}
+	if len(graphIssues) == 0 || len(exportIssues) == 0 {
+		return nil, 0, nil
+	}
+	cfg := analysis.DefaultSuggestAllConfig()
+	if ctx.CandidateIDs != nil || len(exportIssues) < len(graphIssues) {
+		visibleIDs := make(map[string]bool, len(exportIssues))
+		for _, iss := range exportIssues {
+			visibleIDs[iss.ID] = true
+		}
+		cfg.CandidateIDs = visibleIDs
+	}
+	if dataHash == "" {
+		dataHash = analysis.ComputeDataHash(exportIssues)
+	}
+	set := analysis.GenerateAllSuggestionsAt(graphIssues, cfg, dataHash, now.UTC())
+	if len(set.Suggestions) == 0 {
+		return nil, 0, nil
+	}
+	wrapped, err := withEnvelope(ctx.Envelope(), set)
+	if err != nil {
+		return nil, 0, err
+	}
+	raw, err := json.MarshalIndent(wrapped, "", "  ")
+	if err != nil {
+		return nil, 0, err
+	}
+	return raw, len(set.Suggestions), nil
 }

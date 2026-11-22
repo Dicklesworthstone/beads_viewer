@@ -574,10 +574,12 @@ func TestEmbeddedViewerSupportsDirectGraphPath(t *testing.T) {
 	viewerJS := string(content)
 	for _, marker := range []string{
 		"function routeHashFromPathname(pathname)",
-		"const DIRECT_VIEW_ROUTES = new Set(['issues', 'insights', 'graph'])",
+		"const DIRECT_VIEW_ROUTES = new Set(['issues', 'insights', 'sprints', 'graph'])",
 		"parseRoute(hash || routeHashFromPathname(window.location.pathname))",
 		"// Handle the initial hash route or a host-rewritten clean path after",
 		"routeHashFromPathname,",
+		"this.meta?.has_sprints",
+		"this.meta?.has_suggestions",
 	} {
 		if !strings.Contains(viewerJS, marker) {
 			t.Errorf("viewer.js missing direct-route marker %q", marker)

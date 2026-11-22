@@ -218,6 +218,14 @@
                class="px-4 py-2 rounded-lg text-sm font-medium transition-all duration-150 cursor-pointer hover:scale-[1.02] active:scale-95">
               Insights
             </a>
+            <a x-show="hasSprints" x-cloak
+               id="nav-sprints-link"
+               href="#/sprints"
+               @click.prevent="window.location.hash = '#/sprints'"
+               :class="view === 'sprints' ? 'bg-beads-100 text-beads-700 dark:bg-beads-900 dark:text-beads-200 shadow-sm' : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700'"
+               class="px-4 py-2 rounded-lg text-sm font-medium transition-all duration-150 cursor-pointer hover:scale-[1.02] active:scale-95">
+              Sprints
+            </a>
             <a href="#/graph"
                @click.prevent="window.location.hash = '#/graph'"
                :class="view === 'graph' ? 'bg-beads-100 text-beads-700 dark:bg-beads-900 dark:text-beads-200 shadow-sm' : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700'"
@@ -393,6 +401,13 @@
              class="block px-4 py-3 rounded-lg text-base font-medium transition-colors">
             Insights
           </a>
+          <a x-show="hasSprints" x-cloak
+             href="#/sprints"
+             @click.prevent="window.location.hash = '#/sprints'; mobileMenuOpen = false"
+             :class="view === 'sprints' ? 'bg-beads-100 text-beads-700 dark:bg-beads-900 dark:text-beads-200' : 'text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800'"
+             class="block px-4 py-3 rounded-lg text-base font-medium transition-colors">
+            Sprints
+          </a>
           <a href="#/graph"
              @click.prevent="window.location.hash = '#/graph'; mobileMenuOpen = false"
              :class="view === 'graph' ? 'bg-beads-100 text-beads-700 dark:bg-beads-900 dark:text-beads-200' : 'text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800'"
@@ -449,6 +464,19 @@
             <path stroke-linecap="round" stroke-linejoin="round" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/>
           </svg>
           <span class="text-[10px] mt-1 font-medium tracking-wide">Insights</span>
+        </a>
+        <!-- Sprints (shown when sprints.json is present) -->
+        <a x-show="hasSprints" x-cloak
+           href="#/sprints"
+           @click.prevent="window.location.hash = '#/sprints'"
+           class="nav-item-mobile haptic-light relative"
+           :class="view === 'sprints' ? 'active' : ''">
+          <div class="absolute top-0 left-1/2 -translate-x-1/2 h-[3px] w-6 rounded-b-full transition-all duration-200"
+               :class="view === 'sprints' ? 'bg-gradient-to-r from-beads-400 to-beads-600' : 'bg-transparent'"></div>
+          <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24" :stroke-width="view === 'sprints' ? 2.5 : 2">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z"/>
+          </svg>
+          <span class="text-[10px] mt-1 font-medium tracking-wide">Sprints</span>
         </a>
         <!-- Graph -->
         <a href="#/graph"
@@ -675,29 +703,74 @@
 
         <!-- Proactive & Drift Alerts (from triage.json when present) -->
         <div x-show="getTriageAlerts().length > 0"
+             id="dashboard-triage-alerts"
              class="mb-6 bg-amber-50/80 dark:bg-amber-900/20 rounded-2xl border border-amber-200 dark:border-amber-800/60 p-4">
-          <div class="flex items-center justify-between mb-2">
+          <div class="flex items-center justify-between gap-2 mb-2">
             <h3 class="text-sm font-semibold text-amber-900 dark:text-amber-200 flex items-center gap-2">
               <span>⚠️</span>
               <span>Proactive Triage Alerts</span>
               <span class="px-2 py-0.5 text-xs rounded-full bg-amber-200/70 dark:bg-amber-800/60 text-amber-900 dark:text-amber-100" x-text="getTriageAlerts().length"></span>
             </h3>
+            <button x-show="getTriageAlerts().length > 5"
+                    type="button"
+                    @click="window.location.hash = '#/insights'"
+                    class="text-xs font-medium text-amber-800 dark:text-amber-200 hover:underline shrink-0"
+                    x-text="'View all ' + getTriageAlerts().length + ' in Insights →'"></button>
           </div>
           <div class="space-y-2">
             <template x-for="alert in getTriageAlerts().slice(0, 5)" :key="alert.key">
               <div class="flex flex-wrap items-center justify-between gap-2 text-xs bg-white/80 dark:bg-gray-800/70 rounded-xl px-3 py-2 border border-amber-100 dark:border-amber-800/40">
-                <div class="flex items-center gap-2 min-w-0">
-                  <span class="px-1.5 py-0.5 rounded font-semibold uppercase text-[10px]"
-                        :class="alert.severity === 'critical' || alert.severity === 'error' ? 'bg-red-100 dark:bg-red-900/50 text-red-700 dark:text-red-300' : 'bg-amber-100 dark:bg-amber-900/50 text-amber-700 dark:text-amber-300'"
+                <div class="flex items-center gap-2 min-w-0 flex-1">
+                  <span class="px-1.5 py-0.5 rounded font-semibold uppercase text-[10px] shrink-0 whitespace-nowrap"
+                        :class="(alert.severity === 'critical' || alert.severity === 'error') ? 'bg-red-100 dark:bg-red-900/50 text-red-700 dark:text-red-300' : (alert.severity === 'info' ? 'bg-blue-100 dark:bg-blue-900/50 text-blue-700 dark:text-blue-300' : 'bg-amber-100 dark:bg-amber-900/50 text-amber-700 dark:text-amber-300')"
                         x-text="alert.type"></span>
                   <span class="text-gray-700 dark:text-gray-200 truncate" x-text="alert.message"></span>
                 </div>
-                <button x-show="alert.issue_id"
-                        @click="showIssue(alert.issue_id)"
-                        class="font-mono px-2 py-0.5 rounded bg-amber-100 dark:bg-amber-900/50 text-amber-800 dark:text-amber-200 hover:underline shrink-0"
-                        x-text="alert.issue_id"></button>
+                <div x-show="alert.issue_ids?.length > 0" class="flex flex-wrap items-center gap-1 shrink-0">
+                  <template x-for="id in (alert.issue_ids || []).slice(0, 4)" :key="alert.key + '-id-' + id">
+                    <button type="button"
+                            @click="showIssue(id)"
+                            class="font-mono px-2 py-0.5 rounded bg-amber-100 dark:bg-amber-900/50 text-amber-800 dark:text-amber-200 hover:underline shrink-0"
+                            x-text="id"></button>
+                  </template>
+                  <span x-show="(alert.issue_ids?.length || 0) > 4"
+                        class="text-[10px] font-mono text-gray-500 dark:text-gray-400"
+                        x-text="'+' + (alert.issue_ids.length - 4)"></span>
+                </div>
               </div>
             </template>
+          </div>
+        </div>
+
+        <!-- Active Sprint Summary Banner (Dashboard, shown when sprints.json is present) -->
+        <div x-show="hasSprints && activeSprint"
+             x-cloak
+             id="dashboard-sprint-banner"
+             @click="window.location.hash = '#/sprints'"
+             class="mb-4 bg-indigo-50/80 dark:bg-indigo-950/30 rounded-2xl border border-indigo-200 dark:border-indigo-800/60 p-4 cursor-pointer hover:border-indigo-400 dark:hover:border-indigo-600 transition-colors">
+          <div class="flex flex-wrap items-center justify-between gap-3">
+            <div class="flex items-center gap-2.5 min-w-0">
+              <span class="text-lg">🏃</span>
+              <div class="min-w-0">
+                <div class="flex items-center gap-2 flex-wrap">
+                  <span class="text-sm font-semibold text-indigo-950 dark:text-indigo-100 truncate" x-text="activeSprint?.name || activeSprint?.id"></span>
+                  <span class="px-2 py-0.5 text-[10px] font-semibold uppercase rounded-full"
+                        :class="activeSprint?.burndown?.on_track ? 'bg-emerald-100 dark:bg-emerald-900/50 text-emerald-700 dark:text-emerald-300' : 'bg-red-100 dark:bg-red-900/50 text-red-700 dark:text-red-300'"
+                        x-text="activeSprint?.burndown?.on_track ? 'On Track' : 'Behind Pace'"></span>
+                  <span x-show="(activeSprint?.at_risk?.length || 0) > 0"
+                        class="px-2 py-0.5 text-[10px] font-semibold rounded-full bg-amber-100 dark:bg-amber-900/50 text-amber-800 dark:text-amber-200"
+                        x-text="(activeSprint?.at_risk?.length || 0) + ' at risk'"></span>
+                </div>
+                <p class="text-xs text-indigo-700 dark:text-indigo-300 mt-0.5">
+                  <span x-text="(activeSprint?.burndown?.completed_issues || 0) + '/' + (activeSprint?.burndown?.total_issues || 0) + ' completed'"></span>
+                  · <span x-text="'Day ' + (activeSprint?.burndown?.elapsed_days || 0) + ' of ' + (activeSprint?.burndown?.total_days || 0)"></span>
+                  <span x-show="activeSprint?.capacity">
+                    · <span x-text="'Est ' + formatEstimatedMinutes(activeSprint?.capacity?.total_minutes || 0) + ' remaining'"></span>
+                  </span>
+                </p>
+              </div>
+            </div>
+            <span class="text-xs font-medium text-indigo-700 dark:text-indigo-300 shrink-0">Open Sprint Burndown →</span>
           </div>
         </div>
 
@@ -1045,12 +1118,30 @@
             </button>
           </div>
 
-          <!-- Active Critical Path & Repo Filter Pills -->
-          <div x-show="filters.criticalPath || filters.repo" class="mt-2 flex flex-wrap items-center gap-2">
+          <!-- Active Critical Path, Structural & Repo Filter Pills -->
+          <div x-show="filters.criticalPath || filters.repo || filters.inCycle || filters.overdue || filters.articulation" class="mt-2 flex flex-wrap items-center gap-2">
             <button x-show="filters.criticalPath" @click="clearCriticalPathFilter()"
                     class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium bg-red-100 dark:bg-red-900/40 text-red-700 dark:text-red-300 border border-red-200 dark:border-red-800 hover:bg-red-200 dark:hover:bg-red-900/60 transition-colors"
                     title="Remove Critical Path filter">
               <span>🔥 Critical Path</span>
+              <span aria-hidden="true">×</span>
+            </button>
+            <button x-show="filters.inCycle" @click="filters.inCycle = false; applyFilter()"
+                    class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium bg-rose-100 dark:bg-rose-900/40 text-rose-700 dark:text-rose-300 border border-rose-200 dark:border-rose-800 hover:bg-rose-200 dark:hover:bg-rose-900/60 transition-colors"
+                    title="Remove In Cycle filter">
+              <span>↻ In Cycle</span>
+              <span aria-hidden="true">×</span>
+            </button>
+            <button x-show="filters.overdue" @click="filters.overdue = false; applyFilter()"
+                    class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium bg-amber-100 dark:bg-amber-900/40 text-amber-800 dark:text-amber-200 border border-amber-200 dark:border-amber-800 hover:bg-amber-200 dark:hover:bg-amber-900/60 transition-colors"
+                    title="Remove Overdue filter">
+              <span>⏰ Overdue</span>
+              <span aria-hidden="true">×</span>
+            </button>
+            <button x-show="filters.articulation" @click="filters.articulation = false; applyFilter()"
+                    class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium bg-purple-100 dark:bg-purple-900/40 text-purple-800 dark:text-purple-200 border border-purple-200 dark:border-purple-800 hover:bg-purple-200 dark:hover:bg-purple-900/60 transition-colors"
+                    title="Remove Cut Vertex filter">
+              <span>🔗 Cut Vertex</span>
               <span aria-hidden="true">×</span>
             </button>
             <button x-show="filters.repo" id="active-repo-filter-pill" @click="clearRepoFilter()"
@@ -1151,12 +1242,16 @@
               <!-- Sort - moved up for mobile (more important) -->
               <div class="col-span-1 sm:order-last sm:ml-auto">
                 <label class="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Sort by</label>
-                <select x-model="sort" @change="applyFilter()"
+                <select id="issues-sort-select" x-model="sort" @change="applyFilter()"
                         class="w-full sm:w-auto px-3 py-2 sm:py-1.5 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-sm min-h-[44px] sm:min-h-0">
                   <option value="priority">Priority</option>
                   <option value="updated">Updated</option>
                   <option value="created">Created</option>
                   <option value="score">Triage Score</option>
+                  <option value="pagerank">PageRank</option>
+                  <option value="betweenness">Betweenness</option>
+                  <option value="due">Due Date</option>
+                  <option value="estimate">Estimate</option>
                   <option value="blocks">Blocks Count</option>
                   <option value="title">Title</option>
                 </select>
@@ -1188,6 +1283,32 @@
                   <button @click="filters.isBlocking = true; applyFilter()"
                           :class="filters.isBlocking === true ? 'bg-orange-500 text-white' : 'bg-white dark:bg-gray-700 text-gray-700 dark:text-gray-300'"
                           class="flex-1 px-2 sm:px-3 py-2 sm:py-1.5 text-xs font-medium border-l border-gray-300 dark:border-gray-600">Blockers</button>
+                </div>
+              </div>
+
+              <!-- Quick structural & deadline filters -->
+              <div class="col-span-2 sm:col-span-1">
+                <label class="block text-xs font-medium text-gray-500 dark:text-gray-400 mb-1">Signals</label>
+                <div class="flex flex-wrap gap-1.5">
+                  <button id="filter-in-cycle-btn" type="button"
+                          @click="filters.inCycle = !filters.inCycle; applyFilter()"
+                          :class="filters.inCycle ? 'bg-rose-600 text-white border-rose-600' : 'bg-white dark:bg-gray-700 text-gray-700 dark:text-gray-300 border-gray-300 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-gray-600'"
+                          class="px-2.5 py-1.5 rounded-lg border text-xs font-medium transition-colors">
+                    ↻ In Cycle
+                  </button>
+                  <button id="filter-overdue-btn" type="button"
+                          @click="filters.overdue = !filters.overdue; applyFilter()"
+                          :class="filters.overdue ? 'bg-amber-600 text-white border-amber-600' : 'bg-white dark:bg-gray-700 text-gray-700 dark:text-gray-300 border-gray-300 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-gray-600'"
+                          class="px-2.5 py-1.5 rounded-lg border text-xs font-medium transition-colors">
+                    ⏰ Overdue
+                  </button>
+                  <button id="filter-articulation-btn" type="button"
+                          @click="filters.articulation = !filters.articulation; applyFilter()"
+                          :class="filters.articulation ? 'bg-purple-600 text-white border-purple-600' : 'bg-white dark:bg-gray-700 text-gray-700 dark:text-gray-300 border-gray-300 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-gray-600'"
+                          class="px-2.5 py-1.5 rounded-lg border text-xs font-medium transition-colors"
+                          title="Filter to graph articulation points (single points of failure)">
+                    🔗 Cut Vertex
+                  </button>
                 </div>
               </div>
             </div>
@@ -1266,6 +1387,10 @@
                   <span x-show="issue.blocked_by_count"><span class="font-medium">Blocked by:</span> <span x-text="issue.blocked_by_count"></span></span>
                   <span x-show="issue.comment_count > 0" class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-gray-100 dark:bg-gray-700/70 text-gray-600 dark:text-gray-300">
                     💬 <span x-text="issue.comment_count"></span>
+                  </span>
+                  <span x-show="issue.estimated_minutes > 0"
+                        class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-teal-50 dark:bg-teal-900/30 text-teal-700 dark:text-teal-300 font-mono">
+                    ⏱ <span x-text="formatEstimatedMinutes(issue.estimated_minutes)"></span>
                   </span>
                   <span x-show="issue.due_date"
                         :class="isIssueOverdue(issue) ? 'bg-red-100 dark:bg-red-900/40 text-red-700 dark:text-red-300 font-semibold' : 'bg-amber-50 dark:bg-amber-900/20 text-amber-700 dark:text-amber-300'"
@@ -2836,25 +2961,105 @@
 
         <!-- Proactive & Drift Alerts in Insights (when present in triage.json) -->
         <div x-show="getTriageAlerts().length > 0"
+             id="insights-triage-alerts"
              class="mb-6 bg-amber-50/80 dark:bg-amber-900/20 rounded-2xl border border-amber-200 dark:border-amber-800/60 p-4">
           <h3 class="text-sm font-semibold text-amber-900 dark:text-amber-200 mb-2 flex items-center gap-2">
             <span>⚠️</span>
             <span>Triage &amp; Drift Alerts</span>
             <span class="px-2 py-0.5 text-xs rounded-full bg-amber-200/70 dark:bg-amber-800/60 text-amber-900 dark:text-amber-100" x-text="getTriageAlerts().length"></span>
           </h3>
-          <div class="space-y-2">
+          <div class="space-y-2 max-h-[360px] overflow-y-auto pr-1">
             <template x-for="alert in getTriageAlerts()" :key="'ins-' + alert.key">
               <div class="flex flex-wrap items-center justify-between gap-2 text-xs bg-white/80 dark:bg-gray-800/70 rounded-xl px-3 py-2 border border-amber-100 dark:border-amber-800/40">
-                <div class="flex items-center gap-2 min-w-0">
-                  <span class="px-1.5 py-0.5 rounded font-semibold uppercase text-[10px]"
-                        :class="alert.severity === 'critical' || alert.severity === 'error' ? 'bg-red-100 dark:bg-red-900/50 text-red-700 dark:text-red-300' : 'bg-amber-100 dark:bg-amber-900/50 text-amber-700 dark:text-amber-300'"
+                <div class="flex items-center gap-2 min-w-0 flex-1">
+                  <span class="px-1.5 py-0.5 rounded font-semibold uppercase text-[10px] shrink-0 whitespace-nowrap"
+                        :class="(alert.severity === 'critical' || alert.severity === 'error') ? 'bg-red-100 dark:bg-red-900/50 text-red-700 dark:text-red-300' : (alert.severity === 'info' ? 'bg-blue-100 dark:bg-blue-900/50 text-blue-700 dark:text-blue-300' : 'bg-amber-100 dark:bg-amber-900/50 text-amber-700 dark:text-amber-300')"
                         x-text="alert.type"></span>
                   <span class="text-gray-700 dark:text-gray-200" x-text="alert.message"></span>
                 </div>
-                <button x-show="alert.issue_id"
-                        @click="showIssue(alert.issue_id)"
-                        class="font-mono px-2 py-0.5 rounded bg-amber-100 dark:bg-amber-900/50 text-amber-800 dark:text-amber-200 hover:underline shrink-0"
-                        x-text="alert.issue_id"></button>
+                <div x-show="alert.issue_ids?.length > 0" class="flex flex-wrap items-center gap-1 shrink-0">
+                  <template x-for="id in (alert.issue_ids || []).slice(0, 4)" :key="'ins-' + alert.key + '-id-' + id">
+                    <button type="button"
+                            @click="showIssue(id)"
+                            class="font-mono px-2 py-0.5 rounded bg-amber-100 dark:bg-amber-900/50 text-amber-800 dark:text-amber-200 hover:underline shrink-0"
+                            x-text="id"></button>
+                  </template>
+                  <span x-show="(alert.issue_ids?.length || 0) > 4"
+                        class="text-[10px] font-mono text-gray-500 dark:text-gray-400"
+                        x-text="'+' + (alert.issue_ids.length - 4)"></span>
+                </div>
+              </div>
+            </template>
+          </div>
+        </div>
+
+        <!-- Hygiene Suggestions Card (Insights, gated on data/suggestions.json) -->
+        <div x-show="hasSuggestions && (suggestionsData?.suggestions?.length || 0) > 0"
+             x-cloak
+             id="insights-hygiene-suggestions"
+             class="mb-6 bg-indigo-50/70 dark:bg-indigo-950/25 rounded-2xl border border-indigo-200 dark:border-indigo-800/60 p-4 animate-fade-in-up"
+             style="animation-delay: 340ms;">
+          <div class="flex flex-wrap items-center justify-between gap-2 mb-3">
+            <h3 class="text-sm font-semibold text-indigo-900 dark:text-indigo-200 flex items-center gap-2">
+              <span>💡</span>
+              <span>Hygiene Suggestions</span>
+              <span class="px-2 py-0.5 text-xs rounded-full bg-indigo-200/70 dark:bg-indigo-800/60 text-indigo-900 dark:text-indigo-100" x-text="suggestionsData?.suggestions?.length || 0"></span>
+            </h3>
+            <div class="flex flex-wrap items-center gap-1.5 text-[11px]">
+              <button type="button" @click="suggestionsTypeFilter = 'all'"
+                      :class="suggestionsTypeFilter === 'all' ? 'bg-indigo-600 text-white' : 'bg-white/80 dark:bg-gray-800 text-gray-700 dark:text-gray-300'"
+                      class="px-2 py-0.5 rounded-full font-medium border border-indigo-200 dark:border-indigo-800/60">
+                All (<span x-text="suggestionTypeCounts.all"></span>)
+              </button>
+              <button x-show="suggestionTypeCounts.potential_duplicate > 0" type="button" @click="suggestionsTypeFilter = 'potential_duplicate'"
+                      :class="suggestionsTypeFilter === 'potential_duplicate' ? 'bg-indigo-600 text-white' : 'bg-white/80 dark:bg-gray-800 text-gray-700 dark:text-gray-300'"
+                      class="px-2 py-0.5 rounded-full font-medium border border-indigo-200 dark:border-indigo-800/60">
+                Duplicates (<span x-text="suggestionTypeCounts.potential_duplicate"></span>)
+              </button>
+              <button x-show="suggestionTypeCounts.missing_dependency > 0" type="button" @click="suggestionsTypeFilter = 'missing_dependency'"
+                      :class="suggestionsTypeFilter === 'missing_dependency' ? 'bg-indigo-600 text-white' : 'bg-white/80 dark:bg-gray-800 text-gray-700 dark:text-gray-300'"
+                      class="px-2 py-0.5 rounded-full font-medium border border-indigo-200 dark:border-indigo-800/60">
+                Missing Deps (<span x-text="suggestionTypeCounts.missing_dependency"></span>)
+              </button>
+              <button x-show="suggestionTypeCounts.label_suggestion > 0" type="button" @click="suggestionsTypeFilter = 'label_suggestion'"
+                      :class="suggestionsTypeFilter === 'label_suggestion' ? 'bg-indigo-600 text-white' : 'bg-white/80 dark:bg-gray-800 text-gray-700 dark:text-gray-300'"
+                      class="px-2 py-0.5 rounded-full font-medium border border-indigo-200 dark:border-indigo-800/60">
+                Labels (<span x-text="suggestionTypeCounts.label_suggestion"></span>)
+              </button>
+              <button x-show="suggestionTypeCounts.cycle_warning > 0" type="button" @click="suggestionsTypeFilter = 'cycle_warning'"
+                      :class="suggestionsTypeFilter === 'cycle_warning' ? 'bg-indigo-600 text-white' : 'bg-white/80 dark:bg-gray-800 text-gray-700 dark:text-gray-300'"
+                      class="px-2 py-0.5 rounded-full font-medium border border-indigo-200 dark:border-indigo-800/60">
+                Cycles (<span x-text="suggestionTypeCounts.cycle_warning"></span>)
+              </button>
+            </div>
+          </div>
+          <div class="space-y-2 max-h-[360px] overflow-y-auto pr-1">
+            <template x-for="(sug, idx) in filteredSuggestions" :key="'sug-' + idx + '-' + sug.type + '-' + sug.target_bead">
+              <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs bg-white/85 dark:bg-gray-800/75 rounded-xl px-3 py-2.5 border border-indigo-100 dark:border-indigo-800/40">
+                <div class="min-w-0 flex-1 space-y-1">
+                  <div class="flex flex-wrap items-center gap-1.5">
+                    <span class="px-1.5 py-0.5 rounded font-semibold uppercase text-[10px] shrink-0 whitespace-nowrap bg-indigo-100 dark:bg-indigo-900/50 text-indigo-800 dark:text-indigo-200"
+                          x-text="String(sug.type || '').replace(/_/g, ' ')"></span>
+                    <span class="px-1.5 py-0.5 rounded font-mono text-[10px] shrink-0"
+                          :class="(sug.confidence || 0) >= 0.7 ? 'bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300' : 'bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-300'"
+                          x-text="Math.round((sug.confidence || 0) * 100) + '%'"></span>
+                    <button x-show="sug.target_bead" type="button" @click="showIssue(sug.target_bead)"
+                            class="font-mono px-1.5 py-0.5 rounded bg-gray-100 dark:bg-gray-700 text-beads-700 dark:text-beads-300 hover:underline"
+                            x-text="sug.target_bead"></button>
+                    <button x-show="sug.related_bead" type="button" @click="showIssue(sug.related_bead)"
+                            class="font-mono px-1.5 py-0.5 rounded bg-gray-100 dark:bg-gray-700 text-purple-700 dark:text-purple-300 hover:underline"
+                            x-text="'↔ ' + sug.related_bead"></button>
+                  </div>
+                  <p class="font-medium text-gray-800 dark:text-gray-200" x-text="sug.summary"></p>
+                  <p x-show="sug.reason" class="text-[11px] text-gray-500 dark:text-gray-400" x-text="sug.reason"></p>
+                </div>
+                <div x-show="sug.action_command" class="shrink-0 flex items-center gap-1.5">
+                  <button type="button"
+                          @click="copySuggestionCommand(sug.action_command)"
+                          class="px-2.5 py-1 rounded-lg bg-emerald-100 dark:bg-emerald-900/40 text-emerald-800 dark:text-emerald-200 hover:bg-emerald-200 dark:hover:bg-emerald-800/60 font-mono text-[11px] transition-colors max-w-[260px] truncate"
+                          :title="'Copy command: ' + sug.action_command"
+                          x-text="'📋 ' + sug.action_command"></button>
+                </div>
               </div>
             </template>
           </div>
@@ -3335,6 +3540,164 @@
         </div>
       </div>
 
+      <!-- Sprints & Burndown View (#/sprints) -->
+      <div x-show="view === 'sprints'" x-cloak id="sprints-view" class="pb-16 md:pb-8">
+        <div class="mb-6 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+          <div>
+            <h2 class="text-xl sm:text-2xl font-bold text-gray-900 dark:text-white flex items-center gap-2">
+              <span>🏃</span>
+              <span>Sprints &amp; Burndown</span>
+            </h2>
+            <p class="text-xs sm:text-sm text-gray-500 dark:text-gray-400 mt-0.5">
+              Daily burndown trajectory, at-risk signals, and Graham multi-agent capacity bounds
+            </p>
+          </div>
+          <div x-show="(sprintsData?.sprints?.length || 0) > 1" class="flex flex-wrap gap-1.5">
+            <template x-for="sp in (sprintsData?.sprints || [])" :key="sp.id">
+              <button type="button"
+                      @click="selectSprint(sp.id)"
+                      :class="selectedSprintId === sp.id ? 'bg-beads-600 text-white shadow-sm' : 'bg-white dark:bg-gray-800 text-gray-700 dark:text-gray-300 border border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700'"
+                      class="px-3 py-1.5 rounded-lg text-xs font-medium transition-colors">
+                <span x-text="sp.name || sp.id"></span>
+                <span x-show="sp.is_active" class="ml-1 text-[10px] opacity-80">●</span>
+              </button>
+            </template>
+          </div>
+        </div>
+
+        <template x-if="!activeSprint">
+          <div class="bg-white dark:bg-gray-800 rounded-2xl border border-gray-200 dark:border-gray-700 p-8 text-center text-gray-500 dark:text-gray-400">
+            No sprint data available in this export.
+          </div>
+        </template>
+
+        <template x-if="activeSprint">
+          <div class="space-y-6">
+            <!-- KPI Row -->
+            <div class="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
+              <div class="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 p-4">
+                <div class="text-xs text-gray-500 dark:text-gray-400 font-medium">Completion</div>
+                <div class="text-2xl font-bold text-gray-900 dark:text-white mt-1 font-mono"
+                     x-text="(activeSprint.burndown?.completed_issues || 0) + ' / ' + (activeSprint.burndown?.total_issues || 0)"></div>
+                <div class="text-xs text-gray-500 dark:text-gray-400 mt-1"
+                     x-text="(activeSprint.burndown?.remaining_issues || 0) + ' remaining'"></div>
+              </div>
+              <div class="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 p-4">
+                <div class="text-xs text-gray-500 dark:text-gray-400 font-medium">Timeline</div>
+                <div class="text-2xl font-bold text-gray-900 dark:text-white mt-1 font-mono"
+                     x-text="'Day ' + (activeSprint.burndown?.elapsed_days || 0) + '/' + (activeSprint.burndown?.total_days || 0)"></div>
+                <div class="text-xs text-gray-500 dark:text-gray-400 mt-1"
+                     x-text="(activeSprint.burndown?.remaining_days || 0) + ' days left'"></div>
+              </div>
+              <div class="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 p-4">
+                <div class="text-xs text-gray-500 dark:text-gray-400 font-medium">Burn Rate</div>
+                <div class="text-2xl font-bold mt-1 font-mono"
+                     :class="activeSprint.burndown?.on_track ? 'text-emerald-600 dark:text-emerald-400' : 'text-red-600 dark:text-red-400'"
+                     x-text="(activeSprint.burndown?.actual_burn_rate || 0).toFixed(2) + '/d'"></div>
+                <div class="text-xs text-gray-500 dark:text-gray-400 mt-1"
+                     x-text="'Ideal ' + (activeSprint.burndown?.ideal_burn_rate || 0).toFixed(2) + '/d · ' + (activeSprint.burndown?.on_track ? 'On Track' : 'Behind')"></div>
+              </div>
+              <div class="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 p-4">
+                <div class="text-xs text-gray-500 dark:text-gray-400 font-medium">At-Risk Beads</div>
+                <div class="text-2xl font-bold mt-1 font-mono"
+                     :class="(activeSprint.at_risk?.length || 0) > 0 ? 'text-amber-600 dark:text-amber-400' : 'text-emerald-600 dark:text-emerald-400'"
+                     x-text="activeSprint.at_risk?.length || 0"></div>
+                <div class="text-xs text-gray-500 dark:text-gray-400 mt-1"
+                     x-text="activeSprint.burndown?.projected_complete ? ('Projected ' + formatDate(activeSprint.burndown.projected_complete)) : 'Status: ' + (activeSprint.status || 'active')"></div>
+              </div>
+            </div>
+
+            <!-- Graham Multi-Agent Capacity Bounds -->
+            <div x-show="activeSprint.capacity"
+                 class="bg-gradient-to-r from-teal-50 to-cyan-50 dark:from-teal-950/30 dark:to-cyan-950/30 rounded-xl border border-teal-200 dark:border-teal-800/60 p-4">
+              <div class="flex flex-wrap items-center justify-between gap-3">
+                <div class="text-xs font-semibold text-teal-900 dark:text-teal-200 uppercase tracking-wider">
+                  ⚡ Graham Multi-Agent Capacity Bounds (Open Scope)
+                </div>
+                <div class="flex flex-wrap items-center gap-3 text-xs font-mono text-teal-800 dark:text-teal-200">
+                  <span>Work: <strong x-text="formatEstimatedMinutes(activeSprint.capacity?.total_minutes || 0)"></strong></span>
+                  <span>Crit Path: <strong x-text="formatEstimatedMinutes(activeSprint.capacity?.critical_path_minutes || 0)"></strong></span>
+                  <span>1a: <strong x-text="(activeSprint.capacity?.days_1_agent || 0).toFixed(1) + 'd'"></strong></span>
+                  <span>2a: <strong x-text="(activeSprint.capacity?.days_2_agents_min || 0).toFixed(1) + '–' + (activeSprint.capacity?.days_2_agents_max || 0).toFixed(1) + 'd'"></strong></span>
+                  <span>4a: <strong x-text="(activeSprint.capacity?.days_4_agents_min || 0).toFixed(1) + '–' + (activeSprint.capacity?.days_4_agents_max || 0).toFixed(1) + 'd'"></strong></span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Burndown Chart -->
+            <div class="bg-white dark:bg-gray-800 rounded-2xl border border-gray-200 dark:border-gray-700 p-4 sm:p-5">
+              <div class="flex flex-wrap items-center justify-between gap-2 mb-3">
+                <h3 class="text-sm font-semibold text-gray-900 dark:text-white">Ideal vs Actual Burndown</h3>
+                <span class="text-xs text-gray-500 dark:text-gray-400 font-mono"
+                      x-text="formatDate(activeSprint.start_date) + ' → ' + formatDate(activeSprint.end_date)"></span>
+              </div>
+              <div class="relative h-64 sm:h-72 w-full">
+                <canvas id="sprint-burndown-chart"></canvas>
+              </div>
+            </div>
+
+            <!-- At-Risk Items -->
+            <div x-show="(activeSprint.at_risk?.length || 0) > 0"
+                 class="bg-amber-50/75 dark:bg-amber-950/30 rounded-2xl border border-amber-200 dark:border-amber-800/60 p-4">
+              <h3 class="text-sm font-semibold text-amber-900 dark:text-amber-200 mb-3 flex items-center gap-2">
+                <span>⚠️</span>
+                <span>At-Risk Sprint Beads</span>
+                <span class="px-2 py-0.5 text-xs rounded-full bg-amber-200/70 dark:bg-amber-800/60" x-text="activeSprint.at_risk?.length || 0"></span>
+              </h3>
+              <div class="space-y-2">
+                <template x-for="item in (activeSprint.at_risk || [])" :key="'risk-' + item.id">
+                  <div @click="showIssue(item.id)"
+                       class="flex flex-wrap items-center justify-between gap-2 bg-white/85 dark:bg-gray-800/80 rounded-xl px-3 py-2 border border-amber-100 dark:border-amber-800/40 cursor-pointer hover:border-amber-400 transition-colors text-xs">
+                    <div class="min-w-0 flex-1">
+                      <div class="flex items-center gap-2">
+                        <span class="font-mono font-semibold text-beads-700 dark:text-beads-300" x-text="item.id"></span>
+                        <span class="font-medium text-gray-800 dark:text-gray-200 truncate" x-text="item.title"></span>
+                      </div>
+                      <p class="text-[11px] text-amber-800 dark:text-amber-300 mt-0.5" x-text="item.detail"></p>
+                    </div>
+                    <div class="flex flex-wrap gap-1 shrink-0">
+                      <template x-for="sig in (item.signals || [])" :key="item.id + '-' + sig">
+                        <span class="px-1.5 py-0.5 rounded bg-amber-100 dark:bg-amber-900/50 text-amber-800 dark:text-amber-200 text-[10px] font-semibold uppercase"
+                              x-text="String(sig).replace(/_/g, ' ')"></span>
+                      </template>
+                    </div>
+                  </div>
+                </template>
+              </div>
+            </div>
+
+            <!-- Sprint Beads Table -->
+            <div class="bg-white dark:bg-gray-800 rounded-2xl border border-gray-200 dark:border-gray-700 overflow-hidden">
+              <div class="px-4 py-3 border-b border-gray-200 dark:border-gray-700 flex items-center justify-between">
+                <h3 class="text-sm font-semibold text-gray-900 dark:text-white">Sprint Scope</h3>
+                <span class="text-xs text-gray-500 dark:text-gray-400" x-text="(activeSprint.beads?.length || 0) + ' issues'"></span>
+              </div>
+              <div class="divide-y divide-gray-200 dark:divide-gray-700">
+                <template x-for="bead in (activeSprint.beads || [])" :key="'sp-bead-' + bead.id">
+                  <div @click="showIssue(bead.id)"
+                       class="px-4 py-3 hover:bg-gray-50 dark:hover:bg-gray-700/40 cursor-pointer flex flex-wrap items-center justify-between gap-2 text-xs transition-colors">
+                    <div class="flex items-center gap-2 min-w-0 flex-1">
+                      <span class="font-mono text-gray-500 dark:text-gray-400 shrink-0" x-text="bead.id"></span>
+                      <span class="px-1.5 py-0.5 rounded text-[10px] font-semibold shrink-0"
+                            :class="statusBadgeClass(bead.status)"
+                            x-text="bead.status"></span>
+                      <span x-show="bead.is_blocked"
+                            class="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-red-100 dark:bg-red-900/40 text-red-700 dark:text-red-300 shrink-0">blocked</span>
+                      <span class="font-medium text-gray-900 dark:text-gray-100 truncate" x-text="bead.title"></span>
+                    </div>
+                    <div class="flex items-center gap-2 shrink-0 text-[11px] text-gray-500 dark:text-gray-400 font-mono">
+                      <span x-text="'P' + bead.priority"></span>
+                      <span x-show="bead.estimated_minutes > 0" class="text-teal-700 dark:text-teal-300" x-text="formatEstimatedMinutes(bead.estimated_minutes)"></span>
+                      <span x-show="bead.assignee" class="font-sans text-gray-600 dark:text-gray-300" x-text="bead.assignee"></span>
+                    </div>
+                  </div>
+                </template>
+              </div>
+            </div>
+          </div>
+        </template>
+      </div>
+
     </main>
 
     <!-- Full-frame Graph View (outside main for full viewport) -->
@@ -3421,7 +3784,7 @@
            x-transition:leave="transition ease-in duration-200"
            x-transition:leave-start="md:translate-x-0 translate-y-0"
            x-transition:leave-end="md:translate-x-full translate-y-full"
-           @keydown.escape.window="if (graphDetailNode && !selectedIssue && !graphContextMenu.open) { graphDetailNode = null; if(forceGraphModule?.clearSelection) forceGraphModule.clearSelection(); setTimeout(() => resizeForceGraph(), 250); }"
+           @keydown.escape.window="if (graphDetailNode && !selectedIssue && !graphContextMenu.open && !graphFiltersOpen && !graphWhatIfActive && !cycleNavigatorActive && !dependencyConeActive && !criticalPathNavActive) { graphDetailNode = null; if(forceGraphModule?.clearSelection) forceGraphModule.clearSelection(); setTimeout(() => resizeForceGraph(), 250); }"
            @touchstart.passive="touchStartY = $event.touches[0].clientY; touchStartX = $event.touches[0].clientX; touchCurrentY = touchStartY; touchCurrentX = touchStartX; swiping = true"
            @touchmove.passive="if(swiping) { touchCurrentY = $event.touches[0].clientY; touchCurrentX = $event.touches[0].clientX; if(isMobile && touchCurrentY > touchStartY) { $el.style.transform = 'translateY(' + Math.max(0, touchCurrentY - touchStartY) + 'px)'; } else if(!isMobile && touchCurrentX > touchStartX) { $el.style.transform = 'translateX(' + Math.max(0, touchCurrentX - touchStartX) + 'px)'; } }"
            @touchend="if(swiping) { const swipeY = touchCurrentY - touchStartY; const swipeX = touchCurrentX - touchStartX; if((isMobile && swipeY > 100) || (!isMobile && swipeX > 100)) { graphDetailNode = null; if(forceGraphModule?.clearSelection) forceGraphModule.clearSelection(); setTimeout(() => resizeForceGraph(), 250); } $el.style.transform = ''; swiping = false; }"
@@ -3507,13 +3870,20 @@
               <span class="text-[10px] text-gray-500 dark:text-gray-400 uppercase tracking-wider font-medium">Assignee</span>
               <div class="font-semibold text-sm text-gray-900 dark:text-white mt-0.5" x-text="graphDetailNode?.assignee"></div>
             </div>
-            <div x-show="graphDetailNode?.sourceRepo" class="bg-cyan-50/70 dark:bg-cyan-900/20 rounded-lg p-3 border border-cyan-100 dark:border-cyan-800/30">
+            <div x-show="graphDetailNode?.sourceRepo"
+                 :class="graphFilters.repo === graphDetailNode?.sourceRepo ? 'ring-1 ring-cyan-500 bg-cyan-100/80 dark:bg-cyan-900/40' : 'bg-cyan-50/70 dark:bg-cyan-900/20'"
+                 class="rounded-lg p-3 border border-cyan-100 dark:border-cyan-800/30">
               <span class="text-[10px] text-cyan-700 dark:text-cyan-300 uppercase tracking-wider font-medium">Repo</span>
-              <button type="button"
+              <button x-show="filterOptions.repos.length > 1 || Boolean(graphFilters.repo)"
+                      type="button"
+                      id="graph-detail-repo-btn"
                       @click.stop="if (graphDetailNode?.sourceRepo) applyGraphFilter('repo', graphFilters.repo === graphDetailNode.sourceRepo ? '' : graphDetailNode.sourceRepo)"
                       class="block font-semibold text-sm text-cyan-800 dark:text-cyan-200 hover:underline mt-0.5 truncate max-w-full"
-                      title="Filter graph by this repository"
+                      :title="graphFilters.repo === graphDetailNode?.sourceRepo ? 'Clear repository filter' : 'Filter graph by this repository'"
                       x-text="graphDetailNode?.sourceRepo"></button>
+              <span x-show="filterOptions.repos.length <= 1 && !graphFilters.repo"
+                    class="block font-semibold text-sm text-cyan-800 dark:text-cyan-200 mt-0.5 truncate max-w-full"
+                    x-text="graphDetailNode?.sourceRepo"></span>
             </div>
           </div>
 
@@ -3591,7 +3961,7 @@
       </div>
 
       <!-- Floating Control Panel -->
-      <div class="absolute top-4 left-4 right-4 flex items-start justify-between pointer-events-none">
+      <div class="absolute top-4 left-4 right-4 flex items-start justify-between gap-2 pointer-events-none">
         <!-- Left controls -->
         <div class="pointer-events-auto flex flex-col items-start gap-2 md:gap-3">
           <!-- Back button - larger touch target on mobile -->
@@ -3640,7 +4010,7 @@
             <div x-show="graphFiltersOpen"
                  id="graph-filter-hud"
                  x-cloak
-                 class="absolute top-full left-0 mt-2 z-20 bg-white/95 dark:bg-gray-800/95 backdrop-blur-sm rounded-lg shadow-xl border border-gray-200 dark:border-gray-700 p-2.5 w-[240px] sm:w-[272px] max-w-[calc(100vw-2rem)] space-y-2">
+                 class="absolute top-full left-0 mt-2 z-30 bg-white/95 dark:bg-gray-800/95 backdrop-blur-sm rounded-lg shadow-xl border border-gray-200 dark:border-gray-700 p-2.5 w-[240px] sm:w-[272px] max-w-[calc(100vw-2rem)] space-y-2">
             <div class="flex items-center justify-between gap-2">
               <span class="text-[11px] font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">Graph Filters</span>
               <button x-show="hasActiveGraphFilters"
@@ -3683,7 +4053,7 @@
                 <option value="4">P4 Backlog</option>
               </select>
             </div>
-            <div class="grid grid-cols-1 gap-1.5" x-show="filterOptions.labels.length > 0 || filterOptions.repos.length > 1">
+            <div class="grid grid-cols-1 gap-1.5" x-show="filterOptions.labels.length > 0 || filterOptions.repos.length > 1 || Boolean(graphFilters.repo)">
               <select x-show="filterOptions.labels.length > 0"
                       id="graph-filter-label"
                       aria-label="Filter graph by label"
@@ -3695,7 +4065,7 @@
                   <option :value="label" x-text="label"></option>
                 </template>
               </select>
-              <select x-show="filterOptions.repos.length > 1"
+              <select x-show="filterOptions.repos.length > 1 || Boolean(graphFilters.repo)"
                       id="graph-filter-repo"
                       aria-label="Filter graph by repository"
                       :value="graphFilters.repo"
@@ -3807,62 +4177,62 @@
         </div>
 
         <!-- Right controls - Layout presets -->
-        <div class="pointer-events-auto">
-          <div class="bg-white/90 dark:bg-gray-800/90 backdrop-blur-sm rounded-lg shadow-lg border border-gray-200 dark:border-gray-700 p-2">
-            <div class="text-xs text-gray-500 dark:text-gray-400 mb-2 px-1">Layout</div>
-            <div class="grid grid-cols-3 gap-1">
+        <div id="graph-right-controls" class="pointer-events-auto max-w-[162px] sm:max-w-none shrink-0">
+          <div class="bg-white/90 dark:bg-gray-800/90 backdrop-blur-sm rounded-lg shadow-lg border border-gray-200 dark:border-gray-700 p-1.5 sm:p-2">
+            <div class="text-[11px] sm:text-xs text-gray-500 dark:text-gray-400 mb-1.5 sm:mb-2 px-1">Layout</div>
+            <div class="grid grid-cols-2 sm:grid-cols-3 gap-1">
               <button @click="applyGraphPreset('force'); currentPreset = 'force'"
                       :class="currentPreset === 'force' ? 'bg-beads-100 dark:bg-beads-900 text-beads-700 dark:text-beads-300 ring-1 ring-beads-500 shadow-sm' : 'hover:bg-gray-100 dark:hover:bg-gray-700'"
-                      class="px-2 py-1.5 text-xs rounded-md transition-all duration-150 flex items-center gap-1 active:scale-95 hover:scale-[1.02]" title="Standard force-directed">
-                <span>🔄</span> Force
+                      class="px-1.5 sm:px-2 py-1 sm:py-1.5 text-[11px] sm:text-xs rounded-md transition-all duration-150 flex items-center gap-1 active:scale-95 hover:scale-[1.02] min-w-0 truncate" title="Standard force-directed">
+                <span>🔄</span> <span class="truncate">Force</span>
               </button>
               <button @click="applyGraphPreset('compact'); currentPreset = 'compact'"
                       :class="currentPreset === 'compact' ? 'bg-beads-100 dark:bg-beads-900 text-beads-700 dark:text-beads-300 ring-1 ring-beads-500 shadow-sm' : 'hover:bg-gray-100 dark:hover:bg-gray-700'"
-                      class="px-2 py-1.5 text-xs rounded-md transition-all duration-150 flex items-center gap-1 active:scale-95 hover:scale-[1.02]" title="Compact DAG">
-                <span>📦</span> Compact
+                      class="px-1.5 sm:px-2 py-1 sm:py-1.5 text-[11px] sm:text-xs rounded-md transition-all duration-150 flex items-center gap-1 active:scale-95 hover:scale-[1.02] min-w-0 truncate" title="Compact DAG">
+                <span>📦</span> <span class="truncate">Compact</span>
               </button>
               <button @click="applyGraphPreset('spread'); currentPreset = 'spread'"
                       :class="currentPreset === 'spread' ? 'bg-beads-100 dark:bg-beads-900 text-beads-700 dark:text-beads-300 ring-1 ring-beads-500 shadow-sm' : 'hover:bg-gray-100 dark:hover:bg-gray-700'"
-                      class="px-2 py-1.5 text-xs rounded-md transition-all duration-150 flex items-center gap-1 active:scale-95 hover:scale-[1.02]" title="Maximum spacing">
-                <span>🌟</span> Spread
+                      class="px-1.5 sm:px-2 py-1 sm:py-1.5 text-[11px] sm:text-xs rounded-md transition-all duration-150 flex items-center gap-1 active:scale-95 hover:scale-[1.02] min-w-0 truncate" title="Maximum spacing">
+                <span>🌟</span> <span class="truncate">Spread</span>
               </button>
               <button @click="applyGraphPreset('orthogonal'); currentPreset = 'orthogonal'"
                       :class="currentPreset === 'orthogonal' ? 'bg-beads-100 dark:bg-beads-900 text-beads-700 dark:text-beads-300 ring-1 ring-beads-500 shadow-sm' : 'hover:bg-gray-100 dark:hover:bg-gray-700'"
-                      class="px-2 py-1.5 text-xs rounded-md transition-all duration-150 flex items-center gap-1 active:scale-95 hover:scale-[1.02]" title="Grid-aligned">
-                <span>📐</span> Grid
+                      class="px-1.5 sm:px-2 py-1 sm:py-1.5 text-[11px] sm:text-xs rounded-md transition-all duration-150 flex items-center gap-1 active:scale-95 hover:scale-[1.02] min-w-0 truncate" title="Grid-aligned">
+                <span>📐</span> <span class="truncate">Grid</span>
               </button>
               <button @click="applyGraphPreset('radial'); currentPreset = 'radial'"
                       :class="currentPreset === 'radial' ? 'bg-beads-100 dark:bg-beads-900 text-beads-700 dark:text-beads-300 ring-1 ring-beads-500 shadow-sm' : 'hover:bg-gray-100 dark:hover:bg-gray-700'"
-                      class="px-2 py-1.5 text-xs rounded-md transition-all duration-150 flex items-center gap-1 active:scale-95 hover:scale-[1.02]" title="Radial from center">
-                <span>🎯</span> Radial
+                      class="px-1.5 sm:px-2 py-1 sm:py-1.5 text-[11px] sm:text-xs rounded-md transition-all duration-150 flex items-center gap-1 active:scale-95 hover:scale-[1.02] min-w-0 truncate" title="Radial from center">
+                <span>🎯</span> <span class="truncate">Radial</span>
               </button>
               <button @click="applyGraphPreset('cluster'); currentPreset = 'cluster'"
                       :class="currentPreset === 'cluster' ? 'bg-beads-100 dark:bg-beads-900 text-beads-700 dark:text-beads-300 ring-1 ring-beads-500 shadow-sm' : 'hover:bg-gray-100 dark:hover:bg-gray-700'"
-                      class="px-2 py-1.5 text-xs rounded-md transition-all duration-150 flex items-center gap-1 active:scale-95 hover:scale-[1.02]" title="Group by status (4)">
-                <span>🔲</span> Cluster
+                      class="px-1.5 sm:px-2 py-1 sm:py-1.5 text-[11px] sm:text-xs rounded-md transition-all duration-150 flex items-center gap-1 active:scale-95 hover:scale-[1.02] min-w-0 truncate" title="Group by status (4)">
+                <span>🔲</span> <span class="truncate">Cluster</span>
               </button>
               <button @click="applyGraphPreset('galaxy'); currentPreset = 'galaxy'"
                       :class="currentPreset === 'galaxy' ? 'bg-beads-100 dark:bg-beads-900 text-beads-700 dark:text-beads-300 ring-1 ring-beads-500 shadow-sm' : 'hover:bg-gray-100 dark:hover:bg-gray-700'"
-                      class="col-span-3 px-2 py-1.5 text-xs rounded-md transition-all duration-150 flex items-center justify-center gap-1 active:scale-95 hover:scale-[1.02]" title="Cluster by label (5)">
+                      class="col-span-2 sm:col-span-3 px-2 py-1 sm:py-1.5 text-[11px] sm:text-xs rounded-md transition-all duration-150 flex items-center justify-center gap-1 active:scale-95 hover:scale-[1.02]" title="Cluster by label (5)">
                 <span>🌌</span> Galaxy
               </button>
             </div>
           </div>
 
           <!-- Heatmap Controls -->
-          <div class="bg-white/90 dark:bg-gray-800/90 backdrop-blur-sm rounded-lg shadow-lg border border-gray-200 dark:border-gray-700 p-2 mt-2">
-            <div class="text-xs text-gray-500 dark:text-gray-400 mb-2 px-1">Heatmap</div>
-            <div class="flex flex-col gap-2">
+          <div class="bg-white/90 dark:bg-gray-800/90 backdrop-blur-sm rounded-lg shadow-lg border border-gray-200 dark:border-gray-700 p-1.5 sm:p-2 mt-2">
+            <div class="text-[11px] sm:text-xs text-gray-500 dark:text-gray-400 mb-1.5 sm:mb-2 px-1">Heatmap</div>
+            <div class="flex flex-col gap-1.5 sm:gap-2">
               <button @click="toggleGraphHeatmap()"
                       :class="graphHeatmapActive ? 'bg-amber-100 dark:bg-amber-900 text-amber-700 dark:text-amber-300 ring-1 ring-amber-500 shadow-sm' : 'hover:bg-gray-100 dark:hover:bg-gray-700'"
-                      class="px-2 py-1.5 text-xs rounded-md transition-all duration-150 flex items-center gap-1 w-full justify-center active:scale-95 hover:scale-[1.02]" title="Toggle heatmap coloring (H)">
+                      class="px-2 py-1 sm:py-1.5 text-[11px] sm:text-xs rounded-md transition-all duration-150 flex items-center gap-1 w-full justify-center active:scale-95 hover:scale-[1.02]" title="Toggle heatmap coloring (H)">
                 <span>🔥</span> <span x-text="graphHeatmapActive ? 'ON' : 'OFF'"></span>
               </button>
               <select id="graphSizeMetric"
                       aria-label="Node size and heatmap metric"
                       x-model="graphSizeMetric"
                       @change="setGraphSizeMetric($event.target.value)"
-                      class="text-xs px-2 py-1.5 rounded-md border border-gray-200 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-700 dark:text-gray-200">
+                      class="w-full text-[11px] sm:text-xs px-1.5 sm:px-2 py-1 sm:py-1.5 rounded-md border border-gray-200 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-700 dark:text-gray-200">
                 <option value="pagerank">PageRank</option>
                 <option value="betweenness">Betweenness</option>
                 <option value="eigenvector">Eigenvector</option>
@@ -4193,8 +4563,15 @@
 
               <!-- Graph Metrics Section -->
               <div class="mb-6">
-                <h3 class="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider mb-3">Graph Metrics</h3>
-                <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+                <div class="flex items-center justify-between gap-2 mb-3">
+                  <h3 class="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider">Graph Metrics</h3>
+                  <span x-show="selectedIssue.is_articulation_point"
+                        class="px-2 py-0.5 text-[10px] font-semibold rounded-full bg-purple-100 dark:bg-purple-900/50 text-purple-700 dark:text-purple-200 border border-purple-200 dark:border-purple-700/60"
+                        title="Removing this issue disconnects part of the dependency graph">
+                    🔗 Cut Vertex (Articulation Point)
+                  </span>
+                </div>
+                <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">
                   <div class="bg-gradient-to-br from-beads-50 to-beads-100/50 dark:from-beads-900/30 dark:to-beads-900/10 rounded-lg p-3 text-center border border-beads-200/50 dark:border-beads-800/30">
                     <div class="text-[10px] text-beads-600 dark:text-beads-400 uppercase tracking-wider font-medium mb-1">PageRank</div>
                     <div class="text-lg font-bold text-beads-700 dark:text-beads-300 font-mono" x-text="selectedIssue.pagerank ? selectedIssue.pagerank.toFixed(4) : '—'"></div>
@@ -4210,6 +4587,18 @@
                   <div class="bg-gradient-to-br from-emerald-50 to-emerald-100/50 dark:from-emerald-900/30 dark:to-emerald-900/10 rounded-lg p-3 text-center border border-emerald-200/50 dark:border-emerald-800/30">
                     <div class="text-[10px] text-emerald-600 dark:text-emerald-400 uppercase tracking-wider font-medium mb-1">Triage Score</div>
                     <div class="text-lg font-bold text-emerald-700 dark:text-emerald-300 font-mono" x-text="selectedIssue.triage_score ? selectedIssue.triage_score.toFixed(3) : '—'"></div>
+                  </div>
+                  <div x-show="selectedIssue.eigenvector > 0" class="bg-gradient-to-br from-sky-50 to-sky-100/50 dark:from-sky-900/30 dark:to-sky-900/10 rounded-lg p-3 text-center border border-sky-200/50 dark:border-sky-800/30">
+                    <div class="text-[10px] text-sky-600 dark:text-sky-400 uppercase tracking-wider font-medium mb-1">Eigenvector</div>
+                    <div class="text-lg font-bold text-sky-700 dark:text-sky-300 font-mono" x-text="selectedIssue.eigenvector.toFixed(4)"></div>
+                  </div>
+                  <div x-show="selectedIssue.kcore !== null && selectedIssue.kcore !== undefined" class="bg-gradient-to-br from-indigo-50 to-indigo-100/50 dark:from-indigo-900/30 dark:to-indigo-900/10 rounded-lg p-3 text-center border border-indigo-200/50 dark:border-indigo-800/30">
+                    <div class="text-[10px] text-indigo-600 dark:text-indigo-400 uppercase tracking-wider font-medium mb-1">K-Core</div>
+                    <div class="text-lg font-bold text-indigo-700 dark:text-indigo-300 font-mono" x-text="'k=' + selectedIssue.kcore"></div>
+                  </div>
+                  <div x-show="selectedIssue.slack_available" class="bg-gradient-to-br from-teal-50 to-teal-100/50 dark:from-teal-900/30 dark:to-teal-900/10 rounded-lg p-3 text-center border border-teal-200/50 dark:border-teal-800/30">
+                    <div class="text-[10px] text-teal-600 dark:text-teal-400 uppercase tracking-wider font-medium mb-1">Schedule Slack</div>
+                    <div class="text-lg font-bold text-teal-700 dark:text-teal-300 font-mono" x-text="selectedIssue.slack === 0 ? '0 (Crit)' : selectedIssue.slack"></div>
                   </div>
                 </div>
               </div>
@@ -4308,6 +4697,36 @@
                     <span class="text-gray-500 dark:text-gray-400 shrink-0">Close Reason:</span>
                     <span class="text-gray-800 dark:text-gray-200 break-words" x-text="selectedIssue.close_reason"></span>
                   </div>
+                </div>
+              </div>
+
+              <!-- Correlated Git Commits Section (when history.json is loaded) -->
+              <div x-show="getIssueCommits(selectedIssue.id).length > 0" class="mb-6">
+                <h3 class="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider mb-3 flex items-center gap-2">
+                  <span>Correlated Commits</span>
+                  <span class="px-1.5 py-0.5 text-[10px] rounded-full bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300 font-mono"
+                        x-text="getIssueCommits(selectedIssue.id).length"></span>
+                </h3>
+                <div class="space-y-2 max-h-56 overflow-y-auto pr-1">
+                  <template x-for="commit in getIssueCommits(selectedIssue.id).slice(0, 10)" :key="'commit-' + (commit.sha || commit.short_sha)">
+                    <div class="bg-gray-50/70 dark:bg-gray-900/40 rounded-lg px-3 py-2 border border-gray-200/60 dark:border-gray-700/60 text-xs">
+                      <div class="flex flex-wrap items-center justify-between gap-2">
+                        <div class="flex items-center gap-2 min-w-0">
+                          <code class="font-mono text-[11px] px-1.5 py-0.5 rounded bg-gray-200/80 dark:bg-gray-700 text-gray-800 dark:text-gray-200 shrink-0"
+                                x-text="commit.short_sha || String(commit.sha || '').slice(0, 7)"></code>
+                          <span class="font-medium text-gray-800 dark:text-gray-200 truncate" x-text="commit.message"></span>
+                        </div>
+                        <span x-show="commit.confidence > 0"
+                              class="text-[10px] font-mono text-gray-500 dark:text-gray-400 shrink-0"
+                              x-text="Math.round(commit.confidence * 100) + '%'"></span>
+                      </div>
+                      <div class="mt-1 flex items-center gap-3 text-[11px] text-gray-500 dark:text-gray-400">
+                        <span x-show="commit.author" x-text="commit.author"></span>
+                        <span x-show="commit.timestamp" x-text="formatDate(commit.timestamp)"></span>
+                        <span x-show="commit.method" class="font-mono text-[10px]" x-text="commit.method"></span>
+                      </div>
+                    </div>
+                  </template>
                 </div>
               </div>
 

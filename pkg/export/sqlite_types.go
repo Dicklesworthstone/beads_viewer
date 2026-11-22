@@ -70,14 +70,16 @@ type ExportMetrics struct {
 
 // ExportMeta contains metadata about the export.
 type ExportMeta struct {
-	Version       string    `json:"version"`
-	GeneratedAt   time.Time `json:"generated_at"`
-	GitCommit     string    `json:"git_commit,omitempty"`
-	IssueCount    int       `json:"issue_count"`
-	DepCount      int       `json:"dependency_count"`
-	DataHash      string    `json:"data_hash,omitempty"`
-	Title         string    `json:"title,omitempty"`
-	HasHybridWasm bool      `json:"has_hybrid_wasm"`
+	Version        string    `json:"version"`
+	GeneratedAt    time.Time `json:"generated_at"`
+	GitCommit      string    `json:"git_commit,omitempty"`
+	IssueCount     int       `json:"issue_count"`
+	DepCount       int       `json:"dependency_count"`
+	DataHash       string    `json:"data_hash,omitempty"`
+	Title          string    `json:"title,omitempty"`
+	HasHybridWasm  bool      `json:"has_hybrid_wasm"`
+	HasSprints     bool      `json:"has_sprints,omitempty"`
+	HasSuggestions bool      `json:"has_suggestions,omitempty"`
 }
 
 // SQLiteExportConfig configures the SQLite export process.
@@ -109,6 +111,11 @@ type SQLiteExportConfig struct {
 
 	// PageSize is the SQLite page size (optimal: 1024 for httpvfs)
 	PageSize int
+
+	// HasSprints records whether data/sprints.json will be published alongside this bundle.
+	HasSprints bool
+	// HasSuggestions records whether data/suggestions.json will be published alongside this bundle.
+	HasSuggestions bool
 }
 
 // DefaultSQLiteExportConfig returns sensible defaults for export configuration.

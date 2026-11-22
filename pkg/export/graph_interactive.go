@@ -63,13 +63,16 @@ type graphNode struct {
 	Notes              string `json:"notes,omitempty"`
 
 	// Metadata
-	Status          string   `json:"status"`
-	Priority        int      `json:"priority"`
-	Type            string   `json:"type"`
-	Labels          []string `json:"labels"`
-	Assignee        string   `json:"assignee,omitempty"`
-	SourceRepo      string   `json:"source_repo,omitempty"`
-	IsActionable    bool     `json:"is_actionable"`
+	Status           string   `json:"status"`
+	Priority         int      `json:"priority"`
+	Type             string   `json:"type"`
+	Labels           []string `json:"labels"`
+	Assignee         string   `json:"assignee,omitempty"`
+	SourceRepo       string   `json:"source_repo,omitempty"`
+	EstimatedMinutes *int     `json:"estimated_minutes,omitempty"`
+	CreatedBy        string   `json:"created_by,omitempty"`
+	CloseReason      string   `json:"close_reason,omitempty"`
+	IsActionable     bool     `json:"is_actionable"`
 	DependencyState string   `json:"dependency_state"`
 	BlockerCount    int      `json:"blocker_count"`
 	IsTemplate      bool     `json:"is_template,omitempty"`
@@ -567,13 +570,16 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 			Notes:              iss.Notes,
 
 			// Metadata
-			Status:          string(iss.Status),
-			Priority:        iss.Priority,
-			Type:            string(iss.IssueType),
-			Labels:          iss.Labels,
-			Assignee:        iss.Assignee,
-			SourceRepo:      iss.SourceRepo,
-			IsActionable:    isActionable,
+			Status:           string(iss.Status),
+			Priority:         iss.Priority,
+			Type:             string(iss.IssueType),
+			Labels:           iss.Labels,
+			Assignee:         iss.Assignee,
+			SourceRepo:       iss.SourceRepo,
+			EstimatedMinutes: iss.EstimatedMinutes,
+			CreatedBy:        iss.CreatedBy,
+			CloseReason:      iss.CloseReason,
+			IsActionable:     isActionable,
 			DependencyState: depState,
 			BlockerCount:    blockerCount,
 			IsTemplate:      iss.IsTemplate,
@@ -650,13 +656,67 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 		return nodes[i].ID < nodes[j].ID
 	})
 
-	hasCycles := opts.Stats != nil && len(opts.Stats.Cycles()) > 0
+	var exportedCycles [][]string
+	var cycleBreaks []map[string]interface{}
+	if opts.Stats != nil {
+		rawCycles := opts.Stats.Cycles()
+		if len(rawCycles) > 0 {
+			limit := min(len(rawCycles), 50)
+			exportedCycles = make([][]string, 0, limit)
+			edgeFreq := make(map[[2]string]int)
+			for _, cyc := range rawCycles[:limit] {
+				if len(cyc) == 0 {
+					continue
+				}
+				cloned := append([]string(nil), cyc...)
+				exportedCycles = append(exportedCycles, cloned)
+				for i := 0; i < len(cyc); i++ {
+					edgeFreq[[2]string{cyc[i], cyc[(i+1)%len(cyc)]}]++
+				}
+			}
+			type breakCand struct {
+				from, to string
+				count    int
+			}
+			cands := make([]breakCand, 0, len(edgeFreq))
+			for pair, count := range edgeFreq {
+				cands = append(cands, breakCand{from: pair[0], to: pair[1], count: count})
+			}
+			sort.Slice(cands, func(i, j int) bool {
+				if cands[i].count != cands[j].count {
+					return cands[i].count > cands[j].count
+				}
+				if cands[i].from != cands[j].from {
+					return cands[i].from < cands[j].from
+				}
+				return cands[i].to < cands[j].to
+			})
+			for i, c := range cands {
+				if i >= 10 {
+					break
+				}
+				cycleBreaks = append(cycleBreaks, map[string]interface{}{
+					"from":          c.from,
+					"to":            c.to,
+					"cycles_broken": c.count,
+				})
+			}
+		}
+	}
+
+	hasCycles := len(exportedCycles) > 0 || (opts.Stats != nil && len(opts.Stats.Cycles()) > 0)
 	graphData := map[string]interface{}{
 		"nodes":           nodes,
 		"links":           links,
 		"slack_available": slackAvailable,
 		"has_cycles":      hasCycles,
 		"exported_at_ms":  exportTime.UTC().UnixMilli(),
+	}
+	if len(exportedCycles) > 0 {
+		graphData["cycles"] = exportedCycles
+	}
+	if len(cycleBreaks) > 0 {
+		graphData["cycle_breaks"] = cycleBreaks
 	}
 	for key, value := range opts.RobotEnvelope {
 		graphData[key] = value

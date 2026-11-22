@@ -126,18 +126,28 @@ PY
 ) || { cat "$tmp/capabilities-export.log" 2>/dev/null || true; exit 1; }
 
 mkdir -p "$tmp/multirepo-fixture/.beads"
-python3 - "$tmp/multirepo-fixture/.beads/issues.jsonl" <<'PY'
+python3 - "$tmp/multirepo-fixture/.beads/issues.jsonl" "$tmp/multirepo-fixture/.beads/sprints.jsonl" <<'PY'
 import json, pathlib, sys
 base = dict(status='open', priority=1, issue_type='task',
             created_at='2026-10-01T12:00:00Z', updated_at='2026-10-02T12:00:00Z')
 issues = [
-    dict(base, id='api-auth', title='API OAuth token issuer', labels=['auth'], source_repo='api', priority=0),
-    dict(base, id='api-health', title='API health check', labels=['ops'], source_repo='api', status='closed', closed_at='2026-10-02T12:00:00Z'),
+    dict(base, id='api-auth', title='API OAuth token issuer', labels=['auth'], source_repo='api', priority=0,
+         estimated_minutes=120, created_by='founder', due_date='2026-09-15T12:00:00Z'),
+    dict(base, id='api-health', title='API health check', labels=['ops'], source_repo='api', status='closed',
+         closed_at='2026-10-02T12:00:00Z', close_reason='Verified in staging'),
     dict(base, id='web-login', title='Web login page', labels=['ui'], source_repo='web',
+         estimated_minutes=240,
          dependencies=[dict(issue_id='web-login', depends_on_id='api-auth', type='blocks')]),
-    dict(base, id='web-settings', title='Web profile settings', labels=['ui'], source_repo='web', priority=2),
+    dict(base, id='web-settings', title='Web profile settings', labels=['ui'], source_repo='web', priority=2,
+         estimated_minutes=60),
 ]
 pathlib.Path(sys.argv[1]).write_text(''.join(json.dumps(i) + '\n' for i in issues))
+sprints = [
+    dict(id='sprint-mr-1', name='Multi-Repo Sprint 1',
+         start_date='2026-10-01T00:00:00Z', end_date='2026-10-14T23:59:59Z',
+         bead_ids=['api-auth', 'api-health', 'web-login']),
+]
+pathlib.Path(sys.argv[2]).write_text(''.join(json.dumps(s) + '\n' for s in sprints))
 PY
 (
   cd "$tmp/multirepo-fixture"

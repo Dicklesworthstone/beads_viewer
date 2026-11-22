@@ -748,6 +748,7 @@ func generateUltimateHTMLWithTime(title, dataHash, graphDataJSON string, nodeCou
             <div class="toolbar-group">
                 <button id="btn-heatmap" title="Toggle heatmap coloring - shows node importance by color intensity (H)">🔥</button>
                 <button id="btn-triage" title="Show/hide triage recommendations panel with prioritized work items (G)">📋</button>
+                <button id="btn-cycles" title="Inspect dependency cycles (C)" style="display:none">🔄</button>
                 <button id="btn-top" title="Show/hide top nodes panel with highest PageRank nodes (T)">⭐</button>
                 <button id="btn-recent" title="Show/hide recently viewed nodes (Y)">🕐</button>
                 <button id="btn-path" title="Enter path finder mode - click two nodes to find shortest path (P)">🛤️</button>
@@ -837,6 +838,16 @@ func generateUltimateHTMLWithTime(title, dataHash, graphDataJSON string, nodeCou
                 <div id="recent-list"></div>
             </div>
             <div class="pathfinder-banner" id="pathfinder-banner">🔗 Path Finder: Click destination node (Esc to cancel)</div>
+            <div class="pathfinder-banner" id="cycle-banner" style="top:3.5rem;border-color:#ef4444;display:none;gap:0.5rem;align-items:center">
+                <span id="cycle-banner-text">🔄 Cycle</span>
+                <button type="button" id="btn-cycle-prev" style="padding:0.15rem 0.45rem;font-size:0.75rem">◀</button>
+                <button type="button" id="btn-cycle-next" style="padding:0.15rem 0.45rem;font-size:0.75rem">▶</button>
+                <button type="button" id="btn-cycle-close" style="padding:0.15rem 0.45rem;font-size:0.75rem">×</button>
+            </div>
+            <div class="pathfinder-banner" id="whatif-banner" style="top:3.5rem;border-color:#10b981;display:none;gap:0.5rem;align-items:center">
+                <span id="whatif-banner-text">⚡ What-If</span>
+                <button type="button" id="btn-whatif-close" style="padding:0.15rem 0.45rem;font-size:0.75rem">Reset</button>
+            </div>
             <div class="edge-tooltip" id="edge-tooltip"></div>
             <div id="hover-panel">
                 <button class="hover-close" id="hover-close">×</button>
@@ -894,7 +905,13 @@ func generateUltimateHTMLWithTime(title, dataHash, graphDataJSON string, nodeCou
                 <div class="stat-card"><div class="stat-value warning" id="stat-articulation">-</div><div class="stat-label">Cut Pts</div></div>
             </div>
             <div class="panel" id="triage-panel" style="display:none;">
-                <div class="panel-title">Top Recommendations</div>
+                <div class="panel-title">Triage Insights</div>
+                <div id="triage-tabs" style="display:flex;gap:0.25rem;flex-wrap:wrap;margin-bottom:0.5rem">
+                    <button type="button" class="triage-tab-btn active" data-tab="recommendations" style="padding:0.2rem 0.45rem;font-size:0.7rem">Top</button>
+                    <button type="button" class="triage-tab-btn" data-tab="quick_wins" style="padding:0.2rem 0.45rem;font-size:0.7rem">Quick Wins</button>
+                    <button type="button" class="triage-tab-btn" data-tab="blockers" style="padding:0.2rem 0.45rem;font-size:0.7rem">Blockers</button>
+                    <button type="button" class="triage-tab-btn" data-tab="alerts" style="padding:0.2rem 0.45rem;font-size:0.7rem">Alerts</button>
+                </div>
                 <div id="triage-list"></div>
             </div>
             <div class="panel">
@@ -925,6 +942,9 @@ func generateUltimateHTMLWithTime(title, dataHash, graphDataJSON string, nodeCou
                     </div>
                     <div class="detail-name" id="detail-name">-</div>
                     <div class="detail-badges" id="detail-badges"></div>
+                    <div style="margin:0.5rem 0">
+                        <button type="button" id="btn-detail-whatif" style="width:100%%;padding:0.35rem 0.5rem;font-size:0.75rem;display:none">⚡ Simulate Close (What-If)</button>
+                    </div>
                     <div class="detail-metrics">
                         <div class="metric-item"><span class="metric-label">PageRank</span><span class="metric-value" id="m-pagerank">-</span></div>
                         <div class="metric-item"><span class="metric-label">Rank</span><span class="metric-value" id="m-prrank">-</span></div>
@@ -963,6 +983,7 @@ func generateUltimateHTMLWithTime(title, dataHash, graphDataJSON string, nodeCou
         <div class="context-menu-item" id="ctx-deps">📥 Show dependencies</div>
         <div class="context-menu-item" id="ctx-dependents">📤 Show dependents</div>
         <div class="context-menu-item" id="ctx-connected">✨ Highlight connected</div>
+        <div class="context-menu-item" id="ctx-whatif">⚡ What-If: simulate close</div>
         <div class="context-menu-divider"></div>
         <div class="context-menu-item" id="ctx-path">🛤️ Find path to...</div>
         <div class="context-menu-item" id="ctx-copy">📋 Copy ID</div>
@@ -1385,7 +1406,12 @@ function handleDagCycleError() {
     try { Graph.dagMode(null); } catch (_) {}
     try { setGraphLinksMode(false); } catch (_) {}
     localStorage.removeItem('bv-graph-layout');
-    showToast('Cannot apply DAG layout: dependency cycle detected');
+    if (Array.isArray(DATA.cycles) && DATA.cycles.length > 0) {
+        showCycleInspector(0);
+        showToast('Cannot apply DAG layout: ' + DATA.cycles.length + ' dependency cycle(s) highlighted');
+    } else {
+        showToast('Cannot apply DAG layout: dependency cycle detected');
+    }
 }
 function applyGraphDagMode(mode) {
     dagErrorTriggered = false;
@@ -1626,14 +1652,26 @@ function populatePanelContent(prefix, node) {
         if (!value) return;
         metaEl.innerHTML += '<div class="hover-meta-item"><span class="hover-meta-label">' + escapeHTML(label) + '</span><span class="hover-meta-value">' + escapeHTML(value) + '</span></div>';
     };
+    const formatEstimate = (mins) => {
+        const m = Number(mins);
+        if (!isFinite(m) || m <= 0) return '';
+        if (m < 60) return m + 'm';
+        const h = Math.floor(m / 60), rm = m %% 60;
+        if (h < 24) return rm ? (h + 'h ' + rm + 'm') : (h + 'h');
+        const d = Math.floor(h / 24), rh = h %% 24;
+        return rh ? (d + 'd ' + rh + 'h') : (d + 'd');
+    };
     addMeta('Assignee', node.assignee);
     addMeta('Repo', node.source_repo);
+    addMeta('Estimate', formatEstimate(node.estimated_minutes));
+    addMeta('Created By', node.created_by);
     addMeta('Created', node.created_at);
     addMeta('Updated', node.updated_at);
     addMeta('Due Date', node.due_date);
     addMeta('Deferred Until', node.defer_until);
     addMeta('External Ref', node.external_ref);
     if (node.closed_at) addMeta('Closed', node.closed_at);
+    if (node.close_reason) addMeta('Close Reason', node.close_reason);
     if (node.last_author) addMeta('Last Author', node.last_author);
     if (node.commit_count > 0) addMeta('Commits', String(node.commit_count));
     if (DATA.git_range) addMeta('Git Range', DATA.git_range);
@@ -1792,6 +1830,10 @@ function selectNode(node) {
     slackEl.className = 'metric-value' + (node.slack_available !== false && isActiveNodeStatus(node.status) && node.slack === 0 ? ' highlight' : '');
     document.getElementById('m-indeg').textContent = node.in_degree ?? '-';
     document.getElementById('m-outdeg').textContent = node.out_degree ?? '-';
+    const whatIfBtn = document.getElementById('btn-detail-whatif');
+    if (whatIfBtn) {
+        whatIfBtn.style.display = isActiveNodeStatus(node.status) ? '' : 'none';
+    }
     document.getElementById('node-detail').classList.add('visible');
     document.getElementById('no-selection').style.display = 'none';
 }
@@ -1800,6 +1842,8 @@ function clearSelection() {
     selectedNode = null;
     activePathNodes = null;
     highlightedNodes = new Set();
+    closeCycleInspector();
+    clearWhatIfSimulation();
     document.getElementById('node-detail').classList.remove('visible');
     document.getElementById('no-selection').style.display = 'block';
     Graph.nodeColor(Graph.nodeColor());
@@ -1834,7 +1878,9 @@ function performSearch(query) {
                (n.acceptance_criteria || '').toLowerCase().includes(q) ||
                (n.labels || []).some(l => l.toLowerCase().includes(q)) ||
                (n.assignee || '').toLowerCase().includes(q) ||
-               (n.source_repo || '').toLowerCase().includes(q);
+               (n.source_repo || '').toLowerCase().includes(q) ||
+               (n.created_by || '').toLowerCase().includes(q) ||
+               (n.close_reason || '').toLowerCase().includes(q);
     }).slice(0, 8);
 
     if (matches.length === 0) {
@@ -1954,6 +2000,165 @@ document.getElementById('ctx-connected').onclick = () => {
     }
     hideContextMenu();
 };
+document.getElementById('ctx-whatif').onclick = () => {
+    if (contextNode) runWhatIfSimulation(contextNode.id);
+    hideContextMenu();
+};
+
+// Pure-JS active-blocker What-If close cascade simulation (matching bv-graph-wasm)
+let activeWhatIfId = null;
+function simulateWhatIfClose(targetId) {
+    const activeNodes = new Map();
+    DATA.nodes.forEach(n => {
+        if (isActiveNodeStatus(n.status)) activeNodes.set(n.id, n);
+    });
+    if (!activeNodes.has(targetId)) {
+        return { direct: [], transitive: [], cascade: [] };
+    }
+    const blockersByNode = new Map();
+    const dependentsByBlocker = new Map();
+    activeNodes.forEach((_, id) => {
+        blockersByNode.set(id, new Set());
+        dependentsByBlocker.set(id, new Set());
+    });
+    DATA.links.forEach(l => {
+        if (l.type && l.type !== 'blocks' && l.type !== 'conditional-blocks' && l.type !== 'waits-for') return;
+        const src = typeof l.source === 'object' ? l.source.id : l.source;
+        const tgt = typeof l.target === 'object' ? l.target.id : l.target;
+        if (!activeNodes.has(src) || !activeNodes.has(tgt) || src === tgt) return;
+        blockersByNode.get(src).add(tgt);
+        dependentsByBlocker.get(tgt).add(src);
+    });
+    const remainingBlockers = new Map();
+    blockersByNode.forEach((set, id) => remainingBlockers.set(id, set.size));
+    const resolved = new Set([targetId]);
+    const direct = [];
+    const cascade = [];
+    const queue = [targetId];
+    while (queue.length > 0) {
+        const cur = queue.shift();
+        const deps = dependentsByBlocker.get(cur) || new Set();
+        for (const depId of deps) {
+            if (resolved.has(depId)) continue;
+            const rem = (remainingBlockers.get(depId) || 0) - 1;
+            remainingBlockers.set(depId, rem);
+            if (rem <= 0) {
+                resolved.add(depId);
+                cascade.push(depId);
+                if (cur === targetId) direct.push(depId);
+                queue.push(depId);
+            }
+        }
+    }
+    return { direct, transitive: cascade, cascade };
+}
+function clearWhatIfSimulation() {
+    activeWhatIfId = null;
+    const banner = document.getElementById('whatif-banner');
+    if (banner) { banner.style.display = 'none'; banner.classList.remove('visible'); }
+}
+function runWhatIfSimulation(nodeId) {
+    if (!nodeId) return;
+    closeCycleInspector();
+    const res = simulateWhatIfClose(nodeId);
+    activeWhatIfId = nodeId;
+    const ids = new Set([nodeId, ...res.cascade]);
+    activePathNodes = ids;
+    highlightedNodes = ids;
+    Graph.nodeColor(Graph.nodeColor());
+    Graph.linkColor(Graph.linkColor());
+    Graph.linkWidth(Graph.linkWidth());
+    const banner = document.getElementById('whatif-banner');
+    const textEl = document.getElementById('whatif-banner-text');
+    if (banner && textEl) {
+        textEl.textContent = '⚡ What-If ' + nodeId + ': +' + res.direct.length + ' direct / +' + res.transitive.length + ' total unblocked' +
+            (res.cascade.length ? ' (' + res.cascade.slice(0, 5).join(', ') + (res.cascade.length > 5 ? ' +' + (res.cascade.length - 5) : '') + ')' : '');
+        banner.style.display = 'flex';
+        banner.classList.add('visible');
+    }
+    showToast('What-If ' + nodeId + ': +' + res.direct.length + ' direct, +' + res.transitive.length + ' total unblocked');
+}
+document.getElementById('btn-whatif-close').onclick = () => {
+    clearWhatIfSimulation();
+    activePathNodes = null;
+    highlightedNodes = new Set();
+    closeCycleInspector();
+    clearWhatIfSimulation();
+    Graph.nodeColor(Graph.nodeColor());
+    Graph.linkColor(Graph.linkColor());
+    Graph.linkWidth(Graph.linkWidth());
+};
+document.getElementById('btn-detail-whatif').onclick = () => {
+    if (selectedNode) runWhatIfSimulation(selectedNode.id);
+};
+
+// Cycle Inspector (uses exported DATA.cycles + DATA.cycle_breaks)
+let activeCycleIndex = -1;
+function closeCycleInspector() {
+    activeCycleIndex = -1;
+    const banner = document.getElementById('cycle-banner');
+    if (banner) { banner.style.display = 'none'; banner.classList.remove('visible'); }
+    const btn = document.getElementById('btn-cycles');
+    if (btn) btn.classList.remove('active');
+}
+function showCycleInspector(idx) {
+    const cycles = Array.isArray(DATA.cycles) ? DATA.cycles : [];
+    if (cycles.length === 0) return;
+    clearWhatIfSimulation();
+    activeCycleIndex = ((idx %% cycles.length) + cycles.length) %% cycles.length;
+    const cycle = cycles[activeCycleIndex];
+    const nodeSet = new Set(cycle);
+    activePathNodes = nodeSet;
+    highlightedNodes = nodeSet;
+    Graph.nodeColor(Graph.nodeColor());
+    Graph.linkColor(Graph.linkColor());
+    Graph.linkWidth(Graph.linkWidth());
+    const cycleEdges = new Set();
+    for (let i = 0; i < cycle.length; i++) {
+        cycleEdges.add(cycle[i] + '\0' + cycle[(i + 1) %% cycle.length]);
+    }
+    const breakSug = (DATA.cycle_breaks || []).find(b => cycleEdges.has(b.from + '\0' + b.to));
+    const banner = document.getElementById('cycle-banner');
+    const textEl = document.getElementById('cycle-banner-text');
+    if (banner && textEl) {
+        const pathStr = cycle.concat([cycle[0]]).join(' → ');
+        textEl.textContent = '🔄 Cycle [' + (activeCycleIndex + 1) + '/' + cycles.length + ']: ' + pathStr +
+            (breakSug ? ' · Cut: ' + breakSug.from + ' → ' + breakSug.to : '');
+        banner.style.display = 'flex';
+        banner.classList.add('visible');
+    }
+    const btn = document.getElementById('btn-cycles');
+    if (btn) btn.classList.add('active');
+}
+const cyclesBtn = document.getElementById('btn-cycles');
+if (cyclesBtn && Array.isArray(DATA.cycles) && DATA.cycles.length > 0) {
+    cyclesBtn.style.display = '';
+    cyclesBtn.title = 'Inspect ' + DATA.cycles.length + ' dependency cycle(s) (C)';
+    cyclesBtn.onclick = () => {
+        if (activeCycleIndex >= 0) {
+            closeCycleInspector();
+            activePathNodes = null;
+            highlightedNodes = new Set();
+            Graph.nodeColor(Graph.nodeColor());
+            Graph.linkColor(Graph.linkColor());
+            Graph.linkWidth(Graph.linkWidth());
+        } else {
+            showCycleInspector(0);
+        }
+    };
+}
+document.getElementById('btn-cycle-prev').onclick = () => { if (activeCycleIndex >= 0) showCycleInspector(activeCycleIndex - 1); };
+document.getElementById('btn-cycle-next').onclick = () => { if (activeCycleIndex >= 0) showCycleInspector(activeCycleIndex + 1); };
+document.getElementById('btn-cycle-close').onclick = () => {
+    closeCycleInspector();
+    activePathNodes = null;
+    highlightedNodes = new Set();
+    closeCycleInspector();
+    clearWhatIfSimulation();
+    Graph.nodeColor(Graph.nodeColor());
+    Graph.linkColor(Graph.linkColor());
+    Graph.linkWidth(Graph.linkWidth());
+};
 document.getElementById('ctx-copy').onclick = () => {
     const value = contextNode ? contextNode.id : '';
     hideContextMenu();
@@ -2054,7 +2259,7 @@ const labelSelect = document.getElementById('filter-label');
     labelSelect.appendChild(opt);
 });
 const repoSelect = document.getElementById('filter-repo');
-if (repoSelect && allRepos.size > 0) {
+if (repoSelect && (allRepos.size > 1 || (allRepos.size === 1 && DATA.nodes.some(n => !n.source_repo)))) {
     [...allRepos].sort().forEach(r => {
         const opt = document.createElement('option');
         opt.value = r; opt.textContent = r;
@@ -2081,7 +2286,9 @@ function applyFilters() {
             (n.acceptance_criteria || '').toLowerCase().includes(q) ||
             (n.labels || []).some(l => l.toLowerCase().includes(q)) ||
             (n.assignee || '').toLowerCase().includes(q) ||
-            (n.source_repo || '').toLowerCase().includes(q);
+            (n.source_repo || '').toLowerCase().includes(q) ||
+            (n.created_by || '').toLowerCase().includes(q) ||
+            (n.close_reason || '').toLowerCase().includes(q);
         if (!matchSearch) return false;
 
         if (statusFilter && statusFilter !== 'all') {
@@ -2149,6 +2356,8 @@ document.getElementById('btn-reset').onclick = () => {
     pathStart = null;
     activePathNodes = null;
     highlightedNodes = new Set();
+    closeCycleInspector();
+    clearWhatIfSimulation();
     Graph.dagMode(null);
     setGraphLinksMode(false);
     Graph.nodeVal(n => getNodeSize(n));
@@ -2180,30 +2389,78 @@ document.getElementById('btn-heatmap').onclick = () => {
     Graph.nodeColor(computeNodeColor);
 };
 
-// Triage panel
-document.getElementById('btn-triage').onclick = () => {
-    const panel = document.getElementById('triage-panel');
-    const btn = document.getElementById('btn-triage');
-    const visible = panel.style.display === 'none';
-    panel.style.display = visible ? 'block' : 'none';
-    btn.classList.toggle('active', visible);
-    if (visible && DATA.triage && DATA.triage.recommendations) {
-        const list = document.getElementById('triage-list');
-        list.innerHTML = DATA.triage.recommendations.slice(0, 5).map(r => {
+// Triage panel (supports Top Recommendations, Quick Wins, Blockers to Clear, and Alerts)
+let activeTriageTab = 'recommendations';
+function renderTriageTab(tab) {
+    activeTriageTab = tab || 'recommendations';
+    document.querySelectorAll('.triage-tab-btn').forEach(b => {
+        b.classList.toggle('active', b.dataset.tab === activeTriageTab);
+    });
+    const list = document.getElementById('triage-list');
+    if (!list) return;
+    const t = DATA.triage || {};
+    let html = '';
+    if (activeTriageTab === 'recommendations') {
+        const items = (t.recommendations || []).slice(0, 8);
+        html = items.length ? items.map(r => {
             const score = (r.score != null && isFinite(r.score)) ? r.score.toFixed(2) : '-';
             const reason = (r.reasons && r.reasons.length > 0) ? r.reasons[0] : '';
             return '<div class="triage-item" data-id="' + escapeHTML(r.id || '') + '">' +
                 '<div class="triage-item-header"><span class="triage-item-id">' + escapeHTML(r.id || '-') + '</span><span class="triage-item-score">' + escapeHTML(score) + '</span></div>' +
                 '<div class="triage-item-title">' + escapeHTML(r.title || '') + '</div>' +
                 '<div class="triage-item-reason">' + escapeHTML(reason) + '</div></div>';
-        }).join('');
-        list.querySelectorAll('.triage-item').forEach(item => {
-            item.onclick = () => {
-                const graphNodes = Graph.graphData().nodes;
-                const node = graphNodes.find(n => n.id === item.dataset.id);
-                if (node) { selectNode(node); Graph.centerAt(node.x, node.y, 500); Graph.zoom(2.5, 500); }
-            };
-        });
+        }).join('') : '<div class="triage-item-reason">No recommendations</div>';
+    } else if (activeTriageTab === 'quick_wins') {
+        const items = (t.quick_wins || []).slice(0, 8);
+        html = items.length ? items.map(w => {
+            const score = (w.score != null && isFinite(w.score)) ? w.score.toFixed(2) : '-';
+            return '<div class="triage-item" data-id="' + escapeHTML(w.id || '') + '">' +
+                '<div class="triage-item-header"><span class="triage-item-id">⚡ ' + escapeHTML(w.id || '-') + '</span><span class="triage-item-score">' + escapeHTML(score) + '</span></div>' +
+                '<div class="triage-item-title">' + escapeHTML(w.title || '') + '</div>' +
+                '<div class="triage-item-reason">' + escapeHTML(w.reason || '') + '</div></div>';
+        }).join('') : '<div class="triage-item-reason">No quick wins</div>';
+    } else if (activeTriageTab === 'blockers') {
+        const items = (t.blockers_to_clear || []).slice(0, 8);
+        html = items.length ? items.map(b => {
+            return '<div class="triage-item" data-id="' + escapeHTML(b.id || '') + '">' +
+                '<div class="triage-item-header"><span class="triage-item-id">🔓 ' + escapeHTML(b.id || '-') + '</span><span class="triage-item-score">+' + escapeHTML(b.unblocks_count ?? 0) + '</span></div>' +
+                '<div class="triage-item-title">' + escapeHTML(b.title || '') + '</div>' +
+                '<div class="triage-item-reason">' + (b.actionable ? 'Actionable now' : 'Blocked upstream') + '</div></div>';
+        }).join('') : '<div class="triage-item-reason">No blockers to clear</div>';
+    } else if (activeTriageTab === 'alerts') {
+        const items = (t.alerts || []).slice(0, 15);
+        html = items.length ? items.map(a => {
+            const id = a.issue_id || (Array.isArray(a.issue_ids) && a.issue_ids[0]) || '';
+            return '<div class="triage-item" data-id="' + escapeHTML(id) + '">' +
+                '<div class="triage-item-header"><span class="triage-item-id">' + escapeHTML((a.type || 'alert').toUpperCase()) + '</span><span class="triage-item-score">' + escapeHTML(a.severity || 'warning') + '</span></div>' +
+                '<div class="triage-item-title">' + escapeHTML(a.message || '') + '</div>' +
+                (id ? '<div class="triage-item-reason">Bead: ' + escapeHTML(id) + '</div>' : '') + '</div>';
+        }).join('') : '<div class="triage-item-reason">No alerts</div>';
+    }
+    list.innerHTML = html;
+    list.querySelectorAll('.triage-item').forEach(item => {
+        item.onclick = () => {
+            if (!item.dataset.id) return;
+            const graphNodes = Graph.graphData().nodes;
+            const node = graphNodes.find(n => n.id === item.dataset.id);
+            if (node) { selectNode(node); Graph.centerAt(node.x, node.y, 500); Graph.zoom(2.5, 500); }
+        };
+    });
+}
+document.querySelectorAll('.triage-tab-btn').forEach(btn => {
+    btn.onclick = () => renderTriageTab(btn.dataset.tab);
+});
+document.getElementById('btn-triage').onclick = () => {
+    const panel = document.getElementById('triage-panel');
+    const btn = document.getElementById('btn-triage');
+    const visible = panel.style.display === 'none';
+    panel.style.display = visible ? 'block' : 'none';
+    btn.classList.toggle('active', visible);
+    if (visible) {
+        const alertCount = (DATA.triage?.alerts || []).length;
+        const alertTabBtn = document.querySelector('.triage-tab-btn[data-tab="alerts"]');
+        if (alertTabBtn) alertTabBtn.textContent = alertCount > 0 ? ('Alerts (' + alertCount + ')') : 'Alerts';
+        renderTriageTab(activeTriageTab);
     }
 };
 
@@ -2420,6 +2677,7 @@ document.onkeydown = e => {
         case 'h': document.getElementById('btn-heatmap').click(); break;
         case 't': document.getElementById('btn-top').click(); break;
         case 'g': document.getElementById('btn-triage').click(); break;
+        case 'c': if (Array.isArray(DATA.cycles) && DATA.cycles.length > 0) document.getElementById('btn-cycles').click(); break;
         case 'd': togglePanelMode(); break;
         case 'l': toggleLightMode(); break;
         case 'y': document.getElementById('btn-recent').click(); break;
