@@ -245,6 +245,14 @@ func TestIssueDelegate_WorkspaceAndShowMetricsHeaderParity(t *testing.T) {
 			wantHdr:   []string{"REPO", "ID", "STATUS", "METRICS"},
 			wantFirst: "",
 		},
+		{
+			name:      "workspace-explicit-repo-column-deduped",
+			workspace: true,
+			repoPref:  "api",
+			columns:   []string{"id", "repo", "title"},
+			wantHdr:   []string{"ID", "REPO", "TITLE", "METRICS"},
+			wantFirst: "api-42",
+		},
 	}
 
 	for _, tc := range cases {

@@ -2494,7 +2494,7 @@ type Model struct {
 	workspaceSummary     string          // Summary text for footer (e.g., "3 repos")
 
 	// Alerts panel (bv-168)
-	alerts          []drift.Alert
+	alerts                 []drift.Alert
 	alertsCritical         int
 	alertsWarning          int
 	alertsInfo             int
@@ -10997,8 +10997,15 @@ func (m *Model) formatListHeader(width int, split bool) string {
 		if len(cols) == 0 {
 			cols = []string{"id", "title", "status", "priority"}
 		}
+		hasRepoCol := false
+		for _, rawCol := range cols {
+			if canonical, ok := recipe.CanonicalViewColumn(strings.TrimSpace(rawCol)); ok && canonical == "repo" {
+				hasRepoCol = true
+				break
+			}
+		}
 		parts := make([]string, 0, len(cols)+2)
-		if m.workspaceMode {
+		if m.workspaceMode && !hasRepoCol {
 			parts = append(parts, "REPO")
 		}
 		for _, rawCol := range cols {
