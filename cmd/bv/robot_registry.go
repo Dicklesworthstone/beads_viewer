@@ -1598,20 +1598,6 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 		FlagPtr:     cfg.RobotAlertsFlag,
 		Description: "Output drift and proactive alerts",
 		Handler: func(ctx RobotContext) error {
-			projectDir, err := ctx.ProjectDirOrDefault()
-			if err != nil {
-				return fmt.Errorf("getting project directory: %w", err)
-			}
-			baselinePath, err := ctx.BaselinePathOrDefault()
-			if err != nil {
-				return fmt.Errorf("getting baseline path: %w", err)
-			}
-
-			driftConfig, err := drift.LoadConfig(projectDir)
-			if err != nil {
-				return fmt.Errorf("loading drift config: %w", err)
-			}
-
 			graphIssues := ctx.GraphIssues()
 			analyzer := ctx.GraphAnalyzer()
 			if cfg.ForceFullAnalysis != nil && *cfg.ForceFullAnalysis {
@@ -1619,64 +1605,10 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 				analyzer.SetConfig(&fullCfg)
 			}
 			stats := analyzer.Analyze()
-
-			partition := analyzer.CountStatusPartition()
-			openCount := 0
-			for _, issue := range graphIssues {
-				if !analyzer.IsCandidate(issue.ID) {
-					continue
-				}
-				if issue.Status == model.StatusOpen || issue.Status == model.StatusInProgress {
-					openCount++
-				}
+			driftResult, scopeMismatchSkipped, err := computeDriftResultForContext(ctx, analyzer, &stats, graphIssues)
+			if err != nil {
+				return err
 			}
-			cycles := filterCyclesForCandidates(stats.Cycles(), ctx.CandidateIDs)
-			scopedNodes, scopedEdges, scopedDensity := scopedGraphTotalsForCLI(graphIssues, &stats, ctx.CandidateIDs)
-			curStats := baseline.GraphStats{
-				NodeCount:       scopedNodes,
-				EdgeCount:       scopedEdges,
-				Density:         scopedDensity,
-				OpenCount:       openCount,
-				ClosedCount:     partition.Closed,
-				BlockedCount:    partition.Blocked,
-				CycleCount:      len(cycles),
-				ActionableCount: partition.Actionable,
-			}
-
-			curScope := baselineScopeForContext(ctx)
-			bl := &baseline.Baseline{Stats: curStats, Scope: curScope}
-			cur := &baseline.Baseline{Stats: curStats, Cycles: cycles, Scope: curScope}
-			scopeMismatchSkipped := false
-			if baseline.Exists(baselinePath) {
-				loaded, err := baseline.Load(baselinePath)
-				if err != nil {
-					if !ctx.EnvRobot {
-						fmt.Fprintf(ctx.StderrOrDefault(), "Warning: Error loading baseline: %v\n", err)
-					}
-				} else {
-					bl = loaded
-					topMetrics := baseline.TopMetrics{
-						PageRank:     buildScopedMetricItems(stats.PageRank(), 10, ctx.CandidateIDs),
-						Betweenness:  buildScopedMetricItems(stats.ActiveBetweenness(), 10, ctx.CandidateIDs),
-						CriticalPath: buildScopedMetricItems(stats.CriticalPathScore(), 10, ctx.CandidateIDs),
-						Hubs:         buildScopedMetricItems(stats.Hubs(), 10, ctx.CandidateIDs),
-						Authorities:  buildScopedMetricItems(stats.Authorities(), 10, ctx.CandidateIDs),
-					}
-					cur = &baseline.Baseline{Stats: curStats, TopMetrics: topMetrics, Cycles: cycles, Scope: curScope}
-					if !baselineMatchesContext(loaded, ctx) {
-						scopeMismatchSkipped = true
-					}
-				}
-			}
-
-			calc := drift.NewCalculator(bl, cur, driftConfig)
-			calc.SetNow(analyzer.Now())
-			calc.SetIssues(graphIssues)
-			if !calc.ReuseAnalyzer(analyzer) {
-				return fmt.Errorf("preparing alerts: issue rows do not match the scoped analyzer")
-			}
-			attachSourceDiffsForContext(calc, ctx, driftConfig.SourceDriftMaxAlerts)
-			driftResult := calc.Calculate()
 			if scopeMismatchSkipped {
 				driftResult.SkippedChecks = append(driftResult.SkippedChecks, drift.SkippedCheck{
 					Type:   drift.AlertType("baseline_scope_mismatch"),
@@ -8062,4 +7994,139 @@ func matchSprintByID(sprints []model.Sprint, target string) *model.Sprint {
 		}
 	}
 	return suffixMatch
+}
+
+// computeDriftResultForContext evaluates all pkg/drift detectors (with optional
+// saved baseline comparison and live source inconsistency checks) against the
+// provided scoped analyzer and graph statistics.
+func computeDriftResultForContext(ctx RobotContext, analyzer *analysis.Analyzer, stats *analysis.GraphStats, graphIssues []model.Issue) (*drift.Result, bool, error) {
+	projectDir, err := ctx.ProjectDirOrDefault()
+	if err != nil {
+		return nil, false, fmt.Errorf("getting project directory: %w", err)
+	}
+	baselinePath, err := ctx.BaselinePathOrDefault()
+	if err != nil {
+		return nil, false, fmt.Errorf("getting baseline path: %w", err)
+	}
+
+	driftConfig, err := drift.LoadConfig(projectDir)
+	if err != nil {
+		return nil, false, fmt.Errorf("loading drift config: %w", err)
+	}
+
+	if analyzer == nil {
+		analyzer = ctx.GraphAnalyzer()
+	}
+	if stats == nil {
+		analyzed := analyzer.Analyze()
+		stats = &analyzed
+	}
+
+	partition := analyzer.CountStatusPartition()
+	openCount := 0
+	for _, issue := range graphIssues {
+		if !analyzer.IsCandidate(issue.ID) {
+			continue
+		}
+		if issue.Status == model.StatusOpen || issue.Status == model.StatusInProgress {
+			openCount++
+		}
+	}
+	cycles := filterCyclesForCandidates(stats.Cycles(), ctx.CandidateIDs)
+	scopedNodes, scopedEdges, scopedDensity := scopedGraphTotalsForCLI(graphIssues, stats, ctx.CandidateIDs)
+	curStats := baseline.GraphStats{
+		NodeCount:       scopedNodes,
+		EdgeCount:       scopedEdges,
+		Density:         scopedDensity,
+		OpenCount:       openCount,
+		ClosedCount:     partition.Closed,
+		BlockedCount:    partition.Blocked,
+		CycleCount:      len(cycles),
+		ActionableCount: partition.Actionable,
+	}
+
+	curScope := baselineScopeForContext(ctx)
+	bl := &baseline.Baseline{Stats: curStats, Scope: curScope}
+	cur := &baseline.Baseline{Stats: curStats, Cycles: cycles, Scope: curScope}
+	scopeMismatchSkipped := false
+	if baseline.Exists(baselinePath) {
+		loaded, err := baseline.Load(baselinePath)
+		if err != nil {
+			if !ctx.EnvRobot {
+				fmt.Fprintf(ctx.StderrOrDefault(), "Warning: Error loading baseline: %v\n", err)
+			}
+		} else {
+			bl = loaded
+			topMetrics := baseline.TopMetrics{
+				PageRank:     buildScopedMetricItems(stats.PageRank(), 10, ctx.CandidateIDs),
+				Betweenness:  buildScopedMetricItems(stats.ActiveBetweenness(), 10, ctx.CandidateIDs),
+				CriticalPath: buildScopedMetricItems(stats.CriticalPathScore(), 10, ctx.CandidateIDs),
+				Hubs:         buildScopedMetricItems(stats.Hubs(), 10, ctx.CandidateIDs),
+				Authorities:  buildScopedMetricItems(stats.Authorities(), 10, ctx.CandidateIDs),
+			}
+			cur = &baseline.Baseline{Stats: curStats, TopMetrics: topMetrics, Cycles: cycles, Scope: curScope}
+			if !baselineMatchesContext(loaded, ctx) {
+				scopeMismatchSkipped = true
+			}
+		}
+	}
+
+	calc := drift.NewCalculator(bl, cur, driftConfig)
+	calc.SetNow(analyzer.Now())
+	calc.SetIssues(graphIssues)
+	if !calc.ReuseAnalyzer(analyzer) {
+		return nil, false, fmt.Errorf("preparing alerts: issue rows do not match the scoped analyzer")
+	}
+	attachSourceDiffsForContext(calc, ctx, driftConfig.SourceDriftMaxAlerts)
+	return calc.Calculate(), scopeMismatchSkipped, nil
+}
+
+// attachDriftAlertsToTriage merges full pkg/drift alerts (stale_issue,
+// blocking_cascade, high_impact_unblock, potential_duplicate, priority_mismatch,
+// scope_creep, baseline regressions, source_inconsistency, etc.) into
+// triage.Alerts for static-site exports so the exported dashboard matches
+// --robot-alerts and the TUI Alerts panel.
+func attachDriftAlertsToTriage(triage *analysis.TriageResult, ctx RobotContext, analyzer *analysis.Analyzer, stats *analysis.GraphStats, graphIssues []model.Issue) {
+	if triage == nil {
+		return
+	}
+	driftResult, _, err := computeDriftResultForContext(ctx, analyzer, stats, graphIssues)
+	if err != nil || driftResult == nil || len(driftResult.Alerts) == 0 {
+		return
+	}
+
+	seenTypeIssue := make(map[string]bool, len(triage.Alerts))
+	hasType := make(map[string]bool, len(triage.Alerts))
+	for _, existing := range triage.Alerts {
+		hasType[existing.Type] = true
+		seenTypeIssue[existing.Type+"\x00"+existing.IssueID] = true
+	}
+
+	for _, da := range driftResult.Alerts {
+		alertType := string(da.Type)
+		if da.Type == drift.AlertVelocityDrop && hasType["velocity_drop"] {
+			continue
+		}
+		key := alertType + "\x00" + da.IssueID
+		if seenTypeIssue[key] {
+			continue
+		}
+		seenTypeIssue[key] = true
+		hasType[alertType] = true
+
+		mapped := analysis.Alert{
+			Type:     alertType,
+			Severity: string(da.Severity),
+			Message:  da.Message,
+			IssueID:  da.IssueID,
+		}
+		if da.RelatedIssueID != "" {
+			if da.IssueID != "" {
+				mapped.IssueIDs = []string{da.IssueID, da.RelatedIssueID}
+			} else {
+				mapped.IssueIDs = []string{da.RelatedIssueID}
+			}
+		}
+		triage.Alerts = append(triage.Alerts, mapped)
+	}
 }

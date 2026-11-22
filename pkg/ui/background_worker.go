@@ -178,6 +178,7 @@ type BackgroundWorker struct {
 	beadsPath         string
 	projectDir        string
 	sourceDegraded    bool
+	skipSourceDiff    bool
 	debounceDelay     time.Duration
 	heartbeatInterval time.Duration
 	watchdogInterval  time.Duration
@@ -270,6 +271,7 @@ type WorkerConfig struct {
 	BeadsPath      string
 	ProjectDir     string
 	SourceDegraded bool
+	SkipSourceDiff bool
 	SourceReload   func(context.Context) (SourceReloadResult, error)
 	DebounceDelay  time.Duration
 
@@ -344,6 +346,7 @@ func NewBackgroundWorker(cfg WorkerConfig) (*BackgroundWorker, error) {
 		beadsPath:         cfg.BeadsPath,
 		projectDir:        cfg.ProjectDir,
 		sourceDegraded:    cfg.SourceDegraded,
+		skipSourceDiff:    cfg.SkipSourceDiff,
 		sourceReload:      cfg.SourceReload,
 		debounceDelay:     cfg.DebounceDelay,
 		heartbeatInterval: cfg.HeartbeatInterval,
@@ -1076,6 +1079,20 @@ func (w *BackgroundWorker) SetSourceReload(reload func(context.Context) (SourceR
 	w.sourceReload = reload
 }
 
+// SetSkipSourceDiff updates whether snapshot alert building skips local
+// SQLite/JSONL sibling source diffs (e.g., for explicit --db sessions).
+func (w *BackgroundWorker) SetSkipSourceDiff(skip bool) {
+	if w == nil {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.state == WorkerStopped {
+		return
+	}
+	w.skipSourceDiff = skip
+}
+
 func (w *BackgroundWorker) setRecipe(r *recipe.Recipe) (changed bool, shouldRefresh bool) {
 	if w == nil {
 		return false, false
@@ -1616,11 +1633,13 @@ func (w *BackgroundWorker) buildSnapshotResultContext(ctx context.Context, force
 		runtime.ReadMemStats(&memBefore)
 	}
 
-	// Capture recipe state for this snapshot before loading (bv-2h40).
+	// Capture recipe and reload configuration once under lock to prevent races/TOCTOU (bv-2h40).
 	w.mu.RLock()
 	currentRecipe := w.currentRecipe
 	recipeID := w.currentRecipeID
 	recipeHash := w.currentRecipeHash
+	sourceReload := w.sourceReload
+	skipSourceDiff := w.skipSourceDiff
 	w.mu.RUnlock()
 
 	// Determine dataset tier using a fast line count for file-backed reloads (bv-9thm).
@@ -1629,7 +1648,7 @@ func (w *BackgroundWorker) buildSnapshotResultContext(ctx context.Context, force
 	sourceLineCount := 0
 	tier := datasetTierUnknown
 	loadOpenOnly := false
-	if w.sourceReload == nil {
+	if sourceReload == nil {
 		var countStart time.Time
 		if profileSnapshot {
 			countStart = time.Now()
@@ -1662,6 +1681,7 @@ func (w *BackgroundWorker) buildSnapshotResultContext(ctx context.Context, force
 	var pooledRefs []*model.Issue
 	var authority *model.ReadinessIndex
 	var authorityHash string
+	effectiveBeadsPath := w.beadsPath
 	authorityComplete := true
 	sourceDegraded := w.sourceDegraded
 	sourceDegradedKnown := true
@@ -1671,13 +1691,13 @@ func (w *BackgroundWorker) buildSnapshotResultContext(ctx context.Context, force
 		loadStart = time.Now()
 	}
 	loadErr := w.safeCompute("load", func() error {
-		w.mu.Lock()
-		sourceReload := w.sourceReload
-		w.mu.Unlock()
 		if sourceReload != nil {
 			res, err := sourceReload(ctx)
 			if err != nil {
 				return err
+			}
+			if trimmed := strings.TrimSpace(res.SourcePath); trimmed != "" {
+				effectiveBeadsPath = trimmed
 			}
 			authorityHash = analysis.ComputeDataHash(res.Issues)
 			authority = res.Authority
@@ -1738,6 +1758,8 @@ func (w *BackgroundWorker) buildSnapshotResultContext(ctx context.Context, force
 
 	loadMetadataUnchanged := prevSnapshot != nil &&
 		prevSnapshot.explicitProjectDir == projectDir &&
+		prevSnapshot.beadsPath == effectiveBeadsPath &&
+		prevSnapshot.skipSourceDiff == skipSourceDiff &&
 		prevSnapshot.AuthorityHash == authorityHash &&
 		prevSnapshot.AuthorityComplete == authorityComplete &&
 		prevSnapshot.SourceDegraded == sourceDegraded &&
@@ -1778,10 +1800,11 @@ func (w *BackgroundWorker) buildSnapshotResultContext(ctx context.Context, force
 		builder := NewSnapshotBuilder(issues, authority).
 			WithContext(w.ctx).
 			WithDataHash(hash).
-			WithBeadsPath(w.beadsPath).
+			WithBeadsPath(effectiveBeadsPath).
 			WithProjectDir(projectDir).
+			WithSkipSourceDiff(skipSourceDiff).
 			WithRecipe(currentRecipe).
-			WithWeights(feedbackWeightsForBeadsPath(w.beadsPath)).
+			WithWeights(feedbackWeightsForBeadsPath(effectiveBeadsPath)).
 			WithBuildConfig(snapshotBuildConfigForTier(tier))
 		if prevSnapshot != nil {
 			builder.WithPreviousSnapshot(prevSnapshot, diff)

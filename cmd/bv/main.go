@@ -4032,6 +4032,7 @@ func main() {
 				if !exportContext.claimsProven() {
 					suppressUnprovenTriageClaims(&triage)
 				}
+				attachDriftAlertsToTriage(&triage, exportContext, analyzer, stats, exportIssues)
 
 				// Extract all dependencies (blocking + non-blocking such as parent-child, related, discovered-from)
 				var deps []*model.Dependency
@@ -5718,14 +5719,17 @@ func main() {
 				}
 				extWatchers := newTUIExternalWatcherSet()
 				extWatchers.Sync(tuiSingleRepoSiblingWatchPaths(robotDispatchContext, beadsPath), "")
-				externalReloadCh, stopExternalWatchers = extWatchers.ChangeCh(), extWatchers.Stop
-				if externalReloadCh != nil {
+				if extWatchers.HasWatchers() {
+					externalReloadCh, stopExternalWatchers = extWatchers.ChangeCh(), extWatchers.Stop
 					m.DisableInternalWatcher()
 					m.SetExternalWatcherStatusProvider(extWatchers.Status)
+				} else {
+					extWatchers.Stop()
 				}
 			} else {
 				watchPaths := []string{filepath.Join(filepath.Dir(beadsPath), loader.SprintsFileName)}
 				skipPath := ""
+				extWatchers := newTUIExternalWatcherSet()
 				if *labelScope != "" || *repoFilter != "" {
 					// Explicit --db + scoped filter (background mode is disabled for scoped sessions above).
 					m.SetSourceReload(func(ctx context.Context) (ui.SourceReloadResult, error) {
@@ -5733,19 +5737,26 @@ func main() {
 					})
 				} else if bgEnabled && !explicitDBPinned {
 					// BackgroundWorker watches beadsPath itself; attach auto-discovery loader so
-					// sibling SQLite/JSONL changes trigger a real freshest-source reload.
+					// sibling SQLite/JSONL changes trigger a real freshest-source reload and
+					// dynamically sync sibling watchers if the active source switches.
 					reloadDir := projectDir
+					initialBeadsPath := beadsPath
 					m.SetBackgroundSourceReload(func(ctx context.Context) (ui.SourceReloadResult, error) {
-						return reloadSingleRepoAutoDiscoverForUI(ctx, reloadDir, boundSource, boundSourceDegraded, reloadLabel, reloadRepo)
+						res, err := reloadSingleRepoAutoDiscoverForUI(ctx, reloadDir, boundSource, boundSourceDegraded, reloadLabel, reloadRepo)
+						if err == nil && res.SourcePath != "" && res.SourcePath != initialBeadsPath {
+							extWatchers.Sync(tuiSingleRepoSiblingWatchPaths(robotDispatchContext, res.SourcePath), "")
+						}
+						return res, err
 					})
 					watchPaths = tuiSingleRepoSiblingWatchPaths(robotDispatchContext, beadsPath)
 					skipPath = beadsPath
 				}
-				extWatchers := newTUIExternalWatcherSet()
 				extWatchers.Sync(watchPaths, skipPath)
-				externalReloadCh, stopExternalWatchers = extWatchers.ChangeCh(), extWatchers.Stop
-				if externalReloadCh != nil {
+				if extWatchers.HasWatchers() || (bgEnabled && !explicitDBPinned) {
+					externalReloadCh, stopExternalWatchers = extWatchers.ChangeCh(), extWatchers.Stop
 					m.SetExternalWatcherStatusProvider(extWatchers.Status)
+				} else {
+					extWatchers.Stop()
 				}
 			}
 		}
@@ -6760,10 +6771,16 @@ func (s *tuiExternalWatcherSet) notify() {
 	}
 }
 
+func (s *tuiExternalWatcherSet) HasWatchers() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return !s.stopped && len(s.watchers) > 0
+}
+
 func (s *tuiExternalWatcherSet) ChangeCh() <-chan struct{} {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if len(s.watchers) == 0 {
+	if s.stopped {
 		return nil
 	}
 	return s.changeCh
@@ -6867,12 +6884,11 @@ func (s *tuiExternalWatcherSet) Stop() {
 func startExternalTUIWatchers(paths []string, skipPath string) (<-chan struct{}, func()) {
 	set := newTUIExternalWatcherSet()
 	set.Sync(paths, skipPath)
-	ch := set.ChangeCh()
-	if ch == nil {
+	if !set.HasWatchers() {
 		set.Stop()
 		return nil, func() {}
 	}
-	return ch, set.Stop
+	return set.ChangeCh(), set.Stop
 }
 
 func reloadSingleRepoForUI(ctx context.Context, source datasource.DataSource, label, repo string) (ui.SourceReloadResult, error) {
@@ -8095,6 +8111,7 @@ func runPagesWizard(beadsPath string, dispatchCtx RobotContext, activeRecipe *re
 	if !exportContext.claimsProven() {
 		suppressUnprovenTriageClaims(&triage)
 	}
+	attachDriftAlertsToTriage(&triage, exportContext, analyzer, stats, exportIssues)
 
 	// Extract all dependencies (blocking + non-blocking such as parent-child, related, discovered-from)
 	var deps []*model.Dependency
@@ -8985,14 +9002,13 @@ func calculateBurndownAt(sprint *model.Sprint, issues []model.Issue, now time.Ti
 
 // calculateBurndownAtWithThresholds computes sprint burndown using explicit at-risk thresholds.
 func calculateBurndownAtWithThresholds(sprint *model.Sprint, issues []model.Issue, readiness *model.ReadinessIndex, now time.Time, thresholds analysis.AtRiskThresholds) BurndownOutput {
-
 	// Build issue map for sprint beads
 	issueMap := make(map[string]model.Issue, len(issues))
 	for _, iss := range issues {
 		issueMap[iss.ID] = iss
 	}
 
-	// Count total and completed issues in sprint
+	// Collect sprint issues
 	var sprintIssues []model.Issue
 	for _, beadID := range sprint.BeadIDs {
 		if iss, ok := issueMap[beadID]; ok {
@@ -9000,84 +9016,24 @@ func calculateBurndownAtWithThresholds(sprint *model.Sprint, issues []model.Issu
 		}
 	}
 
-	totalIssues := len(sprintIssues)
-	completedIssues := 0
-	for _, iss := range sprintIssues {
-		if iss.Status == model.StatusClosed {
-			completedIssues++
-		}
-	}
-	remainingIssues := totalIssues - completedIssues
-
-	// Calculate days
-	totalDays := 0
-	elapsedDays := 0
-	remainingDays := 0
-
-	if !sprint.StartDate.IsZero() && !sprint.EndDate.IsZero() {
-		totalDays = int(sprint.EndDate.Sub(sprint.StartDate).Hours()/24) + 1
-		if now.Before(sprint.StartDate) {
-			elapsedDays = 0
-			remainingDays = totalDays
-		} else if now.After(sprint.EndDate) {
-			elapsedDays = totalDays
-			remainingDays = 0
-		} else {
-			elapsedDays = int(now.Sub(sprint.StartDate).Hours()/24) + 1
-			remainingDays = totalDays - elapsedDays
-		}
-	}
-
-	// Calculate burn rates
-	idealBurnRate := 0.0
-	if totalDays > 0 {
-		idealBurnRate = float64(totalIssues) / float64(totalDays)
-	}
-
-	actualBurnRate := 0.0
-	if elapsedDays > 0 {
-		actualBurnRate = float64(completedIssues) / float64(elapsedDays)
-	}
-
-	// Calculate projected completion
-	var projectedComplete *time.Time
-	onTrack := true
-	if actualBurnRate > 0 && remainingIssues > 0 {
-		daysToComplete := float64(remainingIssues) / actualBurnRate
-		projected := now.AddDate(0, 0, int(daysToComplete)+1)
-		projectedComplete = &projected
-		onTrack = !projected.After(sprint.EndDate)
-	} else if remainingIssues == 0 {
-		// Already complete
-		onTrack = true
-	} else if elapsedDays > 0 && completedIssues == 0 {
-		// No progress made
-		onTrack = false
-	}
-
-	// Generate daily burndown points
-	dailyPoints := generateDailyBurndown(sprint, sprintIssues, now)
-
-	// Generate ideal line
-	idealLine := generateIdealLine(sprint, totalIssues)
-
+	bd := analysis.ComputeSprintBurndown(sprint, sprintIssues, now)
 	return BurndownOutput{
 		SprintID:          sprint.ID,
 		SprintName:        sprint.Name,
 		StartDate:         sprint.StartDate,
 		EndDate:           sprint.EndDate,
-		TotalDays:         totalDays,
-		ElapsedDays:       elapsedDays,
-		RemainingDays:     remainingDays,
-		TotalIssues:       totalIssues,
-		CompletedIssues:   completedIssues,
-		RemainingIssues:   remainingIssues,
-		IdealBurnRate:     idealBurnRate,
-		ActualBurnRate:    actualBurnRate,
-		ProjectedComplete: projectedComplete,
-		OnTrack:           onTrack,
-		DailyPoints:       dailyPoints,
-		IdealLine:         idealLine,
+		TotalDays:         bd.TotalDays,
+		ElapsedDays:       bd.ElapsedDays,
+		RemainingDays:     bd.RemainingDays,
+		TotalIssues:       bd.TotalIssues,
+		CompletedIssues:   bd.CompletedIssues,
+		RemainingIssues:   bd.RemainingIssues,
+		IdealBurnRate:     bd.IdealBurnRate,
+		ActualBurnRate:    bd.ActualBurnRate,
+		ProjectedComplete: bd.ProjectedComplete,
+		OnTrack:           bd.OnTrack,
+		DailyPoints:       bd.DailyPoints,
+		IdealLine:         bd.IdealLine,
 		ScopeChanges:      nil,
 		AtRisk:            analysis.DetectAtRiskWithReadiness(issues, sprint, readiness, now, thresholds),
 	}
@@ -9168,67 +9124,12 @@ func generateIdealLineScoped(sprint *model.Sprint, totalIssues int, events []Sco
 
 // generateDailyBurndown creates actual burndown points based on issue closure dates
 func generateDailyBurndown(sprint *model.Sprint, issues []model.Issue, now time.Time) []model.BurndownPoint {
-	if sprint.StartDate.IsZero() || sprint.EndDate.IsZero() {
-		return nil
-	}
-
-	var points []model.BurndownPoint
-	totalIssues := len(issues)
-
-	// Iterate through each day of the sprint
-	for d := sprint.StartDate; !d.After(sprint.EndDate) && !d.After(now); d = d.AddDate(0, 0, 1) {
-		dayEnd := d.Add(24*time.Hour - time.Second)
-		completed := 0
-
-		for _, iss := range issues {
-			if iss.Status != model.StatusClosed {
-				continue
-			}
-			closedTime := time.Time{}
-			if iss.ClosedAt != nil && !iss.ClosedAt.IsZero() {
-				closedTime = *iss.ClosedAt
-			} else if !iss.UpdatedAt.IsZero() {
-				closedTime = iss.UpdatedAt
-			}
-			if !closedTime.IsZero() && !closedTime.After(dayEnd) {
-				completed++
-			}
-		}
-
-		points = append(points, model.BurndownPoint{
-			Date:      d,
-			Remaining: totalIssues - completed,
-			Completed: completed,
-		})
-	}
-
-	return points
+	return analysis.GenerateDailyBurndown(sprint, issues, now)
 }
 
 // generateIdealLine creates the ideal burndown line
 func generateIdealLine(sprint *model.Sprint, totalIssues int) []model.BurndownPoint {
-	if sprint.StartDate.IsZero() || sprint.EndDate.IsZero() || totalIssues == 0 {
-		return nil
-	}
-
-	var points []model.BurndownPoint
-	totalDays := int(sprint.EndDate.Sub(sprint.StartDate).Hours()/24) + 1
-	burnPerDay := float64(totalIssues) / float64(totalDays)
-
-	for i := 0; i <= totalDays; i++ {
-		d := sprint.StartDate.AddDate(0, 0, i)
-		remaining := totalIssues - int(float64(i)*burnPerDay)
-		if remaining < 0 {
-			remaining = 0
-		}
-		points = append(points, model.BurndownPoint{
-			Date:      d,
-			Remaining: remaining,
-			Completed: totalIssues - remaining,
-		})
-	}
-
-	return points
+	return analysis.GenerateIdealBurndownLine(sprint, totalIssues)
 }
 
 // generateJQHelpers creates a markdown document with jq snippets for agent brief

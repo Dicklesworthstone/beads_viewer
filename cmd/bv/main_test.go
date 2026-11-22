@@ -10017,11 +10017,19 @@ func TestWave23_TUIExternalWatcherSetDynamicSyncAndStatus(t *testing.T) {
 	set := newTUIExternalWatcherSet()
 	defer set.Stop()
 
-	// Initial Sync watches fileA (skipping fileB).
-	set.Sync([]string{fileA, fileB}, fileB)
+	// Pass 5 #3: ChangeCh() stays non-nil even before any watcher is synced so dynamic Sync() later delivers events.
+	if set.HasWatchers() {
+		t.Fatal("expected HasWatchers()==false before initial Sync")
+	}
 	ch := set.ChangeCh()
 	if ch == nil {
-		t.Fatal("expected non-nil ChangeCh after watching fileA")
+		t.Fatal("expected non-nil ChangeCh even before watchers are synced")
+	}
+
+	// Initial Sync watches fileA (skipping fileB).
+	set.Sync([]string{fileA, fileB}, fileB)
+	if !set.HasWatchers() {
+		t.Fatal("expected HasWatchers()==true after watching fileA")
 	}
 	st := set.Status()
 	if !st.Polling || st.PollInterval != 150*time.Millisecond {
@@ -10044,5 +10052,64 @@ func TestWave23_TUIExternalWatcherSetDynamicSyncAndStatus(t *testing.T) {
 	set.Stop()
 	if got := set.Status(); got.Polling {
 		t.Fatalf("expected stopped watcher set to report Polling=false, got %+v", got)
+	}
+}
+
+func TestAttachDriftAlertsToTriage_MergesFullDriftAlertsIntoStaticExport(t *testing.T) {
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	staleTime := now.AddDate(0, 0, -45)
+	projectDir := t.TempDir()
+	issues := []model.Issue{
+		{
+			ID: "BLK-ROOT", Title: "Root blocker", Status: model.StatusOpen, Priority: 3,
+			IssueType: model.TypeTask, CreatedAt: staleTime, UpdatedAt: staleTime,
+		},
+		{
+			ID: "DEP-1", Title: "Critical dependent 1", Status: model.StatusOpen, Priority: 0,
+			IssueType: model.TypeBug, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "DEP-1", DependsOnID: "BLK-ROOT", Type: model.DepBlocks}},
+		},
+		{
+			ID: "DEP-2", Title: "Critical dependent 2", Status: model.StatusOpen, Priority: 0,
+			IssueType: model.TypeBug, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "DEP-2", DependsOnID: "BLK-ROOT", Type: model.DepBlocks}},
+		},
+		{
+			ID: "DEP-3", Title: "Critical dependent 3", Status: model.StatusOpen, Priority: 1,
+			IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "DEP-3", DependsOnID: "BLK-ROOT", Type: model.DepBlocks}},
+		},
+	}
+
+	an := analysis.NewAnalyzer(issues)
+	an.SetNow(now)
+	stats := an.AnalyzeWithConfig(analysis.FullAnalysisConfig())
+	triage := analysis.ComputeTriageWithOptionsAndTime(issues, analysis.TriageOptions{WaitForPhase2: true}, now)
+	ctx := RobotContext{
+		ProjectDir: projectDir,
+		WorkDir:    projectDir,
+		Issues:     issues,
+		Readiness:  model.NewReadinessIndex(issues),
+		EnvRobot:   true,
+	}
+
+	attachDriftAlertsToTriage(&triage, ctx, an, &stats, issues)
+
+	seenTypes := make(map[string]bool)
+	for _, a := range triage.Alerts {
+		seenTypes[a.Type] = true
+	}
+	if !seenTypes["stale_issue"] {
+		t.Fatalf("expected drift stale_issue alert merged into triage.Alerts, got %+v", triage.Alerts)
+	}
+	if !seenTypes["blocking_cascade"] && !seenTypes["high_impact_unblock"] {
+		t.Fatalf("expected drift blocking_cascade or high_impact_unblock alert merged into triage.Alerts, got %+v", triage.Alerts)
+	}
+
+	// Idempotent deduplication: calling attachDriftAlertsToTriage twice must not duplicate alerts.
+	countBefore := len(triage.Alerts)
+	attachDriftAlertsToTriage(&triage, ctx, an, &stats, issues)
+	if len(triage.Alerts) != countBefore {
+		t.Fatalf("attachDriftAlertsToTriage duplicated alerts on second call: before=%d after=%d", countBefore, len(triage.Alerts))
 	}
 }

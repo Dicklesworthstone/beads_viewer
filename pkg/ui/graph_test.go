@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
@@ -1240,5 +1241,48 @@ func TestGraphModelSelectByIDWithDependencies(t *testing.T) {
 	sel = g.SelectedIssue()
 	if sel == nil || sel.ID != "root" {
 		t.Errorf("Expected 'root' selected, got %v", sel)
+	}
+}
+
+func TestGraphModel_WhatIfAndETAForecastInMetricsPanel(t *testing.T) {
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	closedAt := now.AddDate(0, 0, -2)
+	est := 120
+	issues := []model.Issue{
+		{ID: "root-open", Title: "Root Blocker", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask, EstimatedMinutes: &est, CreatedAt: now.AddDate(0, 0, -5), UpdatedAt: now},
+		{
+			ID: "dep-1", Title: "Dependent 1", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask,
+			Dependencies: []*model.Dependency{{IssueID: "dep-1", DependsOnID: "root-open", Type: model.DepBlocks}},
+		},
+		{
+			ID: "dep-2", Title: "Dependent 2", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask,
+			Dependencies: []*model.Dependency{{IssueID: "dep-2", DependsOnID: "dep-1", Type: model.DepBlocks}},
+		},
+		{ID: "done-1", Title: "Closed Task", Status: model.StatusClosed, Priority: 2, IssueType: model.TypeTask, ClosedAt: &closedAt, CreatedAt: now.AddDate(0, 0, -6), UpdatedAt: closedAt},
+	}
+
+	an := analysis.NewAnalyzer(issues)
+	an.SetNow(now)
+	stats := an.AnalyzeWithConfig(analysis.FullAnalysisConfig())
+	insights := stats.GenerateInsights(len(issues))
+	theme := createTheme()
+
+	g := ui.NewGraphModel(issues, &insights, theme)
+	g.SetAnalyzer(an, func() time.Time { return now })
+
+	if !g.SelectByID("root-open") {
+		t.Fatal("failed to select root-open")
+	}
+	outOpen := g.View(120, 60)
+	if !strings.Contains(outOpen, "What-If & Forecast") || !strings.Contains(outOpen, "+1 direct (+2 total)") || !strings.Contains(outOpen, "ETA:") {
+		t.Fatalf("expected GraphModel metrics panel to display What-If (+1 direct, +2 total) and ETA for open blocker, got:\n%s", outOpen)
+	}
+
+	if !g.SelectByID("done-1") {
+		t.Fatal("failed to select done-1")
+	}
+	outClosed := g.View(120, 60)
+	if strings.Contains(outClosed, "What-If & Forecast") {
+		t.Fatalf("expected GraphModel metrics panel to omit What-If & Forecast for closed issue, got:\n%s", outClosed)
 	}
 }

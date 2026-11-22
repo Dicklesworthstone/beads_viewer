@@ -2,8 +2,10 @@ package ui
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
@@ -17,6 +19,8 @@ type GraphModel struct {
 	issues         []model.Issue
 	issueMap       map[string]*model.Issue
 	insights       *analysis.Insights
+	analyzer       *analysis.Analyzer
+	nowFunc        func() time.Time
 	selectedIdx    int
 	scrollOffset   int
 	width          int
@@ -127,6 +131,16 @@ func (g *GraphModel) SetSnapshot(snapshot *DataSnapshot) {
 		g.selectedIdx = 0
 	}
 	g.restoreNavigation(selectedID)
+}
+
+// SetAnalyzer injects the active scoped Analyzer so What-If impact in the
+// metrics panel reuses the model's readiness/candidate scope without rebuilding.
+func (g *GraphModel) SetAnalyzer(analyzer *analysis.Analyzer, nowFunc func() time.Time) {
+	if g.analyzer != analyzer {
+		g.analyzer = analyzer
+		g.canvasLines = nil
+	}
+	g.nowFunc = nowFunc
 }
 
 // SetIssues updates the graph data preserving the selected issue if possible
@@ -1167,6 +1181,43 @@ func (g *GraphModel) renderMetricsPanel(id string, width int, t Theme) string {
 	rows = append(rows, sectionStyle.Render("Connections"))
 	rows = append(rows, "  "+renderMetricRow("In-Degree", inDeg, rankIn, maxIn, true))
 	rows = append(rows, "  "+renderMetricRow("Out-Degree", outDeg, rankOut, maxOut, true))
+
+	// Section: What-If & ETA Forecast (open issues only, when wired with scoped Analyzer)
+	if selIssue := g.issueMap[id]; selIssue != nil && !isClosedLikeStatus(selIssue.Status) && g.analyzer != nil {
+		whatIf := g.analyzer.ComputeWhatIf(id, stats)
+		now := g.analyzer.Now()
+		if g.nowFunc != nil {
+			now = g.nowFunc()
+		}
+		eta, etaErr := analysis.EstimateETAForIssue(g.issues, stats, id, 1, now)
+		if (whatIf != nil && (whatIf.Delta.DirectUnblocks > 0 || whatIf.Delta.TransitiveUnblocks > 0)) || etaErr == nil {
+			rows = append(rows, "")
+			rows = append(rows, sectionStyle.Render("What-If & Forecast"))
+			detailStyle := t.Renderer.NewStyle().Foreground(ColorText)
+			mutedStyle := t.Renderer.NewStyle().Foreground(ColorMuted)
+			if whatIf != nil && (whatIf.Delta.DirectUnblocks > 0 || whatIf.Delta.TransitiveUnblocks > 0) {
+				unblockLine := fmt.Sprintf("  Closing unblocks +%d direct", whatIf.Delta.DirectUnblocks)
+				if whatIf.Delta.TransitiveUnblocks > whatIf.Delta.DirectUnblocks {
+					unblockLine += fmt.Sprintf(" (+%d total)", whatIf.Delta.TransitiveUnblocks)
+				}
+				if len(whatIf.Delta.UnblockedIssueIDs) > 0 {
+					shown := whatIf.Delta.UnblockedIssueIDs
+					suffix := ""
+					if len(shown) > 3 {
+						suffix = fmt.Sprintf(" +%d", len(shown)-3)
+						shown = shown[:3]
+					}
+					unblockLine += " → " + strings.Join(shown, ", ") + suffix
+				}
+				rows = append(rows, detailStyle.Render(unblockLine))
+			}
+			if etaErr == nil {
+				confPct := int(math.Round(eta.Confidence * 100))
+				etaLine := fmt.Sprintf("  ETA: %s (~%.1fd • %d%% conf)", eta.ETADate.Format("2006-01-02"), eta.EstimatedDays, confPct)
+				rows = append(rows, mutedStyle.Render(etaLine))
+			}
+		}
+	}
 
 	rows = append(rows, "")
 

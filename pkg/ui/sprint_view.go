@@ -143,32 +143,62 @@ func (m *Model) renderSprintDashboard() string {
 	sb.WriteString(valStyle.Render(fmt.Sprintf("○%d", openBeads-inProgressBeads-blockedBeads)))
 	sb.WriteString("\n\n")
 
-	// Simple burndown chart (ASCII)
+	// Real daily burndown chart (ASCII) powered by analysis.ComputeSprintBurndown
+	// so TUI Sprint View and --robot-burndown share the exact same closure curve,
+	// burn rates, and completion projection.
+	burndown := analysis.ComputeSprintBurndown(sprint, sprintIssues, now)
 	sb.WriteString(labelStyle.Render("Burndown:"))
 	sb.WriteString("\n")
-	if sprintDuration > 0 && totalBeads > 0 {
-		// Ideal line: from totalBeads to 0 over sprintDuration days
-		// Current: totalBeads - closedBeads remaining on day daysPassed
+	if burndown.TotalDays > 0 && totalBeads > 0 {
 		chartHeight := 5
-		chartWidth := min(sprintDuration, 20)
-		actualRemaining := float64(totalBeads - closedBeads)
+		chartWidth := min(max(burndown.TotalDays-1, 1), 24)
+		rowForRemaining := func(rem float64) int {
+			if totalBeads <= 0 {
+				return 0
+			}
+			frac := rem / float64(totalBeads)
+			if frac < 0 {
+				frac = 0
+			}
+			if frac > 1 {
+				frac = 1
+			}
+			r := int(frac*float64(chartHeight-1) + 0.5)
+			if r < 0 {
+				return 0
+			}
+			if r >= chartHeight {
+				return chartHeight - 1
+			}
+			return r
+		}
 
-		// Create simple ASCII chart
+		// Precompute per-column ideal and actual remaining rows.
+		idealRows := make([]int, chartWidth+1)
+		actualRows := make([]int, chartWidth+1)
+		for col := 0; col <= chartWidth; col++ {
+			dayFrac := float64(col) / float64(chartWidth)
+			idealVal := float64(totalBeads) * (1.0 - dayFrac)
+			idealRows[col] = rowForRemaining(idealVal)
+			actualRows[col] = -1
+			if len(burndown.DailyPoints) > 0 {
+				dayIdx := int(dayFrac*float64(max(burndown.TotalDays-1, 0)) + 0.5)
+				if dayIdx < len(burndown.DailyPoints) {
+					actualRows[col] = rowForRemaining(float64(burndown.DailyPoints[dayIdx].Remaining))
+				}
+			}
+		}
+
 		for row := chartHeight - 1; row >= 0; row-- {
-			threshold := float64(totalBeads) * float64(row+1) / float64(chartHeight)
 			var line strings.Builder
 			line.WriteString("  ")
 			for col := 0; col <= chartWidth; col++ {
-				dayFrac := float64(col) / float64(chartWidth)
-				idealVal := float64(totalBeads) * (1 - dayFrac)
-				passedFrac := float64(daysPassed) / float64(sprintDuration)
-
-				if idealVal >= threshold-0.5 && idealVal < threshold+float64(totalBeads)/float64(chartHeight) {
-					// Ideal line
-					line.WriteString(t.Renderer.NewStyle().Foreground(t.Secondary).Render("·"))
-				} else if col <= int(float64(chartWidth)*passedFrac) && actualRemaining >= threshold-0.5 && actualRemaining < threshold+float64(totalBeads)/float64(chartHeight) {
-					// Actual current point
+				hasActual := actualRows[col] == row
+				hasIdeal := idealRows[col] == row
+				if hasActual {
 					line.WriteString(t.Renderer.NewStyle().Foreground(t.Primary).Bold(true).Render("●"))
+				} else if hasIdeal {
+					line.WriteString(t.Renderer.NewStyle().Foreground(t.Secondary).Render("·"))
 				} else {
 					line.WriteString(" ")
 				}
@@ -180,6 +210,25 @@ func (m *Model) renderSprintDashboard() string {
 		sb.WriteString(strings.Repeat("─", chartWidth+1))
 		sb.WriteString("\n")
 		sb.WriteString(t.Renderer.NewStyle().Foreground(t.Muted).Italic(true).Render("  · ideal  ● actual"))
+		sb.WriteString("\n")
+
+		// Burn rate & completion projection summary
+		statusLabel := t.Renderer.NewStyle().Foreground(t.Open).Bold(true).Render("On track")
+		if !burndown.OnTrack {
+			statusLabel = t.Renderer.NewStyle().Foreground(t.Blocked).Bold(true).Render("Behind")
+		}
+		projText := "Complete!"
+		if burndown.RemainingIssues > 0 {
+			if burndown.ProjectedComplete != nil {
+				projText = "Projected " + burndown.ProjectedComplete.Format("Jan 2")
+			} else {
+				projText = "No closures yet"
+			}
+		}
+		sb.WriteString(labelStyle.Render("Velocity: "))
+		sb.WriteString(valStyle.Render(fmt.Sprintf("%.2f/day (ideal %.2f/day) • ", burndown.ActualBurnRate, burndown.IdealBurnRate)))
+		sb.WriteString(statusLabel)
+		sb.WriteString(valStyle.Render(" • " + projText))
 		sb.WriteString("\n\n")
 	} else {
 		sb.WriteString(valStyle.Render("  (insufficient data)"))
@@ -227,33 +276,59 @@ func (m *Model) renderSprintDashboard() string {
 	}
 	sb.WriteString("\n")
 
-	// Sprint beads list (abbreviated)
+	// Sprint beads list with selectable bead cursor (Tab/Shift+Tab or n/p)
 	sb.WriteString(labelStyle.Render("Beads in Sprint:"))
 	sb.WriteString("\n")
-	displayLimit := min(10, len(sprintIssues))
-	for i := 0; i < displayLimit; i++ {
-		iss := sprintIssues[i]
-		statusIcon := "○"
-		statusStyle := valStyle
-		if isClosedLikeStatus(iss.Status) {
-			statusIcon = "✓"
-			statusStyle = t.Renderer.NewStyle().Foreground(t.Open)
-		} else {
-			isDepBlocked := sprintReadiness != nil && len(sprintReadiness.Blockers(iss.ID)) > 0
-			switch {
-			case iss.Status == model.StatusBlocked || isDepBlocked:
-				statusIcon = "⛔"
-				statusStyle = t.Renderer.NewStyle().Foreground(t.Blocked)
-			case iss.Status == model.StatusInProgress:
-				statusIcon = "⏳"
-				statusStyle = t.Renderer.NewStyle().Foreground(t.Feature)
-			}
-		}
-		sb.WriteString(statusStyle.Render(fmt.Sprintf("  %s %s - %s\n", statusIcon, iss.ID, truncateStrSprint(iss.Title, 40))))
-	}
-	if len(sprintIssues) > displayLimit {
-		sb.WriteString(valStyle.Render(fmt.Sprintf("  … +%d more", len(sprintIssues)-displayLimit)))
+	if len(sprintIssues) == 0 {
+		m.sprintBeadCursor = 0
+		sb.WriteString(valStyle.Render("  (none)"))
 		sb.WriteString("\n")
+	} else {
+		if m.sprintBeadCursor < 0 {
+			m.sprintBeadCursor = 0
+		}
+		if m.sprintBeadCursor >= len(sprintIssues) {
+			m.sprintBeadCursor = len(sprintIssues) - 1
+		}
+		const maxVisibleBeads = 10
+		startIdx := 0
+		if m.sprintBeadCursor >= maxVisibleBeads {
+			startIdx = m.sprintBeadCursor - maxVisibleBeads + 1
+		}
+		endIdx := min(startIdx+maxVisibleBeads, len(sprintIssues))
+		if startIdx > 0 {
+			sb.WriteString(valStyle.Render(fmt.Sprintf("  … +%d above", startIdx)))
+			sb.WriteString("\n")
+		}
+		for i := startIdx; i < endIdx; i++ {
+			iss := sprintIssues[i]
+			statusIcon := "○"
+			statusStyle := valStyle
+			if isClosedLikeStatus(iss.Status) {
+				statusIcon = "✓"
+				statusStyle = t.Renderer.NewStyle().Foreground(t.Open)
+			} else {
+				isDepBlocked := sprintReadiness != nil && len(sprintReadiness.Blockers(iss.ID)) > 0
+				switch {
+				case iss.Status == model.StatusBlocked || isDepBlocked:
+					statusIcon = "⛔"
+					statusStyle = t.Renderer.NewStyle().Foreground(t.Blocked)
+				case iss.Status == model.StatusInProgress:
+					statusIcon = "⏳"
+					statusStyle = t.Renderer.NewStyle().Foreground(t.Feature)
+				}
+			}
+			prefix := "  "
+			if i == m.sprintBeadCursor {
+				prefix = "▸ "
+				statusStyle = statusStyle.Bold(true).Foreground(t.Primary)
+			}
+			sb.WriteString(statusStyle.Render(fmt.Sprintf("%s%s %s - %s\n", prefix, statusIcon, iss.ID, truncateStrSprint(iss.Title, 40))))
+		}
+		if endIdx < len(sprintIssues) {
+			sb.WriteString(valStyle.Render(fmt.Sprintf("  … +%d more", len(sprintIssues)-endIdx)))
+			sb.WriteString("\n")
+		}
 	}
 
 	// Window inner content for short/narrow terminals while preserving footer + borders.
@@ -277,7 +352,7 @@ func (m *Model) renderSprintDashboard() string {
 		return line
 	}
 	footerLine := clampLine(t.Renderer.NewStyle().Foreground(t.Muted).Italic(true).Render(
-		"P/esc: close • j/k: next/prev sprint • ctrl+d/u: scroll • Enter: jump"))
+		"P/esc: close • j/k: sprint • tab/n/p: bead • ctrl+d/u: scroll • Enter: jump"))
 	rawBodyLines := strings.Split(strings.TrimRight(sb.String(), "\n"), "\n")
 	bodyLines := make([]string, len(rawBodyLines))
 	for i, line := range rawBodyLines {
@@ -402,10 +477,29 @@ func (m *Model) openSprintView() (*Model, tea.Cmd) {
 	}
 	m.selectedSprint = &m.sprints[idx]
 	m.sprintScroll = 0
+	m.sprintBeadCursor = 0
 	m.isSprintView = true
 	m.focused = focusSprint
 	m.sprintViewText = m.renderSprintDashboard()
 	return m, nil
+}
+
+// sprintScopedIssues returns the currently visible sprint issues in displayed order.
+func (m *Model) sprintScopedIssues() []model.Issue {
+	if m.selectedSprint == nil {
+		return nil
+	}
+	beadIDSet := make(map[string]bool, len(m.selectedSprint.BeadIDs))
+	for _, id := range m.selectedSprint.BeadIDs {
+		beadIDSet[id] = true
+	}
+	var out []model.Issue
+	for _, iss := range m.candidateScopedIssues() {
+		if beadIDSet[iss.ID] {
+			out = append(out, iss)
+		}
+	}
+	return out
 }
 
 // handleSprintKeys handles keyboard input when in sprint view (bv-161)
@@ -422,6 +516,7 @@ func (m *Model) handleSprintKeys(msg tea.KeyMsg) *Model {
 				if s.ID == m.selectedSprint.ID && i < len(m.sprints)-1 {
 					m.selectedSprint = &m.sprints[i+1]
 					m.sprintScroll = 0
+					m.sprintBeadCursor = 0
 					m.sprintViewText = m.renderSprintDashboard()
 					break
 				}
@@ -434,10 +529,25 @@ func (m *Model) handleSprintKeys(msg tea.KeyMsg) *Model {
 				if s.ID == m.selectedSprint.ID && i > 0 {
 					m.selectedSprint = &m.sprints[i-1]
 					m.sprintScroll = 0
+					m.sprintBeadCursor = 0
 					m.sprintViewText = m.renderSprintDashboard()
 					break
 				}
 			}
+		}
+	case "tab", "n":
+		// Next bead in sprint
+		sprintIssues := m.sprintScopedIssues()
+		if len(sprintIssues) > 0 {
+			m.sprintBeadCursor = (m.sprintBeadCursor + 1) % len(sprintIssues)
+			m.sprintViewText = m.renderSprintDashboard()
+		}
+	case "shift+tab", "p":
+		// Previous bead in sprint
+		sprintIssues := m.sprintScopedIssues()
+		if len(sprintIssues) > 0 {
+			m.sprintBeadCursor = (m.sprintBeadCursor - 1 + len(sprintIssues)) % len(sprintIssues)
+			m.sprintViewText = m.renderSprintDashboard()
 		}
 	case "ctrl+d", "pgdown":
 		m.sprintScroll += 5
@@ -449,18 +559,16 @@ func (m *Model) handleSprintKeys(msg tea.KeyMsg) *Model {
 		if m.selectedSprint == nil {
 			return m
 		}
-		// Match displayed sprintIssues order (scopedIssues filtered by BeadIDs)
-		beadIDSet := make(map[string]bool, len(m.selectedSprint.BeadIDs))
-		for _, id := range m.selectedSprint.BeadIDs {
-			beadIDSet[id] = true
+		// Match displayed sprintIssues order and jump to the highlighted bead cursor
+		sprintIssues := m.sprintScopedIssues()
+		if len(sprintIssues) == 0 {
+			return m
 		}
-		var targetID string
-		for _, iss := range m.candidateScopedIssues() {
-			if beadIDSet[iss.ID] {
-				targetID = iss.ID
-				break
-			}
+		idx := m.sprintBeadCursor
+		if idx < 0 || idx >= len(sprintIssues) {
+			idx = 0
 		}
+		targetID := sprintIssues[idx].ID
 		if targetID == "" {
 			return m
 		}

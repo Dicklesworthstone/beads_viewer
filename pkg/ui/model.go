@@ -318,7 +318,17 @@ func (m *Model) SetExplicitDB(explicit bool) {
 	if m == nil {
 		return
 	}
+	if m.isExplicitDB == explicit {
+		return
+	}
 	m.isExplicitDB = explicit
+	if m.backgroundWorker != nil {
+		m.backgroundWorker.SetSkipSourceDiff(explicit)
+	}
+	if m.analysis != nil && m.analyzer != nil {
+		m.alerts, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlertsWithOptions(m.issues, m.analysis, m.analyzer, m.alertOptions())
+		m.recomputeVisibleAlertCounts()
+	}
 }
 
 // SetSourceReload supplies a live reload route for aggregated sources. Replacing
@@ -2496,6 +2506,7 @@ type Model struct {
 	isSprintView           bool
 	sprintViewText         string
 	sprintScroll           int
+	sprintBeadCursor       int
 	sprintAtRiskThresholds analysis.AtRiskThresholds
 
 	// AGENTS.md integration (bv-i8dk)
@@ -3463,6 +3474,10 @@ func (m *Model) SetAsOfRevision(rev string) {
 	m.historyFullReport = nil
 	m.historyCommitRepoDirs = nil
 	m.historyView.SetReport(nil)
+	if m.analysis != nil && m.analyzer != nil {
+		m.alerts, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlertsWithOptions(m.issues, m.analysis, m.analyzer, m.alertOptions())
+		m.recomputeVisibleAlertCounts()
+	}
 }
 
 // SetSprints replaces the in-memory sprint list (for example from --as-of
@@ -3656,6 +3671,7 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 	insightsPanel := NewInsightsModel(ins, issueMap, theme)
 	insightsPanel.SetSize(defaultWidth, defaultHeight-1)
 	graphView := NewGraphModel(issues, &ins, theme)
+	graphView.SetAnalyzer(analyzer, analyzer.Now)
 
 	// Priority hints are generated asynchronously when Phase 2 completes
 	// This avoids blocking startup on expensive graph analysis
@@ -3994,7 +4010,14 @@ func (m *Model) SetWorkDir(dir string) {
 	if m == nil {
 		return
 	}
-	m.workDir = strings.TrimSpace(dir)
+	nextDir := strings.TrimSpace(dir)
+	dirChanged := nextDir != m.workDir
+	m.workDir = nextDir
+	if dirChanged {
+		m.cancelCassLookup()
+		m.cassCorrelator = nil
+		m.historyView.ClearSessionCache()
+	}
 	var loaderOpts []recipe.LoaderOption
 	if m.workDir != "" {
 		loaderOpts = append(loaderOpts, recipe.WithProjectDir(m.workDir))
@@ -5293,6 +5316,8 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 			default:
 				m.statusMsg = "No correlated sessions found for " + msg.request.beadID
 			}
+			// Keep background prefetch suppressed for this bead until cursor moves or user retries with V.
+			m.cassPrefetchLastID = msg.request.beadID
 			m.statusIsError = false
 			return m, nil
 		}
@@ -5420,6 +5445,10 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Swap snapshot pointer
 		m.snapshot = msg.Snapshot
+		if !m.workspaceMode && msg.Snapshot.beadsPath != "" && msg.Snapshot.beadsPath != m.beadsPath {
+			m.beadsPath = msg.Snapshot.beadsPath
+			m.tree.SetBeadsDir(filepath.Dir(m.beadsPath))
+		}
 		if m.instanceLock != nil {
 			m.instanceLock.Refresh()
 		}
@@ -5672,6 +5701,7 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.installSnapshotSemanticDocuments(msg.Snapshot.semanticIDs, msg.Snapshot.semanticDocs)
 				m.board.SetSnapshot(msg.Snapshot)
 				m.graphView.SetSnapshot(msg.Snapshot)
+				m.graphView.SetAnalyzer(m.analyzer, m.analysisReferenceTime)
 				if !listFilterActive && selectedID != "" {
 					if index, ok := msg.Snapshot.listIndexByID[selectedID]; ok {
 						m.list.Select(index)
@@ -5876,7 +5906,7 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if failedWorker != nil {
 				failedWorker.Stop()
 			}
-			if m.watcher == nil && m.sourceReload == nil && m.beadsPath != "" && !strings.HasPrefix(strings.TrimSpace(m.beadsPath), "git:") {
+			if m.watcher == nil && (m.sourceReload == nil || m.allowBackgroundAutoPromote) && m.beadsPath != "" && !strings.HasPrefix(strings.TrimSpace(m.beadsPath), "git:") {
 				if w, wErr := watcher.NewWatcher(m.beadsPath, watcher.WithDebounceDuration(200*time.Millisecond)); wErr == nil {
 					if sErr := w.Start(); sErr == nil {
 						m.watcher = w
@@ -6421,6 +6451,7 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 					BeadsPath:      m.beadsPath,
 					ProjectDir:     m.workDir,
 					SourceDegraded: m.sourceDegraded,
+					SkipSourceDiff: m.isExplicitDB,
 					SourceReload:   m.sourceReload,
 					DebounceDelay:  200 * time.Millisecond,
 				})
@@ -6589,7 +6620,10 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 		if m.cassRequest != nil && (msg.String() == "V" || msg.String() == "esc") {
+			cancelledID := m.cassRequest.beadID
 			m.cancelCassLookup()
+			// Suppress immediate 250ms background re-prefetch on the cancelled bead until cursor moves.
+			m.cassPrefetchLastID = cancelledID
 			m.statusMsg = "Session lookup cancelled"
 			return m, nil
 		}
@@ -8402,6 +8436,7 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 							if s.ID == m.selectedSprint.ID && i > 0 {
 								m.selectedSprint = &m.sprints[i-1]
 								m.sprintScroll = 0
+								m.sprintBeadCursor = 0
 								m.sprintViewText = m.renderSprintDashboard()
 								break
 							}
@@ -8461,6 +8496,7 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 							if s.ID == m.selectedSprint.ID && i < len(m.sprints)-1 {
 								m.selectedSprint = &m.sprints[i+1]
 								m.sprintScroll = 0
+								m.sprintBeadCursor = 0
 								m.sprintViewText = m.renderSprintDashboard()
 								break
 							}
@@ -10578,6 +10614,7 @@ func (m *Model) renderMainView() (body string, overlay bool) {
 			m.tree.SetSize(bodyWidth, max(bodyHeight, 1))
 			body = m.tree.View()
 		case m.isGraphView:
+			m.graphView.SetAnalyzer(m.analyzer, m.analysisReferenceTime)
 			body = m.graphView.View(bodyWidth, bodyHeight)
 		case m.isBoardView:
 			m.board.SetSize(bodyWidth, bodyHeight)
@@ -12670,6 +12707,10 @@ func (m *Model) setActiveRecipe(r *recipe.Recipe) {
 	}
 	m.refreshRecipeMetrics()
 	m.updateListDelegate()
+	if m.analysis != nil && m.analyzer != nil {
+		m.alerts, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlertsWithOptions(m.issues, m.analysis, m.analyzer, m.alertOptions())
+		m.recomputeVisibleAlertCounts()
+	}
 	if m.backgroundWorker != nil {
 		m.backgroundWorker.SetRecipe(r)
 	}
@@ -13698,6 +13739,53 @@ func (m *Model) updateViewportContent() {
 		}
 
 		sb.WriteString("\n")
+	}
+
+	// What-If Impact & ETA Forecast (open issues only)
+	if !isClosedLikeStatus(item.Status) {
+		var whatIf *analysis.WhatIfResult
+		if m.analyzer != nil && m.analysis != nil {
+			whatIf = m.analyzer.ComputeWhatIf(item.ID, m.analysis)
+		}
+		eta, etaErr := analysis.EstimateETAForIssue(m.issues, m.analysis, item.ID, 1, m.analysisReferenceTime())
+		hasWhatIf := whatIf != nil && (whatIf.Delta.DirectUnblocks > 0 || whatIf.Delta.TransitiveUnblocks > 0)
+		if hasWhatIf || etaErr == nil {
+			sb.WriteString("### 🔮 What-If & Forecast\n")
+			if hasWhatIf {
+				unblockSummary := fmt.Sprintf("**+%d direct**", whatIf.Delta.DirectUnblocks)
+				if whatIf.Delta.TransitiveUnblocks > whatIf.Delta.DirectUnblocks {
+					unblockSummary += fmt.Sprintf(" (**+%d total** transitive)", whatIf.Delta.TransitiveUnblocks)
+				}
+				sb.WriteString(fmt.Sprintf("- **If Closed:** Unblocks %s", unblockSummary))
+				if len(whatIf.Delta.UnblockedIssueIDs) > 0 {
+					shown := whatIf.Delta.UnblockedIssueIDs
+					extra := ""
+					if len(shown) > 5 {
+						extra = fmt.Sprintf(" (+%d more)", len(shown)-5)
+						shown = shown[:5]
+					}
+					sb.WriteString(fmt.Sprintf(" → %s%s", strings.Join(shown, ", "), extra))
+				}
+				sb.WriteString("\n")
+				if whatIf.Delta.EstimatedDaysSaved > 0 {
+					sb.WriteString(fmt.Sprintf("- **Schedule Impact:** Est. %.1f days saved", whatIf.Delta.EstimatedDaysSaved))
+					if whatIf.Delta.ParallelizationGain != nil && *whatIf.Delta.ParallelizationGain > 0 {
+						sb.WriteString(fmt.Sprintf(" (+%d parallel tracks)", *whatIf.Delta.ParallelizationGain))
+					}
+					sb.WriteString("\n")
+				}
+			}
+			if etaErr == nil {
+				confPct := int(eta.Confidence*100 + 0.5)
+				sb.WriteString(fmt.Sprintf("- **ETA Forecast:** %s (~%.1fd • range %s–%s • %d%% confidence)\n",
+					eta.ETADate.Format("2006-01-02"),
+					eta.EstimatedDays,
+					eta.ETADateLow.Format("Jan 2"),
+					eta.ETADateHigh.Format("Jan 2"),
+					confPct))
+			}
+			sb.WriteString("\n")
+		}
 	}
 
 	// Search Scores (hybrid mode)
@@ -15489,7 +15577,7 @@ func (m *Model) cassPrefetchBlocked() bool {
 	case focusDetail:
 		return false
 	case focusHistory:
-		return m.historyView.IsSearchActive()
+		return m.historyView.IsSearchActive() || m.historyView.FileTreeHasFocus()
 	default:
 		return true
 	}
@@ -17393,6 +17481,7 @@ func (m *Model) RenderDebugView(viewName string, width, height int) string {
 		m.isGraphView = true
 		m.focused = focusGraph
 		m.refreshBoardAndGraphForCurrentFilter()
+		m.graphView.SetAnalyzer(m.analyzer, m.analysisReferenceTime)
 		m.graphView.SetSize(width, bodyHeight)
 		return m.graphView.View(width, bodyHeight)
 	case "tree":

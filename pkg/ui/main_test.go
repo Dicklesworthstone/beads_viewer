@@ -1779,5 +1779,136 @@ func TestWave23_SprintAtRiskParity_AlertsParity_CassPrefetch_And_WatcherStatus(t
 		if _, isQuit := quitCmd().(tea.QuitMsg); !isQuit {
 			t.Fatalf("expected ctrl+c cmd to emit tea.QuitMsg directly without cass prefetch batching, got %T", quitCmd())
 		}
+
+		// Pass 5 #10 & #11: Cancelling explicit V lookup suppresses immediate re-prefetch;
+		// SetWorkDir clears stale cassCorrelator & history session cache; FileTreeHasFocus blocks prefetch.
+		mCancel := NewModel(issues, nil, "")
+		t.Cleanup(mCancel.Stop)
+		mCancel.SetWorkDir(workDir)
+		mCancel.cassStatus = cass.StatusHealthy
+		mCancel.cassRequest = &cassSessionRequest{beadID: "CS-1", cancel: func() {}}
+		updatedC, cancelCmd := mCancel.Update(tea.KeyMsg{Type: tea.KeyEsc})
+		mCancel = updatedC.(*Model)
+		if cancelCmd != nil {
+			t.Fatal("expected cancelling V lookup not to reschedule immediate cass prefetch tick")
+		}
+		if mCancel.cassPrefetchLastID != "CS-1" {
+			t.Fatalf("expected cassPrefetchLastID=CS-1 after cancel, got %q", mCancel.cassPrefetchLastID)
+		}
+		mCancel.ensureCassCorrelator()
+		mCancel.historyView.SetSessionsForBead("CS-1", []cass.ScoredResult{{SearchResult: cass.SearchResult{SourcePath: "/old.jsonl"}}})
+		mCancel.SetWorkDir(t.TempDir())
+		if mCancel.cassCorrelator != nil {
+			t.Fatal("SetWorkDir did not clear stale cassCorrelator")
+		}
+		if len(mCancel.historyView.GetSessionsForBead("CS-1")) != 0 {
+			t.Fatal("SetWorkDir did not clear historyView session cache")
+		}
 	})
+
+	// 5. Pass 5 #1, #2, #9: BackgroundWorker SetSourceReload race-free + SourcePath propagation + recipe alert refresh.
+	t.Run("background_worker_source_path_and_recipe_alerts_refresh", func(t *testing.T) {
+		projDir := t.TempDir()
+		beadsDir := filepath.Join(projDir, ".beads")
+		if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		initialJSONL := filepath.Join(beadsDir, "issues.jsonl")
+		switchedDB := filepath.Join(beadsDir, "beads.db")
+		if err := os.WriteFile(initialJSONL, []byte(`{"id":"BG-1","title":"Initial","status":"open","priority":1,"issue_type":"task"}`+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		unscopedBL := baseline.NewForDir(
+			projDir,
+			baseline.GraphStats{NodeCount: 40, EdgeCount: 80, Density: 0.50, OpenCount: 30, ClosedCount: 10, BlockedCount: 15},
+			baseline.TopMetrics{},
+			nil,
+			"unscoped",
+		)
+		if err := unscopedBL.Save(baseline.DefaultPath(projDir)); err != nil {
+			t.Fatal(err)
+		}
+
+		// BackgroundWorker concurrent SetSourceReload + Build must be race-free and propagate res.SourcePath.
+		bw, err := NewBackgroundWorker(WorkerConfig{
+			BeadsPath:      initialJSONL,
+			ProjectDir:     projDir,
+			SkipSourceDiff: true,
+			DebounceDelay:  20 * time.Millisecond,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer bw.Stop()
+		bw.SetSourceReload(func(context.Context) (SourceReloadResult, error) {
+			return SourceReloadResult{
+				Issues:     []model.Issue{{ID: "BG-1", Title: "From SQLite", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now}},
+				SourcePath: switchedDB,
+			}, nil
+		})
+		res := bw.buildSnapshotResultContext(context.Background(), true)
+		if res.err != nil || res.snapshot == nil {
+			t.Fatalf("buildSnapshotResultContext failed: err=%v snap=%v", res.err, res.snapshot)
+		}
+		if res.snapshot.beadsPath != switchedDB || !res.snapshot.skipSourceDiff {
+			t.Fatalf("snapshot lost switched SourcePath or SkipSourceDiff: path=%q skip=%v", res.snapshot.beadsPath, res.snapshot.skipSourceDiff)
+		}
+
+		// Model receiving SnapshotReadyMsg updates m.beadsPath; toggling active recipe refreshes m.alerts.
+		m := NewModel([]model.Issue{{ID: "BG-1", Title: "Initial", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now}}, nil, initialJSONL)
+		t.Cleanup(m.Stop)
+		m.SetWorkDir(projDir)
+		updated, _ := m.Update(SnapshotReadyMsg{Snapshot: res.snapshot})
+		m = updated.(*Model)
+		if m.beadsPath != switchedDB {
+			t.Fatalf("SnapshotReadyMsg did not update m.beadsPath to %q, got %q", switchedDB, m.beadsPath)
+		}
+		// Unscoped alerts include density drift vs unscopedBL; activating recipe clears mismatched unscoped drift alerts.
+		m.setActiveRecipe(&recipe.Recipe{Name: "actionable"})
+		for _, a := range m.alerts {
+			if a.Type == drift.AlertDensityGrowth || a.Type == drift.AlertBlockedIncrease {
+				t.Fatalf("setActiveRecipe did not drop mismatched unscoped baseline alert: %+v", a)
+			}
+		}
+	})
+}
+
+func TestDetailPane_WhatIfAndETAForecastForOpenIssuesOnly(t *testing.T) {
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	closedAt := now.AddDate(0, 0, -2)
+	est := 180
+	issues := []model.Issue{
+		{ID: "WF-ROOT", Title: "Critical Blocker", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask, EstimatedMinutes: &est, CreatedAt: now.AddDate(0, 0, -4), UpdatedAt: now},
+		{
+			ID: "WF-CHILD", Title: "Blocked Child", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask,
+			CreatedAt: now.AddDate(0, 0, -3), UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "WF-CHILD", DependsOnID: "WF-ROOT", Type: model.DepBlocks}},
+		},
+		{ID: "WF-DONE", Title: "Completed Item", Status: model.StatusClosed, Priority: 2, IssueType: model.TypeTask, ClosedAt: &closedAt, CreatedAt: now.AddDate(0, 0, -6), UpdatedAt: closedAt},
+	}
+
+	m := NewModel(issues, nil, "")
+	t.Cleanup(m.Stop)
+	m.referenceNow = now
+	m.analysis.WaitForPhase2()
+	updated, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+	m = updated.(*Model)
+
+	if !m.selectListIssueByID("WF-ROOT") {
+		t.Fatal("failed to select WF-ROOT")
+	}
+	m.updateViewportContent()
+	openDetail := ansi.Strip(m.viewport.View())
+	if !strings.Contains(openDetail, "What-If & Forecast") || !strings.Contains(openDetail, "+1 direct") || !strings.Contains(openDetail, "WF-CHILD") || !strings.Contains(openDetail, "ETA Forecast") {
+		t.Fatalf("expected Detail Pane for WF-ROOT to include What-If & Forecast with +1 direct -> WF-CHILD and ETA, got:\n%s", openDetail)
+	}
+
+	if !m.selectListIssueByID("WF-DONE") {
+		t.Fatal("failed to select WF-DONE")
+	}
+	m.updateViewportContent()
+	closedDetail := ansi.Strip(m.viewport.View())
+	if strings.Contains(closedDetail, "What-If & Forecast") {
+		t.Fatalf("expected Detail Pane for closed WF-DONE to omit What-If & Forecast, got:\n%s", closedDetail)
+	}
 }

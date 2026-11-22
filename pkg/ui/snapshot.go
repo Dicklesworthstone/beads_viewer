@@ -278,6 +278,7 @@ type DataSnapshot struct {
 	projectDir         string
 	explicitProjectDir string
 	explicitWeights    bool
+	skipSourceDiff     bool
 }
 
 func (s *DataSnapshot) attachPooledIssues(refs []*model.Issue) {
@@ -404,6 +405,7 @@ type SnapshotBuilder struct {
 	projectDir         string
 	explicitProjectDir string
 	explicitWeights    bool
+	skipSourceDiff     bool
 
 	prevSnapshot *DataSnapshot
 	diff         *analysis.IssueDiff
@@ -472,6 +474,13 @@ func (b *SnapshotBuilder) WithBeadsPath(beadsPath string) *SnapshotBuilder {
 func (b *SnapshotBuilder) WithProjectDir(projectDir string) *SnapshotBuilder {
 	b.projectDir = projectDir
 	b.explicitProjectDir = projectDir
+	return b
+}
+
+// WithSkipSourceDiff configures whether alert computation skips local sibling
+// SQLite/JSONL consistency checks (e.g., for explicit --db sessions).
+func (b *SnapshotBuilder) WithSkipSourceDiff(skip bool) *SnapshotBuilder {
+	b.skipSourceDiff = skip
 	return b
 }
 
@@ -767,9 +776,10 @@ func (b *SnapshotBuilder) Build() *DataSnapshot {
 		snapAlertScope = &baseline.BaselineScope{Recipe: strings.TrimSpace(b.recipe.Name)}
 	}
 	alerts, alertsCritical, alertsWarning, alertsInfo := computeAlertsWithOptions(issues, graphStats, b.analyzer, alertComputeOptions{
-		ProjectDir: projectDir,
-		BeadsPath:  b.beadsPath,
-		Scope:      snapAlertScope,
+		ProjectDir:     projectDir,
+		BeadsPath:      b.beadsPath,
+		Scope:          snapAlertScope,
+		SkipSourceDiff: b.skipSourceDiff,
 	})
 	dataHash := b.dataHash
 	if dataHash == "" {
@@ -825,6 +835,7 @@ func (b *SnapshotBuilder) Build() *DataSnapshot {
 		projectDir:          projectDir,
 		explicitProjectDir:  b.explicitProjectDir,
 		explicitWeights:     b.explicitWeights,
+		skipSourceDiff:      b.skipSourceDiff,
 	}
 	snapshot.phase2Input = snapshot.detachedPhase2Input()
 	return snapshot
@@ -1602,9 +1613,10 @@ func (s *DataSnapshot) WithPhase2(stats *analysis.GraphStats, insights analysis.
 		phase2AlertScope = &baseline.BaselineScope{Recipe: strings.TrimSpace(s.recipe.Name)}
 	}
 	alerts, alertsCritical, alertsWarning, alertsInfo := computeAlertsWithOptions(issuesClone, stats, analyzer, alertComputeOptions{
-		ProjectDir: s.projectDir,
-		BeadsPath:  s.beadsPath,
-		Scope:      phase2AlertScope,
+		ProjectDir:     s.projectDir,
+		BeadsPath:      s.beadsPath,
+		Scope:          phase2AlertScope,
+		SkipSourceDiff: s.skipSourceDiff,
 	})
 
 	return &DataSnapshot{
@@ -1671,5 +1683,6 @@ func (s *DataSnapshot) WithPhase2(stats *analysis.GraphStats, insights analysis.
 		projectDir:           s.projectDir,
 		explicitProjectDir:   s.explicitProjectDir,
 		explicitWeights:      s.explicitWeights,
+		skipSourceDiff:       s.skipSourceDiff,
 	}
 }

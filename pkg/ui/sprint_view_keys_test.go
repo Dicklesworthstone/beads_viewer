@@ -687,3 +687,74 @@ func TestRenderSprintDashboard_RespectsDriftConfigThresholds(t *testing.T) {
 		t.Fatalf("expected sprint_blocked_days=10 from .bv/drift.yaml to suppress 3-day blocked warning:\n%s", outCustom)
 	}
 }
+
+func TestSprintView_RealDailyBurndownVelocityAndBeadCursorJump(t *testing.T) {
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	closedDay2 := now.AddDate(0, 0, -4)
+	closedDay4 := now.AddDate(0, 0, -2)
+	issues := []model.Issue{
+		{ID: "SP-1", Title: "Closed Day 2", Status: model.StatusClosed, Priority: 1, IssueType: model.TypeTask, ClosedAt: &closedDay2, UpdatedAt: closedDay2},
+		{ID: "SP-2", Title: "Closed Day 4", Status: model.StatusClosed, Priority: 1, IssueType: model.TypeTask, ClosedAt: &closedDay4, UpdatedAt: closedDay4},
+		{ID: "SP-3", Title: "Open Target Bead", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, UpdatedAt: now},
+		{ID: "SP-4", Title: "Open Trailing Bead", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, UpdatedAt: now},
+	}
+	sprints := []model.Sprint{
+		{
+			ID:        "sprint-real",
+			Name:      "Sprint Real Burndown",
+			StartDate: now.AddDate(0, 0, -5),
+			EndDate:   now.AddDate(0, 0, 5),
+			BeadIDs:   []string{"SP-1", "SP-2", "SP-3", "SP-4"},
+		},
+	}
+
+	m := NewModel(issues, nil, "")
+	t.Cleanup(m.Stop)
+	m.referenceNow = now
+	m.width = 120
+	m.height = 40
+	m.sprints = sprints
+	m.selectedSprint = &sprints[0]
+	m.isSprintView = true
+	m.focused = focusSprint
+
+	out := m.renderSprintDashboard()
+	if !strings.Contains(out, "Velocity:") || !strings.Contains(out, "ideal") || !strings.Contains(out, "Projected") {
+		t.Fatalf("expected Sprint View to show real Velocity/Projection line, got:\n%s", out)
+	}
+	// Stepped daily burndown must place ● on at least 2 distinct vertical rows (not a single flat horizontal line).
+	bulletRows := 0
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "●") && !strings.Contains(line, "actual") {
+			bulletRows++
+		}
+	}
+	if bulletRows < 2 {
+		t.Fatalf("expected stepped multi-row daily burndown curve, got %d bullet rows:\n%s", bulletRows, out)
+	}
+
+	// Navigate sprint bead cursor with Tab / n / p and verify Enter jumps to the highlighted bead (index 2, distinct from index 0).
+	displayed := m.sprintScopedIssues()
+	if len(displayed) < 3 || displayed[0].ID == displayed[2].ID {
+		t.Fatalf("expected >=3 distinct displayed sprint beads, got %+v", displayed)
+	}
+	wantTargetID := displayed[2].ID
+	m = m.handleSprintKeys(tea.KeyMsg{Type: tea.KeyTab})
+	m = m.handleSprintKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")})
+	if m.sprintBeadCursor != 2 {
+		t.Fatalf("expected sprintBeadCursor=2 after Tab+n, got %d", m.sprintBeadCursor)
+	}
+	m = m.handleSprintKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
+	if m.sprintBeadCursor != 1 {
+		t.Fatalf("expected sprintBeadCursor=1 after p, got %d", m.sprintBeadCursor)
+	}
+	m = m.handleSprintKeys(tea.KeyMsg{Type: tea.KeyTab})
+	m = m.handleSprintKeys(tea.KeyMsg{Type: tea.KeyEnter})
+	if m.isSprintView {
+		t.Fatalf("expected Enter to exit Sprint View and jump to bead")
+	}
+	sel, ok := m.list.SelectedItem().(IssueItem)
+	if !ok || sel.Issue.ID != wantTargetID {
+		t.Fatalf("expected Enter with cursor=2 to jump to %s (not index-0 %s), got %+v (ok=%v)", wantTargetID, displayed[0].ID, sel.Issue.ID, ok)
+	}
+}
