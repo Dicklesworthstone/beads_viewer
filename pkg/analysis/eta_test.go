@@ -997,3 +997,37 @@ func TestWave22_ComputeGrahamBounds_ClosedParentStopsInheritedBlocking(t *testin
 			gb.CriticalPathMinutes, gb.TotalMinutes)
 	}
 }
+
+func TestETAContext_BitIdenticalToEstimateETAForIssue(t *testing.T) {
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	closed1 := now.AddDate(0, 0, -5)
+	closed2 := now.AddDate(0, 0, -10)
+	est120 := 120
+	est240 := 240
+	issues := []model.Issue{
+		{ID: "CL-1", Title: "Closed backend", Status: model.StatusClosed, IssueType: model.TypeTask, Labels: []string{"Backend", "backend", "api"}, EstimatedMinutes: &est120, ClosedAt: &closed1, UpdatedAt: closed1},
+		{ID: "CL-2", Title: "Closed frontend", Status: model.StatusClosed, IssueType: model.TypeFeature, Labels: []string{"frontend"}, EstimatedMinutes: &est240, ClosedAt: &closed2, UpdatedAt: closed2},
+		{ID: "OP-1", Title: "Open backend", Status: model.StatusOpen, IssueType: model.TypeBug, Labels: []string{"backend", "frontend"}, EstimatedMinutes: &est120, UpdatedAt: now},
+		{ID: "OP-2", Title: "Open unlabeled", Status: model.StatusOpen, IssueType: model.TypeTask, UpdatedAt: now},
+	}
+	an := NewAnalyzer(issues)
+	an.SetNow(now)
+	stats := an.AnalyzeWithConfig(FullAnalysisConfig())
+	etaCtx := NewETAContext(issues, &stats, now)
+
+	for _, iss := range issues[2:] {
+		want, err := EstimateETAForIssue(issues, &stats, iss.ID, 1, now)
+		if err != nil {
+			t.Fatalf("EstimateETAForIssue(%s): %v", iss.ID, err)
+		}
+		got := etaCtx.EstimateForIssue(iss, 1)
+		if got.EstimatedMinutes != want.EstimatedMinutes ||
+			math.Abs(got.EstimatedDays-want.EstimatedDays) > 1e-12 ||
+			math.Abs(got.Confidence-want.Confidence) > 1e-12 ||
+			!got.ETADate.Equal(want.ETADate) ||
+			!got.ETADateLow.Equal(want.ETADateLow) ||
+			!got.ETADateHigh.Equal(want.ETADateHigh) {
+			t.Fatalf("ETAContext mismatch for %s:\ngot:  %+v\nwant: %+v", iss.ID, got, want)
+		}
+	}
+}
