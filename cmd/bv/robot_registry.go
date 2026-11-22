@@ -8086,20 +8086,30 @@ func computeDriftResultForContext(ctx RobotContext, analyzer *analysis.Analyzer,
 // scope_creep, baseline regressions, source_inconsistency, etc.) into
 // triage.Alerts for static-site exports so the exported dashboard matches
 // --robot-alerts and the TUI Alerts panel.
-func attachDriftAlertsToTriage(triage *analysis.TriageResult, ctx RobotContext, analyzer *analysis.Analyzer, stats *analysis.GraphStats, graphIssues []model.Issue) {
+func attachDriftAlertsToTriage(triage *analysis.TriageResult, ctx RobotContext, analyzer *analysis.Analyzer, stats *analysis.GraphStats, graphIssues []model.Issue, forceFullAnalysis bool) {
 	if triage == nil {
 		return
+	}
+	if analyzer == nil {
+		analyzer = ctx.GraphAnalyzer()
+		if forceFullAnalysis && analyzer != nil {
+			fullCfg := analysis.FullAnalysisConfig()
+			analyzer.SetConfig(&fullCfg)
+		}
+		stats = nil
 	}
 	driftResult, _, err := computeDriftResultForContext(ctx, analyzer, stats, graphIssues)
 	if err != nil || driftResult == nil || len(driftResult.Alerts) == 0 {
 		return
 	}
 
+	seenExact := make(map[string]bool, len(triage.Alerts))
 	seenTypeIssue := make(map[string]bool, len(triage.Alerts))
 	hasType := make(map[string]bool, len(triage.Alerts))
 	for _, existing := range triage.Alerts {
 		hasType[existing.Type] = true
 		seenTypeIssue[existing.Type+"\x00"+existing.IssueID] = true
+		seenExact[existing.Type+"\x00"+existing.IssueID+"\x00"+strings.Join(existing.IssueIDs, ",")+"\x00"+existing.Message] = true
 	}
 
 	for _, da := range driftResult.Alerts {
@@ -8107,12 +8117,10 @@ func attachDriftAlertsToTriage(triage *analysis.TriageResult, ctx RobotContext, 
 		if da.Type == drift.AlertVelocityDrop && hasType["velocity_drop"] {
 			continue
 		}
-		key := alertType + "\x00" + da.IssueID
-		if seenTypeIssue[key] {
+		// Deduplicate single-issue abandoned_claim overlap against built-in triage summary.
+		if da.Type == drift.AlertAbandonedClaim && seenTypeIssue[alertType+"\x00"+da.IssueID] {
 			continue
 		}
-		seenTypeIssue[key] = true
-		hasType[alertType] = true
 
 		mapped := analysis.Alert{
 			Type:     alertType,
@@ -8127,6 +8135,13 @@ func attachDriftAlertsToTriage(triage *analysis.TriageResult, ctx RobotContext, 
 				mapped.IssueIDs = []string{da.RelatedIssueID}
 			}
 		}
+		exactKey := mapped.Type + "\x00" + mapped.IssueID + "\x00" + strings.Join(mapped.IssueIDs, ",") + "\x00" + mapped.Message
+		if seenExact[exactKey] {
+			continue
+		}
+		seenExact[exactKey] = true
+		seenTypeIssue[alertType+"\x00"+da.IssueID] = true
+		hasType[alertType] = true
 		triage.Alerts = append(triage.Alerts, mapped)
 	}
 }

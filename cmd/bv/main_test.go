@@ -10093,7 +10093,7 @@ func TestAttachDriftAlertsToTriage_MergesFullDriftAlertsIntoStaticExport(t *test
 		EnvRobot:   true,
 	}
 
-	attachDriftAlertsToTriage(&triage, ctx, an, &stats, issues)
+	attachDriftAlertsToTriage(&triage, ctx, an, &stats, issues, false)
 
 	seenTypes := make(map[string]bool)
 	for _, a := range triage.Alerts {
@@ -10108,8 +10108,33 @@ func TestAttachDriftAlertsToTriage_MergesFullDriftAlertsIntoStaticExport(t *test
 
 	// Idempotent deduplication: calling attachDriftAlertsToTriage twice must not duplicate alerts.
 	countBefore := len(triage.Alerts)
-	attachDriftAlertsToTriage(&triage, ctx, an, &stats, issues)
+	attachDriftAlertsToTriage(&triage, ctx, an, &stats, issues, false)
 	if len(triage.Alerts) != countBefore {
 		t.Fatalf("attachDriftAlertsToTriage duplicated alerts on second call: before=%d after=%d", countBefore, len(triage.Alerts))
+	}
+
+	// Distinct pairwise potential_duplicate alerts sharing IssueID (A->B and A->C) must BOTH be preserved.
+	dupIssues := []model.Issue{
+		{ID: "DUP-A", Title: "Fix OAuth login callback timeout error in production", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeBug, CreatedAt: now, UpdatedAt: now},
+		{ID: "DUP-B", Title: "Fix OAuth login callback timeout error in production", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeBug, CreatedAt: now, UpdatedAt: now},
+		{ID: "DUP-C", Title: "Fix OAuth login callback timeout error in production", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeBug, CreatedAt: now, UpdatedAt: now},
+	}
+	dupTriage := analysis.TriageResult{}
+	dupCtx := RobotContext{
+		ProjectDir: projectDir,
+		WorkDir:    projectDir,
+		Issues:     dupIssues,
+		Readiness:  model.NewReadinessIndex(dupIssues),
+		EnvRobot:   true,
+	}
+	attachDriftAlertsToTriage(&dupTriage, dupCtx, nil, nil, dupIssues, true)
+	dupCount := 0
+	for _, a := range dupTriage.Alerts {
+		if a.Type == "potential_duplicate" && a.IssueID == "DUP-A" {
+			dupCount++
+		}
+	}
+	if dupCount < 2 {
+		t.Fatalf("expected >=2 distinct potential_duplicate alerts for DUP-A (vs DUP-B and DUP-C), got %d: %+v", dupCount, dupTriage.Alerts)
 	}
 }

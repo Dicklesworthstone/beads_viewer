@@ -4032,7 +4032,11 @@ func main() {
 				if !exportContext.claimsProven() {
 					suppressUnprovenTriageClaims(&triage)
 				}
-				attachDriftAlertsToTriage(&triage, exportContext, analyzer, stats, exportIssues)
+				if !*pagesIncludeClosed || exportContext.ActiveRecipe != nil || exportContext.CandidateIDs != nil {
+					attachDriftAlertsToTriage(&triage, exportContext, nil, nil, exportContext.GraphIssues(), *forceFullAnalysis)
+				} else {
+					attachDriftAlertsToTriage(&triage, exportContext, analyzer, stats, exportIssues, *forceFullAnalysis)
+				}
 
 				// Extract all dependencies (blocking + non-blocking such as parent-child, related, discovered-from)
 				var deps []*model.Dependency
@@ -5741,10 +5745,20 @@ func main() {
 					// dynamically sync sibling watchers if the active source switches.
 					reloadDir := projectDir
 					initialBeadsPath := beadsPath
+					var syncMu sync.Mutex
+					lastSyncedPath := initialBeadsPath
 					m.SetBackgroundSourceReload(func(ctx context.Context) (ui.SourceReloadResult, error) {
 						res, err := reloadSingleRepoAutoDiscoverForUI(ctx, reloadDir, boundSource, boundSourceDegraded, reloadLabel, reloadRepo)
-						if err == nil && res.SourcePath != "" && res.SourcePath != initialBeadsPath {
-							extWatchers.Sync(tuiSingleRepoSiblingWatchPaths(robotDispatchContext, res.SourcePath), "")
+						if err == nil && res.SourcePath != "" {
+							syncMu.Lock()
+							changed := res.SourcePath != lastSyncedPath
+							if changed {
+								lastSyncedPath = res.SourcePath
+							}
+							syncMu.Unlock()
+							if changed {
+								extWatchers.Sync(tuiSingleRepoSiblingWatchPaths(robotDispatchContext, res.SourcePath), initialBeadsPath)
+							}
 						}
 						return res, err
 					})
@@ -8066,13 +8080,14 @@ func runPagesWizard(beadsPath string, dispatchCtx RobotContext, activeRecipe *re
 
 	// Compute triage
 	fmt.Println("  -> Generating triage data...")
-	exportContext := scopedSourceCtx
-	exportContext.Issues = exportIssues
-	exportContext.ProjectDir = wizardProjectDir
-	exportContext.WorkDir = wizardProjectDir
-	if exportContext.DataHash == "" {
-		exportContext.DataHash = analysis.ComputeDataHash(source.Issues)
+	driftCtx := scopedSourceCtx
+	driftCtx.ProjectDir = wizardProjectDir
+	driftCtx.WorkDir = wizardProjectDir
+	if driftCtx.DataHash == "" {
+		driftCtx.DataHash = analysis.ComputeDataHash(source.Issues)
 	}
+	exportContext := driftCtx
+	exportContext.Issues = exportIssues
 	_, wizardFeedbackWeights := loadRobotFeedbackForContext(exportContext)
 	var wizardHistLimit *int
 	if exportContext.HistoryLimit > 0 {
@@ -8111,7 +8126,11 @@ func runPagesWizard(beadsPath string, dispatchCtx RobotContext, activeRecipe *re
 	if !exportContext.claimsProven() {
 		suppressUnprovenTriageClaims(&triage)
 	}
-	attachDriftAlertsToTriage(&triage, exportContext, analyzer, stats, exportIssues)
+	if !config.IncludeClosed || driftCtx.ActiveRecipe != nil || driftCtx.CandidateIDs != nil {
+		attachDriftAlertsToTriage(&triage, driftCtx, nil, nil, driftCtx.GraphIssues(), forceFullAnalysis)
+	} else {
+		attachDriftAlertsToTriage(&triage, driftCtx, analyzer, stats, exportIssues, forceFullAnalysis)
+	}
 
 	// Extract all dependencies (blocking + non-blocking such as parent-child, related, discovered-from)
 	var deps []*model.Dependency
