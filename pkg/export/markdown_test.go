@@ -3229,3 +3229,61 @@ func TestGenerateHTMLAndReport_IncludeActionsAndNotReadyLabelsGating(t *testing.
 		t.Fatalf("wip-2 JSON actions = %+v, want Claim=nil (withheld by NotReadyLabels) and Show!=nil", actionsByID["wip-2"])
 	}
 }
+
+func TestGenerateReport_SourceRepoParityAcrossMarkdownHTMLAndCSV(t *testing.T) {
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	issues := []model.Issue{
+		{ID: "api-1", Title: "Auth service", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, SourceRepo: "api", CreatedAt: now, UpdatedAt: now},
+		{ID: "web-1", Title: "UI login", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeFeature, SourceRepo: "web", CreatedAt: now, UpdatedAt: now},
+		{ID: "loc-1", Title: "Local task", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
+	}
+
+	// Markdown: group_by repo + summary column repo + per-issue Repo metadata row.
+	mdBytes, err := GenerateReport(issues, issues, ReportOptions{
+		Format:      "markdown",
+		GeneratedAt: now,
+		GroupBy:     "repo",
+		View:        recipe.ViewConfig{Columns: []string{"id", "title", "repo"}},
+	})
+	if err != nil {
+		t.Fatalf("GenerateReport(markdown): %v", err)
+	}
+	md := string(mdBytes)
+	for _, want := range []string{"| **Repo** | api |", "| **Repo** | web |", "| Repo |", "api", "web", "Default Repo"} {
+		if !strings.Contains(md, want) {
+			t.Fatalf("Markdown report missing %q:\n%s", want, md)
+		}
+	}
+
+	// HTML: Repo metadata row + group_by repo.
+	htmlBytes, err := GenerateReport(issues, issues, ReportOptions{
+		Format:      "html",
+		GeneratedAt: now,
+		GroupBy:     "repo",
+	})
+	if err != nil {
+		t.Fatalf("GenerateReport(html): %v", err)
+	}
+	htmlStr := string(htmlBytes)
+	for _, want := range []string{"<tr><th>Repo</th><td>api</td></tr>", "<tr><th>Repo</th><td>web</td></tr>", "Default Repo"} {
+		if !strings.Contains(htmlStr, want) {
+			t.Fatalf("HTML report missing %q", want)
+		}
+	}
+
+	// CSV: source_repo column via "repo" alias.
+	csvBytes, err := GenerateReport(issues, issues, ReportOptions{
+		Format:      "csv",
+		GeneratedAt: now,
+		View:        recipe.ViewConfig{Columns: []string{"id", "repo"}},
+	})
+	if err != nil {
+		t.Fatalf("GenerateReport(csv): %v", err)
+	}
+	csvStr := string(csvBytes)
+	for _, want := range []string{"id,source_repo", "api-1,api", "web-1,web", "loc-1,"} {
+		if !strings.Contains(csvStr, want) {
+			t.Fatalf("CSV report missing %q:\n%s", want, csvStr)
+		}
+	}
+}

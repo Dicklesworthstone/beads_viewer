@@ -68,6 +68,7 @@ type graphNode struct {
 	Type            string   `json:"type"`
 	Labels          []string `json:"labels"`
 	Assignee        string   `json:"assignee,omitempty"`
+	SourceRepo      string   `json:"source_repo,omitempty"`
 	IsActionable    bool     `json:"is_actionable"`
 	DependencyState string   `json:"dependency_state"`
 	BlockerCount    int      `json:"blocker_count"`
@@ -571,6 +572,7 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 			Type:            string(iss.IssueType),
 			Labels:          iss.Labels,
 			Assignee:        iss.Assignee,
+			SourceRepo:      iss.SourceRepo,
 			IsActionable:    isActionable,
 			DependencyState: depState,
 			BlockerCount:    blockerCount,

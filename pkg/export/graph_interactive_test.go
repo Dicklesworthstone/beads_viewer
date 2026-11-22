@@ -750,3 +750,50 @@ func TestGenerateInteractiveGraphHTML_ExternalReadinessWithheldFlagsAndClosedArt
 		t.Fatalf("expected top active issue to receive PageRankRank == 1 even when closed hubs exist")
 	}
 }
+
+func TestGenerateInteractiveGraphHTML_SourceRepoSerializedAndFilterable(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "api-1", Title: "API auth", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, SourceRepo: "api"},
+		{ID: "web-1", Title: "Web UI", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeFeature, SourceRepo: "web"},
+	}
+	stats := analysis.NewAnalyzer(issues).AnalyzeWithConfig(analysis.FullAnalysisConfig())
+	outPath := filepath.Join(t.TempDir(), "multi_repo.html")
+	written, err := GenerateInteractiveGraphHTML(InteractiveGraphOptions{
+		Issues: issues,
+		Stats:  &stats,
+		Path:   outPath,
+	})
+	if err != nil {
+		t.Fatalf("GenerateInteractiveGraphHTML failed: %v", err)
+	}
+	raw, err := os.ReadFile(written)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	html := string(raw)
+	if !strings.Contains(html, `id="filter-repo"`) {
+		t.Fatalf("standalone interactive graph HTML missing #filter-repo control")
+	}
+	const prefix = "const DATA = "
+	start := strings.Index(html, prefix)
+	if start < 0 {
+		t.Fatalf("missing DATA payload in standalone HTML")
+	}
+	end := strings.Index(html[start+len(prefix):], ";\nconst STATUS_COLORS")
+	if end < 0 {
+		t.Fatalf("missing STATUS_COLORS terminator in standalone HTML")
+	}
+	var payload struct {
+		Nodes []graphNode `json:"nodes"`
+	}
+	if err := json.Unmarshal([]byte(html[start+len(prefix):start+len(prefix)+end]), &payload); err != nil {
+		t.Fatalf("Unmarshal DATA JSON: %v", err)
+	}
+	repos := make(map[string]string, len(payload.Nodes))
+	for _, n := range payload.Nodes {
+		repos[n.ID] = n.SourceRepo
+	}
+	if repos["api-1"] != "api" || repos["web-1"] != "web" {
+		t.Fatalf("graphNode.SourceRepo mismatch: %+v", repos)
+	}
+}

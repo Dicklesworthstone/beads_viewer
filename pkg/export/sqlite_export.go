@@ -1345,6 +1345,7 @@ func (e *SQLiteExporter) GetExportedIssues() []ExportIssue {
 			EstimatedMinutes:   estCopy,
 			CreatedBy:          issue.CreatedBy,
 			CloseReason:        issue.CloseReason,
+			SourceRepo:         issue.SourceRepo,
 		}
 
 		if m := e.Metrics; m != nil {

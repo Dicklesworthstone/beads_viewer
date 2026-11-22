@@ -310,6 +310,7 @@ class GraphStore {
             status: null,
             priority: null,
             labels: [],
+            repo: null,
             search: '',
             showClosed: true  // Default to showing all issues in static export
         };
@@ -1359,9 +1360,11 @@ function computeMetrics(layout = null) {
         }
 
         // Tarjan bridge cut-edges on active subgraph (single-link bottlenecks)
+        // Exclude antiparallel 2-node directed cycles (A->B and B->A), which are not single-edge cuts.
         if (typeof activeGraph.bridges === 'function') {
             try {
                 const rawBridges = activeGraph.bridges();
+                const activeDirEdges = buildActiveBlockingEdgeKeys();
                 const bridgeKeys = new Set();
                 if (Array.isArray(rawBridges)) {
                     for (const pair of rawBridges) {
@@ -1369,8 +1372,13 @@ function computeMetrics(layout = null) {
                         const idA = activeGraph.nodeId(pair[0]);
                         const idB = activeGraph.nodeId(pair[1]);
                         if (idA && idB) {
-                            bridgeKeys.add(`${idA}-${idB}`);
-                            bridgeKeys.add(`${idB}-${idA}`);
+                            const keyAB = edgeKey(idA, idB);
+                            const keyBA = edgeKey(idB, idA);
+                            if (activeDirEdges.has(keyAB) && activeDirEdges.has(keyBA)) {
+                                continue;
+                            }
+                            bridgeKeys.add(keyAB);
+                            bridgeKeys.add(keyBA);
                         }
                     }
                 }
@@ -1390,7 +1398,8 @@ function computeMetrics(layout = null) {
         // Cycle-break edge recommendations (active subgraph only)
         if (hasCycles && typeof activeGraph.cycleBreakSuggestions === 'function') {
             try {
-                const rawBreak = activeGraph.cycleBreakSuggestions(10, 100);
+                const maxBreakCandidates = Math.max(100, typeof activeGraph.edgeCount === 'function' ? activeGraph.edgeCount() : 100);
+                const rawBreak = activeGraph.cycleBreakSuggestions(10, maxBreakCandidates);
                 const list = rawBreak?.suggestions || rawBreak?.top_suggestions || [];
                 const resolved = [];
                 if (Array.isArray(list)) {
@@ -1402,7 +1411,7 @@ function computeMetrics(layout = null) {
                             resolved.push({
                                 from: String(from),
                                 to: String(to),
-                                edgeKey: `${from}-${to}`,
+                                edgeKey: edgeKey(String(from), String(to)),
                                 cyclesBroken: Number(item.cycles_broken ?? item.cyclesBroken ?? 1) || 1
                             });
                         }
@@ -1864,6 +1873,10 @@ function resolveCycleNodeId(idx, activeGraph) {
     return store.nodeIdByIndex?.[idx];
 }
 
+function edgeKey(from, to) {
+    return `${from}\0${to}`;
+}
+
 function buildActiveBlockingEdgeKeys() {
     const keys = new Set();
     for (const d of (store.dependencies || [])) {
@@ -1871,7 +1884,7 @@ function buildActiveBlockingEdgeKeys() {
         const srcIssue = store.nodeMap.get(d.issue_id);
         const tgtIssue = store.nodeMap.get(d.depends_on_id);
         if ((srcIssue && isResolvedIssue(srcIssue)) || (tgtIssue && isResolvedIssue(tgtIssue))) continue;
-        keys.add(`${d.issue_id}-${d.depends_on_id}`);
+        keys.add(edgeKey(d.issue_id, d.depends_on_id));
     }
     return keys;
 }
@@ -2024,10 +2037,13 @@ function prepareGraphData(layout = null) {
             if (!filters.labels.some(l => issueLabels.includes(l))) return false;
         }
 
+        // Source repo filter
+        if (filters.repo && (issue.source_repo || '') !== filters.repo) return false;
+
         // Search filter
         if (filters.search) {
             const term = filters.search.toLowerCase();
-            const searchable = `${issue.id} ${issue.title} ${issue.description || ''}`.toLowerCase();
+            const searchable = `${issue.id} ${issue.title} ${issue.description || ''} ${issue.source_repo || ''}`.toLowerCase();
             if (!searchable.includes(term)) return false;
         }
 
@@ -2048,7 +2064,7 @@ function prepareGraphData(layout = null) {
                 target: d.depends_on_id,
                 type: d.type || 'blocks',
                 blocking,
-                isBridge: blocking && Boolean(metrics.bridges?.has(`${d.issue_id}-${d.depends_on_id}`))
+                isBridge: blocking && Boolean(metrics.bridges?.has(edgeKey(d.issue_id, d.depends_on_id)))
             };
         });
 
@@ -2363,7 +2379,7 @@ function getLinkDistance(link) {
 }
 
 function getLinkColor(link) {
-    const linkId = `${link.source?.id || link.source}-${link.target?.id || link.target}`;
+    const linkId = edgeKey(link.source?.id || link.source, link.target?.id || link.target);
     const sourceNode = typeof link.source === 'object' ? link.source : store.nodeMap.get(link.source);
     const targetNode = typeof link.target === 'object' ? link.target : store.nodeMap.get(link.target);
     const srcId = sourceNode?.id || link.source;
@@ -2454,7 +2470,7 @@ function getLinkColor(link) {
 
 function getLinkOpacity(link) {
     if (store.highlightedLinks.size > 0) {
-        const linkId = `${link.source?.id || link.source}-${link.target?.id || link.target}`;
+        const linkId = edgeKey(link.source?.id || link.source, link.target?.id || link.target);
         return store.highlightedLinks.has(linkId) ? 1 : 0.15;
     }
     if (store.highlightedNodes.size > 0) {
@@ -2485,7 +2501,7 @@ function getLinkWidth(link, globalScale) {
     const targetNode = typeof link.target === 'object' ? link.target : store.nodeMap.get(link.target);
     const srcId = sourceNode?.id || link.source;
     const tgtId = targetNode?.id || link.target;
-    const linkId = `${srcId}-${tgtId}`;
+    const linkId = edgeKey(srcId, tgtId);
 
     // Cycle navigator recommended break edge gets extra emphasis (blocking edges only)
     if (link.blocking !== false && cycleNavigatorState.active && cycleNavigatorState.suggestedBreakEdgeKey === linkId) {
@@ -2502,8 +2518,8 @@ function getLinkWidth(link, globalScale) {
         return Math.max(2.5, 3 / globalScale);
     }
 
-    // Tarjan bridge cut-edges get medium emphasis
-    if (link.isBridge) {
+    // Tarjan bridge cut-edges get medium emphasis (respect heatmap & cycle precedence)
+    if (link.isBridge && !store.heatmapMode && !(sourceNode?.inCycle && targetNode?.inCycle)) {
         return Math.max(2, 2.2 / globalScale);
     }
 
@@ -2548,7 +2564,7 @@ function drawLink(link, ctx, globalScale) {
     const opacity = getLinkOpacity(link);
     const width = getLinkWidth(link, globalScale);
 
-    const linkId = `${start.id || start}-${end.id || end}`;
+    const linkId = edgeKey(start.id || start, end.id || end);
     const isSuggestedCycleBreak = link.blocking !== false && cycleNavigatorState.active && cycleNavigatorState.suggestedBreakEdgeKey === linkId;
     ctx.save();
     ctx.globalAlpha = opacity;
@@ -2558,7 +2574,7 @@ function drawLink(link, ctx, globalScale) {
         ctx.setLineDash([6 / globalScale, 3 / globalScale]);
     } else if (link.blocking === false) {
         ctx.setLineDash([4 / globalScale, 4 / globalScale]);
-    } else if (link.isBridge) {
+    } else if (link.isBridge && !store.heatmapMode && !(start?.inCycle && end?.inCycle)) {
         ctx.setLineDash([6 / globalScale, 3 / globalScale]);
     }
 
@@ -2945,7 +2961,7 @@ function animateWhatIfCascade(sourceNodesInput, result) {
                 if (!isBlockingDependency(dep) || dep.issue_id !== id) return;
                 const blocker = store.nodeMap.get(dep.depends_on_id);
                 if (sourceIdSet.has(dep.depends_on_id) || (blocker && isResolvedIssue(blocker))) {
-                    store.highlightedLinks.add(`${id}-${dep.depends_on_id}`);
+                    store.highlightedLinks.add(edgeKey(id, dep.depends_on_id));
                 }
             });
 
@@ -3007,6 +3023,9 @@ export function resetWhatIf() {
         clearTimeout(whatIfState.animationTimer);
         whatIfState.animationTimer = null;
     }
+
+    const wasActive = whatIfState.active || whatIfState.sourceNodes.length > 0 || whatIfState.unblockedNodes.size > 0;
+    if (!wasActive) return;
 
     // Clear visual states
     const graphData = store.graph?.graphData();
@@ -3202,13 +3221,17 @@ export function animateCriticalPath(animate = true) {
         return null;
     }
 
-    resetDependencyCone({ refresh: false });
-    resetCriticalPath();
-    criticalPathState.paths = computeTopCriticalPaths(5);
-    if (!criticalPathState.paths.length) {
+    const paths = computeTopCriticalPaths(5);
+    if (!paths.length) {
         showToast('No critical path found (graph may be empty or cyclic)', 'info');
         return null;
     }
+
+    resetWhatIf();
+    resetCycleNavigator();
+    resetDependencyCone({ refresh: false });
+    resetCriticalPath();
+    criticalPathState.paths = paths;
 
     return highlightCriticalPathByIndex(0, animate);
 }
@@ -3273,8 +3296,8 @@ function animateCriticalPathTraversal() {
         // Highlight the edge from previous node
         if (criticalPathState.currentStep > 0) {
             const prevNodeId = path[criticalPathState.currentStep - 1];
-            store.highlightedLinks.add(`${prevNodeId}-${nodeId}`);
-            store.highlightedLinks.add(`${nodeId}-${prevNodeId}`); // Both directions
+            store.highlightedLinks.add(edgeKey(prevNodeId, nodeId));
+            store.highlightedLinks.add(edgeKey(nodeId, prevNodeId)); // Both directions
         }
 
         refreshGraph();
@@ -3297,8 +3320,8 @@ function animateCriticalPathTraversal() {
 function highlightCriticalPathLinks() {
     const path = criticalPathState.path;
     for (let i = 0; i < path.length - 1; i++) {
-        store.highlightedLinks.add(`${path[i]}-${path[i+1]}`);
-        store.highlightedLinks.add(`${path[i+1]}-${path[i]}`);
+        store.highlightedLinks.add(edgeKey(path[i], path[i+1]));
+        store.highlightedLinks.add(edgeKey(path[i+1], path[i]));
     }
 }
 
@@ -3338,6 +3361,9 @@ export function resetCriticalPath() {
         clearTimeout(criticalPathState.animationTimer);
         criticalPathState.animationTimer = null;
     }
+
+    const wasActive = criticalPathState.active || criticalPathState.path.length > 0 || criticalPathState.paths.length > 0;
+    if (!wasActive) return;
 
     // Clear visual states
     const graphData = store.graph?.graphData();
@@ -3496,7 +3522,7 @@ export function highlightDependencyPath(node) {
         const sourceId = link.source?.id || link.source;
         const targetId = link.target?.id || link.target;
         if (store.highlightedNodes.has(sourceId) && store.highlightedNodes.has(targetId)) {
-            store.highlightedLinks.add(`${sourceId}-${targetId}`);
+            store.highlightedLinks.add(edgeKey(sourceId, targetId));
         }
     });
 
@@ -3521,6 +3547,21 @@ export function highlightCriticalPath() {
 
 export function highlightCycles() {
     if (!store.metrics.cycles?.cycles) return;
+
+    cycleNavigatorState.active = false;
+    cycleNavigatorState.cycles = [];
+    cycleNavigatorState.currentIndex = 0;
+    cycleNavigatorState.highlightedCycleNodes.clear();
+    cycleNavigatorState.highlightedCycleEdges.clear();
+    cycleNavigatorState.suggestedBreakEdgeKey = null;
+    cycleNavigatorState.suggestedBreakEdge = null;
+    const graphData = store.graph?.graphData();
+    if (graphData?.nodes) {
+        graphData.nodes.forEach(node => {
+            delete node._cycleHighlight;
+        });
+    }
+    store.highlightedLinks.clear();
 
     const activeGraph = store.activeWasmGraph || store.wasmGraph;
     const cycleNodeIndices = new Set(store.metrics.cycles.cycles.flat());
@@ -3571,6 +3612,10 @@ export function initCycleNavigator() {
         cycleNavigatorState.active = false;
         cycleNavigatorState.cycles = [];
         cycleNavigatorState.currentIndex = 0;
+        cycleNavigatorState.highlightedCycleNodes.clear();
+        cycleNavigatorState.highlightedCycleEdges.clear();
+        cycleNavigatorState.suggestedBreakEdgeKey = null;
+        cycleNavigatorState.suggestedBreakEdge = null;
         dispatchEvent('cycleNavigatorInit', { hasCycles: false, cycleCount: 0 });
         return null;
     }
@@ -3629,7 +3674,7 @@ export function highlightCycle(index, zoom = false) {
     for (let i = 0; i < cycle.length; i++) {
         const from = cycle[i];
         const to = cycle[(i + 1) % cycle.length];
-        const edgeId = `${from}-${to}`;
+        const edgeId = edgeKey(from, to);
         if (activeBlockingEdges.has(edgeId)) {
             store.highlightedLinks.add(edgeId);
             cycleNavigatorState.highlightedCycleEdges.add(edgeId);
@@ -3743,6 +3788,11 @@ export function zoomToCycle(index = cycleNavigatorState.currentIndex) {
  * Reset cycle navigator state
  */
 export function resetCycleNavigator() {
+    const wasActive = cycleNavigatorState.active ||
+        cycleNavigatorState.highlightedCycleNodes.size > 0 ||
+        cycleNavigatorState.highlightedCycleEdges.size > 0;
+    if (!wasActive) return;
+
     cycleNavigatorState.active = false;
     cycleNavigatorState.cycles = [];
     cycleNavigatorState.currentIndex = 0;
@@ -3773,14 +3823,21 @@ export function toggleCycleNavigator() {
     if (cycleNavigatorState.active && cycleNavigatorState.highlightedCycleNodes.size > 0) {
         resetCycleNavigator();
     } else {
+        const activeGraph = store.activeWasmGraph || store.wasmGraph;
+        const rawCycles = store.metrics.cycles?.cycles || [];
+        const resolvedCycles = rawCycles
+            .map(cycle => cycle.map(idx => resolveCycleNodeId(idx, activeGraph)).filter(Boolean))
+            .filter(cycle => cycle.length > 0);
+        if (resolvedCycles.length === 0) {
+            showToast('No cycles detected in the graph', 'info');
+            return;
+        }
         resetWhatIf();
         resetCriticalPath();
         resetDependencyCone({ refresh: false });
         initCycleNavigator();
         if (cycleNavigatorState.cycles.length > 0) {
             highlightCycle(0, true);
-        } else {
-            showToast('No cycles detected in the graph', 'info');
         }
     }
 }
@@ -3878,7 +3935,7 @@ function applyDependencyConeToGraphData(graphData) {
         const srcId = link.source?.id || link.source;
         const tgtId = link.target?.id || link.target;
         if (dependencyConeState.nodeIds.has(srcId) && dependencyConeState.nodeIds.has(tgtId)) {
-            store.highlightedLinks.add(`${srcId}-${tgtId}`);
+            store.highlightedLinks.add(edgeKey(srcId, tgtId));
         }
     }
 }
@@ -3975,6 +4032,30 @@ function syncOverlaysAfterGraphRebuild(graphData) {
             graphData.nodes.forEach(node => {
                 node._cycleHighlight = cycleNavigatorState.highlightedCycleNodes.has(node.id);
             });
+            const prevBreakKey = cycleNavigatorState.suggestedBreakEdgeKey;
+            const prevBreak = cycleNavigatorState.suggestedBreakEdge;
+            if (prevBreak && (!nodeById.has(prevBreak.from) || !nodeById.has(prevBreak.to))) {
+                let nextBreak = null;
+                for (const suggestion of (store.metrics.cycleBreakSuggestions || [])) {
+                    if (cycleNavigatorState.highlightedCycleEdges.has(suggestion.edgeKey) &&
+                        nodeById.has(suggestion.from) && nodeById.has(suggestion.to)) {
+                        nextBreak = suggestion;
+                        break;
+                    }
+                }
+                cycleNavigatorState.suggestedBreakEdge = nextBreak;
+                cycleNavigatorState.suggestedBreakEdgeKey = nextBreak ? nextBreak.edgeKey : null;
+                if (prevBreakKey !== cycleNavigatorState.suggestedBreakEdgeKey) {
+                    const cycle = cycleNavigatorState.cycles[cycleNavigatorState.currentIndex] || [];
+                    dispatchEvent('cycleHighlightChange', {
+                        currentIndex: cycleNavigatorState.currentIndex,
+                        cycleCount: cycleNavigatorState.cycles.length,
+                        cycle,
+                        cyclePath: formatCyclePath(cycle),
+                        suggestedBreakEdge: cycleNavigatorState.suggestedBreakEdge
+                    });
+                }
+            }
         }
     }
 
@@ -4021,12 +4102,28 @@ function syncOverlaysAfterGraphRebuild(graphData) {
     }
 }
 
+function countVisibleGraphNodes(graphData) {
+    const nodes = graphData?.nodes || [];
+    let open = 0;
+    let closed = 0;
+    for (const n of nodes) {
+        if (isResolvedIssue(n)) closed++;
+        else open++;
+    }
+    return {
+        visibleCount: nodes.length,
+        openCount: open,
+        closedCount: closed,
+        totalCount: store.issues.length
+    };
+}
+
 export function setFilter(key, value) {
     store.filters[key] = value;
     const graphData = prepareGraphData();
     store.graph.graphData(graphData);
     syncOverlaysAfterGraphRebuild(graphData);
-    dispatchEvent('filterChange', { filters: { ...store.filters } });
+    dispatchEvent('filterChange', { filters: { ...store.filters }, ...countVisibleGraphNodes(graphData) });
 }
 
 export function clearFilters() {
@@ -4034,13 +4131,14 @@ export function clearFilters() {
         status: null,
         priority: null,
         labels: [],
+        repo: null,
         search: '',
         showClosed: true  // Reset to showing all issues
     };
     const graphData = prepareGraphData();
     store.graph.graphData(graphData);
     syncOverlaysAfterGraphRebuild(graphData);
-    dispatchEvent('filterChange', { filters: { ...store.filters } });
+    dispatchEvent('filterChange', { filters: { ...store.filters }, ...countVisibleGraphNodes(graphData) });
 }
 
 export function search(term) {
@@ -4754,6 +4852,7 @@ function showTooltip(node) {
             <span style="color: ${priorityColor}; font-weight: 600;">
                 P${escapeHtml(String(node.priority))}
             </span>
+            ${node.sourceRepo ? `<span style="background: ${THEME.bgTertiary}; color: ${THEME.accent.cyan}; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: 600;">${escapeHtml(node.sourceRepo)}</span>` : ''}
             ${node.isArticulationPoint ? `<span style="background: ${(THEME.accent.orange || '#ffb86c')}33; color: ${THEME.accent.orange || '#ffb86c'}; padding: 2px 6px; border-radius: 4px; font-size: 10px; font-weight: 600;">ARTICULATION</span>` : ''}
         </div>
         <div style="font-size: 10px; color: ${THEME.fgMuted}; display: grid; grid-template-columns: 1fr 1fr; gap: 4px;">

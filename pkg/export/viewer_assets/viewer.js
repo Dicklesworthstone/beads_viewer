@@ -220,6 +220,10 @@ const DB_STATE = {
   fts5: null,           // Actual browser SQLite capability, not exported schema.
   jsonEach: null,       // Cached SQLite json_each() table-valued function capability
   jsonEachDb: null,     // DB instance associated with jsonEach capability
+  overviewCols: null,   // Cached Set of lowercased issue_overview_mv columns
+  overviewColsDb: null, // DB instance associated with overviewCols
+  ftsCols: null,        // Cached ordered Array of lowercased issues_fts columns
+  ftsColsDb: null,      // DB instance associated with ftsCols
   referenceNowMs: null, // Snapshot reference timestamp (ms) for deterministic recency scoring
   referenceDb: null,    // DB instance associated with referenceNowMs
 };
@@ -1433,28 +1437,47 @@ function buildClosedSet() {
 }
 
 function getOverviewColumnSet() {
+  if (!DB_STATE.db) return new Set();
+  if (DB_STATE.overviewColsDb === DB_STATE.db && DB_STATE.overviewCols instanceof Set) {
+    return DB_STATE.overviewCols;
+  }
+  let cols = new Set();
   try {
-    return new Set(
-      execQuery('PRAGMA table_info(issue_overview_mv)').map(r => String(r.name || '').toLowerCase())
+    cols = new Set(
+      execQuery('PRAGMA table_info(issue_overview_mv)').map(r => String(r.name || '').toLowerCase()).filter(Boolean)
     );
   } catch {
-    return new Set();
+    cols = new Set();
   }
+  DB_STATE.overviewColsDb = DB_STATE.db;
+  DB_STATE.overviewCols = cols;
+  return cols;
 }
 
 function hasSourceRepoColumn() {
   return getOverviewColumnSet().has('source_repo');
 }
 
-function getFtsColumnSet() {
-  if (!supportsFTS5()) return new Set();
-  try {
-    return new Set(
-      execQuery('PRAGMA table_info(issues_fts)').map(r => String(r.name || '').toLowerCase())
-    );
-  } catch {
-    return new Set();
+function getFtsColumnList() {
+  if (!DB_STATE.db || !supportsFTS5()) return [];
+  if (DB_STATE.ftsColsDb === DB_STATE.db && Array.isArray(DB_STATE.ftsCols)) {
+    return DB_STATE.ftsCols;
   }
+  let cols = [];
+  try {
+    cols = execQuery('PRAGMA table_info(issues_fts)')
+      .map(r => String(r.name || '').toLowerCase())
+      .filter(Boolean);
+  } catch {
+    cols = [];
+  }
+  DB_STATE.ftsColsDb = DB_STATE.db;
+  DB_STATE.ftsCols = cols;
+  return cols;
+}
+
+function getFtsColumnSet() {
+  return new Set(getFtsColumnList());
 }
 
 function getOverviewWithheldGuardSQL() {
@@ -2524,11 +2547,26 @@ function getGraphViewData() {
 /**
  * Full-text search using FTS5 (if available)
  */
-const BM25_WEIGHTS_LEGACY = '3.0, 2.0, 1.0, 1.5, 0.5, 0.8, 0.8, 0.8, 1.0'; // 9 cols
-const BM25_WEIGHTS = '3.0, 2.0, 1.0, 1.5, 0.5, 0.8, 0.8, 0.8, 1.0, 0.8'; // id, title, description, labels, assignee, notes, design, acceptance_criteria, external_ref, source_repo
+const BM25_COLUMN_WEIGHTS = {
+  id: 3.0,
+  title: 2.0,
+  description: 1.0,
+  labels: 1.5,
+  assignee: 0.5,
+  notes: 0.8,
+  design: 0.8,
+  acceptance_criteria: 0.8,
+  external_ref: 1.0,
+  source_repo: 0.8,
+};
 function getBM25Expr() {
-  const ftsCols = getFtsColumnSet();
-  const weights = ftsCols.has('source_repo') ? BM25_WEIGHTS : BM25_WEIGHTS_LEGACY;
+  const ftsCols = getFtsColumnList();
+  if (ftsCols.length === 0) {
+    return 'bm25(issues_fts)';
+  }
+  const weights = ftsCols
+    .map(col => (BM25_COLUMN_WEIGHTS[col] ?? 0.5).toFixed(1))
+    .join(', ');
   return `bm25(issues_fts, ${weights})`;
 }
 
@@ -4686,6 +4724,18 @@ function beadsApp() {
     graphWhatIfTransitiveUnblocks: 0,
     graphWhatIfUnblockedIds: [],
     graphWhatIfBatchIds: [],
+    graphFiltersOpen: false,
+    graphFilters: {
+      status: '',
+      priority: '',
+      label: '',
+      repo: '',
+      search: '',
+      showClosed: true,
+    },
+    graphVisibleTotal: 0,
+    graphVisibleOpen: 0,
+    graphVisibleClosed: 0,
 
     // Graph loading stages: 'init' | 'loading-data' | 'computing-metrics' | 'simulating' | null
     graphLoadingStage: null,
@@ -4824,6 +4874,23 @@ function beadsApp() {
           document.querySelectorAll('.metric-tooltip-trigger.tooltip-open').forEach(el => el.classList.remove('tooltip-open'));
         }
         if (this.graphContextMenu?.open && !e.target?.closest?.('#graph-context-menu')) {
+          this.graphContextMenu = { open: false, x: 0, y: 0, node: null };
+        }
+      });
+
+      // Dismiss graph context menu on right-click outside the menu, canvas pan/wheel, or window resize
+      document.addEventListener('contextmenu', (e) => {
+        if (this.graphContextMenu?.open && !e.target?.closest?.('#graph-context-menu')) {
+          this.graphContextMenu = { open: false, x: 0, y: 0, node: null };
+        }
+      }, true);
+      document.addEventListener('wheel', (e) => {
+        if (this.graphContextMenu?.open && !e.target?.closest?.('#graph-context-menu')) {
+          this.graphContextMenu = { open: false, x: 0, y: 0, node: null };
+        }
+      }, { passive: true });
+      window.addEventListener('resize', () => {
+        if (this.graphContextMenu?.open) {
           this.graphContextMenu = { open: false, x: 0, y: 0, node: null };
         }
       });
@@ -5455,13 +5522,35 @@ function beadsApp() {
           document.addEventListener('bv-graph:nodeContextMenu', (e) => {
             const node = e.detail?.node;
             if (!node) return;
-            const rawX = Number(e.detail?.x ?? e.detail?.event?.clientX ?? 16);
-            const rawY = Number(e.detail?.y ?? e.detail?.event?.clientY ?? 16);
+            const parsedX = Number(e.detail?.x ?? e.detail?.event?.clientX);
+            const parsedY = Number(e.detail?.y ?? e.detail?.event?.clientY);
+            const rawX = Number.isFinite(parsedX) ? parsedX : 16;
+            const rawY = Number.isFinite(parsedY) ? parsedY : 16;
             const menuWidth = 224;
             const menuHeight = 232;
             const clampedX = Math.max(8, Math.min(rawX, (window.innerWidth || 1024) - menuWidth - 8));
             const clampedY = Math.max(8, Math.min(rawY, (window.innerHeight || 768) - menuHeight - 8));
             this.graphContextMenu = { open: true, x: clampedX, y: clampedY, node };
+          });
+          document.addEventListener('bv-graph:filterChange', (e) => {
+            const detail = e.detail || {};
+            if (Number.isFinite(detail.visibleCount)) {
+              this.graphVisibleTotal = detail.visibleCount;
+              this.graphVisibleOpen = Number(detail.openCount || 0);
+              this.graphVisibleClosed = Number(detail.closedCount || 0);
+            } else {
+              this.syncGraphVisibleCounts();
+            }
+            if (detail.filters) {
+              this.graphFilters = {
+                status: detail.filters.status || '',
+                priority: detail.filters.priority !== null && detail.filters.priority !== undefined ? String(detail.filters.priority) : '',
+                label: Array.isArray(detail.filters.labels) && detail.filters.labels.length > 0 ? String(detail.filters.labels[0]) : '',
+                repo: detail.filters.repo || '',
+                search: detail.filters.search || '',
+                showClosed: detail.filters.showClosed !== false,
+              };
+            }
           });
           document.addEventListener('bv-graph:selectionChange', (e) => {
             if (e.detail?.node) {
@@ -5569,7 +5658,9 @@ function beadsApp() {
         this.graphSimulationDone = false;
 
         console.log(`[ForceGraph] Loading ${issues.length} issues, ${dependencies.length} dependencies`);
+        this.graphFilters = { status: '', priority: '', label: '', repo: '', search: '', showClosed: true };
         this.forceGraphModule.loadData(issues, dependencies, precomputedLayout);
+        this.syncGraphVisibleCounts(this.forceGraphModule.getGraph?.()?.graphData?.()?.nodes || issues);
 
         // Try to load history data for time-travel feature (bv-z38b)
         // Use cache-busting to avoid stale data from CDN
@@ -5800,6 +5891,72 @@ function beadsApp() {
       this.criticalPathData = null;
       this.criticalPathAnimationStep = -1;
       this.applyFilter();
+    },
+
+    clearRepoFilter() {
+      this.filters.repo = '';
+      this.applyFilter();
+    },
+
+    get hasActiveGraphFilters() {
+      return Boolean(
+        this.graphFilters.status ||
+        this.graphFilters.priority !== '' ||
+        this.graphFilters.label ||
+        this.graphFilters.repo ||
+        (this.graphFilters.search || '').trim() ||
+        this.graphFilters.showClosed === false
+      );
+    },
+
+    syncGraphVisibleCounts(nodes = null) {
+      const list = Array.isArray(nodes)
+        ? nodes
+        : (this.forceGraphModule?.getGraph?.()?.graphData?.()?.nodes || []);
+      let open = 0;
+      let closed = 0;
+      for (const n of list) {
+        const st = String(n?.status || 'open').toLowerCase();
+        if (st === 'closed' || st === 'tombstone') closed++;
+        else open++;
+      }
+      this.graphVisibleTotal = list.length;
+      this.graphVisibleOpen = open;
+      this.graphVisibleClosed = closed;
+    },
+
+    applyGraphFilter(key, value) {
+      if (!this.forceGraphModule?.setFilter || !this.forceGraphReady) return;
+      this.graphFilters = { ...this.graphFilters, [key]: value };
+      switch (key) {
+        case 'status':
+          this.forceGraphModule.setFilter('status', value || null);
+          break;
+        case 'priority':
+          this.forceGraphModule.setFilter('priority', value === '' || value === null || value === undefined ? null : Number(value));
+          break;
+        case 'label':
+          this.forceGraphModule.setFilter('labels', value ? [value] : []);
+          break;
+        case 'repo':
+          this.forceGraphModule.setFilter('repo', value || null);
+          break;
+        case 'search':
+          this.forceGraphModule.setFilter('search', String(value || ''));
+          break;
+        case 'showClosed':
+          this.forceGraphModule.setFilter('showClosed', Boolean(value));
+          break;
+        default:
+          break;
+      }
+    },
+
+    clearGraphFilters() {
+      this.graphFilters = { status: '', priority: '', label: '', repo: '', search: '', showClosed: true };
+      if (this.forceGraphModule?.clearFilters && this.forceGraphReady) {
+        this.forceGraphModule.clearFilters();
+      }
     },
 
     /**
@@ -6772,7 +6929,10 @@ function beadsApp() {
       if (!nodeId) return false;
       this.closeGraphContextMenu();
       const ready = await this.initForceGraph();
-      if (!ready) return false;
+      if (!ready || !this.graphReady) {
+        showToast('What-If simulation requires WASM graph engine', 'info');
+        return false;
+      }
       const result = this.forceGraphModule?.performWhatIf?.(nodeId);
       return Boolean(result);
     },
@@ -6780,6 +6940,12 @@ function beadsApp() {
     async toggleGraphWhatIfBatch(nodeId) {
       if (!nodeId) return;
       this.closeGraphContextMenu();
+      const ready = await this.initForceGraph();
+      if (!ready || !this.graphReady) {
+        showToast('What-If simulation requires WASM graph engine', 'info');
+        return;
+      }
+      const prevBatchIds = [...this.graphWhatIfBatchIds];
       const idx = this.graphWhatIfBatchIds.indexOf(nodeId);
       if (idx === -1) {
         this.graphWhatIfBatchIds = [...this.graphWhatIfBatchIds, nodeId];
@@ -6793,7 +6959,10 @@ function beadsApp() {
         return;
       }
       if (this.graphWhatIfActive || this.graphWhatIfBatchIds.length >= 2) {
-        await this.runGraphWhatIfBatch();
+        const ok = await this.runGraphWhatIfBatch();
+        if (!ok) {
+          this.graphWhatIfBatchIds = prevBatchIds;
+        }
       }
     },
 
@@ -6802,7 +6971,10 @@ function beadsApp() {
       if (batchIds.length === 0) return false;
       this.closeGraphContextMenu();
       const ready = await this.initForceGraph();
-      if (!ready) return false;
+      if (!ready || !this.graphReady) {
+        showToast('What-If simulation requires WASM graph engine', 'info');
+        return false;
+      }
       const res = batchIds.length === 1
         ? this.forceGraphModule?.performWhatIf?.(batchIds[0])
         : this.forceGraphModule?.performBatchWhatIf?.(batchIds);

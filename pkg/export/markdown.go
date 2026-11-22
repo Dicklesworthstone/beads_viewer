@@ -590,6 +590,8 @@ func writeCSVReport(selected, context []model.Issue, opts ReportOptions, metrics
 			return csvColSpec{key: "labels", header: "labels", render: func(i model.Issue) string { return strings.Join(i.Labels, ";") }}, true
 		case "assignee":
 			return csvColSpec{key: "assignee", header: "assignee", render: func(i model.Issue) string { return strings.TrimSpace(i.Assignee) }}, true
+		case "repo", "source_repo":
+			return csvColSpec{key: "source_repo", header: "source_repo", render: func(i model.Issue) string { return strings.TrimSpace(i.SourceRepo) }}, true
 		case "created", "created_at":
 			return csvColSpec{
 				key:    "created_at",
@@ -1181,6 +1183,15 @@ func groupMarkdownIssues(issues []model.Issue, groupBy string) []markdownIssueGr
 				addToBucket(strings.ToLower(primary), 0, primary, idx)
 			}
 		}
+	case "repo", "source_repo":
+		for idx, iss := range issues {
+			clean := sanitizeGroupHeading(iss.SourceRepo)
+			if clean == "" {
+				addToBucket("~default-repo", 1, "Default Repo", idx)
+			} else {
+				addToBucket(strings.ToLower(clean), 0, clean, idx)
+			}
+		}
 	default:
 		return nil
 	}
@@ -1262,6 +1273,17 @@ func writeSummaryTable(sb *strings.Builder, issues []model.Issue, opts ReportOpt
 					return "@" + escapeTableText(clean)
 				},
 			}, "assignee", true
+		case "repo", "source_repo":
+			return summaryColumnSpec{
+				header: "Repo",
+				render: func(i model.Issue) string {
+					clean := strings.TrimSpace(i.SourceRepo)
+					if clean == "" {
+						return "-"
+					}
+					return escapeTableText(clean)
+				},
+			}, "source_repo", true
 		case "label", "labels", "tag", "tags":
 			return summaryColumnSpec{
 				header: "Labels",
@@ -1420,6 +1442,9 @@ func writeMarkdownIssueSection(sb *strings.Builder, i model.Issue, slug string, 
 	sb.WriteString(fmt.Sprintf("| **Status** | %s %s |\n", getStatusEmoji(string(i.Status)), escapeTableText(string(i.Status))))
 	if i.Assignee != "" {
 		sb.WriteString(fmt.Sprintf("| **Assignee** | @%s |\n", escapeTableText(i.Assignee)))
+	}
+	if strings.TrimSpace(i.SourceRepo) != "" {
+		sb.WriteString(fmt.Sprintf("| **Repo** | %s |\n", escapeTableText(i.SourceRepo)))
 	}
 	if strings.TrimSpace(i.CreatedBy) != "" {
 		sb.WriteString(fmt.Sprintf("| **Created By** | %s |\n", escapeTableText(i.CreatedBy)))
@@ -1741,6 +1766,9 @@ func GenerateHTMLReport(issues []model.Issue, title string, opts ReportOptions) 
 		sb.WriteString(fmt.Sprintf("<tr><th>Status</th><td>%s</td></tr>\n", html.EscapeString(string(iss.Status))))
 		if iss.Assignee != "" {
 			sb.WriteString(fmt.Sprintf("<tr><th>Assignee</th><td>@%s</td></tr>\n", html.EscapeString(iss.Assignee)))
+		}
+		if strings.TrimSpace(iss.SourceRepo) != "" {
+			sb.WriteString(fmt.Sprintf("<tr><th>Repo</th><td>%s</td></tr>\n", html.EscapeString(iss.SourceRepo)))
 		}
 		if strings.TrimSpace(iss.CreatedBy) != "" {
 			sb.WriteString(fmt.Sprintf("<tr><th>Created By</th><td>%s</td></tr>\n", html.EscapeString(iss.CreatedBy)))

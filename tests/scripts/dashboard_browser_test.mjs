@@ -11,7 +11,7 @@ import path from 'node:path';
 import http from 'node:http';
 import { spawn } from 'node:child_process';
 
-const [browser, bundle, artifacts, mode = 'journeys', updatedBundle, projectBundle, capabilitiesBundle] = process.argv.slice(2);
+const [browser, bundle, artifacts, mode = 'journeys', updatedBundle, projectBundle, capabilitiesBundle, multiRepoBundle] = process.argv.slice(2);
 assert.ok(browser && bundle && artifacts, 'browser, bundle, artifacts required');
 assert.ok(['journeys', 'offline-only', 'blocking-types', 'what-if', 'hits', 'readiness', 'metric-visibility', 'suggestion-visibility', 'layout-seeds', 'precomputed-metrics', 'graph-startup', 'graph-reload', 'history-loading', 'timeline', 'timeline-controls', 'timeline-baseline', 'timeline-removal', 'timeline-animation', 'timeline-sprints', 'timeline-performance'].includes(mode), 'unknown browser test mode');
 fs.mkdirSync(artifacts, { recursive: true });
@@ -1384,6 +1384,30 @@ async function journey(page, mobile) {
   const point = await evaluate(page, `(() => { const g=${app}.forceGraphModule.getGraph(); const n=g.graphData().nodes.find(n=>n.id==='browser-root'); const p=g.graph2ScreenCoords(n.x,n.y); const r=document.querySelector('#graph-container canvas').getBoundingClientRect(); return {x:r.x+p.x,y:r.y+p.y}; })()`);
   for (const type of ['mousePressed', 'mouseReleased']) await send('Input.dispatchMouseEvent', { type, ...point, button: 'left', clickCount: 1 }, page.session);
   await waitFor(page, `${app}.graphDetailNode?.id === 'browser-root'`, 'graph pointer selects actual root node');
+  const detailHeaderLayout = await evaluate(page, `(() => {
+    const closeBtn = document.querySelector('button[title="Close detail pane (Esc)"]');
+    const whatIfBtn = document.querySelector('#graph-whatif-btn');
+    const batchBtn = document.querySelector('#graph-whatif-batch-btn');
+    const coneBtn = document.querySelector('#graph-focus-cone-btn');
+    const rectOf = el => {
+      if (!el) return null;
+      const r = el.getBoundingClientRect();
+      return { visible: (${visible})(el), left: r.left, right: r.right, width: r.width, height: r.height };
+    };
+    return {
+      innerWidth: window.innerWidth,
+      close: rectOf(closeBtn),
+      whatIf: rectOf(whatIfBtn),
+      batch: rectOf(batchBtn),
+      cone: rectOf(coneBtn),
+    };
+  })()`);
+  assert.ok(detailHeaderLayout.close?.visible && detailHeaderLayout.close.right <= detailHeaderLayout.innerWidth + 1,
+    `${page.name}: graphDetailNode Close button stays visible and unclipped: ${JSON.stringify(detailHeaderLayout)}`);
+  assert.ok(detailHeaderLayout.whatIf?.visible && detailHeaderLayout.batch?.visible && detailHeaderLayout.cone?.visible,
+    `${page.name}: graphDetailNode action buttons stay visible: ${JSON.stringify(detailHeaderLayout)}`);
+  assert.ok(detailHeaderLayout.cone.right <= detailHeaderLayout.innerWidth + 1,
+    `${page.name}: graphDetailNode action bar fits inside viewport width: ${JSON.stringify(detailHeaderLayout)}`);
   await capture(page, 'graph');
   assert.ok(await evaluate(page, 'document.documentElement.scrollWidth <= innerWidth + 1'), 'no horizontal loss at viewport width');
   await send('Page.navigate', { url: origin + '/#/issue/browser-detail' }, page.session);
@@ -3327,17 +3351,40 @@ async function capabilitiesJourney(page) {
     const graphData = ${app}.forceGraphModule.getGraph().graphData();
     const hubLeaf = graphData.nodes.find(n => n.id === 'cap-hub-leaf');
     const authRoot = graphData.nodes.find(n => n.id === 'cap-auth-root');
-    const bridgeCount = graphData.links.filter(l => l.isBridge).length;
+    const bridgeLinks = graphData.links.filter(l => l.isBridge).map(l => [l.source?.id || l.source, l.target?.id || l.target]);
+    const hasTwoNodeCycleBridge = bridgeLinks.some(([s, t]) =>
+      (s === 'cap-auth-root' && t === 'cap-auth-ui') || (s === 'cap-auth-ui' && t === 'cap-auth-root') ||
+      (s === 'cap-billing-a' && t === 'cap-billing-b') || (s === 'cap-billing-b' && t === 'cap-billing-a')
+    );
+    const colsCached1 = getOverviewColumnSet();
+    const colsCached2 = getOverviewColumnSet();
     return {
       hasHubLeaf: Boolean(hubLeaf),
       hasAuthRoot: Boolean(authRoot),
-      bridgeCount,
+      bridgeCount: bridgeLinks.length,
+      hasTwoNodeCycleBridge,
+      overviewColsCached: colsCached1 === colsCached2 && colsCached1.has('source_repo'),
       listenersBound: Boolean(${app}._graphListenersBound),
     };
   })()`);
   assert.equal(wave23GraphAudit.hasHubLeaf && wave23GraphAudit.hasAuthRoot, true, 'graph nodes loaded');
   assert.ok(wave23GraphAudit.bridgeCount >= 1, `expected >=1 Tarjan bridge cut-edge on capabilities graph (cap-hub-leaf -> cap-auth-root), got ${wave23GraphAudit.bridgeCount}`);
+  assert.equal(wave23GraphAudit.hasTwoNodeCycleBridge, false, 'bidirectional 2-node cycles are never flagged as single-edge Tarjan bridges');
+  assert.equal(wave23GraphAudit.overviewColsCached, true, 'PRAGMA table_info(issue_overview_mv) column set is cached per DB instance');
   assert.equal(wave23GraphAudit.listenersBound, true, 'graph document listeners guarded by _graphListenersBound');
+
+  // Wave 24 Graph Filter HUD: toggle panel, filter status=closed, verify live counts, reset!
+  await click(page, '#graph-filter-toggle-btn');
+  await waitFor(page, `(${visible})(document.querySelector('#graph-filter-hud'))`, 'Graph Filter HUD opens');
+  await evaluate(page, `(() => {
+    const sel = document.getElementById('graph-filter-status');
+    sel.value = 'closed';
+    sel.dispatchEvent(new Event('change', { bubbles: true }));
+  })()`);
+  await waitFor(page, `${app}.graphVisibleTotal === 1 && ${app}.graphVisibleOpen === 0 && ${app}.graphVisibleClosed === 1`, 'Graph Filter HUD updates live visible node counts');
+  await click(page, '#graph-filter-clear');
+  await waitFor(page, `${app}.graphVisibleTotal === 6 && ${app}.graphVisibleOpen === 5 && ${app}.graphVisibleClosed === 1`, 'Graph Filter HUD Reset restores all graph nodes');
+  await click(page, '#graph-filter-toggle-btn');
 
   // Toggle Cycle Navigator -> #graph-cycle-hud shows cycle counter AND recommended break edge!
   await evaluate(page, `${app}.forceGraphModule.toggleCycleNavigator()`);
@@ -3345,7 +3392,14 @@ async function capabilitiesJourney(page) {
   const breakEdge = await evaluate(page, `JSON.parse(JSON.stringify(${app}.currentCycleBreakEdge))`);
   assert.ok(breakEdge.from && breakEdge.to, `recommended cycle break edge populated: ${JSON.stringify(breakEdge)}`);
 
-  // Dispatch bv-graph:nodeContextMenu while Cycle Navigator is active -> Escape closes ONLY the context menu, keeping Cycle Navigator intact!
+  // Dispatch bv-graph:nodeContextMenu with NaN & huge coordinates -> clamps safely; Escape closes ONLY context menu, keeping Cycle Navigator intact!
+  await evaluate(page, `(() => {
+    const node = ${app}.forceGraphModule.getGraph().graphData().nodes.find(n => n.id === 'cap-auth-root');
+    document.dispatchEvent(new CustomEvent('bv-graph:nodeContextMenu', { detail: { node, x: NaN, y: Infinity } }));
+  })()`);
+  await waitFor(page, `${app}.graphContextMenu.open && Number.isFinite(${app}.graphContextMenu.x) && Number.isFinite(${app}.graphContextMenu.y)`, 'NaN context menu coords safely fall back to finite clamped position');
+  await evaluate(page, `document.getElementById('graph-container')?.dispatchEvent(new WheelEvent('wheel', { deltaY: 120, bubbles: true }))`);
+  await waitFor(page, `!${app}.graphContextMenu.open`, 'canvas wheel zoom dismisses open context menu');
   await evaluate(page, `(() => {
     const node = ${app}.forceGraphModule.getGraph().graphData().nodes.find(n => n.id === 'cap-auth-root');
     document.dispatchEvent(new CustomEvent('bv-graph:nodeContextMenu', { detail: { node, x: 99999, y: 99999 } }));
@@ -3366,6 +3420,9 @@ async function capabilitiesJourney(page) {
   await click(page, '#graph-context-menu button span', 'What-If Close');
   await waitFor(page, `!${app}.graphContextMenu.open && ${app}.graphWhatIfActive && !${app}.cycleNavigatorActive && (${visible})(document.querySelector('#graph-whatif-hud'))`, 'What-If HUD opens from context menu and clears competing Cycle Navigator');
   assert.deepEqual(await evaluate(page, `[...${app}.graphWhatIfBatchIds]`), ['cap-auth-root'], 'graphWhatIfBatchIds stays synced with active What-If');
+  // Calling no-op animateCriticalPath on cyclic graph must NOT tear down active What-If highlight!
+  await evaluate(page, `${app}.forceGraphModule.animateCriticalPath(false)`);
+  assert.equal(await evaluate(page, `${app}.graphWhatIfActive`), true, 'no-op animateCriticalPath on cyclic graph preserves active What-If overlay');
   await click(page, '#graph-whatif-hud button', 'Reset');
   await waitFor(page, `!${app}.graphWhatIfActive && ${app}.graphWhatIfBatchIds.length === 0`, 'What-If HUD Reset clears active simulation and batch queue');
 
@@ -3752,6 +3809,71 @@ async function standaloneGraphJourney(page) {
   clean(page);
   console.log(`PASS: ${page.name} standalone HTML graph filters, blocked colors, active-only critical badge, addToRecent, heatmap dimming, and Path Finder ON/OFF reset`);
 }
+
+async function multiRepoJourney(page, standalonePage) {
+  await waitFor(page, `typeof Alpine !== 'undefined' && !${app}.loading && ${app}.stats.total === 4 && ${app}.graphReady`, 'multi-repo bundle booted');
+  await waitFor(page, '!!navigator.serviceWorker.controller', 'multi-repo worker controls page');
+  await delay(400);
+  await waitFor(page, `typeof Alpine !== 'undefined' && !${app}.loading && ${app}.stats.total === 4`, 'multi-repo app ready');
+
+  await click(page, 'a[href="#/issues"]');
+  await waitFor(page, `${app}.view === 'issues' && (${visible})(document.querySelector('#filter-repo-select'))`, 'multi-repo #filter-repo-select visible in Issues view');
+  assert.deepEqual(await evaluate(page, `[...${app}.filterOptions.repos]`), ['api', 'web'], 'filterOptions.repos contains sorted multi-repo values');
+
+  // Select 'api' via dropdown -> filters Issues, updates ?repo=api URL, displays removable #active-repo-filter-pill!
+  await evaluate(page, `(() => {
+    const sel = document.getElementById('filter-repo-select');
+    sel.value = 'api';
+    sel.dispatchEvent(new Event('change', { bubbles: true }));
+  })()`);
+  await waitFor(page, `${app}.filters.repo === 'api' && window.location.hash.includes('repo=api') && (${visible})(document.querySelector('#active-repo-filter-pill'))`, 'repo filter updates URL and active pill');
+  await resultIDs(page, ['api-auth', 'api-health']);
+
+  // Click removable Repo pill -> clears filter cleanly!
+  await click(page, '#active-repo-filter-pill');
+  await waitFor(page, `${app}.filters.repo === '' && !window.location.hash.includes('repo=')`, 'clicking Repo pill clears repo filter');
+  await resultIDs(page, ['api-auth', 'api-health', 'web-login', 'web-settings']);
+
+  // Click repo badge on issue card -> toggles filter on, clicking again toggles off!
+  await click(page, 'span[title="Filter by repository: web"]', 'web');
+  await waitFor(page, `${app}.filters.repo === 'web'`, 'repo badge click filters web');
+  await resultIDs(page, ['web-login', 'web-settings']);
+  await click(page, 'span[title="Filter by repository: web"]', 'web');
+  await waitFor(page, `${app}.filters.repo === ''`, 'second repo badge click clears filter');
+
+  // Graph View: #graph-filter-repo filters nodes & updates live counts, and graphDetailNode shows sourceRepo!
+  await click(page, 'a[href="#/graph"]');
+  await waitFor(page, `${app}.view === 'graph' && ${app}.forceGraphReady && !${app}.forceGraphLoading && !!document.querySelector('#graph-container canvas')`, 'multi-repo graph ready');
+  await click(page, '#graph-filter-toggle-btn');
+  await waitFor(page, `(${visible})(document.querySelector('#graph-filter-repo'))`, 'Graph Filter HUD shows #graph-filter-repo for multi-repo export');
+  await evaluate(page, `(() => {
+    const sel = document.getElementById('graph-filter-repo');
+    sel.value = 'api';
+    sel.dispatchEvent(new Event('change', { bubbles: true }));
+  })()`);
+  await waitFor(page, `${app}.graphVisibleTotal === 2 && ${app}.graphVisibleOpen === 1 && ${app}.graphVisibleClosed === 1`, 'Graph Filter HUD repo=api shows 2 api nodes (1 open, 1 closed)');
+  await evaluate(page, `${app}.forceGraphModule.selectNode('api-auth')`);
+  await waitFor(page, `${app}.graphDetailNode?.id === 'api-auth' && ${app}.graphDetailNode?.sourceRepo === 'api'`, 'graphDetailNode exposes sourceRepo');
+  await click(page, '#graph-filter-clear');
+  await waitFor(page, `${app}.graphVisibleTotal === 4`, 'Graph Filter HUD Reset restores all 4 multi-repo nodes');
+  clean(page);
+
+  // Standalone multi-repo HTML graph shows #filter-repo and filters DATA.nodes!
+  await waitFor(standalonePage, `typeof Graph !== 'undefined' && DATA.nodes.length === 4`, 'multi-repo standalone HTML booted');
+  const standaloneRepoAudit = await evaluate(standalonePage, `(() => {
+    const sel = document.getElementById('filter-repo');
+    const shown = Boolean(sel && sel.style.display !== 'none' && sel.options.length === 3);
+    sel.value = 'web';
+    sel.dispatchEvent(new Event('change', { bubbles: true }));
+    const webCount = DATA.nodes.filter(n => currentVisibilityFilter(n)).length;
+    document.getElementById('btn-reset').click();
+    const resetCount = DATA.nodes.filter(n => currentVisibilityFilter(n)).length;
+    return { shown, webCount, resetCount };
+  })()`);
+  assert.deepEqual(standaloneRepoAudit, { shown: true, webCount: 2, resetCount: 4 }, 'standalone HTML #filter-repo filters and resets multi-repo nodes');
+  clean(standalonePage);
+  console.log('PASS: multi-repo Issues dropdown/pill/badge/URL, Graph Filter HUD repo filter, and standalone HTML repo filter');
+}
 try {
   const stderr = fs.createWriteStream(path.join(artifacts, 'chrome.stderr'));
   chrome = spawn(browser, ['--headless=new', '--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage',
@@ -3859,6 +3981,14 @@ try {
     const standalone = await openPage('standalone-graph', 1280, false, '/standalone-graph.html');
     await standaloneGraphJourney(standalone);
     await send('Target.closeTarget', { targetId: standalone.target });
+    if (multiRepoBundle) {
+      activeBundle = multiRepoBundle;
+      const multi = await openPage('multi-repo');
+      const multiStandalone = await openPage('multi-repo-standalone', 1280, false, '/standalone-graph.html');
+      await multiRepoJourney(multi, multiStandalone);
+      await send('Target.closeTarget', { targetId: multi.target });
+      await send('Target.closeTarget', { targetId: multiStandalone.target });
+    }
     activeBundle = bundle;
   }
   const desktop = await openPage('desktop');

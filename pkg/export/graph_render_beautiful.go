@@ -741,6 +741,9 @@ func generateUltimateHTMLWithTime(title, dataHash, graphDataJSON string, nodeCou
                 <select id="filter-label" title="Filter nodes by label">
                     <option value="all">All Labels</option>
                 </select>
+                <select id="filter-repo" title="Filter nodes by source repository" style="display:none">
+                    <option value="all">All Repos</option>
+                </select>
             </div>
             <div class="toolbar-group">
                 <button id="btn-heatmap" title="Toggle heatmap coloring - shows node importance by color intensity (H)">🔥</button>
@@ -1624,6 +1627,7 @@ function populatePanelContent(prefix, node) {
         metaEl.innerHTML += '<div class="hover-meta-item"><span class="hover-meta-label">' + escapeHTML(label) + '</span><span class="hover-meta-value">' + escapeHTML(value) + '</span></div>';
     };
     addMeta('Assignee', node.assignee);
+    addMeta('Repo', node.source_repo);
     addMeta('Created', node.created_at);
     addMeta('Updated', node.updated_at);
     addMeta('Due Date', node.due_date);
@@ -2033,22 +2037,36 @@ function highlightDependencies(node, type) {
 }
 
 // Unified filter state and handler
-let statusFilter = 'all', typeFilter = 'all', priorityFilter = 'all', labelFilter = 'all';
+let statusFilter = 'all', typeFilter = 'all', priorityFilter = 'all', labelFilter = 'all', repoFilter = 'all';
 let currentVisibilityFilter = () => true;
 
 const allLabels = new Set();
-DATA.nodes.forEach(n => (n.labels || []).forEach(l => allLabels.add(l)));
+const allRepos = new Set();
+DATA.nodes.forEach(n => {
+    (n.labels || []).forEach(l => allLabels.add(l));
+    if (n.source_repo) allRepos.add(n.source_repo);
+});
 const labelSelect = document.getElementById('filter-label');
 [...allLabels].sort().forEach(l => {
     const opt = document.createElement('option');
     opt.value = l; opt.textContent = l;
     labelSelect.appendChild(opt);
 });
+const repoSelect = document.getElementById('filter-repo');
+if (repoSelect && allRepos.size > 0) {
+    [...allRepos].sort().forEach(r => {
+        const opt = document.createElement('option');
+        opt.value = r; opt.textContent = r;
+        repoSelect.appendChild(opt);
+    });
+    repoSelect.style.display = '';
+}
 
 document.getElementById('filter-status').onchange = e => { statusFilter = e.target.value || 'all'; applyFilters(); };
 document.getElementById('filter-type').onchange = e => { typeFilter = e.target.value || 'all'; applyFilters(); };
 document.getElementById('filter-priority').onchange = e => { priorityFilter = e.target.value || 'all'; applyFilters(); };
 labelSelect.onchange = e => { labelFilter = e.target.value || 'all'; applyFilters(); };
+if (repoSelect) repoSelect.onchange = e => { repoFilter = e.target.value || 'all'; applyFilters(); };
 
 function applyFilters() {
     const q = (searchQuery || document.getElementById('search-input').value || '').trim().toLowerCase();
@@ -2061,7 +2079,8 @@ function applyFilters() {
             (n.notes || '').toLowerCase().includes(q) ||
             (n.acceptance_criteria || '').toLowerCase().includes(q) ||
             (n.labels || []).some(l => l.toLowerCase().includes(q)) ||
-            (n.assignee || '').toLowerCase().includes(q);
+            (n.assignee || '').toLowerCase().includes(q) ||
+            (n.source_repo || '').toLowerCase().includes(q);
         if (!matchSearch) return false;
 
         if (statusFilter && statusFilter !== 'all') {
@@ -2077,6 +2096,7 @@ function applyFilters() {
         if (typeFilter && typeFilter !== 'all' && n.type !== typeFilter) return false;
         if (priorityFilter && priorityFilter !== 'all' && n.priority !== parseInt(priorityFilter, 10)) return false;
         if (labelFilter && labelFilter !== 'all' && !(n.labels || []).includes(labelFilter)) return false;
+        if (repoFilter && repoFilter !== 'all' && (n.source_repo || '') !== repoFilter) return false;
         return true;
     };
     Graph.nodeVisibility(currentVisibilityFilter);
@@ -2111,6 +2131,7 @@ document.getElementById('btn-reset').onclick = () => {
     document.getElementById('filter-type').value = 'all';
     document.getElementById('filter-priority').value = 'all';
     document.getElementById('filter-label').value = 'all';
+    if (repoSelect) repoSelect.value = 'all';
     document.getElementById('search-input').value = '';
     document.getElementById('search-results').classList.remove('visible');
     document.getElementById('view-mode').value = 'force';
@@ -2120,6 +2141,7 @@ document.getElementById('btn-reset').onclick = () => {
     typeFilter = 'all';
     priorityFilter = 'all';
     labelFilter = 'all';
+    repoFilter = 'all';
     sizeMetric = 'pagerank';
     heatmapMode = false;
     pathFinderMode = false;

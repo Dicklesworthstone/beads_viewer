@@ -125,10 +125,30 @@ PY
   "$bv" --export-graph "$tmp/capabilities-bundle/standalone-graph.html" >>"$tmp/capabilities-export.log" 2>&1
 ) || { cat "$tmp/capabilities-export.log" 2>/dev/null || true; exit 1; }
 
+mkdir -p "$tmp/multirepo-fixture/.beads"
+python3 - "$tmp/multirepo-fixture/.beads/issues.jsonl" <<'PY'
+import json, pathlib, sys
+base = dict(status='open', priority=1, issue_type='task',
+            created_at='2026-10-01T12:00:00Z', updated_at='2026-10-02T12:00:00Z')
+issues = [
+    dict(base, id='api-auth', title='API OAuth token issuer', labels=['auth'], source_repo='api', priority=0),
+    dict(base, id='api-health', title='API health check', labels=['ops'], source_repo='api', status='closed', closed_at='2026-10-02T12:00:00Z'),
+    dict(base, id='web-login', title='Web login page', labels=['ui'], source_repo='web',
+         dependencies=[dict(issue_id='web-login', depends_on_id='api-auth', type='blocks')]),
+    dict(base, id='web-settings', title='Web profile settings', labels=['ui'], source_repo='web', priority=2),
+]
+pathlib.Path(sys.argv[1]).write_text(''.join(json.dumps(i) + '\n' for i in issues))
+PY
+(
+  cd "$tmp/multirepo-fixture"
+  "$bv" --export-pages "$tmp/multirepo-bundle" --pages-title "Multi-Repo Workspace" >"$tmp/multirepo-export.log" 2>&1
+  "$bv" --export-graph "$tmp/multirepo-bundle/standalone-graph.html" >>"$tmp/multirepo-export.log" 2>&1
+) || { cat "$tmp/multirepo-export.log" 2>/dev/null || true; exit 1; }
+
 if [ -n "$target" ]; then
   (cd "$target" && "$bv" --export-pages "$tmp/project-bundle" --pages-title "Project browser check" >"$tmp/project-export.log" 2>&1) || { cat "$tmp/project-export.log"; exit 1; }
   project_bundle="$tmp/project-bundle"
 else
   project_bundle=""
 fi
-node "$root/tests/scripts/dashboard_browser_test.mjs" "$browser" "$tmp/bundle" "$tmp/browser" journeys "$tmp/updated-bundle" "$project_bundle" "$tmp/capabilities-bundle"
+node "$root/tests/scripts/dashboard_browser_test.mjs" "$browser" "$tmp/bundle" "$tmp/browser" journeys "$tmp/updated-bundle" "$project_bundle" "$tmp/capabilities-bundle" "$tmp/multirepo-bundle"

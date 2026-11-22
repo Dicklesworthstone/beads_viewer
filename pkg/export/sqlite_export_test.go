@@ -1812,4 +1812,14 @@ func TestSQLiteExportSourceRepoColumnAndFTS(t *testing.T) {
 	`).Scan(&matchedID, &bm25Score); err != nil || matchedID != "web-1" {
 		t.Fatalf("FTS5 10-col bm25 match for web: id=%q score=%v err=%v", matchedID, bm25Score, err)
 	}
+
+	// Verify GetExportedIssues() populates ExportIssue.SourceRepo for issues.json parity.
+	exported := exp.GetExportedIssues()
+	repoByID := make(map[string]string, len(exported))
+	for _, ei := range exported {
+		repoByID[ei.ID] = ei.SourceRepo
+	}
+	if repoByID["api-1"] != "api" || repoByID["web-1"] != "web" || repoByID["local-1"] != "" {
+		t.Fatalf("GetExportedIssues() SourceRepo mismatch: %+v", repoByID)
+	}
 }

@@ -35,6 +35,7 @@ type ExportIssue struct {
 	EstimatedMinutes   *int            `json:"estimated_minutes,omitempty"`
 	CreatedBy          string          `json:"created_by,omitempty"`
 	CloseReason        string          `json:"close_reason,omitempty"`
+	SourceRepo         string          `json:"source_repo,omitempty"`
 
 	// Computed graph metrics
 	PageRank       float64  `json:"pagerank"`
