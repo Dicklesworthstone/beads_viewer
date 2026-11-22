@@ -2200,7 +2200,7 @@ function buildFilterClauses(filters = {}, tableAlias = '') {
   if (filters.inCycle === true || filters.inCycle === 'true') {
     const cycleIds = Array.isArray(filters.cycleIds)
       ? filters.cycleIds
-      : [...new Set((getCycleInfo()?.cycles || []).flat())];
+      : getActiveCycleIssueIDs();
     if (cycleIds.length === 0) {
       clauses.push('1 = 0');
     } else {
@@ -2418,6 +2418,26 @@ function isIssueOverdue(issue) {
   if (st === 'closed' || st === 'tombstone') return false;
   const due = new Date(issue.due_date);
   return !Number.isNaN(due.getTime()) && due.getTime() < getReferenceNowMs();
+}
+
+function getActiveCycleIssueIDs(cycleInfoOverride = null) {
+  const info = cycleInfoOverride || getCycleInfo();
+  const ids = new Set();
+  if (Array.isArray(info?.sccComponents)) {
+    for (const comp of info.sccComponents) {
+      if (Array.isArray(comp)) {
+        for (const id of comp) if (id) ids.add(id);
+      }
+    }
+  }
+  if (ids.size === 0 && Array.isArray(info?.cycles)) {
+    for (const cyc of info.cycles) {
+      if (Array.isArray(cyc)) {
+        for (const id of cyc) if (id) ids.add(id);
+      }
+    }
+  }
+  return [...ids];
 }
 
 function isIssueInCycle(id) {
@@ -6004,7 +6024,7 @@ function beadsApp() {
         filters.criticalPathIds = this.criticalPathData?.path || getCriticalPathSequence()?.path || [];
       }
       if (filters.inCycle) {
-        filters.cycleIds = [...new Set((this.cycleInfo?.cycles || getCycleInfo()?.cycles || []).flat())];
+        filters.cycleIds = getActiveCycleIssueIDs(this.cycleInfo);
       }
       if (filters.articulation) {
         filters.articulationIds = (this.articulationPoints || getArticulationPoints() || []).map(a => a?.id || a).filter(Boolean);
