@@ -668,10 +668,16 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 				if len(cyc) == 0 {
 					continue
 				}
-				cloned := append([]string(nil), cyc...)
+				// Stats.Cycles() returns closed paths [A, B, A] (or [A, A] for self-loops).
+				// Strip the repeated closing element so edges are (A->B, B->A) with no phantom A->A self-loop.
+				open := cyc
+				if len(open) > 1 && open[0] == open[len(open)-1] {
+					open = open[:len(open)-1]
+				}
+				cloned := append([]string(nil), open...)
 				exportedCycles = append(exportedCycles, cloned)
-				for i := 0; i < len(cyc); i++ {
-					edgeFreq[[2]string{cyc[i], cyc[(i+1)%len(cyc)]}]++
+				for i := 0; i < len(open); i++ {
+					edgeFreq[[2]string{open[i], open[(i+1)%len(open)]}]++
 				}
 			}
 			type breakCand struct {
