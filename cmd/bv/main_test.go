@@ -10137,4 +10137,206 @@ func TestAttachDriftAlertsToTriage_MergesFullDriftAlertsIntoStaticExport(t *test
 	if dupCount < 2 {
 		t.Fatalf("expected >=2 distinct potential_duplicate alerts for DUP-A (vs DUP-B and DUP-C), got %d: %+v", dupCount, dupTriage.Alerts)
 	}
+
+	// Built-in summary abandoned_claim listing multiple IssueIDs must deduplicate every ID
+	// in IssueIDs against per-issue drift abandoned_claim alerts (not only IssueID).
+	abandonedTime := now.AddDate(0, 0, -21)
+	abIssues := []model.Issue{
+		{ID: "AB-1", Title: "Abandoned one", Status: model.StatusInProgress, Priority: 1, Assignee: "alice", CreatedAt: abandonedTime, UpdatedAt: abandonedTime},
+		{ID: "AB-2", Title: "Abandoned two", Status: model.StatusInProgress, Priority: 1, Assignee: "bob", CreatedAt: abandonedTime, UpdatedAt: abandonedTime},
+	}
+	abTriage := analysis.TriageResult{
+		Alerts: []analysis.Alert{
+			{
+				Type:     "abandoned_claim",
+				Severity: "warning",
+				Message:  "2 in-progress issues have no activity for 14+ days",
+				IssueID:  "AB-1",
+				IssueIDs: []string{"AB-1", "AB-2"},
+			},
+		},
+	}
+	abCtx := RobotContext{
+		ProjectDir: projectDir,
+		WorkDir:    projectDir,
+		Issues:     abIssues,
+		Readiness:  model.NewReadinessIndex(abIssues),
+		EnvRobot:   true,
+	}
+	attachDriftAlertsToTriage(&abTriage, abCtx, nil, nil, abIssues, true)
+	abandonedCount := 0
+	for _, a := range abTriage.Alerts {
+		if a.Type == "abandoned_claim" {
+			abandonedCount++
+		}
+	}
+	if abandonedCount != 1 {
+		t.Fatalf("expected IssueIDs deduplication to suppress duplicate per-issue abandoned_claim for AB-2, got %d alerts: %+v", abandonedCount, abTriage.Alerts)
+	}
+}
+
+func TestExportPages_SprintsAndSuggestionsArtifactsAndMetaGating(t *testing.T) {
+	exe := buildTestBinary(t)
+
+	// Case 1: Workspace WITH .beads/sprints.jsonl AND duplicate-title issues (triggers hygiene suggestions).
+	projWith := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(projWith, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	issuesWith := strings.Join([]string{
+		`{"id":"SP-1","title":"Fix OAuth login callback timeout failure in production","status":"open","priority":1,"issue_type":"bug","estimated_minutes":120,"created_at":"2026-10-01T12:00:00Z","updated_at":"2026-10-05T12:00:00Z"}`,
+		`{"id":"SP-2","title":"Fix OAuth login callback timeout failure in production","status":"open","priority":1,"issue_type":"bug","estimated_minutes":180,"created_at":"2026-10-01T12:00:00Z","updated_at":"2026-10-05T12:00:00Z"}`,
+		`{"id":"SP-3","title":"Shipped database index migration","status":"closed","priority":2,"issue_type":"task","closed_at":"2026-10-03T12:00:00Z","created_at":"2026-10-01T12:00:00Z","updated_at":"2026-10-03T12:00:00Z"}`,
+	}, "\n") + "\n"
+	sprintsJSONL := `{"id":"sprint-42","name":"Sprint 42","start_date":"2026-10-01T00:00:00Z","end_date":"2026-10-14T23:59:59Z","bead_ids":["SP-1","SP-2","SP-3"]}` + "\n"
+	if err := os.WriteFile(filepath.Join(projWith, ".beads", "issues.jsonl"), []byte(issuesWith), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projWith, ".beads", "sprints.jsonl"), []byte(sprintsJSONL), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	outWith := filepath.Join(t.TempDir(), "bundle-with")
+	t.Setenv("SOURCE_DATE_EPOCH", "1791201600") // 2026-10-05T12:00:00Z
+	_, stderrWith, err := runCommandWithTimeout(t, projWith, exe, "--export-pages", outWith, "--pages-title", "Sprints & Hygiene")
+	t.Setenv("SOURCE_DATE_EPOCH", "")
+	if err != nil {
+		t.Fatalf("--export-pages (with sprints/suggestions) failed: %v\nstderr=%s", err, stderrWith)
+	}
+
+	metaRaw, err := os.ReadFile(filepath.Join(outWith, "data", "meta.json"))
+	if err != nil {
+		t.Fatalf("read meta.json: %v", err)
+	}
+	var metaDoc struct {
+		HasSprints     bool `json:"has_sprints"`
+		HasSuggestions bool `json:"has_suggestions"`
+	}
+	if err := json.Unmarshal(metaRaw, &metaDoc); err != nil {
+		t.Fatalf("unmarshal meta.json: %v", err)
+	}
+	if !metaDoc.HasSprints || !metaDoc.HasSuggestions {
+		t.Fatalf("expected has_sprints=true and has_suggestions=true in meta.json, got %+v (%s)", metaDoc, string(metaRaw))
+	}
+
+	sprintsRaw, err := os.ReadFile(filepath.Join(outWith, "data", "sprints.json"))
+	if err != nil {
+		t.Fatalf("expected data/sprints.json to be written: %v", err)
+	}
+	var sprintsDoc struct {
+		ActiveSprintID string `json:"active_sprint_id"`
+		SprintCount    int    `json:"sprint_count"`
+		Sprints        []struct {
+			ID       string `json:"id"`
+			Burndown struct {
+				TotalIssues     int               `json:"total_issues"`
+				CompletedIssues int               `json:"completed_issues"`
+				DailyPoints     []json.RawMessage `json:"daily_points"`
+				IdealLine       []json.RawMessage `json:"ideal_line"`
+			} `json:"burndown"`
+			Capacity *struct {
+				TotalMinutes int     `json:"total_minutes"`
+				Days1Agent   float64 `json:"days_1_agent"`
+			} `json:"capacity"`
+		} `json:"sprints"`
+	}
+	if err := json.Unmarshal(sprintsRaw, &sprintsDoc); err != nil {
+		t.Fatalf("unmarshal sprints.json: %v\n%s", err, string(sprintsRaw))
+	}
+	if sprintsDoc.SprintCount != 1 || sprintsDoc.ActiveSprintID != "sprint-42" || len(sprintsDoc.Sprints) != 1 {
+		t.Fatalf("unexpected sprints.json payload: %+v", sprintsDoc)
+	}
+	sp := sprintsDoc.Sprints[0]
+	if sp.Burndown.TotalIssues != 3 || sp.Burndown.CompletedIssues != 1 || len(sp.Burndown.IdealLine) == 0 || len(sp.Burndown.DailyPoints) == 0 {
+		t.Fatalf("expected snake_case burndown fields populated in sprints.json, got %+v\nraw=%s", sp.Burndown, string(sprintsRaw))
+	}
+	// With Phase 2 GraphStats wired (depth=1 -> 1.1x complexity), 120m + 180m = 132m + 198m = 330m (matching TUI & --robot-capacity).
+	if sp.Capacity == nil || sp.Capacity.TotalMinutes != 330 || sp.Capacity.Days1Agent <= 0 {
+		t.Fatalf("expected Phase-2 depth-adjusted Graham capacity bounds (330m), got %+v", sp.Capacity)
+	}
+
+	sugRaw, err := os.ReadFile(filepath.Join(outWith, "data", "suggestions.json"))
+	if err != nil {
+		t.Fatalf("expected data/suggestions.json to be written: %v", err)
+	}
+	if !strings.Contains(string(sugRaw), `"potential_duplicate"`) {
+		t.Fatalf("expected data/suggestions.json to contain potential_duplicate suggestion:\n%s", string(sugRaw))
+	}
+
+	swRaw, err := os.ReadFile(filepath.Join(outWith, "coi-serviceworker.js"))
+	if err != nil {
+		t.Fatalf("read coi-serviceworker.js: %v", err)
+	}
+	if !strings.Contains(string(swRaw), "data/sprints.json") || !strings.Contains(string(swRaw), "data/suggestions.json") {
+		t.Fatalf("expected coi-serviceworker.js OFFLINE_ASSETS to cache data/sprints.json and data/suggestions.json")
+	}
+
+	// Case 2: Minimal workspace WITHOUT sprints and WITHOUT hygiene triggers -> flags false and files absent.
+	projWithout := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(projWithout, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projWithout, ".beads", "issues.jsonl"),
+		[]byte(`{"id":"SOLO-1","title":"Standalone clean item","status":"open","priority":2,"issue_type":"task","created_at":"2026-10-01T12:00:00Z","updated_at":"2026-10-05T12:00:00Z"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	outWithout := filepath.Join(t.TempDir(), "bundle-without")
+	if _, stderrWithout, err := runCommandWithTimeout(t, projWithout, exe, "--export-pages", outWithout, "--pages-title", "Clean Minimal"); err != nil {
+		t.Fatalf("--export-pages (minimal) failed: %v\nstderr=%s", err, stderrWithout)
+	}
+	metaWithoutRaw, err := os.ReadFile(filepath.Join(outWithout, "data", "meta.json"))
+	if err != nil {
+		t.Fatalf("read minimal meta.json: %v", err)
+	}
+	var metaWithout struct {
+		HasSprints     bool `json:"has_sprints"`
+		HasSuggestions bool `json:"has_suggestions"`
+	}
+	if err := json.Unmarshal(metaWithoutRaw, &metaWithout); err != nil {
+		t.Fatalf("unmarshal minimal meta.json: %v", err)
+	}
+	if metaWithout.HasSprints || metaWithout.HasSuggestions {
+		t.Fatalf("expected minimal export has_sprints=false and has_suggestions=false, got %+v", metaWithout)
+	}
+	if _, err := os.Stat(filepath.Join(outWithout, "data", "sprints.json")); !os.IsNotExist(err) {
+		t.Fatalf("expected no data/sprints.json on minimal export, err=%v", err)
+	}
+	if _, err := os.Stat(filepath.Join(outWithout, "data", "suggestions.json")); !os.IsNotExist(err) {
+		t.Fatalf("expected no data/suggestions.json on minimal export, err=%v", err)
+	}
+
+	// Case 3: Sprint whose beads are ALL filtered out (--pages-include-closed=false) must NOT emit ghost sprints.json.
+	projClosedSprint := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(projClosedSprint, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projClosedSprint, ".beads", "issues.jsonl"),
+		[]byte(`{"id":"OPEN-1","title":"Unrelated open item","status":"open","priority":2,"issue_type":"task","created_at":"2026-10-01T12:00:00Z","updated_at":"2026-10-05T12:00:00Z"}`+"\n"+
+			`{"id":"DONE-SP","title":"Finished sprint bead","status":"closed","priority":1,"issue_type":"task","closed_at":"2026-10-04T12:00:00Z","created_at":"2026-10-01T12:00:00Z","updated_at":"2026-10-04T12:00:00Z"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(projClosedSprint, ".beads", "sprints.jsonl"),
+		[]byte(`{"id":"sp-closed","name":"Closed Sprint","start_date":"2026-10-01T00:00:00Z","end_date":"2026-10-10T00:00:00Z","bead_ids":["DONE-SP"]}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	outClosedFiltered := filepath.Join(t.TempDir(), "bundle-filtered-sprints")
+	if _, stderrFilt, err := runCommandWithTimeout(t, projClosedSprint, exe, "--export-pages", outClosedFiltered, "--pages-include-closed=false"); err != nil {
+		t.Fatalf("--export-pages (--pages-include-closed=false) failed: %v\nstderr=%s", err, stderrFilt)
+	}
+	metaFiltRaw, err := os.ReadFile(filepath.Join(outClosedFiltered, "data", "meta.json"))
+	if err != nil {
+		t.Fatalf("read filtered meta.json: %v", err)
+	}
+	var metaFilt struct {
+		HasSprints bool `json:"has_sprints"`
+	}
+	if err := json.Unmarshal(metaFiltRaw, &metaFilt); err != nil {
+		t.Fatalf("unmarshal filtered meta.json: %v", err)
+	}
+	if metaFilt.HasSprints {
+		t.Fatalf("expected filtered-out sprint export has_sprints=false, got %s", string(metaFiltRaw))
+	}
+	if _, err := os.Stat(filepath.Join(outClosedFiltered, "data", "sprints.json")); !os.IsNotExist(err) {
+		t.Fatalf("expected no ghost data/sprints.json when all sprint beads are filtered out, err=%v", err)
+	}
 }

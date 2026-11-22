@@ -4078,10 +4078,10 @@ func main() {
 					exporter.SetGitHash(commit)
 				}
 
-				// Precompute optional sprints & hygiene suggestions artifacts before ExportBundle
-				// so beads.sqlite3 and data/meta.json accurately record has_sprints / has_suggestions
+				// Precompute optional sprints, hygiene suggestions, & history artifacts before ExportBundle
+				// so beads.sqlite3 and data/meta.json accurately record has_sprints / has_suggestions / has_history
 				// (preventing 404 fetches in static bundles when absent).
-				sprintsJSON, sprintCount, sprintsErr := buildExportSprintsPayload(exportContext, projectDir, exportIssues, exportNow)
+				sprintsJSON, sprintCount, sprintsErr := buildExportSprintsPayload(exportContext, projectDir, exportIssues, stats, exportNow)
 				if sprintsErr != nil {
 					fmt.Printf("  → Warning: failed to build sprints data: %v\n", sprintsErr)
 				}
@@ -4089,8 +4089,22 @@ func main() {
 				if suggestionsErr != nil {
 					fmt.Printf("  → Warning: failed to build hygiene suggestions: %v\n", suggestionsErr)
 				}
+				var historyJSON []byte
+				var historyCommitCount int
+				if *pagesIncludeHistory {
+					fmt.Println("  → Generating time-travel history data...")
+					if historyReport, err := generateHistoryForExportContext(exportContext); err == nil && historyReport != nil {
+						if encoded, mErr := json.MarshalIndent(historyReport, "", "  "); mErr == nil {
+							historyJSON = encoded
+							historyCommitCount = len(historyReport.Commits)
+						}
+					} else if err != nil {
+						fmt.Printf("  → Warning: failed to generate history: %v\n", err)
+					}
+				}
 				exporter.Config.HasSprints = sprintCount > 0 && len(sprintsJSON) > 0
 				exporter.Config.HasSuggestions = suggestionCount > 0 && len(suggestionsJSON) > 0
+				exporter.Config.HasHistory = len(historyJSON) > 0
 
 				// Prepare optional WASM scorer assets before ExportBundle so
 				// beads.sqlite3 and data/meta.json accurately record has_hybrid_wasm.
@@ -4117,27 +4131,18 @@ func main() {
 						fmt.Printf("  → suggestions.json (%d suggestions)\n", suggestionCount)
 					}
 				}
+				if exporter.Config.HasHistory {
+					if err := bundle.WriteFile("data/history.json", historyJSON, 0644); err != nil {
+						fmt.Printf("  → Warning: failed to write history.json: %v\n", err)
+					} else {
+						fmt.Printf("  → history.json (%d commits)\n", historyCommitCount)
+					}
+				}
 
 				// Generate README.md with project stats (useful for GitHub Pages deployment)
 				fmt.Println("  → Generating README.md...")
 				if err := generateREADME(bundle, *pagesTitle, "", exportIssues, &triage, stats); err != nil {
 					fmt.Printf("  → Warning: failed to generate README: %v\n", err)
-				}
-
-				// Export history data for time-travel feature (bv-z38b)
-				if *pagesIncludeHistory {
-					fmt.Println("  → Generating time-travel history data...")
-					if historyReport, err := generateHistoryForExportContext(exportContext); err == nil && historyReport != nil {
-						if historyJSON, err := json.MarshalIndent(historyReport, "", "  "); err == nil {
-							if err := bundle.WriteFile("data/history.json", historyJSON, 0644); err != nil {
-								fmt.Printf("  → Warning: failed to write history.json: %v\n", err)
-							} else {
-								fmt.Printf("  → history.json (%d commits)\n", len(historyReport.Commits))
-							}
-						}
-					} else if err != nil {
-						fmt.Printf("  → Warning: failed to generate history: %v\n", err)
-					}
 				}
 
 				// Bind the offline viewer to the completed data, including history.
@@ -8204,9 +8209,9 @@ func runPagesWizard(beadsPath string, dispatchCtx RobotContext, activeRecipe *re
 		}
 	}
 
-	// Precompute optional sprints & hygiene suggestions artifacts before ExportBundle
-	// so beads.sqlite3 and data/meta.json accurately record has_sprints / has_suggestions.
-	wizardSprintsJSON, wizardSprintCount, wizardSprintsErr := buildExportSprintsPayload(driftCtx, wizardProjectDir, exportIssues, wizardNow)
+	// Precompute optional sprints, hygiene suggestions, & history artifacts before ExportBundle
+	// so beads.sqlite3 and data/meta.json accurately record has_sprints / has_suggestions / has_history.
+	wizardSprintsJSON, wizardSprintCount, wizardSprintsErr := buildExportSprintsPayload(driftCtx, wizardProjectDir, exportIssues, stats, wizardNow)
 	if wizardSprintsErr != nil {
 		fmt.Printf("  -> Warning: failed to build sprints data: %v\n", wizardSprintsErr)
 	}
@@ -8214,8 +8219,22 @@ func runPagesWizard(beadsPath string, dispatchCtx RobotContext, activeRecipe *re
 	if wizardSuggestionsErr != nil {
 		fmt.Printf("  -> Warning: failed to build hygiene suggestions: %v\n", wizardSuggestionsErr)
 	}
+	var wizardHistoryJSON []byte
+	var wizardHistoryCommitCount int
+	if config.IncludeHistory {
+		fmt.Println("  -> Generating time-travel history data...")
+		if historyReport, err := generateHistoryForExportContext(exportContext); err == nil && historyReport != nil {
+			if encoded, mErr := json.MarshalIndent(historyReport, "", "  "); mErr == nil {
+				wizardHistoryJSON = encoded
+				wizardHistoryCommitCount = len(historyReport.Commits)
+			}
+		} else if err != nil {
+			fmt.Printf("  -> Warning: failed to generate history: %v\n", err)
+		}
+	}
 	exporter.Config.HasSprints = wizardSprintCount > 0 && len(wizardSprintsJSON) > 0
 	exporter.Config.HasSuggestions = wizardSuggestionCount > 0 && len(wizardSuggestionsJSON) > 0
+	exporter.Config.HasHistory = len(wizardHistoryJSON) > 0
 
 	// Prepare optional WASM scorer assets before ExportBundle so
 	// beads.sqlite3 and data/meta.json accurately record has_hybrid_wasm.
@@ -8240,6 +8259,13 @@ func runPagesWizard(beadsPath string, dispatchCtx RobotContext, activeRecipe *re
 			fmt.Printf("  -> Warning: failed to write suggestions.json: %v\n", err)
 		} else {
 			fmt.Printf("  -> suggestions.json (%d suggestions)\n", wizardSuggestionCount)
+		}
+	}
+	if exporter.Config.HasHistory {
+		if err := bundle.WriteFile("data/history.json", wizardHistoryJSON, 0644); err != nil {
+			fmt.Printf("  -> Warning: failed to write history.json: %v\n", err)
+		} else {
+			fmt.Printf("  -> history.json (%d commits)\n", wizardHistoryCommitCount)
 		}
 	}
 
@@ -8269,22 +8295,6 @@ func runPagesWizard(beadsPath string, dispatchCtx RobotContext, activeRecipe *re
 		}
 		if err := generateREADME(bundle, config.Title, pagesURL, exportIssues, &triage, stats); err != nil {
 			fmt.Printf("  -> Warning: failed to generate README: %v\n", err)
-		}
-	}
-
-	// Export history data for time-travel feature if requested
-	if config.IncludeHistory {
-		fmt.Println("  -> Generating time-travel history data...")
-		if historyReport, err := generateHistoryForExportContext(exportContext); err == nil && historyReport != nil {
-			if historyJSON, err := json.MarshalIndent(historyReport, "", "  "); err == nil {
-				if err := bundle.WriteFile("data/history.json", historyJSON, 0644); err != nil {
-					fmt.Printf("  -> Warning: failed to write history.json: %v\n", err)
-				} else {
-					fmt.Printf("  -> history.json (%d commits)\n", len(historyReport.Commits))
-				}
-			}
-		} else if err != nil {
-			fmt.Printf("  -> Warning: failed to generate history: %v\n", err)
 		}
 	}
 
@@ -9292,13 +9302,31 @@ jq -r '.recommendations[] | [.id, .score, .action] | @csv' triage.json
 `
 }
 
+// TimeTravelBeadCommit is a compact per-bead correlated commit record attached
+// to history.json for Issue Detail Modal display.
+type TimeTravelBeadCommit struct {
+	SHA        string  `json:"sha"`
+	ShortSHA   string  `json:"short_sha"`
+	Message    string  `json:"message"`
+	Author     string  `json:"author,omitempty"`
+	Timestamp  string  `json:"timestamp,omitempty"`
+	Method     string  `json:"method,omitempty"`
+	Confidence float64 `json:"confidence,omitempty"`
+}
+
+// TimeTravelBeadHistory holds correlated commits for one bead in history.json.
+type TimeTravelBeadHistory struct {
+	Commits []TimeTravelBeadCommit `json:"commits"`
+}
+
 // TimeTravelHistory represents the history data format for time-travel animation (bv-z38b)
 type TimeTravelHistory struct {
 	GeneratedAt string             `json:"generated_at"`
 	Commits     []TimeTravelCommit `json:"commits"`
 	// InitialBeads were observed unresolved before their first retained event.
-	InitialBeads []string       `json:"initial_beads,omitempty"`
-	Sprints      []model.Sprint `json:"sprints,omitempty"`
+	InitialBeads []string                          `json:"initial_beads,omitempty"`
+	Sprints      []model.Sprint                    `json:"sprints,omitempty"`
+	Histories    map[string]*TimeTravelBeadHistory `json:"histories,omitempty"`
 }
 
 // TimeTravelCommit represents a single commit in the time-travel history
@@ -9544,11 +9572,76 @@ func generateHistoryForExportContext(ctx RobotContext) (*TimeTravelHistory, erro
 		return sprints[i].ID < sprints[j].ID
 	})
 
+	beadHistories := make(map[string]*TimeTravelBeadHistory)
+	for beadID, history := range report.Histories {
+		seenSHA := make(map[string]bool)
+		var list []TimeTravelBeadCommit
+		for _, c := range history.Commits {
+			if c.SHA == "" || seenSHA[c.SHA] {
+				continue
+			}
+			seenSHA[c.SHA] = true
+			short := c.ShortSHA
+			if short == "" && len(c.SHA) >= 7 {
+				short = c.SHA[:7]
+			}
+			ts := ""
+			if !c.Timestamp.IsZero() {
+				ts = c.Timestamp.UTC().Format(time.RFC3339)
+			}
+			list = append(list, TimeTravelBeadCommit{
+				SHA:        c.SHA,
+				ShortSHA:   short,
+				Message:    c.Message,
+				Author:     c.Author,
+				Timestamp:  ts,
+				Method:     string(c.Method),
+				Confidence: c.Confidence,
+			})
+		}
+		for _, ev := range history.Events {
+			if ev.CommitSHA == "" || seenSHA[ev.CommitSHA] {
+				continue
+			}
+			seenSHA[ev.CommitSHA] = true
+			short := ev.CommitSHA
+			if len(short) > 7 {
+				short = short[:7]
+			}
+			ts := ""
+			if !ev.Timestamp.IsZero() {
+				ts = ev.Timestamp.UTC().Format(time.RFC3339)
+			}
+			list = append(list, TimeTravelBeadCommit{
+				SHA:        ev.CommitSHA,
+				ShortSHA:   short,
+				Message:    ev.CommitMsg,
+				Author:     ev.Author,
+				Timestamp:  ts,
+				Method:     "lifecycle:" + string(ev.EventType),
+				Confidence: 1.0,
+			})
+		}
+		if len(list) > 0 {
+			sort.Slice(list, func(i, j int) bool {
+				if list[i].Timestamp != list[j].Timestamp {
+					return list[i].Timestamp > list[j].Timestamp
+				}
+				return list[i].SHA < list[j].SHA
+			})
+			if len(list) > 20 {
+				list = list[:20]
+			}
+			beadHistories[beadID] = &TimeTravelBeadHistory{Commits: list}
+		}
+	}
+
 	return &TimeTravelHistory{
 		GeneratedAt:  robotNow().Format(time.RFC3339),
 		Commits:      commits,
 		InitialBeads: initialBeads,
 		Sprints:      sprints,
+		Histories:    beadHistories,
 	}, nil
 }
 
@@ -13069,7 +13162,7 @@ type exportSprintsDocument struct {
 	Sprints        []exportSprintEntry `json:"sprints"`
 }
 
-func buildExportSprintsPayload(ctx RobotContext, workDir string, exportIssues []model.Issue, now time.Time) ([]byte, int, error) {
+func buildExportSprintsPayload(ctx RobotContext, workDir string, exportIssues []model.Issue, stats *analysis.GraphStats, now time.Time) ([]byte, int, error) {
 	sprints, err := loadSprintsForContext(ctx, workDir)
 	if err != nil || len(sprints) == 0 {
 		return nil, 0, err
@@ -13087,6 +13180,11 @@ func buildExportSprintsPayload(ctx RobotContext, workDir string, exportIssues []
 	if len(graphIssues) == 0 {
 		graphIssues = exportIssues
 	}
+	velocityIssues := ctx.VelocityIssues()
+	if len(velocityIssues) == 0 {
+		velocityIssues = graphIssues
+	}
+	scopeFiltered := ctx.CandidateIDs != nil || len(exportIssues) < len(graphIssues)
 	readiness := ctx.Readiness
 	if readiness == nil {
 		readiness = model.NewReadinessIndex(graphIssues)
@@ -13128,6 +13226,9 @@ func buildExportSprintsPayload(ctx RobotContext, workDir string, exportIssues []
 				IsBlocked:        isBlocked,
 			})
 		}
+		if len(sprintIssues) == 0 && (len(sp.BeadIDs) > 0 || scopeFiltered) {
+			continue
+		}
 		scopedSprint := sp
 		scopedSprint.BeadIDs = scopedBeadIDs
 		burndown := analysis.ComputeSprintBurndown(&scopedSprint, sprintIssues, now)
@@ -13137,10 +13238,10 @@ func buildExportSprintsPayload(ctx RobotContext, workDir string, exportIssues []
 		}
 		var capInfo *exportSprintCapacity
 		if len(openSprintIssues) > 0 {
-			g1 := analysis.ComputeGrahamBounds(openSprintIssues, graphIssues, nil, 1, now)
+			g1 := analysis.ComputeGrahamBounds(openSprintIssues, velocityIssues, stats, 1, now)
 			if g1.TotalMinutes > 0 {
-				g2 := analysis.ComputeGrahamBounds(openSprintIssues, graphIssues, nil, 2, now)
-				g4 := analysis.ComputeGrahamBounds(openSprintIssues, graphIssues, nil, 4, now)
+				g2 := analysis.ComputeGrahamBounds(openSprintIssues, velocityIssues, stats, 2, now)
+				g4 := analysis.ComputeGrahamBounds(openSprintIssues, velocityIssues, stats, 4, now)
 				capInfo = &exportSprintCapacity{
 					TotalMinutes:        g1.TotalMinutes,
 					CriticalPathMinutes: g1.CriticalPathMinutes,
@@ -13175,7 +13276,10 @@ func buildExportSprintsPayload(ctx RobotContext, workDir string, exportIssues []
 			Beads:     beads,
 		})
 	}
-	if activeSprintID == "" && len(entries) > 0 {
+	if len(entries) == 0 {
+		return nil, 0, nil
+	}
+	if activeSprintID == "" {
 		activeSprintID = entries[0].ID
 	}
 
@@ -13185,7 +13289,9 @@ func buildExportSprintsPayload(ctx RobotContext, workDir string, exportIssues []
 		SprintCount:    len(entries),
 		Sprints:        entries,
 	}
-	wrapped, err := withEnvelope(ctx.Envelope(), doc)
+	envCtx := ctx
+	envCtx.Command = "robot-burndown"
+	wrapped, err := withEnvelope(envCtx.Envelope(), doc)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -13219,7 +13325,7 @@ func buildExportSuggestionsPayload(ctx RobotContext, exportIssues []model.Issue,
 	if len(set.Suggestions) == 0 {
 		return nil, 0, nil
 	}
-	wrapped, err := withEnvelope(ctx.Envelope(), set)
+	wrapped, err := withEnvelope(ctx.EnvelopeWithHash(dataHash), set)
 	if err != nil {
 		return nil, 0, err
 	}
