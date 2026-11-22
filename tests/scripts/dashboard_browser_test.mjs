@@ -1384,6 +1384,13 @@ async function journey(page, mobile) {
   const point = await evaluate(page, `(() => { const g=${app}.forceGraphModule.getGraph(); const n=g.graphData().nodes.find(n=>n.id==='browser-root'); const p=g.graph2ScreenCoords(n.x,n.y); const r=document.querySelector('#graph-container canvas').getBoundingClientRect(); return {x:r.x+p.x,y:r.y+p.y}; })()`);
   for (const type of ['mousePressed', 'mouseReleased']) await send('Input.dispatchMouseEvent', { type, ...point, button: 'left', clickCount: 1 }, page.session);
   await waitFor(page, `${app}.graphDetailNode?.id === 'browser-root'`, 'graph pointer selects actual root node');
+  // Wait for Alpine's 300ms slide-in transition (md:translate-x-full -> translate-x-0) to settle before measuring rects.
+  await waitFor(page, `(() => {
+    const closeBtn = document.querySelector('button[title="Close detail pane (Esc)"]');
+    if (!closeBtn || !(${visible})(closeBtn)) return false;
+    const r = closeBtn.getBoundingClientRect();
+    return r.width > 0 && r.right <= window.innerWidth + 1;
+  })()`, 'graphDetailNode drawer finishes slide-in with Close button inside viewport');
   const detailHeaderLayout = await evaluate(page, `(() => {
     const closeBtn = document.querySelector('button[title="Close detail pane (Esc)"]');
     const whatIfBtn = document.querySelector('#graph-whatif-btn');
@@ -3835,10 +3842,10 @@ async function multiRepoJourney(page, standalonePage) {
   await resultIDs(page, ['api-auth', 'api-health', 'web-login', 'web-settings']);
 
   // Click repo badge on issue card -> toggles filter on, clicking again toggles off!
-  await click(page, 'span[title="Filter by repository: web"]', 'web');
+  await click(page, 'span[title="Filter by repo: web"]', 'web');
   await waitFor(page, `${app}.filters.repo === 'web'`, 'repo badge click filters web');
   await resultIDs(page, ['web-login', 'web-settings']);
-  await click(page, 'span[title="Filter by repository: web"]', 'web');
+  await click(page, 'span[title="Filter by repo: web"]', 'web');
   await waitFor(page, `${app}.filters.repo === ''`, 'second repo badge click clears filter');
 
   // Graph View: #graph-filter-repo filters nodes & updates live counts, and graphDetailNode shows sourceRepo!
