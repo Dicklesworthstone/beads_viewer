@@ -374,18 +374,18 @@ func daysBetween(t, now time.Time) float64 {
 // SprintBurndown summarizes sprint progress, daily closure curve, burn rates,
 // and completion projection shared by --robot-burndown and the TUI Sprint View.
 type SprintBurndown struct {
-	TotalDays         int
-	ElapsedDays       int
-	RemainingDays     int
-	TotalIssues       int
-	CompletedIssues   int
-	RemainingIssues   int
-	IdealBurnRate     float64
-	ActualBurnRate    float64
-	ProjectedComplete *time.Time
-	OnTrack           bool
-	DailyPoints       []model.BurndownPoint
-	IdealLine         []model.BurndownPoint
+	TotalDays         int                   `json:"total_days"`
+	ElapsedDays       int                   `json:"elapsed_days"`
+	RemainingDays     int                   `json:"remaining_days"`
+	TotalIssues       int                   `json:"total_issues"`
+	CompletedIssues   int                   `json:"completed_issues"`
+	RemainingIssues   int                   `json:"remaining_issues"`
+	IdealBurnRate     float64               `json:"ideal_burn_rate"`
+	ActualBurnRate    float64               `json:"actual_burn_rate"`
+	ProjectedComplete *time.Time            `json:"projected_complete,omitempty"`
+	OnTrack           bool                  `json:"on_track"`
+	DailyPoints       []model.BurndownPoint `json:"daily_points"`
+	IdealLine         []model.BurndownPoint `json:"ideal_line"`
 }
 
 // ComputeSprintBurndown computes deterministic daily burndown points, ideal line,
@@ -407,11 +407,8 @@ func ComputeSprintBurndown(sprint *model.Sprint, sprintIssues []model.Issue, now
 	totalDays := 0
 	elapsedDays := 0
 	remainingDays := 0
-	if !sprint.StartDate.IsZero() && !sprint.EndDate.IsZero() {
-		totalDays = int(sprint.EndDate.Sub(sprint.StartDate).Hours()/24) + 1
-		if totalDays < 0 {
-			totalDays = 0
-		}
+	if !sprint.StartDate.IsZero() && !sprint.EndDate.IsZero() && !sprint.EndDate.Before(sprint.StartDate) {
+		totalDays = inclusiveSprintDays(sprint.StartDate, sprint.EndDate)
 		if now.Before(sprint.StartDate) {
 			elapsedDays = 0
 			remainingDays = totalDays
@@ -419,7 +416,7 @@ func ComputeSprintBurndown(sprint *model.Sprint, sprintIssues []model.Issue, now
 			elapsedDays = totalDays
 			remainingDays = 0
 		} else {
-			elapsedDays = int(now.Sub(sprint.StartDate).Hours()/24) + 1
+			elapsedDays = min(inclusiveSprintDays(sprint.StartDate, now), totalDays)
 			remainingDays = max(totalDays-elapsedDays, 0)
 		}
 	}
@@ -465,10 +462,38 @@ func ComputeSprintBurndown(sprint *model.Sprint, sprintIssues []model.Issue, now
 	}
 }
 
+// inclusiveSprintDays counts the exact number of calendar-day steps produced by
+// iterating d = start; !d.After(end); d = d.AddDate(0, 0, 1) in O(1), safely
+// handling DST transitions (23h/25h days) and returning 0 when end < start.
+func inclusiveSprintDays(start, end time.Time) int {
+	if start.IsZero() || end.IsZero() || end.Before(start) {
+		return 0
+	}
+	endInStartLoc := end.In(start.Location())
+	startDay := time.Date(start.Year(), start.Month(), start.Day(), 0, 0, 0, 0, time.UTC)
+	endDay := time.Date(endInStartLoc.Year(), endInStartLoc.Month(), endInStartLoc.Day(), 0, 0, 0, 0, time.UTC)
+	k := int(endDay.Sub(startDay) / (24 * time.Hour))
+	if k < 0 {
+		return 0
+	}
+	for k >= 0 && start.AddDate(0, 0, k).After(end) {
+		k--
+	}
+	if k < 0 {
+		return 0
+	}
+	for !start.AddDate(0, 0, k+1).After(end) {
+		k++
+	}
+	return k + 1
+}
+
 // GenerateDailyBurndown creates actual day-by-day remaining/completed points
-// from issue closure timestamps (falling back to UpdatedAt when ClosedAt is absent).
+// from issue closure timestamps (falling back to UpdatedAt, then CreatedAt,
+// and counting timeless closed/tombstone issues as completed on day 1 so
+// DailyPoints always reconciles with CompletedIssues).
 func GenerateDailyBurndown(sprint *model.Sprint, issues []model.Issue, now time.Time) []model.BurndownPoint {
-	if sprint == nil || sprint.StartDate.IsZero() || sprint.EndDate.IsZero() {
+	if sprint == nil || sprint.StartDate.IsZero() || sprint.EndDate.IsZero() || sprint.EndDate.Before(sprint.StartDate) {
 		return nil
 	}
 
@@ -476,7 +501,7 @@ func GenerateDailyBurndown(sprint *model.Sprint, issues []model.Issue, now time.
 	totalIssues := len(issues)
 
 	for d := sprint.StartDate; !d.After(sprint.EndDate) && !d.After(now); d = d.AddDate(0, 0, 1) {
-		dayEnd := d.Add(24*time.Hour - time.Second)
+		nextDay := d.AddDate(0, 0, 1)
 		completed := 0
 
 		for _, iss := range issues {
@@ -488,8 +513,10 @@ func GenerateDailyBurndown(sprint *model.Sprint, issues []model.Issue, now time.
 				closedTime = *iss.ClosedAt
 			} else if !iss.UpdatedAt.IsZero() {
 				closedTime = iss.UpdatedAt
+			} else if !iss.CreatedAt.IsZero() {
+				closedTime = iss.CreatedAt
 			}
-			if !closedTime.IsZero() && !closedTime.After(dayEnd) {
+			if closedTime.IsZero() || closedTime.Before(nextDay) {
 				completed++
 			}
 		}
@@ -506,11 +533,11 @@ func GenerateDailyBurndown(sprint *model.Sprint, issues []model.Issue, now time.
 
 // GenerateIdealBurndownLine creates the linear ideal burndown curve for a sprint.
 func GenerateIdealBurndownLine(sprint *model.Sprint, totalIssues int) []model.BurndownPoint {
-	if sprint == nil || sprint.StartDate.IsZero() || sprint.EndDate.IsZero() || totalIssues == 0 {
+	if sprint == nil || sprint.StartDate.IsZero() || sprint.EndDate.IsZero() || sprint.EndDate.Before(sprint.StartDate) || totalIssues == 0 {
 		return nil
 	}
 
-	totalDays := int(sprint.EndDate.Sub(sprint.StartDate).Hours()/24) + 1
+	totalDays := inclusiveSprintDays(sprint.StartDate, sprint.EndDate)
 	if totalDays <= 0 {
 		return nil
 	}

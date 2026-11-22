@@ -481,7 +481,7 @@ func TestDetectAtRiskWithReadiness_HonorsTombstoneIDsAndCrossRepoBlockers(t *tes
 
 func TestComputeSprintBurndown_DailyClosureCurveAndProjection(t *testing.T) {
 	start := time.Date(2026, 11, 10, 0, 0, 0, 0, time.UTC)
-	end := time.Date(2026, 11, 19, 0, 0, 0, 0, time.UTC) // 10 days total
+	end := time.Date(2026, 11, 19, 0, 0, 0, 0, time.UTC)  // 10 days total
 	now := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC) // day 5 elapsed
 	closedDay1 := time.Date(2026, 11, 10, 18, 0, 0, 0, time.UTC)
 	closedDay3 := time.Date(2026, 11, 12, 18, 0, 0, 0, time.UTC)
@@ -518,5 +518,45 @@ func TestComputeSprintBurndown_DailyClosureCurveAndProjection(t *testing.T) {
 	}
 	if bd.ProjectedComplete == nil || bd.ActualBurnRate <= 0 || bd.IdealBurnRate <= 0 {
 		t.Fatalf("expected positive burn rates and projected completion: %+v", bd)
+	}
+}
+
+func TestComputeSprintBurndown_EdgeCases_InvertedDSTSubSecondAndTimeless(t *testing.T) {
+	// 1. Inverted dates < 24h apart must yield TotalDays=0 and nil DailyPoints/IdealLine.
+	invStart := time.Date(2026, 11, 10, 12, 0, 0, 0, time.UTC)
+	invEnd := invStart.Add(-12 * time.Hour)
+	invSprint := &model.Sprint{ID: "inv", Name: "Inverted", StartDate: invStart, EndDate: invEnd, BeadIDs: []string{"B1"}}
+	invBD := ComputeSprintBurndown(invSprint, []model.Issue{{ID: "B1", Status: model.StatusOpen}}, invStart)
+	if invBD.TotalDays != 0 || invBD.ElapsedDays != 0 || invBD.RemainingDays != 0 || len(invBD.DailyPoints) != 0 || len(invBD.IdealLine) != 0 {
+		t.Fatalf("inverted <24h sprint produced non-zero days/lines: %+v", invBD)
+	}
+
+	// 2. Timeless closed issue + sub-second 23:59:59.500 closure on day 1 must both count on day 1.
+	start := time.Date(2026, 11, 10, 0, 0, 0, 0, time.UTC)
+	end := time.Date(2026, 11, 12, 0, 0, 0, 0, time.UTC)
+	lateDay1 := time.Date(2026, 11, 10, 23, 59, 59, 500_000_000, time.UTC)
+	sp := &model.Sprint{ID: "edge", Name: "Edge", StartDate: start, EndDate: end, BeadIDs: []string{"TIMELESS", "LATE"}}
+	issues := []model.Issue{
+		{ID: "TIMELESS", Status: model.StatusClosed},
+		{ID: "LATE", Status: model.StatusClosed, ClosedAt: &lateDay1},
+	}
+	bd := ComputeSprintBurndown(sp, issues, end)
+	if bd.TotalDays != 3 || len(bd.DailyPoints) != 3 {
+		t.Fatalf("expected 3 days & 3 points, got TotalDays=%d len=%d", bd.TotalDays, len(bd.DailyPoints))
+	}
+	if bd.DailyPoints[0].Completed != 2 || bd.DailyPoints[0].Remaining != 0 {
+		t.Fatalf("day 1 missed timeless or sub-second closure: %+v", bd.DailyPoints[0])
+	}
+
+	// 3. DST spring-forward (23h day in America/New_York): TotalDays must equal len(DailyPoints).
+	ny, err := time.LoadLocation("America/New_York")
+	if err == nil {
+		dstStart := time.Date(2026, 3, 7, 0, 0, 0, 0, ny)
+		dstEnd := time.Date(2026, 3, 10, 0, 0, 0, 0, ny) // crosses Mar 8 spring-forward
+		dstSprint := &model.Sprint{ID: "dst", Name: "DST", StartDate: dstStart, EndDate: dstEnd, BeadIDs: []string{"D1"}}
+		dstBD := ComputeSprintBurndown(dstSprint, []model.Issue{{ID: "D1", Status: model.StatusOpen}}, dstEnd)
+		if dstBD.TotalDays != 4 || len(dstBD.DailyPoints) != 4 {
+			t.Fatalf("DST spring-forward mismatch: TotalDays=%d len(DailyPoints)=%d", dstBD.TotalDays, len(dstBD.DailyPoints))
+		}
 	}
 }
