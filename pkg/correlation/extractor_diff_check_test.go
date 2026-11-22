@@ -1126,8 +1126,10 @@ func TestWave22_Pass2ShortSHARejectIncrementalWindowAndMergeRejectedPairs(t *tes
 		t.Fatalf("Pass 1 did not record canonical rejected pair for %s: %+v", firstSHA, rejPass1)
 	}
 
-	// 7. Pass 5 #6: Pass 2 orphan-confirm tie-break against a newer Pass 1 Ignore for the same canonical SHA
-	//    must NOT re-inject the ignored commit, whereas a newer Pass 2 Confirm DOES override an older Ignore.
+	// 7. Pass 5 #6 & Pass 6 #1/#9: Pass 2 tie-break against Pass 1 Ignore / Reject:
+	//    - older short Confirm must NOT override newer full Ignore (commit stays unconfirmed, Ignored==1)
+	//    - newer short Confirm DOES override older full Ignore (commit becomes confirmed, Confirmed==1, Ignored==0)
+	//    - newer short Confirm DOES override older full Reject (synthesized commit present, removed from rejectedPairs, Rejected==0, Confirmed==1)
 	storePass2NewerIgnore := NewFeedbackStore(t.TempDir())
 	storePass2NewerIgnore.cache[feedbackKey{commitSHA: firstSHA[:8], beadID: "bv-s1"}] = CorrelationFeedback{
 		CommitSHA: firstSHA[:8], BeadID: "bv-s1", Type: FeedbackConfirm, FeedbackAt: sameTime, FeedbackBy: "alice",
@@ -1139,7 +1141,37 @@ func TestWave22_Pass2ShortSHARejectIncrementalWindowAndMergeRejectedPairs(t *tes
 		"bv-s1": {BeadID: "bv-s1", Commits: []CorrelatedCommit{{SHA: firstSHA, BeadID: "bv-s1"}}},
 	}
 	appliedIgnoreWins, _ := applyFeedbackWithRepoAndOptions(storePass2NewerIgnore, context.Background(), repo, histIgnoreWins, CorrelatorOptions{})
-	if len(histIgnoreWins["bv-s1"].Commits) != 0 || appliedIgnoreWins == nil || appliedIgnoreWins.Ignored != 1 {
+	if len(histIgnoreWins["bv-s1"].Commits) != 1 || histIgnoreWins["bv-s1"].Commits[0].Confirmed || appliedIgnoreWins == nil || appliedIgnoreWins.Ignored != 1 || appliedIgnoreWins.Confirmed != 0 {
 		t.Fatalf("older short Confirm overrode newer full Ignore: commits=%+v applied=%+v", histIgnoreWins["bv-s1"].Commits, appliedIgnoreWins)
+	}
+
+	storePass2NewerConfirmOverIgnore := NewFeedbackStore(t.TempDir())
+	storePass2NewerConfirmOverIgnore.cache[feedbackKey{commitSHA: firstSHA, beadID: "bv-s1"}] = CorrelationFeedback{
+		CommitSHA: firstSHA, BeadID: "bv-s1", Type: FeedbackIgnore, FeedbackAt: sameTime, FeedbackBy: "alice",
+	}
+	storePass2NewerConfirmOverIgnore.cache[feedbackKey{commitSHA: firstSHA[:8], beadID: "bv-s1"}] = CorrelationFeedback{
+		CommitSHA: firstSHA[:8], BeadID: "bv-s1", Type: FeedbackConfirm, FeedbackAt: sameTime.Add(time.Second), FeedbackBy: "bob",
+	}
+	histConfirmOverIgnore := map[string]BeadHistory{
+		"bv-s1": {BeadID: "bv-s1", Commits: []CorrelatedCommit{{SHA: firstSHA, BeadID: "bv-s1"}}},
+	}
+	appliedConfirmOverIgnore, _ := applyFeedbackWithRepoAndOptions(storePass2NewerConfirmOverIgnore, context.Background(), repo, histConfirmOverIgnore, CorrelatorOptions{})
+	if len(histConfirmOverIgnore["bv-s1"].Commits) != 1 || !histConfirmOverIgnore["bv-s1"].Commits[0].Confirmed || appliedConfirmOverIgnore == nil || appliedConfirmOverIgnore.Confirmed != 1 || appliedConfirmOverIgnore.Ignored != 0 {
+		t.Fatalf("newer short Confirm failed to override older full Ignore: commits=%+v applied=%+v", histConfirmOverIgnore["bv-s1"].Commits, appliedConfirmOverIgnore)
+	}
+
+	storePass2NewerConfirmOverReject := NewFeedbackStore(t.TempDir())
+	storePass2NewerConfirmOverReject.cache[feedbackKey{commitSHA: firstSHA, beadID: "bv-s1"}] = CorrelationFeedback{
+		CommitSHA: firstSHA, BeadID: "bv-s1", Type: FeedbackReject, FeedbackAt: sameTime, FeedbackBy: "alice",
+	}
+	storePass2NewerConfirmOverReject.cache[feedbackKey{commitSHA: firstSHA[:8], beadID: "bv-s1"}] = CorrelationFeedback{
+		CommitSHA: firstSHA[:8], BeadID: "bv-s1", Type: FeedbackConfirm, FeedbackAt: sameTime.Add(time.Second), FeedbackBy: "bob",
+	}
+	histConfirmOverReject := map[string]BeadHistory{
+		"bv-s1": {BeadID: "bv-s1", Commits: []CorrelatedCommit{{SHA: firstSHA, BeadID: "bv-s1"}}},
+	}
+	appliedConfirmOverReject, rejConfirmOverReject := applyFeedbackWithRepoAndOptions(storePass2NewerConfirmOverReject, context.Background(), repo, histConfirmOverReject, CorrelatorOptions{})
+	if len(histConfirmOverReject["bv-s1"].Commits) != 1 || !histConfirmOverReject["bv-s1"].Commits[0].Confirmed || appliedConfirmOverReject == nil || appliedConfirmOverReject.Confirmed != 1 || appliedConfirmOverReject.Rejected != 0 || rejConfirmOverReject[firstSHA]["bv-s1"] {
+		t.Fatalf("newer short Confirm failed to override older full Reject cleanly: commits=%+v applied=%+v rej=%+v", histConfirmOverReject["bv-s1"].Commits, appliedConfirmOverReject, rejConfirmOverReject)
 	}
 }

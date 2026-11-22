@@ -1338,6 +1338,7 @@ func applyFeedbackWithRepoAndOptions(store *FeedbackStore, ctx context.Context, 
 	}
 	applied := &FeedbackApplied{}
 	rejectedPairs := make(map[string]map[string]bool)
+	pass1Rejected := make(map[string]map[string]bool)
 	recordReject := func(sha, beadID string) {
 		if sha == "" || beadID == "" {
 			return
@@ -1511,6 +1512,10 @@ func applyFeedbackWithRepoAndOptions(store *FeedbackStore, ctx context.Context, 
 				recordReject(commit.SHA, beadID)
 				if commitCanon != "" {
 					recordReject(commitCanon, beadID)
+					if pass1Rejected[commitCanon] == nil {
+						pass1Rejected[commitCanon] = make(map[string]bool)
+					}
+					pass1Rejected[commitCanon][beadID] = true
 				}
 				changed = true
 				continue
@@ -1607,17 +1612,31 @@ func applyFeedbackWithRepoAndOptions(store *FeedbackStore, ctx context.Context, 
 				if existingCanon.fb.Type == FeedbackIgnore && seenByBead[beadID][resolved.SHA] && applied.Ignored > 0 {
 					applied.Ignored--
 				}
+				if existingCanon.fb.Type == FeedbackReject {
+					if rejectedPairs[resolved.SHA] != nil {
+						delete(rejectedPairs[resolved.SHA], beadID)
+					}
+					for _, raw := range existingCanon.rawSHAs {
+						if rejectedPairs[raw] != nil {
+							delete(rejectedPairs[raw], beadID)
+						}
+					}
+					if pass1Rejected[resolved.SHA][beadID] && applied.Rejected > 0 {
+						applied.Rejected--
+						delete(pass1Rejected[resolved.SHA], beadID)
+					}
+				}
 			} else if rejectedPairs[resolved.SHA][beadID] {
 				continue
 			}
 			if seenByBead[beadID][resolved.SHA] {
 				// Short-SHA / alias confirm matched an existing commit (or outranked an older
-				// Ignore): upgrade in-place and count applied.Confirmed (matching Pass 1).
+				// Ignore): upgrade in-place and count applied.Confirmed once.
 				for i := range history.Commits {
 					if canonicalizeCommitSHA(history.Commits[i].SHA) == resolved.SHA {
-						applied.Confirmed++
 						history.Commits[i].Confidence = 1.0
 						if !history.Commits[i].Confirmed {
+							applied.Confirmed++
 							history.Commits[i].Confirmed = true
 							if history.Commits[i].Reason == "" {
 								history.Commits[i].Reason = "confirmed by feedback (" + fb.FeedbackBy + ")"
