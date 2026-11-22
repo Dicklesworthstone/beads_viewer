@@ -4234,7 +4234,17 @@ func (a *Analyzer) GetBlockerChain(issueID string) *BlockerChainResult {
 	if !ok {
 		return nil
 	}
-	triageCtx := NewTriageContext(a)
+	readiness := a.Readiness()
+	now := a.Now()
+	isActionable := func(id string) bool {
+		return a.IsCandidate(id) && readiness.Ready(id, now)
+	}
+	blocksCount := func(id string) int {
+		if nodeID, exists := a.idToNode[id]; exists && nodeID >= 0 && int(nodeID) < len(a.blockerCounts) {
+			return a.blockerCounts[nodeID]
+		}
+		return a.countBlockedBy(id)
+	}
 
 	result := &BlockerChainResult{
 		TargetID:     issueID,
@@ -4253,14 +4263,14 @@ func (a *Analyzer) GetBlockerChain(issueID string) *BlockerChainResult {
 		Priority:    issue.Priority,
 		Depth:       0,
 		IsRoot:      false,
-		Actionable:  triageCtx.IsActionable(issueID),
-		BlocksCount: a.countBlockedBy(issueID),
+		Actionable:  isActionable(issueID),
+		BlocksCount: blocksCount(issueID),
 	}
 	result.Chain = append(result.Chain, targetEntry)
 
 	// Include both direct predecessor blockers and parent-blocked propagation,
 	// matching the readiness contract used by triage and execution planning.
-	openBlockers := triageCtx.OpenBlockers(issueID)
+	openBlockers := readiness.Blockers(issueID)
 	if len(openBlockers) == 0 {
 		targetEntry.IsRoot = true
 		result.Chain[0] = targetEntry
@@ -4298,7 +4308,7 @@ func (a *Analyzer) GetBlockerChain(issueID string) *BlockerChainResult {
 					Depth:       depth,
 					IsRoot:      true,
 					Actionable:  false,
-					BlocksCount: a.countBlockedBy(id),
+					BlocksCount: blocksCount(id),
 				}
 				result.Chain = append(result.Chain, entry)
 				result.RootBlockers = append(result.RootBlockers, entry)
@@ -4308,7 +4318,7 @@ func (a *Analyzer) GetBlockerChain(issueID string) *BlockerChainResult {
 			return
 		}
 
-		blockerOpenBlockers := triageCtx.OpenBlockers(id)
+		blockerOpenBlockers := readiness.Blockers(id)
 		isRoot := len(blockerOpenBlockers) == 0
 
 		if id != issueID {
@@ -4319,8 +4329,8 @@ func (a *Analyzer) GetBlockerChain(issueID string) *BlockerChainResult {
 				Priority:    blocker.Priority,
 				Depth:       depth,
 				IsRoot:      isRoot,
-				Actionable:  triageCtx.IsActionable(id),
-				BlocksCount: a.countBlockedBy(id),
+				Actionable:  isActionable(id),
+				BlocksCount: blocksCount(id),
 			}
 			result.Chain = append(result.Chain, entry)
 

@@ -133,10 +133,26 @@ var metricDescriptions = map[MetricPanel]MetricInfo{
 	},
 }
 
+// GlobalCapacitySummary captures project-wide Graham parallel capacity bounds
+// over all open issues in the current TUI scope (works even without sprints.jsonl).
+type GlobalCapacitySummary struct {
+	OpenCount           int
+	TotalMinutes        int
+	CriticalPathMinutes int
+	ParallelizablePct   float64
+	Days1Agent          float64
+	Days2Min            float64
+	Days2Max            float64
+	Days4Min            float64
+	Days4Max            float64
+}
+
 // InsightsModel is an interactive insights dashboard
 type InsightsModel struct {
 	insights         analysis.Insights
 	advancedInsights *analysis.AdvancedInsights
+	globalCapacity   *GlobalCapacitySummary
+	feedbackSummary  *analysis.FeedbackJSON
 	issueMap         map[string]*model.Issue
 	theme            Theme
 	labelFlow        *analysis.CrossLabelFlow
@@ -302,6 +318,30 @@ func (m *InsightsModel) SetAdvancedInsights(adv *analysis.AdvancedInsights) {
 	m.advancedInsights = adv
 	m.detailContent = ""
 	if adv != nil && m.ready {
+		m.updateDetailContent()
+	}
+}
+
+// SetGlobalCapacity attaches project-wide Graham capacity bounds for the Insights detail panel.
+func (m *InsightsModel) SetGlobalCapacity(capSummary *GlobalCapacitySummary) {
+	if m.globalCapacity == capSummary {
+		return
+	}
+	m.globalCapacity = capSummary
+	m.detailContent = ""
+	if m.ready && m.focusedPanel == PanelPriority {
+		m.updateDetailContent()
+	}
+}
+
+// SetFeedbackSummary attaches adaptive triage feedback summary for display on PanelPriority.
+func (m *InsightsModel) SetFeedbackSummary(fb *analysis.FeedbackJSON) {
+	if m.feedbackSummary == fb {
+		return
+	}
+	m.feedbackSummary = fb
+	m.detailContent = ""
+	if m.ready && m.focusedPanel == PanelPriority {
 		m.updateDetailContent()
 	}
 }
@@ -2118,6 +2158,9 @@ func (m *InsightsModel) buildDetailMarkdown(selectedID string) string {
 	if advMD := m.renderAdvancedInsightsMD(); advMD != "" {
 		sb.WriteString(advMD)
 	}
+	if extraMD := m.renderPriorityExtrasMD(); extraMD != "" {
+		sb.WriteString(extraMD)
+	}
 
 	// === Description ===
 	if issue.Description != "" {
@@ -2383,6 +2426,72 @@ func (m *InsightsModel) renderAdvancedInsightsMD() string {
 		}
 	}
 
+	return sb.String()
+}
+
+// renderPriorityExtrasMD renders backlog-wide Graham capacity bounds and adaptive
+// feedback weight summaries on PanelPriority (even when Phase 2 AdvancedInsights is nil).
+func (m *InsightsModel) renderPriorityExtrasMD() string {
+	if m.focusedPanel != PanelPriority {
+		return ""
+	}
+	var sb strings.Builder
+	if capSum := m.globalCapacity; capSum != nil && capSum.TotalMinutes > 0 {
+		sb.WriteString("### ⚡ Backlog Capacity (Graham Bounds)\n\n")
+		sb.WriteString(fmt.Sprintf("- **Open Scope:** `%d` issues • **Work:** `%s` • **Crit Path:** `%s` • **Parallelizable:** `%.0f%%`\n",
+			capSum.OpenCount,
+			formatEstimateDuration(capSum.TotalMinutes),
+			formatEstimateDuration(capSum.CriticalPathMinutes),
+			capSum.ParallelizablePct))
+		sb.WriteString(fmt.Sprintf("- **Makespan:** 1a `%.1fd` • 2a `%.1f–%.1fd` • 4a `%.1f–%.1fd`\n\n",
+			capSum.Days1Agent, capSum.Days2Min, capSum.Days2Max, capSum.Days4Min, capSum.Days4Max))
+	}
+	if fb := m.feedbackSummary; fb != nil && fb.TotalEvents > 0 {
+		sb.WriteString("### ⚖️ Adaptive Triage Weights\n\n")
+		state := fmt.Sprintf("collecting (%d/%d events)", fb.TotalEvents, fb.MinSamples)
+		if fb.Applied {
+			state = "active"
+		}
+		sb.WriteString(fmt.Sprintf("- **Status:** `%s` (`%d` accepted / `%d` ignored) — press `+` to accept, `-` to ignore\n",
+			state, fb.AcceptedCount, fb.IgnoredCount))
+		if len(fb.WeightAdjustments) > 0 {
+			type adjPair struct {
+				name string
+				mult float64
+			}
+			changed := make([]adjPair, 0, len(fb.WeightAdjustments))
+			for k, v := range fb.WeightAdjustments {
+				if v < 0.995 || v > 1.005 {
+					changed = append(changed, adjPair{name: k, mult: v})
+				}
+			}
+			sort.Slice(changed, func(i, j int) bool {
+				di := changed[i].mult - 1.0
+				if di < 0 {
+					di = -di
+				}
+				dj := changed[j].mult - 1.0
+				if dj < 0 {
+					dj = -dj
+				}
+				if di != dj {
+					return di > dj
+				}
+				return changed[i].name < changed[j].name
+			})
+			if len(changed) > 4 {
+				changed = changed[:4]
+			}
+			if len(changed) > 0 {
+				parts := make([]string, 0, len(changed))
+				for _, p := range changed {
+					parts = append(parts, fmt.Sprintf("%s `%.2fx`", p.name, p.mult))
+				}
+				sb.WriteString("- **Top Adjustments:** " + strings.Join(parts, " • ") + "\n")
+			}
+		}
+		sb.WriteString("\n")
+	}
 	return sb.String()
 }
 

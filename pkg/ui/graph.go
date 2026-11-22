@@ -1193,9 +1193,20 @@ func (g *GraphModel) renderMetricsPanel(id string, width int, t Theme) string {
 	rows = append(rows, "  "+renderMetricRow("In-Degree", inDeg, rankIn, maxIn, true))
 	rows = append(rows, "  "+renderMetricRow("Out-Degree", outDeg, rankOut, maxOut, true))
 
-	// Section: What-If & ETA Forecast (open issues only, when wired with scoped Analyzer)
+	// Section: What-If, Root Blockers & ETA Forecast (open issues only, when wired with scoped Analyzer)
 	if selIssue := g.issueMap[id]; selIssue != nil && !isClosedLikeStatus(selIssue.Status) && g.analyzer != nil {
 		whatIf := g.analyzer.ComputeWhatIf(id, stats)
+		blockerChain := g.analyzer.GetBlockerChain(id)
+		var visibleRoots []analysis.BlockerChainEntry
+		if blockerChain != nil && blockerChain.IsBlocked {
+			for _, rb := range blockerChain.RootBlockers {
+				// Respect current GraphView filter scope: never leak hidden/out-of-filter context IDs.
+				if _, ok := g.issueMap[rb.ID]; ok {
+					visibleRoots = append(visibleRoots, rb)
+				}
+			}
+		}
+		hasRootBlockers := blockerChain != nil && blockerChain.IsBlocked && (len(visibleRoots) > 0 || blockerChain.HasCycle)
 		var eta analysis.ETAEstimate
 		var etaErr error
 		if g.etaCtx != nil {
@@ -1207,11 +1218,36 @@ func (g *GraphModel) renderMetricsPanel(id string, width int, t Theme) string {
 			}
 			eta, etaErr = analysis.EstimateETAForIssue(g.issues, stats, id, 1, now)
 		}
-		if (whatIf != nil && (whatIf.Delta.DirectUnblocks > 0 || whatIf.Delta.TransitiveUnblocks > 0)) || etaErr == nil {
+		if (whatIf != nil && (whatIf.Delta.DirectUnblocks > 0 || whatIf.Delta.TransitiveUnblocks > 0)) || hasRootBlockers || etaErr == nil {
 			rows = append(rows, "")
 			rows = append(rows, sectionStyle.Render("What-If & Forecast"))
 			detailStyle := t.Renderer.NewStyle().Foreground(ColorText)
 			mutedStyle := t.Renderer.NewStyle().Foreground(ColorMuted)
+			if hasRootBlockers {
+				if len(visibleRoots) > 0 {
+					rootLabels := make([]string, 0, min(3, len(visibleRoots)))
+					for i, rb := range visibleRoots {
+						if i >= 3 {
+							break
+						}
+						tag := rb.ID
+						if rb.Actionable {
+							tag += " ✓"
+						}
+						rootLabels = append(rootLabels, tag)
+					}
+					suffix := ""
+					if len(visibleRoots) > len(rootLabels) {
+						suffix = fmt.Sprintf(" +%d", len(visibleRoots)-len(rootLabels))
+					}
+					rootLine := fmt.Sprintf("  Start here (%d blk): %s%s", blockerChain.ChainLength, strings.Join(rootLabels, ", "), suffix)
+					rows = append(rows, detailStyle.Render(truncateRunesHelper(rootLine, max(20, width-4), "…")))
+				}
+				if blockerChain.HasCycle {
+					cycLine := "  ⚠ Blocked by dependency cycle"
+					rows = append(rows, mutedStyle.Render(truncateRunesHelper(cycLine, max(20, width-4), "…")))
+				}
+			}
 			if whatIf != nil && (whatIf.Delta.DirectUnblocks > 0 || whatIf.Delta.TransitiveUnblocks > 0) {
 				unblockLine := fmt.Sprintf("  Closing unblocks +%d direct", whatIf.Delta.DirectUnblocks)
 				if whatIf.Delta.TransitiveUnblocks > whatIf.Delta.DirectUnblocks {

@@ -553,10 +553,32 @@ func feedbackWeightsForBeadsDir(beadsDir string) *analysis.Weights {
 // priority hints (p) and the actionable view rank issues the same way
 // --robot-triage does.
 func feedbackWeightsForBeadsPath(beadsPath string) *analysis.Weights {
+	w, _ := loadFeedbackForBeadsPath(beadsPath)
+	return w
+}
+
+// loadFeedbackForBeadsPath reads .beads/feedback.json once and returns both
+// the effective weights (non-nil only when feedback.Applies() is true) and the
+// JSON summary (non-nil whenever at least one feedback event is recorded).
+func loadFeedbackForBeadsPath(beadsPath string) (*analysis.Weights, *analysis.FeedbackJSON) {
 	if strings.TrimSpace(beadsPath) == "" || isHistoricalGitBeadsPath(beadsPath) {
-		return nil
+		return nil, nil
 	}
-	return feedbackWeightsForBeadsDir(filepath.Dir(beadsPath))
+	fb, err := analysis.LoadFeedback(filepath.Dir(beadsPath))
+	if err != nil || fb == nil {
+		return nil, nil
+	}
+	var weights *analysis.Weights
+	if fb.Applies() {
+		w := fb.Weights()
+		weights = &w
+	}
+	var summary *analysis.FeedbackJSON
+	if len(fb.Events) > 0 {
+		s := fb.ToJSON()
+		summary = &s
+	}
+	return weights, summary
 }
 
 // WithContext binds Phase 2 async analysis to the caller's lifecycle context.

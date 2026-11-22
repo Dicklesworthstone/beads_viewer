@@ -8984,3 +8984,233 @@ func TestWave19Round2AuditRemediationsR2B1ToR2B3(t *testing.T) {
 		}
 	})
 }
+
+func TestWave26_AlertsSuggestionsCompactFit_LazyRepoScope_RootBlockers_Capacity_AndFeedback(t *testing.T) {
+	refNow := time.Date(2026, 10, 15, 12, 0, 0, 0, time.UTC)
+
+	t.Run("A9_3_SuggestionsTab_CompactAndNarrow_NeverClipsFooter", func(t *testing.T) {
+		issues := []model.Issue{
+			{ID: "S-1", Title: "First\nmultiline title", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: refNow.Add(-48 * time.Hour), UpdatedAt: refNow},
+		}
+		m := NewModel(issues, nil, "", ReadinessScope{ReferenceNow: refNow})
+		t.Cleanup(m.Stop)
+		m.showAlertsPanel = true
+		m.alertsTab = 1
+		m.suggestionsCacheLoaded = true
+		m.suggestionsCache = []analysis.Suggestion{
+			{
+				Type:          analysis.SuggestionMissingDependency,
+				Confidence:    0.92,
+				Summary:       "First line\nSecond line\r\nThird line of a very long hygiene summary",
+				Reason:        "Reason line 1\nReason line 2",
+				TargetBead:    "S-1",
+				RelatedBead:   "S-2",
+				ActionCommand: "br dep add S-1 S-2 --note 'multiline\ncmd'",
+			},
+			{
+				Type:       analysis.SuggestionPotentialDuplicate,
+				Confidence: 0.85,
+				Summary:    "Second suggestion",
+				TargetBead: "S-1",
+			},
+		}
+		for _, sz := range [][2]int{{80, 18}, {80, 16}, {36, 24}, {36, 18}} {
+			m.suggestionsCursor = 1
+			u, _ := m.Update(tea.WindowSizeMsg{Width: sz[0], Height: sz[1]})
+			m = u.(*Model)
+			out := ansi.Strip(m.renderAlertsPanel())
+			if !strings.Contains(out, "Esc: close") {
+				t.Fatalf("A9-3/A10-P1-5 regression at %dx%d: Suggestions tab clipped footer 'Esc: close':\n%s", sz[0], sz[1], out)
+			}
+		}
+	})
+
+	t.Run("A9_4_RepoScopeToggle_KeepsSuggestionsLazyWhenAlertsRemain", func(t *testing.T) {
+		issues := []model.Issue{
+			{ID: "R1-1", Title: "Repo 1 item", Status: model.StatusOpen, Priority: 1, SourceRepo: "repo1", CreatedAt: refNow, UpdatedAt: refNow},
+			{ID: "R2-1", Title: "Repo 2 item", Status: model.StatusOpen, Priority: 1, SourceRepo: "repo2", CreatedAt: refNow, UpdatedAt: refNow},
+		}
+		m := NewModel(issues, nil, "", ReadinessScope{ReferenceNow: refNow})
+		t.Cleanup(m.Stop)
+		m.workspaceMode = true
+		m.availableRepos = []string{"repo1", "repo2"}
+		m.alerts = []drift.Alert{{Type: drift.AlertStaleIssue, Severity: drift.SeverityWarning, IssueID: "R1-1", Message: "stale"}}
+		m.showAlertsPanel = true
+		m.alertsTab = 0
+		m.suggestionsCacheLoaded = false
+		m.activeRepos = map[string]bool{"repo1": true}
+		m.syncSecondaryViewsForRepoScope(focusList)
+		if m.suggestionsCacheLoaded {
+			t.Fatal("A9-4 regression: syncSecondaryViewsForRepoScope eagerly loaded suggestions while Alerts tab had remaining alerts")
+		}
+	})
+
+	t.Run("W26_3_And_W26_4_RootBlockers_AndGlobalCapacity", func(t *testing.T) {
+		est := 120
+		issues := []model.Issue{
+			{ID: "RB-ROOT", Title: "Actionable root blocker", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask, EstimatedMinutes: &est, CreatedAt: refNow, UpdatedAt: refNow},
+			{ID: "RB-MID", Title: "Middle blocked item", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, EstimatedMinutes: &est,
+				Dependencies: []*model.Dependency{{IssueID: "RB-MID", DependsOnID: "RB-ROOT", Type: model.DepBlocks}}, CreatedAt: refNow, UpdatedAt: refNow},
+			{ID: "RB-LEAF", Title: "Leaf blocked item", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, EstimatedMinutes: &est,
+				Dependencies: []*model.Dependency{{IssueID: "RB-LEAF", DependsOnID: "RB-MID", Type: model.DepBlocks}}, CreatedAt: refNow, UpdatedAt: refNow},
+			{ID: "RB-CLOSED", Title: "Closed item", Status: model.StatusClosed, Priority: 2, IssueType: model.TypeTask,
+				Dependencies: []*model.Dependency{{IssueID: "RB-CLOSED", DependsOnID: "RB-MID", Type: model.DepBlocks}}, CreatedAt: refNow, UpdatedAt: refNow},
+		}
+		m := NewModel(issues, nil, "", ReadinessScope{ReferenceNow: refNow})
+		t.Cleanup(m.Stop)
+		m.analysis.WaitForPhase2()
+		u, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 35})
+		m = u.(*Model)
+
+		selectByID := func(mod *Model, id string) {
+			t.Helper()
+			for i, it := range mod.list.Items() {
+				if ii, ok := it.(IssueItem); ok && ii.Issue.ID == id {
+					mod.list.Select(i)
+					return
+				}
+			}
+			t.Fatalf("issue %s not found in list", id)
+		}
+
+		// DetailPane on RB-LEAF must show "Start Here: Root Blockers" pointing at RB-ROOT.
+		selectByID(m, "RB-LEAF")
+		m.updateViewportContent()
+		leafPlain := ansi.Strip(m.viewportContent)
+		if !strings.Contains(leafPlain, "Start Here: Root Blockers") || !strings.Contains(leafPlain, "RB-ROOT") {
+			t.Fatalf("W26-3 regression: DetailPane for blocked RB-LEAF missing Start Here root blocker RB-ROOT:\n%s", leafPlain)
+		}
+
+		// DetailPane on closed RB-CLOSED must NOT show Start Here: Root Blockers.
+		selectByID(m, "RB-CLOSED")
+		m.updateViewportContent()
+		closedPlain := ansi.Strip(m.viewportContent)
+		if strings.Contains(closedPlain, "Start Here: Root Blockers") {
+			t.Fatalf("W26-3 regression: closed RB-CLOSED should suppress Start Here: Root Blockers:\n%s", closedPlain)
+		}
+
+		// GraphView inspector on RB-LEAF must surface Start here root blocker RB-ROOT.
+		m.refreshBoardAndGraphForCurrentFilter()
+		m.graphView.SelectByID("RB-LEAF")
+		graphDetail := ansi.Strip(m.graphView.renderMetricsPanel("RB-LEAF", 60, m.theme))
+		if !strings.Contains(graphDetail, "Start here") || !strings.Contains(graphDetail, "RB-ROOT") {
+			t.Fatalf("W26-3 regression: GraphView inspector missing Start here root blocker RB-ROOT:\n%s", graphDetail)
+		}
+
+		// Insights PanelPriority must render global Backlog Capacity (Graham Bounds) without sprints.jsonl.
+		m.focused = focusInsights
+		m.insightsPanel.focusedPanel = PanelPriority
+		m.rebuildInsightsPanel()
+		m.insightsPanel.updateDetailContent()
+		prioPlain := ansi.Strip(m.insightsPanel.detailContent)
+		if !strings.Contains(prioPlain, "Backlog Capacity (Graham Bounds)") || !strings.Contains(prioPlain, "Makespan") {
+			t.Fatalf("W26-4 regression: Insights PanelPriority missing global Backlog Capacity:\n%s", prioPlain)
+		}
+
+		// A10-P1-2: computeGlobalCapacitySummary must exclude non-candidate context neighbors.
+		m.candidateIDs = map[string]bool{"RB-ROOT": true}
+		capCand := m.computeGlobalCapacitySummary(m.issues, nil)
+		if capCand == nil || capCand.OpenCount != 1 {
+			t.Fatalf("A10-P1-2 regression: expected candidate-scoped OpenCount=1, got %+v", capCand)
+		}
+		m.candidateIDs = nil
+	})
+
+	t.Run("W26_5_InteractiveFeedback_PersistsAdaptsAndRespectsGuards", func(t *testing.T) {
+		t.Setenv("BV_NO_SAVED_CONFIG", "") // TestMain disables persistence; opt back in for this test
+		tmp := t.TempDir()
+		beadsDir := filepath.Join(tmp, ".beads")
+		if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		beadsFile := filepath.Join(beadsDir, "issues.jsonl")
+		issues := []model.Issue{
+			{ID: "FB-1", Title: "High priority item", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask, CreatedAt: refNow, UpdatedAt: refNow},
+			{ID: "FB-2", Title: "Secondary item", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, CreatedAt: refNow, UpdatedAt: refNow},
+		}
+		m := NewModel(issues, nil, beadsFile, ReadinessScope{ReferenceNow: refNow})
+		t.Cleanup(m.Stop)
+		m.analysis.WaitForPhase2()
+		u, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 35})
+		m = u.(*Model)
+		selectByID := func(mod *Model, id string) {
+			t.Helper()
+			for i, it := range mod.list.Items() {
+				if ii, ok := it.(IssueItem); ok && ii.Issue.ID == id {
+					mod.list.Select(i)
+					return
+				}
+			}
+			t.Fatalf("issue %s not found in list", id)
+		}
+		selectByID(m, "FB-1")
+
+		// Press '+' twice (collecting 2/3) then '-' once (3 events -> active!).
+		for _, k := range []string{"+", "+", "-"} {
+			u, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(k)})
+			m = u.(*Model)
+		}
+		fb, err := analysis.LoadFeedback(beadsDir)
+		if err != nil {
+			t.Fatalf("LoadFeedback failed: %v", err)
+		}
+		if len(fb.Events) != 3 || fb.Stats.TotalAccepted != 2 || fb.Stats.TotalIgnored != 1 || !fb.Applies() {
+			t.Fatalf("W26-5 regression: expected 3 persisted feedback events (2 accept, 1 ignore, applied=true), got %+v", fb)
+		}
+		if !strings.Contains(m.statusMsg, "adaptive weights active") {
+			t.Fatalf("expected active adaptive weights toast, got %q", m.statusMsg)
+		}
+
+		// Guard 1: historical git:HEAD~1 beadsPath must refuse without writing.
+		mHist := NewModel(copyIssues(issues), nil, "git:HEAD~1", ReadinessScope{ReferenceNow: refNow})
+		t.Cleanup(mHist.Stop)
+		mHist.analysis.WaitForPhase2()
+		selectByID(mHist, "FB-1")
+		u, _ = mHist.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("+")})
+		mHist = u.(*Model)
+		if !strings.Contains(mHist.statusMsg, "historical") {
+			t.Fatalf("expected historical refusal message, got %q", mHist.statusMsg)
+		}
+
+		// Guard 3 (A10-P1-6): Insights 2D heatmap without drilldown must NOT silently record feedback.
+		m.focused = focusInsights
+		m.insightsPanel.focusedPanel = PanelPriority
+		m.insightsPanel.showHeatmap = true
+		m.insightsPanel.heatmapDrill = false
+		u, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("+")})
+		m = u.(*Model)
+		fbAfterHeatmap, _ := analysis.LoadFeedback(beadsDir)
+		if len(fbAfterHeatmap.Events) != 3 {
+			t.Fatalf("A10-P1-6 regression: 2D heatmap '+' recorded feedback on hidden issue (events=%d)", len(fbAfterHeatmap.Events))
+		}
+
+		// Guard 4 (A10-P2-4): standalone explicit --db outside .beads must refuse without writing.
+		standaloneDB := filepath.Join(t.TempDir(), "custom.db")
+		mDB := NewModel(copyIssues(issues), nil, standaloneDB, ReadinessScope{ReferenceNow: refNow})
+		t.Cleanup(mDB.Stop)
+		mDB.isExplicitDB = true
+		mDB.analysis.WaitForPhase2()
+		selectByID(mDB, "FB-1")
+		u, _ = mDB.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("+")})
+		mDB = u.(*Model)
+		if _, statErr := os.Stat(filepath.Join(filepath.Dir(standaloneDB), analysis.FeedbackFile)); !os.IsNotExist(statErr) {
+			t.Fatalf("A10-P2-4 regression: explicit standalone --db wrote feedback.json outside .beads")
+		}
+
+		// Guard 2: BV_NO_SAVED_CONFIG=1 must refuse without writing.
+		t.Setenv("BV_NO_SAVED_CONFIG", "1")
+		noSaveDir := filepath.Join(t.TempDir(), ".beads")
+		if err := os.MkdirAll(noSaveDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		mNoSave := NewModel(copyIssues(issues), nil, filepath.Join(noSaveDir, "issues.jsonl"), ReadinessScope{ReferenceNow: refNow})
+		t.Cleanup(mNoSave.Stop)
+		mNoSave.analysis.WaitForPhase2()
+		selectByID(mNoSave, "FB-1")
+		u, _ = mNoSave.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("+")})
+		mNoSave = u.(*Model)
+		if _, statErr := os.Stat(filepath.Join(noSaveDir, analysis.FeedbackFile)); !os.IsNotExist(statErr) {
+			t.Fatalf("BV_NO_SAVED_CONFIG guard violated: feedback.json was created")
+		}
+	})
+}

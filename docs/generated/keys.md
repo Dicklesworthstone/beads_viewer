@@ -48,6 +48,8 @@
 |  | `N` | Previous changed issue (time travel) |
 | **list,detail** | `x` | Export to markdown |
 | **list,detail,board,graph,insights,tree,actionable,flow** | `y` | Copy issue ID |
+| **list,detail,insights** | `+` | Accept triage recommendation (tune weights) |
+|  | `-` | Ignore triage recommendation (tune weights) |
 | **list,detail,board,graph,insights,tree,actionable,flow,history** | `C` | Copy full issue |
 | **list,detail,board,graph,tree,actionable,insights,flow,history** | `O` | Open in $EDITOR |
 | **list** | `'` | Recipe picker |

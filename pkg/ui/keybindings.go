@@ -276,6 +276,8 @@ func GetKeyBindingDocs() []KeyBindingDoc {
 		{"N", "Previous changed issue (time travel)", "Actions", "list"},
 		{"x", "Export to markdown", "Actions", "list,detail"},
 		{"y", "Copy issue ID", "Actions", "list,detail,board,graph,insights,tree,actionable,flow"},
+		{"+", "Accept triage recommendation (tune weights)", "Actions", "list,detail,insights"},
+		{"-", "Ignore triage recommendation (tune weights)", "Actions", "list,detail,insights"},
 		{"C", "Copy full issue", "Actions", "list,detail,board,graph,insights,tree,actionable,flow,history"},
 		{"O", "Open in $EDITOR", "Actions", "list,detail,board,graph,tree,actionable,insights,flow,history"},
 		{"'", "Recipe picker", "Actions", "list"},
