@@ -20,6 +20,7 @@ type GraphModel struct {
 	issueMap       map[string]*model.Issue
 	insights       *analysis.Insights
 	analyzer       *analysis.Analyzer
+	etaCtx         *analysis.ETAContext
 	nowFunc        func() time.Time
 	selectedIdx    int
 	scrollOffset   int
@@ -141,6 +142,16 @@ func (g *GraphModel) SetAnalyzer(analyzer *analysis.Analyzer, nowFunc func() tim
 		g.canvasLines = nil
 	}
 	g.nowFunc = nowFunc
+}
+
+// SetETAContext injects a precomputed full-corpus ETAContext so Graph View ETA
+// forecasts stay O(1+L) and match the Detail Pane even when g.issues is filtered
+// to open/ready issues (excluding closed closure history).
+func (g *GraphModel) SetETAContext(ctx *analysis.ETAContext) {
+	if g.etaCtx != ctx {
+		g.etaCtx = ctx
+		g.canvasLines = nil
+	}
 }
 
 // SetIssues updates the graph data preserving the selected issue if possible
@@ -1185,11 +1196,17 @@ func (g *GraphModel) renderMetricsPanel(id string, width int, t Theme) string {
 	// Section: What-If & ETA Forecast (open issues only, when wired with scoped Analyzer)
 	if selIssue := g.issueMap[id]; selIssue != nil && !isClosedLikeStatus(selIssue.Status) && g.analyzer != nil {
 		whatIf := g.analyzer.ComputeWhatIf(id, stats)
-		now := g.analyzer.Now()
-		if g.nowFunc != nil {
-			now = g.nowFunc()
+		var eta analysis.ETAEstimate
+		var etaErr error
+		if g.etaCtx != nil {
+			eta = g.etaCtx.EstimateForIssue(*selIssue, 1)
+		} else {
+			now := g.analyzer.Now()
+			if g.nowFunc != nil {
+				now = g.nowFunc()
+			}
+			eta, etaErr = analysis.EstimateETAForIssue(g.issues, stats, id, 1, now)
 		}
-		eta, etaErr := analysis.EstimateETAForIssue(g.issues, stats, id, 1, now)
 		if (whatIf != nil && (whatIf.Delta.DirectUnblocks > 0 || whatIf.Delta.TransitiveUnblocks > 0)) || etaErr == nil {
 			rows = append(rows, "")
 			rows = append(rows, sectionStyle.Render("What-If & Forecast"))
@@ -1202,10 +1219,13 @@ func (g *GraphModel) renderMetricsPanel(id string, width int, t Theme) string {
 				}
 				if len(whatIf.Delta.UnblockedIssueIDs) > 0 {
 					shown := whatIf.Delta.UnblockedIssueIDs
-					suffix := ""
 					if len(shown) > 3 {
-						suffix = fmt.Sprintf(" +%d", len(shown)-3)
 						shown = shown[:3]
+					}
+					totalDirect := max(whatIf.Delta.DirectUnblocks, len(whatIf.Delta.UnblockedIssueIDs))
+					suffix := ""
+					if totalDirect > len(shown) {
+						suffix = fmt.Sprintf(" +%d", totalDirect-len(shown))
 					}
 					unblockLine += " → " + strings.Join(shown, ", ") + suffix
 				}

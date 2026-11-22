@@ -397,6 +397,10 @@ func GetKeyBindingDocs() []KeyBindingDoc {
 		{"P", "Close sprint dashboard", "Sprint", "sprint"},
 		{"j", "Next sprint", "Sprint", "sprint"},
 		{"k", "Previous sprint", "Sprint", "sprint"},
-		{"enter", "Jump to first sprint bead", "Sprint", "sprint"},
+		{"tab", "Next sprint bead", "Sprint", "sprint"},
+		{"shift+tab", "Previous sprint bead", "Sprint", "sprint"},
+		{"n", "Next sprint bead", "Sprint", "sprint"},
+		{"p", "Previous sprint bead", "Sprint", "sprint"},
+		{"enter", "Jump to selected sprint bead", "Sprint", "sprint"},
 	}
 }

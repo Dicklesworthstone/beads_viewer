@@ -362,7 +362,8 @@ func (s *ShortcutsSidebar) hardcodedSections() []shortcutSection {
 			contexts: []string{"sprint"},
 			items: []shortcutItem{
 				{"j/k", "Next / Prev sprint"},
-				{"Enter", "Jump to first bead"},
+				{"Tab/n/p", "Next / Prev bead"},
+				{"Enter", "Jump to selected bead"},
 				{"P/Esc", "Exit sprint view"},
 			},
 		},

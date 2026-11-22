@@ -318,13 +318,13 @@ func (m *Model) SetExplicitDB(explicit bool) {
 	if m == nil {
 		return
 	}
+	if m.backgroundWorker != nil {
+		m.backgroundWorker.SetSkipSourceDiff(explicit)
+	}
 	if m.isExplicitDB == explicit {
 		return
 	}
 	m.isExplicitDB = explicit
-	if m.backgroundWorker != nil {
-		m.backgroundWorker.SetSkipSourceDiff(explicit)
-	}
 	if m.analysis != nil && m.analyzer != nil {
 		m.alerts, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlertsWithOptions(m.issues, m.analysis, m.analyzer, m.alertOptions())
 		m.recomputeVisibleAlertCounts()
@@ -2509,6 +2509,12 @@ type Model struct {
 	sprintBeadCursor       int
 	sprintAtRiskThresholds analysis.AtRiskThresholds
 
+	// Cached dataset-level ETA context (O(1+L) per-issue forecasts on cursor move)
+	etaCtx       *analysis.ETAContext
+	etaCtxStats  *analysis.GraphStats
+	etaCtxCount  int
+	etaCtxMinute int64
+
 	// AGENTS.md integration (bv-i8dk)
 	showAgentPrompt  bool
 	agentPromptModal AgentPromptModal
@@ -3757,6 +3763,7 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 			BeadsPath:      beadsPath,
 			ProjectDir:     workDir,
 			SourceDegraded: sourceDegraded,
+			SkipSourceDiff: isExplicitDB,
 			DebounceDelay:  200 * time.Millisecond,
 		})
 		if err != nil {
@@ -7876,9 +7883,9 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 
 			case focusSprint:
-				// Sprint uses P/esc/j/k/ctrl+d/ctrl+u/pgdown/pgup/enter — no conflicts with view-toggles.
+				// Sprint uses P/esc/j/k/tab/shift+tab/n/p/ctrl+d/ctrl+u/pgdown/pgup/enter — no conflicts with view-toggles.
 				switch keyStr {
-				case "P", "esc", "j", "k", "up", "down", "ctrl+d", "ctrl+u", "pgdown", "pgup", "enter":
+				case "P", "esc", "j", "k", "up", "down", "tab", "shift+tab", "n", "p", "ctrl+d", "ctrl+u", "pgdown", "pgup", "enter":
 					m = m.handleSprintKeys(msg)
 					viewToggleHandled = true
 				}
@@ -10615,6 +10622,7 @@ func (m *Model) renderMainView() (body string, overlay bool) {
 			body = m.tree.View()
 		case m.isGraphView:
 			m.graphView.SetAnalyzer(m.analyzer, m.analysisReferenceTime)
+			m.graphView.SetETAContext(m.etaContext())
 			body = m.graphView.View(bodyWidth, bodyHeight)
 		case m.isBoardView:
 			m.board.SetSize(bodyWidth, bodyHeight)
@@ -13747,9 +13755,15 @@ func (m *Model) updateViewportContent() {
 		if m.analyzer != nil && m.analysis != nil {
 			whatIf = m.analyzer.ComputeWhatIf(item.ID, m.analysis)
 		}
-		eta, etaErr := analysis.EstimateETAForIssue(m.issues, m.analysis, item.ID, 1, m.analysisReferenceTime())
+		etaCtx := m.etaContext()
+		var eta analysis.ETAEstimate
+		hasETA := false
+		if etaCtx != nil {
+			eta = etaCtx.EstimateForIssue(item, 1)
+			hasETA = true
+		}
 		hasWhatIf := whatIf != nil && (whatIf.Delta.DirectUnblocks > 0 || whatIf.Delta.TransitiveUnblocks > 0)
-		if hasWhatIf || etaErr == nil {
+		if hasWhatIf || hasETA {
 			sb.WriteString("### 🔮 What-If & Forecast\n")
 			if hasWhatIf {
 				unblockSummary := fmt.Sprintf("**+%d direct**", whatIf.Delta.DirectUnblocks)
@@ -13759,10 +13773,13 @@ func (m *Model) updateViewportContent() {
 				sb.WriteString(fmt.Sprintf("- **If Closed:** Unblocks %s", unblockSummary))
 				if len(whatIf.Delta.UnblockedIssueIDs) > 0 {
 					shown := whatIf.Delta.UnblockedIssueIDs
-					extra := ""
 					if len(shown) > 5 {
-						extra = fmt.Sprintf(" (+%d more)", len(shown)-5)
 						shown = shown[:5]
+					}
+					totalDirect := max(whatIf.Delta.DirectUnblocks, len(whatIf.Delta.UnblockedIssueIDs))
+					extra := ""
+					if totalDirect > len(shown) {
+						extra = fmt.Sprintf(" (+%d more)", totalDirect-len(shown))
 					}
 					sb.WriteString(fmt.Sprintf(" → %s%s", strings.Join(shown, ", "), extra))
 				}
@@ -13775,7 +13792,7 @@ func (m *Model) updateViewportContent() {
 					sb.WriteString("\n")
 				}
 			}
-			if etaErr == nil {
+			if hasETA {
 				confPct := int(eta.Confidence*100 + 0.5)
 				sb.WriteString(fmt.Sprintf("- **ETA Forecast:** %s (~%.1fd • range %s–%s • %d%% confidence)\n",
 					eta.ETADate.Format("2006-01-02"),
@@ -17482,6 +17499,7 @@ func (m *Model) RenderDebugView(viewName string, width, height int) string {
 		m.focused = focusGraph
 		m.refreshBoardAndGraphForCurrentFilter()
 		m.graphView.SetAnalyzer(m.analyzer, m.analysisReferenceTime)
+		m.graphView.SetETAContext(m.etaContext())
 		m.graphView.SetSize(width, bodyHeight)
 		return m.graphView.View(width, bodyHeight)
 	case "tree":
@@ -17743,4 +17761,26 @@ func (m *Model) reloadSprintsFromDisk(underlyingFocus focus) {
 			m.sprintViewText = m.renderSprintDashboard()
 		}
 	}
+}
+
+// etaContext returns a lazily cached dataset-level ETAContext for m.issues so
+// TUI Detail Pane and Graph View compute per-issue ETA forecasts in O(1+L)
+// without rescanning all N issues on every cursor move.
+func (m *Model) etaContext() *analysis.ETAContext {
+	if len(m.issues) == 0 {
+		return nil
+	}
+	now := m.analysisReferenceTime()
+	nowBucket := now.Unix() / 60
+	if !m.referenceNow.IsZero() {
+		nowBucket = now.UnixNano()
+	}
+	if m.etaCtx != nil && m.etaCtxStats == m.analysis && m.etaCtxCount == len(m.issues) && m.etaCtxMinute == nowBucket {
+		return m.etaCtx
+	}
+	m.etaCtx = analysis.NewETAContext(m.issues, m.analysis, now)
+	m.etaCtxStats = m.analysis
+	m.etaCtxCount = len(m.issues)
+	m.etaCtxMinute = nowBucket
+	return m.etaCtx
 }

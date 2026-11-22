@@ -733,23 +733,28 @@ func TestSprintView_RealDailyBurndownVelocityAndBeadCursorJump(t *testing.T) {
 		t.Fatalf("expected stepped multi-row daily burndown curve, got %d bullet rows:\n%s", bulletRows, out)
 	}
 
-	// Navigate sprint bead cursor with Tab / n / p and verify Enter jumps to the highlighted bead (index 2, distinct from index 0).
+	// Navigate sprint bead cursor with Tab / n / p through m.Update (verifying live TUI key routing
+	// and proving `p` does not fall through to toggle m.showPriorityHints) and Enter jumps to cursor.
 	displayed := m.sprintScopedIssues()
 	if len(displayed) < 3 || displayed[0].ID == displayed[2].ID {
 		t.Fatalf("expected >=3 distinct displayed sprint beads, got %+v", displayed)
 	}
 	wantTargetID := displayed[2].ID
-	m = m.handleSprintKeys(tea.KeyMsg{Type: tea.KeyTab})
-	m = m.handleSprintKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")})
+	hintsBefore := m.showPriorityHints
+	m = asModelPtr(t, must2(m.Update(tea.KeyMsg{Type: tea.KeyTab})))
+	m = asModelPtr(t, must2(m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")})))
 	if m.sprintBeadCursor != 2 {
-		t.Fatalf("expected sprintBeadCursor=2 after Tab+n, got %d", m.sprintBeadCursor)
+		t.Fatalf("expected sprintBeadCursor=2 after Update(Tab+n), got %d", m.sprintBeadCursor)
 	}
-	m = m.handleSprintKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})
+	m = asModelPtr(t, must2(m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("p")})))
 	if m.sprintBeadCursor != 1 {
-		t.Fatalf("expected sprintBeadCursor=1 after p, got %d", m.sprintBeadCursor)
+		t.Fatalf("expected sprintBeadCursor=1 after Update(p), got %d", m.sprintBeadCursor)
 	}
-	m = m.handleSprintKeys(tea.KeyMsg{Type: tea.KeyTab})
-	m = m.handleSprintKeys(tea.KeyMsg{Type: tea.KeyEnter})
+	if m.showPriorityHints != hintsBefore {
+		t.Fatalf("pressing p in Sprint View leaked to toggle showPriorityHints (%v -> %v)", hintsBefore, m.showPriorityHints)
+	}
+	m = asModelPtr(t, must2(m.Update(tea.KeyMsg{Type: tea.KeyTab})))
+	m = asModelPtr(t, must2(m.Update(tea.KeyMsg{Type: tea.KeyEnter})))
 	if m.isSprintView {
 		t.Fatalf("expected Enter to exit Sprint View and jump to bead")
 	}
