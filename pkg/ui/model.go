@@ -5991,6 +5991,7 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.backgroundWorker != nil && m.backgroundWorker.State() == WorkerStopped {
 			m.backgroundWorker = nil
+			m.syncInternalWatchedPath()
 		}
 		if (m.beadsPath == "" || isHistoricalGitBeadsPath(m.beadsPath)) && msg.source == nil {
 			// Re-start watch for next change
@@ -9860,12 +9861,29 @@ func (m *Model) syncSecondaryViewsForRepoScope(targetFocus focus) {
 	}
 	m.recomputeVisibleAlertCounts()
 	if m.showAlertsPanel {
-		remaining := len(m.activeScopedAlerts())
-		if remaining == 0 {
+		remainingAlerts := len(m.activeScopedAlerts())
+		remainingSuggestions := len(m.activeScopedSuggestions())
+		if remainingAlerts == 0 && remainingSuggestions == 0 {
 			m.showAlertsPanel = false
 			m.alertsCursor = 0
-		} else if m.alertsCursor >= remaining {
-			m.alertsCursor = remaining - 1
+			m.suggestionsCursor = 0
+		} else {
+			if remainingAlerts == 0 {
+				m.alertsCursor = 0
+				if m.alertsTab == 0 {
+					m.alertsTab = 1
+				}
+			} else if m.alertsCursor >= remainingAlerts {
+				m.alertsCursor = remainingAlerts - 1
+			}
+			if remainingSuggestions == 0 {
+				m.suggestionsCursor = 0
+				if m.alertsTab == 1 {
+					m.alertsTab = 0
+				}
+			} else if m.suggestionsCursor >= remainingSuggestions {
+				m.suggestionsCursor = remainingSuggestions - 1
+			}
 		}
 	}
 }
@@ -13987,23 +14005,24 @@ func (m *Model) updateViewportContent() {
 		}
 	}
 
-	// Structural Graph Metrics (K-Core, Schedule Slack, Cut Vertex) — placed below
-	// Description so primary issue prose remains above the fold on compact terminals.
-	if m.analysis != nil && m.analysis.IsPhase2Ready() {
+	// Structural Graph Metrics (Active K-Core, Active Schedule Slack, Active Cut Vertex) —
+	// suppressed for closed/tombstoned issues and placed below Description so primary issue
+	// prose remains above the fold on compact terminals.
+	if m.analysis != nil && m.analysis.IsPhase2Ready() && !isClosedLikeStatus(item.Status) {
 		structParts := make([]string, 0, 3)
-		if coreMap := m.analysis.CoreNumber(); coreMap != nil {
+		if coreMap := m.analysis.ActiveCoreNumber(); coreMap != nil {
 			if kcore, ok := coreMap[item.ID]; ok && kcore > 0 {
 				structParts = append(structParts, fmt.Sprintf("**K-Core:** `%d`", kcore))
 			}
 		}
 		if len(m.analysis.Cycles()) == 0 {
-			if slackMap := m.analysis.Slack(); slackMap != nil {
+			if slackMap := m.analysis.ActiveSlack(); slackMap != nil {
 				if sl, ok := slackMap[item.ID]; ok {
 					structParts = append(structParts, fmt.Sprintf("**Slack:** `%.1f`", sl))
 				}
 			}
 		}
-		for _, ap := range m.analysis.ArticulationPoints() {
+		for _, ap := range m.analysis.ActiveArticulationPoints() {
 			if ap == item.ID {
 				structParts = append(structParts, "**Cut Vertex:** ⚠ Articulation Point")
 				break
@@ -17474,11 +17493,14 @@ func (m *Model) renderAlertsPanel() string {
 	if m.suggestionsCacheLoaded || m.alertsTab == 1 {
 		suggTabLabel = fmt.Sprintf("Suggestions (%d)", len(suggestions))
 	}
+	var headerRendered string
 	if m.alertsTab == 1 {
-		sb.WriteString(titleStyle.Render("🔔 Alerts Panel  " + inactiveTabStyle.Render(alertTabLabel) + "  │  " + activeTabStyle.Render("["+suggTabLabel+"]")))
+		headerRendered = titleStyle.Render("🔔 Alerts Panel  " + inactiveTabStyle.Render(alertTabLabel) + "  │  " + activeTabStyle.Render("["+suggTabLabel+"]"))
 	} else {
-		sb.WriteString(titleStyle.Render("🔔 Alerts Panel  " + activeTabStyle.Render("["+alertTabLabel+"]") + "  │  " + inactiveTabStyle.Render(suggTabLabel)))
+		headerRendered = titleStyle.Render("🔔 Alerts Panel  " + activeTabStyle.Render("["+alertTabLabel+"]") + "  │  " + inactiveTabStyle.Render(suggTabLabel))
 	}
+	headerPlain := ansi.Strip(headerRendered)
+	sb.WriteString(headerRendered)
 	sb.WriteString("\n\n")
 
 	if m.alertsTab == 1 {
@@ -17487,7 +17509,8 @@ func (m *Model) renderAlertsPanel() string {
 			sb.WriteString("\n\n")
 		} else {
 			summaryStyle := t.Renderer.NewStyle().Foreground(t.Secondary)
-			sb.WriteString(summaryStyle.Render(fmt.Sprintf("%d hygiene suggestion(s)", len(suggestions))))
+			summaryText := fmt.Sprintf("%d hygiene suggestion(s)", len(suggestions))
+			sb.WriteString(summaryStyle.Render(summaryText))
 			sb.WriteString("\n\n")
 			totalS := len(suggestions)
 			cur := m.suggestionsCursor
@@ -17497,12 +17520,92 @@ func (m *Model) renderAlertsPanel() string {
 			if cur >= totalS {
 				cur = totalS - 1
 			}
-			maxVisible := max(3, (maxBoxHeight-12)/2)
-			startIdx := 0
-			if cur >= maxVisible {
-				startIdx = cur - maxVisible + 1
+
+			formatSuggLines := func(sg analysis.Suggestion, selected bool) (string, []string) {
+				cursor := "  "
+				if selected {
+					cursor = "▸ "
+				}
+				confPct := int(sg.Confidence*100 + 0.5)
+				prefix := fmt.Sprintf("%s[%s %d%%] ", cursor, sg.Type, confPct)
+				prefixW := lipgloss.Width(prefix)
+				availSummary := innerWidth - prefixW
+				var mainLine string
+				if availSummary >= 4 {
+					mainLine = prefix + ansi.Truncate(sg.Summary, availSummary, "…")
+				} else {
+					mainLine = ansi.Truncate(prefix+sg.Summary, innerWidth, "…")
+				}
+				if !selected {
+					return mainLine, nil
+				}
+				var details []string
+				if sg.TargetBead != "" {
+					targetLine := fmt.Sprintf("     Bead: %s", sg.TargetBead)
+					if sg.RelatedBead != "" {
+						targetLine += fmt.Sprintf(" ↔ %s", sg.RelatedBead)
+					}
+					details = append(details, ansi.Truncate(targetLine, innerWidth, "…"))
+				}
+				if sg.Reason != "" {
+					details = append(details, ansi.Truncate("     "+sg.Reason, innerWidth, "…"))
+				}
+				if sg.ActionCommand != "" {
+					details = append(details, ansi.Truncate("     Cmd (c to copy): "+sg.ActionCommand, innerWidth, "…"))
+				}
+				return mainLine, details
 			}
-			endIdx := min(startIdx+maxVisible, totalS)
+			suggRenderedLineCount := func(sg analysis.Suggestion, selected bool) int {
+				mainLine, details := formatSuggLines(sg, selected)
+				n := wrappedAlertTextLines(mainLine, innerWidth)
+				for _, dl := range details {
+					n += wrappedAlertTextLines(dl, innerWidth)
+				}
+				return n
+			}
+
+			chromeLines := 4 +
+				(wrappedAlertTextLines(headerPlain, innerWidth) + 2) +
+				(wrappedAlertTextLines(summaryText, innerWidth) + 1) +
+				(1 + wrappedAlertTextLines(footerText, innerWidth))
+			lineBudget := max(2, maxBoxHeight-chromeLines)
+
+			startIdx := cur
+			endIdx := cur + 1
+			usedLines := suggRenderedLineCount(suggestions[cur], true)
+			totalWithIndicators := func(s, e, contentLines int) int {
+				ind := 0
+				if s > 0 {
+					ind++
+				}
+				if e < totalS {
+					ind++
+				}
+				return contentLines + ind
+			}
+			for {
+				progressed := false
+				if endIdx < totalS {
+					h := suggRenderedLineCount(suggestions[endIdx], false)
+					if totalWithIndicators(startIdx, endIdx+1, usedLines+h) <= lineBudget {
+						usedLines += h
+						endIdx++
+						progressed = true
+					}
+				}
+				if startIdx > 0 {
+					h := suggRenderedLineCount(suggestions[startIdx-1], false)
+					if totalWithIndicators(startIdx-1, endIdx, usedLines+h) <= lineBudget {
+						usedLines += h
+						startIdx--
+						progressed = true
+					}
+				}
+				if !progressed {
+					break
+				}
+			}
+
 			if startIdx > 0 {
 				sb.WriteString(t.Renderer.NewStyle().Foreground(t.Muted).Italic(true).Render(fmt.Sprintf("  ↑ %d more", startIdx)))
 				sb.WriteString("\n")
@@ -17510,12 +17613,7 @@ func (m *Model) renderAlertsPanel() string {
 			for i := startIdx; i < endIdx; i++ {
 				sg := suggestions[i]
 				selected := i == cur
-				cursor := "  "
-				if selected {
-					cursor = "▸ "
-				}
-				confPct := int(sg.Confidence*100 + 0.5)
-				line := fmt.Sprintf("%s[%s %d%%] %s", cursor, sg.Type, confPct, truncateRunesHelper(sg.Summary, max(16, innerWidth-26), "…"))
+				mainLine, details := formatSuggLines(sg, selected)
 				style := t.Renderer.NewStyle().Foreground(t.Secondary)
 				if sg.Confidence >= analysis.ConfidenceThresholdHigh {
 					style = t.Renderer.NewStyle().Foreground(t.Feature)
@@ -17523,23 +17621,17 @@ func (m *Model) renderAlertsPanel() string {
 				if selected {
 					style = style.Bold(true).Foreground(t.Primary)
 				}
-				sb.WriteString(style.Render(line))
+				sb.WriteString(style.Render(mainLine))
 				sb.WriteString("\n")
 				if selected {
-					if sg.TargetBead != "" {
-						targetLine := fmt.Sprintf("     Bead: %s", sg.TargetBead)
-						if sg.RelatedBead != "" {
-							targetLine += fmt.Sprintf(" ↔ %s", sg.RelatedBead)
+					for idxD, dl := range details {
+						dStyle := t.Renderer.NewStyle().Foreground(t.Muted)
+						if idxD == 0 && sg.TargetBead != "" {
+							dStyle = dStyle.Italic(true)
+						} else if strings.HasPrefix(dl, "     Cmd (c to copy):") {
+							dStyle = t.Renderer.NewStyle().Foreground(t.Open)
 						}
-						sb.WriteString(t.Renderer.NewStyle().Foreground(t.Muted).Italic(true).Render(targetLine))
-						sb.WriteString("\n")
-					}
-					if sg.Reason != "" {
-						sb.WriteString(t.Renderer.NewStyle().Foreground(t.Muted).Render("     " + truncateRunesHelper(sg.Reason, max(16, innerWidth-6), "…")))
-						sb.WriteString("\n")
-					}
-					if sg.ActionCommand != "" {
-						sb.WriteString(t.Renderer.NewStyle().Foreground(t.Open).Render("     Cmd (c to copy): " + truncateRunesHelper(sg.ActionCommand, max(16, innerWidth-22), "…")))
+						sb.WriteString(dStyle.Render(dl))
 						sb.WriteString("\n")
 					}
 				}
@@ -17598,7 +17690,7 @@ func (m *Model) renderAlertsPanel() string {
 		}
 		// Chrome inside MaxHeight: border(2) + padding(2) + title(MarginBottom+2) + summary(+1) + blank+footer.
 		chromeLines := 4 +
-			(wrappedAlertTextLines("🔔 Alerts Panel", innerWidth) + 2) +
+			(wrappedAlertTextLines(headerPlain, innerWidth) + 2) +
 			(wrappedAlertTextLines(summary, innerWidth) + 1) +
 			(1 + wrappedAlertTextLines(footerText, innerWidth))
 		lineBudget := max(3, maxBoxHeight-chromeLines)

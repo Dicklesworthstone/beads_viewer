@@ -1179,11 +1179,11 @@ presentation fields configure the existing list, details, and graph:
 
 | Field | Behavior |
 |-------|----------|
-| `view.columns` | Ordered columns: `id`, `title`, `status`, `priority`, `created`, `updated`, `tags`, `blockers`. Empty uses the ordinary adaptive row. |
+| `view.columns` | Ordered columns: `id`, `title`, `status`, `priority`, `assignee`, `repo` (`source_repo`), `created`, `updated`, `tags`, `blockers`. Empty uses the ordinary adaptive row. |
 | `view.show_graph` | Opens the dependency graph when selecting the recipe. Later keyboard navigation is preserved across refreshes. |
 | `view.show_metrics` | Shows PageRank, impact, and triage values in rows and issue details. Unavailable metrics display an em dash in rows and `unavailable` in details. |
 | `metrics` | Selects displayed metrics and enables metric display: `pagerank`, `betweenness`, `impact`, `triage`, `hub`, `authority`, `eigenvector`, `kcore`, `slack`. |
-| `view.group_by` | Groups the list by `status`, `priority`, `assignee`, or `tag` (`label`/`labels`); `none` disables groups. Tag grouping uses the first alphabetically sorted label, or `untagged`. |
+| `view.group_by` | Groups the list by `status`, `priority`, `assignee`, `repo` (`source_repo`), or `tag` (`label`/`labels`); `none` disables groups. Tag grouping uses the first alphabetically sorted label, or `untagged`. |
 | `view.collapsed` | Starts groups collapsed. Enter or Space on a group expands/collapses it; search still includes collapsed issues. |
 | `view.truncate_title` | Maximum title display cells, including ellipsis; respects wide Unicode characters. Zero uses available width. |
 
@@ -1206,7 +1206,7 @@ bv --recipe sprint-review --export review.mmd --export-format mermaid
 
 Explicit export flags override recipe defaults. Without either, the format is
 Markdown and graphs are included; CSV defaults to no graph. `--export-md PATH`
-explicitly selects Markdown. `--export-group-by <status|priority|type|assignee|label|none>`
+explicitly selects Markdown. `--export-group-by <status|priority|type|assignee|label|repo|none>`
 overrides `view.group_by` for Markdown and HTML exports. `--export-include-graph=false` disables a recipe
 graph, and `--export-template=` clears a recipe template. CSV with a graph,
 Mermaid without a graph, and custom templates for other formats are errors.

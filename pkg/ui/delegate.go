@@ -494,7 +494,7 @@ func (d IssueDelegate) renderConfiguredRow(w io.Writer, m list.Model, index int,
 		prefix = "▸ "
 	}
 	cells := values
-	if d.WorkspaceMode {
+	if d.WorkspaceMode && !hasRepoColumn {
 		cells = append([]string{repoCell}, values...)
 	}
 	row := prefix + strings.Join(cells, " │ ")

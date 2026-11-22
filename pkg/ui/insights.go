@@ -2088,21 +2088,21 @@ func (m *InsightsModel) buildDetailMarkdown(selectedID string) string {
 		sb.WriteString(fmt.Sprintf("- **Centrality:** PR `%.4f` • BW `%.4f` • EV `%.4f`\n", pr, bt, ev))
 		sb.WriteString(fmt.Sprintf("- **Flow Role:** Hub `%.4f` • Auth `%.4f`\n", hub, auth))
 		sb.WriteString(fmt.Sprintf("- **Degree:** In `%d` ← → Out `%d`\n", stats.InDegree[selectedID], stats.OutDegree[selectedID]))
-		if stats.IsPhase2Ready() {
+		if stats.IsPhase2Ready() && !isClosedLikeStatus(issue.Status) {
 			structParts := make([]string, 0, 3)
-			if coreMap := stats.CoreNumber(); coreMap != nil {
+			if coreMap := stats.ActiveCoreNumber(); coreMap != nil {
 				if kcore, ok := coreMap[selectedID]; ok {
 					structParts = append(structParts, fmt.Sprintf("K-Core `%d`", kcore))
 				}
 			}
 			if len(stats.Cycles()) == 0 {
-				if slackMap := stats.Slack(); slackMap != nil {
+				if slackMap := stats.ActiveSlack(); slackMap != nil {
 					if sl, ok := slackMap[selectedID]; ok {
 						structParts = append(structParts, fmt.Sprintf("Slack `%.1f`", sl))
 					}
 				}
 			}
-			for _, ap := range stats.ArticulationPoints() {
+			for _, ap := range stats.ActiveArticulationPoints() {
 				if ap == selectedID {
 					structParts = append(structParts, "⚠ Cut Vertex")
 					break
