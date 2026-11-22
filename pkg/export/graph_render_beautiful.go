@@ -1408,7 +1408,7 @@ function handleDagCycleError() {
     localStorage.removeItem('bv-graph-layout');
     if (Array.isArray(DATA.cycles) && DATA.cycles.length > 0) {
         showCycleInspector(0);
-        showToast('Cannot apply DAG layout: ' + DATA.cycles.length + ' dependency cycle(s) highlighted');
+        showToast('Cannot apply DAG layout: dependency cycle detected (' + DATA.cycles.length + ' highlighted)');
     } else {
         showToast('Cannot apply DAG layout: dependency cycle detected');
     }
@@ -2151,10 +2151,9 @@ document.getElementById('btn-cycle-prev').onclick = () => { if (activeCycleIndex
 document.getElementById('btn-cycle-next').onclick = () => { if (activeCycleIndex >= 0) showCycleInspector(activeCycleIndex + 1); };
 document.getElementById('btn-cycle-close').onclick = () => {
     closeCycleInspector();
+    clearWhatIfSimulation();
     activePathNodes = null;
     highlightedNodes = new Set();
-    closeCycleInspector();
-    clearWhatIfSimulation();
     Graph.nodeColor(Graph.nodeColor());
     Graph.linkColor(Graph.linkColor());
     Graph.linkWidth(Graph.linkWidth());
@@ -2561,6 +2560,8 @@ function updatePathfinderBanner(text) {
     banner.classList.toggle('visible', pathFinderMode);
 }
 function togglePathFinder() {
+    closeCycleInspector();
+    clearWhatIfSimulation();
     pathFinderMode = !pathFinderMode;
     document.getElementById('btn-path').classList.toggle('active', pathFinderMode);
     if (!pathFinderMode) {
@@ -2671,7 +2672,7 @@ document.onkeydown = e => {
         case 'r': document.getElementById('btn-reset').click(); break;
         case 'escape':
             if (pathFinderMode) { pathFinderMode = false; pathStart = null; activePathNodes = null; highlightedNodes = new Set(); document.getElementById('pathfinder-banner').classList.remove('visible'); document.getElementById('btn-path').classList.remove('active'); Graph.nodeColor(computeNodeColor).linkColor(Graph.linkColor()).linkWidth(Graph.linkWidth()); }
-            else { clearSelection(); hideHoverPanel(); activePathNodes = null; highlightedNodes = new Set(); Graph.nodeColor(computeNodeColor).linkColor(Graph.linkColor()).linkWidth(Graph.linkWidth()); }
+            else { closeCycleInspector(); clearWhatIfSimulation(); clearSelection(); hideHoverPanel(); activePathNodes = null; highlightedNodes = new Set(); Graph.nodeColor(computeNodeColor).linkColor(Graph.linkColor()).linkWidth(Graph.linkWidth()); }
             break;
         case ' ': e.preventDefault(); document.getElementById('btn-fullscreen').click(); break;
         case 'h': document.getElementById('btn-heatmap').click(); break;
