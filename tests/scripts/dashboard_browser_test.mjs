@@ -1415,17 +1415,53 @@ async function journey(page, mobile) {
     `${page.name}: graphDetailNode action buttons stay visible: ${JSON.stringify(detailHeaderLayout)}`);
   assert.ok(detailHeaderLayout.cone.right <= detailHeaderLayout.innerWidth + 1,
     `${page.name}: graphDetailNode action bar fits inside viewport width: ${JSON.stringify(detailHeaderLayout)}`);
-  // Also prove opening #graph-filter-hud popover does NOT displace right-hand layout controls off-screen (even at 360px mobile).
+  // Also prove opening #graph-filter-hud popover does NOT displace right-hand layout/heatmap controls off-screen (even at 360px mobile).
   await click(page, '#graph-filter-toggle-btn');
   await waitFor(page, `(${visible})(document.querySelector('#graph-filter-hud'))`, 'Graph Filter HUD popover opens cleanly');
   const popoverLayout = await evaluate(page, `(() => {
     const hud = document.querySelector('#graph-filter-hud')?.getBoundingClientRect();
-    const layoutBtn = [...document.querySelectorAll('button')].find(b => (${visible})(b) && b.textContent.includes('Heatmap'))?.getBoundingClientRect();
-    return { innerWidth: window.innerWidth, hudRight: hud?.right || 0, layoutRight: layoutBtn?.right || 0 };
+    const rightPanel = document.querySelector('#graph-right-controls')?.getBoundingClientRect();
+    const heatmapBtn = document.querySelector('button[title="Toggle heatmap coloring (H)"]')?.getBoundingClientRect();
+    return {
+      innerWidth: window.innerWidth,
+      hudRight: hud?.right || 0,
+      layoutRight: rightPanel?.right || 0,
+      heatmapRight: heatmapBtn?.right || 0,
+    };
   })()`);
-  assert.ok(popoverLayout.hudRight <= popoverLayout.innerWidth + 1 && popoverLayout.layoutRight <= popoverLayout.innerWidth + 1,
-    `${page.name}: opening #graph-filter-hud keeps popover and right-hand controls within viewport: ${JSON.stringify(popoverLayout)}`);
+  assert.ok(
+    popoverLayout.hudRight > 0 && popoverLayout.layoutRight > 0 && popoverLayout.heatmapRight > 0 &&
+    popoverLayout.hudRight <= popoverLayout.innerWidth + 1 &&
+    popoverLayout.layoutRight <= popoverLayout.innerWidth + 1 &&
+    popoverLayout.heatmapRight <= popoverLayout.innerWidth + 1,
+    `${page.name}: opening #graph-filter-hud keeps popover and right-hand Layout/Heatmap controls genuinely visible within viewport: ${JSON.stringify(popoverLayout)}`
+  );
+  // Capture-phase Escape closes #graph-filter-hud without dismissing graphDetailNode underneath.
+  await key(page, 'Escape');
+  await waitFor(page, `!${app}.graphFiltersOpen && ${app}.graphDetailNode?.id === 'browser-root'`, 'Escape closes filter HUD without leaking to graphDetailNode');
+  // Re-open filter HUD and verify:
+  // (a) filtering out selected node closes graphDetailNode and clears selection,
+  // (b) status='closed' auto-keeps showClosed=true, unchecking showClosed clears status='closed',
+  // (c) status='blocked' matches dependency-blocked open issues (browser-detail),
+  // (d) single-repo fixture renders non-clickable plain Repo text or hides #graph-filter-repo.
   await click(page, '#graph-filter-toggle-btn');
+  await waitFor(page, `${app}.graphFiltersOpen`, 're-open filter HUD');
+  await evaluate(page, `${app}.applyGraphFilter('status', 'closed')`);
+  await waitFor(page, `${app}.graphDetailNode === null && ${app}.graphVisibleTotal === 1 && ${app}.graphFilters.showClosed === true`, 'filtering out selected node closes drawer and shows closed node');
+  await evaluate(page, `${app}.applyGraphFilter('showClosed', false)`);
+  await waitFor(page, `${app}.graphFilters.status === '' && ${app}.graphVisibleClosed === 0 && ${app}.graphVisibleOpen === 3`, 'unchecking showClosed clears status=closed conflict');
+  await evaluate(page, `${app}.applyGraphFilter('status', 'blocked')`);
+  await waitFor(page, `${app}.graphVisibleTotal === 1 && ${app}.forceGraphModule.getGraph().graphData().nodes[0]?.id === 'browser-detail'`, 'status=blocked matches dependency-blocked open issue');
+  await click(page, '#graph-filter-clear');
+  await waitFor(page, `${app}.graphVisibleTotal === 4`, 'reset restores all 4 graph nodes');
+  await click(page, '#graph-filter-toggle-btn');
+  // Verify showIssue on excluded ID displays warning toast instead of blank modal.
+  const excludedToastOk = await evaluate(page, `(() => {
+    const before = ${app}.toasts.length;
+    ${app}.showIssue('excluded-missing-id');
+    return ${app}.selectedIssue === null && ${app}.toasts.length > before && ${app}.toasts.some(t => t.message.includes('excluded-missing-id'));
+  })()`);
+  assert.equal(excludedToastOk, true, `${page.name}: showIssue on excluded ID emits warning toast`);
   await capture(page, 'graph');
   assert.ok(await evaluate(page, 'document.documentElement.scrollWidth <= innerWidth + 1'), 'no horizontal loss at viewport width');
   await send('Page.navigate', { url: origin + '/#/issue/browser-detail' }, page.session);
@@ -2518,7 +2554,9 @@ async function capabilitiesJourney(page) {
     m.focusDependencyCone('cap-auth-root', false);
   })()`);
   await key(page, 'Escape');
-  await waitFor(page, `${app}.dependencyConeActive === false && !${app}.graphDetailNode`, 'Escape clears dependency cone and selection');
+  await waitFor(page, `${app}.dependencyConeActive === false && ${app}.graphDetailNode?.id === 'cap-auth-root'`, 'first Escape clears dependency cone while preserving graphDetailNode');
+  await key(page, 'Escape');
+  await waitFor(page, `!${app}.graphDetailNode`, 'second Escape clears graphDetailNode and selection');
 
   await click(page, 'a[href="#/insights"]');
   await waitFor(page, `${app}.view === 'insights'`, 'navigated to insights for Wave 14/15 WASM & triage checks');
@@ -2693,6 +2731,81 @@ async function capabilitiesJourney(page) {
   assert.equal(insightsWave14Audit.claimHiddenWhenProvisional, true, 'provisional source_authority hides Claim button');
   assert.equal(insightsWave14Audit.showKeptWhenProvisional, true, 'provisional source_authority keeps Show button');
   assert.equal(insightsWave14Audit.helperOmitsClaimWhenProvisional, true, 'getIssueActionCommands omits claim when hasProvisionalSourceAuthority()');
+
+  // Wave 25: Hygiene Suggestions card in #/insights + absent-sprints meta gating (zero 404s)
+  const wave25InsightsCheck = await evaluate(page, `(() => {
+    const sugCard = document.getElementById('insights-hygiene-suggestions');
+    const sugVisible = (${visible})(sugCard);
+    const sugCount = ${app}.suggestionsData?.suggestions?.length || 0;
+    const cycleCount = ${app}.suggestionTypeCounts?.cycle_warning || 0;
+    const prevFilter = ${app}.suggestionsTypeFilter;
+    ${app}.suggestionsTypeFilter = 'cycle_warning';
+    const filteredCycleLen = ${app}.filteredSuggestions.length;
+    ${app}.suggestionsTypeFilter = prevFilter;
+    return {
+      hasSuggestions: ${app}.hasSuggestions,
+      hasSprints: ${app}.hasSprints,
+      sprintsNavVisible: (${visible})(document.getElementById('nav-sprints-link')),
+      sugVisible,
+      sugCount,
+      cycleCount,
+      filteredCycleLen,
+    };
+  })()`);
+  assert.equal(wave25InsightsCheck.hasSuggestions, true, 'capabilities-fixture emits hygiene suggestions (cycle_warning)');
+  assert.equal(wave25InsightsCheck.sugVisible, true, '#insights-hygiene-suggestions card is visible');
+  assert.ok(wave25InsightsCheck.sugCount > 0 && wave25InsightsCheck.cycleCount > 0 && wave25InsightsCheck.filteredCycleLen === wave25InsightsCheck.cycleCount,
+    `Hygiene suggestions type filter works accurately: ${JSON.stringify(wave25InsightsCheck)}`);
+  assert.equal(wave25InsightsCheck.hasSprints, false, 'capabilities-fixture without sprints.jsonl keeps hasSprints=false');
+  assert.equal(wave25InsightsCheck.sprintsNavVisible, false, 'Sprints nav link hidden when hasSprints=false');
+
+  // Wave 25: Issues quick filters (#filter-in-cycle-btn, #filter-articulation-btn), new sorts (pagerank/betweenness/due/estimate), and Detail Modal K-Core/Slack/Correlated Commits
+  await click(page, 'a[href="#/issues"]');
+  await waitFor(page, `${app}.view === 'issues'`, 'navigated to issues for Wave 25 quick filter and structural metric check');
+  await click(page, '#filter-in-cycle-btn');
+  await waitFor(page, `${app}.filters.inCycle === true && window.location.hash.includes('cycle=true')`, 'In Cycle quick filter updates state and URL');
+  const inCycleIds = await evaluate(page, `${app}.issues.map(i => i.id).sort()`);
+  assert.deepEqual(inCycleIds, ['cap-auth-root', 'cap-auth-ui', 'cap-billing-a', 'cap-billing-b'], 'In Cycle filter returns exact 4 active cycle issues');
+  await click(page, '#filter-in-cycle-btn');
+  await waitFor(page, `${app}.filters.inCycle === false`, 'toggling In Cycle quick filter off clears filter');
+
+  await click(page, '#filter-articulation-btn');
+  await waitFor(page, `${app}.filters.articulation === true && window.location.hash.includes('cutvertex=true')`, 'Cut Vertex quick filter updates state and URL');
+  const artIds = await evaluate(page, `${app}.issues.map(i => i.id).sort()`);
+  assert.deepEqual(artIds, ['cap-auth-root'], 'Cut Vertex filter returns active articulation point cap-auth-root');
+  await click(page, '#filter-articulation-btn');
+  await waitFor(page, `${app}.filters.articulation === false`, 'toggling Cut Vertex quick filter off clears filter');
+
+  const wave25DetailMetrics = await evaluate(page, `(() => {
+    const sel = document.getElementById('issues-sort-select');
+    const sortVals = [...sel.options].map(o => o.value);
+    const prIssues = queryIssues({}, 'pagerank', 10, 0).map(i => i.id);
+    const bwIssues = queryIssues({}, 'betweenness', 10, 0).map(i => i.id);
+    const dueIssues = queryIssues({}, 'due', 10, 0).map(i => i.id);
+    const issue = getIssue('cap-auth-root');
+    const closedIssue = getIssue('cap-closed-prereq');
+    const commits = ${app}.getIssueCommits('cap-auth-root');
+    return {
+      hasNewSorts: ['pagerank', 'betweenness', 'due', 'estimate'].every(v => sortVals.includes(v)),
+      sortsReturnAll6: prIssues.length === 6 && bwIssues.length === 6 && dueIssues.length === 6,
+      kcoreType: typeof issue?.kcore,
+      isCutVertex: issue?.is_articulation_point === true,
+      closedSuppressesCutVertex: closedIssue?.is_articulation_point === false && closedIssue?.kcore === null,
+      hasHistoryMeta: ${app}.meta?.has_history === true || ${app}.meta?.has_history === 'true',
+      commitsLen: Array.isArray(commits) ? commits.length : -1,
+      firstCommitHasShaAndMsg: Boolean(commits?.[0]?.short_sha && commits?.[0]?.message),
+    };
+  })()`);
+  assert.deepEqual(wave25DetailMetrics, {
+    hasNewSorts: true,
+    sortsReturnAll6: true,
+    kcoreType: 'number',
+    isCutVertex: true,
+    closedSuppressesCutVertex: true,
+    hasHistoryMeta: true,
+    commitsLen: wave25DetailMetrics.commitsLen >= 1 ? wave25DetailMetrics.commitsLen : 1,
+    firstCommitHasShaAndMsg: true,
+  }, `Issues new sorts, active-only structural metrics, and non-empty correlated commits verified: ${JSON.stringify(wave25DetailMetrics)}`);
 
   // Corpus-global MAX(blocks_count) hybrid impact normalization, [C-1] template/pinned hybrid status parity, & exact-ID substring search.
   await click(page, 'a[href="#/issues"]');
@@ -3835,6 +3948,86 @@ async function standaloneGraphJourney(page) {
   assert.deepEqual(standaloneThemeAndMenuAudit.withheldActionable, [false, false, false, true], 'standalone graph withholds ephemeral, pinned, and template open nodes from actionability');
   assert.deepEqual(standaloneThemeAndMenuAudit.withheldColors, ['#94a3b8', '#94a3b8', '#94a3b8', '#22c55e'], 'standalone graph colors withheld nodes muted slate (#94a3b8) instead of open green (#22c55e)');
 
+  // Wave 25: Standalone Interactive HTML Graph Cycle Inspector, What-If Cascade, and 4-Tab Triage Panel
+  const wave25StandaloneAudit = await evaluate(page, `(() => {
+    const cyclesCount = Array.isArray(DATA.cycles) ? DATA.cycles.length : 0;
+    const cycleBreaks = Array.isArray(DATA.cycle_breaks) ? DATA.cycle_breaks : [];
+    const cycleBreaksCount = cycleBreaks.length;
+    const allBreaksNonSelfLoop = cycleBreaks.every(b => b && b.from && b.to && b.from !== b.to);
+    const linkPairs = new Set(DATA.links.map(l => (typeof l.source === 'object' ? l.source.id : l.source) + '\\0' + (typeof l.target === 'object' ? l.target.id : l.target)));
+    const allBreaksRealLinks = cycleBreaks.every(b => linkPairs.has(b.from + '\\0' + b.to));
+
+    // Cycle Inspector: click #btn-cycles -> banner opens at [1/2] with exact non-doubled path -> [2/2] -> close
+    document.getElementById('btn-cycles').click();
+    const cycleBannerOpen = document.getElementById('cycle-banner').classList.contains('visible');
+    const cycleLabel1 = document.getElementById('cycle-banner-text').textContent.trim();
+    document.getElementById('btn-cycle-next').click();
+    const cycleLabel2 = document.getElementById('cycle-banner-text').textContent.trim();
+    document.getElementById('btn-cycle-close').click();
+    const cycleBannerClosed = !document.getElementById('cycle-banner').classList.contains('visible');
+
+    // Closed node context menu must hide #ctx-whatif and runWhatIfSimulation must ignore closed nodes
+    const closedNode = Graph.graphData().nodes.find(n => n.id === 'cap-closed-prereq');
+    showContextMenu(closedNode, { clientX: 200, clientY: 200 });
+    const ctxWhatIfHiddenOnClosed = document.getElementById('ctx-whatif').style.display === 'none';
+    hideContextMenu();
+    runWhatIfSimulation('cap-closed-prereq');
+    const closedWhatIfIgnored = !document.getElementById('whatif-banner').classList.contains('visible');
+
+    // What-If Close Cascade: simulate closing cap-auth-root -> opens #whatif-banner, reset clears it
+    runWhatIfSimulation('cap-auth-root');
+    const whatIfVisible = document.getElementById('whatif-banner').classList.contains('visible');
+    const whatIfSummary = document.getElementById('whatif-banner-text').textContent.trim();
+    document.getElementById('btn-whatif-close').click();
+    const whatIfCleared = !document.getElementById('whatif-banner').classList.contains('visible');
+
+    // 4-Tab Triage Panel: open #triage-panel and verify tabs Top / Quick Wins / Blockers / Alerts
+    document.getElementById('btn-triage').click();
+    const triageOpen = document.getElementById('triage-panel').style.display !== 'none';
+    const tabButtons = [...document.querySelectorAll('#triage-tabs .triage-tab-btn')];
+    const tabKeys = tabButtons.map(b => b.dataset.tab);
+    tabButtons.find(b => b.dataset.tab === 'alerts')?.click();
+    const alertsTabActive = document.querySelector('#triage-tabs .triage-tab-btn[data-tab="alerts"]')?.classList.contains('active');
+    document.getElementById('btn-triage').click();
+
+    return {
+      cyclesCount,
+      cycleBreaksCount,
+      allBreaksNonSelfLoop,
+      allBreaksRealLinks,
+      cycleBannerOpen,
+      cycleLabel1,
+      cycleLabel2,
+      cycleBannerClosed,
+      ctxWhatIfHiddenOnClosed,
+      closedWhatIfIgnored,
+      whatIfVisible,
+      whatIfSummaryHasRoot: whatIfSummary.includes('cap-auth-root'),
+      whatIfCleared,
+      triageOpen,
+      tabKeys,
+      alertsTabActive,
+    };
+  })()`);
+  assert.equal(wave25StandaloneAudit.cyclesCount, 2, 'standalone HTML DATA.cycles exports both active cycles');
+  assert.ok(wave25StandaloneAudit.cycleBreaksCount >= 1, 'standalone HTML DATA.cycle_breaks exports ranked break edges');
+  assert.equal(wave25StandaloneAudit.allBreaksNonSelfLoop, true, '2-node cycle breaks never emit phantom A -> A self-loops');
+  assert.equal(wave25StandaloneAudit.allBreaksRealLinks, true, 'every cycle break recommendation corresponds to a real directed link');
+  assert.equal(wave25StandaloneAudit.cycleBannerOpen, true, 'clicking #btn-cycles opens #cycle-banner');
+  assert.ok(wave25StandaloneAudit.cycleLabel1.includes('[1/2]') && wave25StandaloneAudit.cycleLabel2.includes('[2/2]'),
+    `Cycle Inspector steps [1/2] -> [2/2]: ${JSON.stringify(wave25StandaloneAudit)}`);
+  assert.equal(/(cap-[a-z-]+) → \1/.test(wave25StandaloneAudit.cycleLabel1), false,
+    `Cycle Inspector path must not double closing node: ${wave25StandaloneAudit.cycleLabel1}`);
+  assert.equal(wave25StandaloneAudit.cycleBannerClosed, true, 'closing #btn-cycle-close hides #cycle-banner');
+  assert.equal(wave25StandaloneAudit.ctxWhatIfHiddenOnClosed, true, '#ctx-whatif is hidden on closed nodes');
+  assert.equal(wave25StandaloneAudit.closedWhatIfIgnored, true, 'runWhatIfSimulation ignores closed nodes');
+  assert.equal(wave25StandaloneAudit.whatIfVisible, true, 'runWhatIfSimulation opens #whatif-banner');
+  assert.equal(wave25StandaloneAudit.whatIfSummaryHasRoot, true, '#whatif-banner-text names target node cap-auth-root');
+  assert.equal(wave25StandaloneAudit.whatIfCleared, true, '#btn-whatif-close hides #whatif-banner');
+  assert.equal(wave25StandaloneAudit.triageOpen, true, '#btn-triage opens #triage-panel');
+  assert.deepEqual(wave25StandaloneAudit.tabKeys, ['recommendations', 'quick_wins', 'blockers', 'alerts'], '4-tab Triage panel renders Top/Quick Wins/Blockers/Alerts');
+  assert.equal(wave25StandaloneAudit.alertsTabActive, true, 'clicking Alerts triage tab activates it');
+
   await capture(page, 'standalone-graph');
   clean(page);
   console.log(`PASS: ${page.name} standalone HTML graph filters, blocked colors, active-only critical badge, addToRecent, heatmap dimming, and Path Finder ON/OFF reset`);
@@ -3884,8 +4077,144 @@ async function multiRepoJourney(page, standalonePage) {
   await waitFor(page, `${app}.graphVisibleTotal === 2 && ${app}.graphVisibleOpen === 1 && ${app}.graphVisibleClosed === 1`, 'Graph Filter HUD repo=api shows 2 api nodes (1 open, 1 closed)');
   await evaluate(page, `${app}.forceGraphModule.selectNode('api-auth')`);
   await waitFor(page, `${app}.graphDetailNode?.id === 'api-auth' && ${app}.graphDetailNode?.sourceRepo === 'api'`, 'graphDetailNode exposes sourceRepo');
-  await click(page, '#graph-filter-clear');
-  await waitFor(page, `${app}.graphVisibleTotal === 4`, 'Graph Filter HUD Reset restores all 4 multi-repo nodes');
+  // Clicking Repo tile toggles repo filter off (was 'api') -> 4 nodes, then back on -> 2 nodes!
+  await click(page, '#graph-detail-repo-btn');
+  await waitFor(page, `${app}.graphFilters.repo === '' && ${app}.graphVisibleTotal === 4`, 'clicking graphDetailNode Repo tile clears active repo filter');
+  await click(page, '#graph-detail-repo-btn');
+  await waitFor(page, `${app}.graphFilters.repo === 'api' && ${app}.graphVisibleTotal === 2`, 'clicking graphDetailNode Repo tile re-applies repo filter');
+  // Cross-view initForceGraph() resets stale graph filters when returning from another view.
+  await click(page, 'a[href="#/issues"]');
+  await waitFor(page, `${app}.view === 'issues' && !${app}.graphFiltersOpen`, 'leaving graph closes filter popover');
+  await evaluate(page, `${app}.initForceGraph()`);
+  await waitFor(page, `${app}.view === 'graph' && ${app}.graphFilters.repo === '' && ${app}.graphVisibleTotal === 4`, 'cross-view initForceGraph clears stale graph filters');
+  // Batch What-If toggle lifecycle: 0 -> 1 -> 2 -> 1 -> 0.
+  const batchSteps = await evaluate(page, `(async () => {
+    const s = [];
+    s.push(${app}.graphWhatIfBatchIds.length);
+    await ${app}.toggleGraphWhatIfBatch('api-auth'); s.push(${app}.graphWhatIfBatchIds.length);
+    await ${app}.toggleGraphWhatIfBatch('web-login'); s.push(${app}.graphWhatIfBatchIds.length);
+    await ${app}.toggleGraphWhatIfBatch('api-auth'); s.push(${app}.graphWhatIfBatchIds.length);
+    await ${app}.toggleGraphWhatIfBatch('web-login'); s.push(${app}.graphWhatIfBatchIds.length);
+    return s;
+  })()`);
+  assert.deepEqual(batchSteps, [0, 1, 2, 1, 0], 'Batch What-If toggles cleanly through 0->1->2->1->0');
+  // Verify getTriageAlerts() preserves multi-issue_ids, sorts critical->warning->info, and renders blue info badge.
+  const alertOrderCheck = await evaluate(page, `(() => {
+    const prev = ${app}.triageData;
+    ${app}.triageData = {
+      ...(prev || {}),
+      alerts: [
+        { type: 'high_impact_unblock', severity: 'info', message: 'Info item', issue_id: 'api-auth' },
+        { type: 'abandoned_claim', severity: 'warning', message: 'Warn multi', issue_id: 'api-auth', issue_ids: ['api-auth', 'web-login'] },
+        { type: 'cycle_detected', severity: 'critical', message: 'Crit item', issue_id: 'web-login' },
+      ],
+    };
+    const res = ${app}.getTriageAlerts().map(a => ({ sev: a.severity, ids: a.issue_ids }));
+    ${app}.triageData = prev;
+    return res;
+  })()`);
+  assert.deepEqual(alertOrderCheck, [
+    { sev: 'critical', ids: ['web-login'] },
+    { sev: 'warning', ids: ['api-auth', 'web-login'] },
+    { sev: 'info', ids: ['api-auth'] },
+  ], 'getTriageAlerts sorts critical->warning->info and preserves deduplicated multi-issue_ids');
+
+  // Wave 25: Sprints & Burndown View (#/sprints) + Dashboard Banner + Chart.js Canvas + Overdue Filter & Estimate Sort
+  await waitFor(page, `${app}.hasSprints === true && (${visible})(document.getElementById('nav-sprints-link'))`, 'multi-repo export enables Sprints nav link');
+  await click(page, '#nav-sprints-link');
+  await waitFor(page, `${app}.view === 'sprints' && (${visible})(document.getElementById('sprints-view'))`, 'navigated to #/sprints view');
+  await delay(150);
+  const sprintViewAudit = await evaluate(page, `(() => {
+    const canvas = document.getElementById('sprint-burndown-chart');
+    const chart = typeof Chart !== 'undefined' && canvas ? Chart.getChart(canvas) : null;
+    const text = document.getElementById('sprints-view')?.textContent || '';
+    return {
+      sprintId: ${app}.activeSprint?.id || '',
+      hasChart: Boolean(chart),
+      datasetCount: chart?.data?.datasets?.length || 0,
+      firstTickLabel: chart?.data?.labels?.[0] || '',
+      canvasWidth: canvas?.getBoundingClientRect?.().width || 0,
+      hasCapacityText: text.includes('Graham Multi-Agent Capacity Bounds'),
+      hasSprintBead: text.includes('api-auth') && text.includes('web-login'),
+      hasUtcRangeText: text.includes('Oct 1, 2026') && text.includes('Oct 14, 2026'),
+    };
+  })()`);
+  assert.equal(sprintViewAudit.sprintId, 'sprint-mr-1', '#/sprints activates sprint-mr-1');
+  assert.equal(sprintViewAudit.hasChart, true, 'Chart.js renders #sprint-burndown-chart');
+  assert.equal(sprintViewAudit.datasetCount, 2, 'sprint burndown chart renders Ideal + Actual datasets');
+  assert.equal(sprintViewAudit.firstTickLabel, 'Oct 1', 'sprint burndown x-axis uses UTC date without negative-TZ off-by-one');
+  assert.ok(sprintViewAudit.canvasWidth > 100, `sprint burndown canvas rendered non-zero width: ${sprintViewAudit.canvasWidth}`);
+  assert.equal(sprintViewAudit.hasCapacityText, true, '#/sprints renders Graham Multi-Agent Capacity Bounds');
+  assert.equal(sprintViewAudit.hasSprintBead, true, '#/sprints lists clickable sprint scope beads');
+  assert.equal(sprintViewAudit.hasUtcRangeText, true, '#/sprints displays absolute UTC start/end date range');
+
+  // Direct reload on #/sprints renders #sprint-burndown-chart after loading completes (not stuck on 0x0 hidden main)
+  await reload(page);
+  await waitFor(page, `typeof Alpine !== 'undefined' && !${app}.loading && ${app}.view === 'sprints' && ${app}.hasSprints`, 'direct #/sprints reload ready');
+  await delay(150);
+  const directSprintWidth = await evaluate(page, `(() => {
+    const canvas = document.getElementById('sprint-burndown-chart');
+    const chart = typeof Chart !== 'undefined' && canvas ? Chart.getChart(canvas) : null;
+    return { hasChart: Boolean(chart), width: canvas?.getBoundingClientRect?.().width || 0 };
+  })()`);
+  assert.ok(directSprintWidth.hasChart && directSprintWidth.width > 100,
+    `direct #/sprints reload renders visible Chart.js burndown: ${JSON.stringify(directSprintWidth)}`);
+
+  // Mobile 360px direct boot onto #/sprints with hasSprints=true: 5-item bottom nav fits with zero horizontal overflow
+  const mobileSprintPage = await openPage('multi-repo-mobile-360', 360, false, '/#/sprints');
+  await waitFor(mobileSprintPage, `typeof Alpine !== 'undefined' && !${app}.loading && ${app}.view === 'sprints' && ${app}.hasSprints`, '360px mobile direct #/sprints initial boot');
+  await waitFor(mobileSprintPage, '!!navigator.serviceWorker.controller', '360px mobile worker controls page');
+  await delay(400);
+  await waitFor(mobileSprintPage, `typeof Alpine !== 'undefined' && !${app}.loading && ${app}.view === 'sprints' && ${app}.hasSprints && !!document.querySelector('nav.fixed.bottom-0') && getComputedStyle(document.querySelector('nav.fixed.bottom-0')).position === 'fixed'`, '360px mobile direct #/sprints settled after SW activation');
+  await delay(150);
+  const mobileFiveNavAudit = await evaluate(mobileSprintPage, `(() => {
+    const items = [...document.querySelectorAll('nav.fixed.bottom-0 a.nav-item-mobile')].filter(${visible});
+    const rects = items.map(el => {
+      const r = el.getBoundingClientRect();
+      return { left: Math.round(r.left), right: Math.round(r.right), width: Math.round(r.width) };
+    });
+    const allWithin360 = rects.every(r => r.left >= 0 && r.right <= 361 && r.width >= 56);
+    const noHorizOverflow = document.documentElement.scrollWidth <= 361;
+    const canvas = document.getElementById('sprint-burndown-chart');
+    const chart = typeof Chart !== 'undefined' && canvas ? Chart.getChart(canvas) : null;
+    const offenders = noHorizOverflow ? [] : [...document.querySelectorAll('*')]
+      .map(el => ({ tag: el.tagName, id: el.id, cls: String(el.className || '').slice(0, 40), right: Math.round(el.getBoundingClientRect().right) }))
+      .filter(o => o.right > 361)
+      .slice(0, 5);
+    return {
+      visibleCount: items.length,
+      allWithin360,
+      noHorizOverflow,
+      hasChart: Boolean(chart),
+      canvasWidth: Math.round(canvas?.getBoundingClientRect?.().width || 0),
+      scrollWidth: document.documentElement.scrollWidth,
+      rects,
+      offenders,
+    };
+  })()`);
+  clean(mobileSprintPage);
+  await send('Target.closeTarget', { targetId: mobileSprintPage.target });
+  assert.equal(mobileFiveNavAudit.visibleCount, 5, `expected 5 visible mobile nav items with hasSprints=true: ${JSON.stringify(mobileFiveNavAudit)}`);
+  assert.equal(mobileFiveNavAudit.allWithin360, true, `all 5 mobile nav items fit within 360px: ${JSON.stringify(mobileFiveNavAudit)}`);
+  assert.equal(mobileFiveNavAudit.noHorizOverflow, true, `no horizontal overflow at 360px on #/sprints: ${JSON.stringify(mobileFiveNavAudit)}`);
+  assert.ok(mobileFiveNavAudit.hasChart && mobileFiveNavAudit.canvasWidth > 100 && mobileFiveNavAudit.canvasWidth <= 360,
+    `360px mobile #/sprints burndown canvas fits viewport cleanly: ${JSON.stringify(mobileFiveNavAudit)}`);
+
+  // Overdue quick filter & Estimate sort in #/issues
+  await click(page, 'a[href="#/issues"]');
+  await waitFor(page, `${app}.view === 'issues'`, 'navigated to #/issues for overdue/estimate check');
+  await click(page, '#filter-overdue-btn');
+  await waitFor(page, `${app}.filters.overdue === true`, 'Overdue quick filter active');
+  await resultIDs(page, ['api-auth']);
+  await click(page, '#filter-overdue-btn');
+  await waitFor(page, `${app}.filters.overdue === false`, 'Overdue quick filter cleared');
+  await evaluate(page, `(() => {
+    const sel = document.getElementById('issues-sort-select');
+    sel.value = 'estimate';
+    sel.dispatchEvent(new Event('change', { bubbles: true }));
+  })()`);
+  await waitFor(page, `${app}.sort === 'estimate' && ${app}.issues[0]?.id === 'web-settings'`, 'Estimate sort places shortest-estimated 60m web-settings first');
+  await resultIDs(page, ['web-settings', 'api-auth', 'web-login', 'api-health']);
   clean(page);
 
   // Standalone multi-repo HTML graph shows #filter-repo and filters DATA.nodes!
