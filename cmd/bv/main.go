@@ -4032,8 +4032,10 @@ func main() {
 				if !exportContext.claimsProven() {
 					suppressUnprovenTriageClaims(&triage)
 				}
+				exportContext.ForceFullAnalysis = *forceFullAnalysis
+				fullAnalyzer, fullStats := resolveExportFullGraphStats(exportContext, exportIssues, analyzer, stats, *forceFullAnalysis)
 				if !*pagesIncludeClosed || exportContext.ActiveRecipe != nil || exportContext.CandidateIDs != nil {
-					attachDriftAlertsToTriage(&triage, exportContext, nil, nil, exportContext.GraphIssues(), *forceFullAnalysis)
+					attachDriftAlertsToTriage(&triage, exportContext, fullAnalyzer, fullStats, exportContext.GraphIssues(), *forceFullAnalysis)
 				} else {
 					attachDriftAlertsToTriage(&triage, exportContext, analyzer, stats, exportIssues, *forceFullAnalysis)
 				}
@@ -4078,10 +4080,10 @@ func main() {
 					exporter.SetGitHash(commit)
 				}
 
-				// Precompute optional sprints, hygiene suggestions, & history artifacts before ExportBundle
-				// so beads.sqlite3 and data/meta.json accurately record has_sprints / has_suggestions / has_history
+				// Precompute optional sprints, hygiene suggestions, labels intelligence, & history artifacts before ExportBundle
+				// so beads.sqlite3 and data/meta.json accurately record has_sprints / has_suggestions / has_labels / has_history
 				// (preventing 404 fetches in static bundles when absent).
-				sprintsJSON, sprintCount, sprintsErr := buildExportSprintsPayload(exportContext, projectDir, exportIssues, stats, exportNow)
+				sprintsJSON, sprintCount, sprintsErr := buildExportSprintsPayload(exportContext, projectDir, exportIssues, fullStats, exportNow)
 				if sprintsErr != nil {
 					fmt.Printf("  → Warning: failed to build sprints data: %v\n", sprintsErr)
 				}
@@ -4089,11 +4091,21 @@ func main() {
 				if suggestionsErr != nil {
 					fmt.Printf("  → Warning: failed to build hygiene suggestions: %v\n", suggestionsErr)
 				}
+				labelsJSON, labelCount, labelsErr := buildExportLabelsPayload(exportContext, exportIssues, fullStats, exportContext.DataHash, exportNow)
+				if labelsErr != nil {
+					fmt.Printf("  → Warning: failed to build label intelligence: %v\n", labelsErr)
+				}
+				forecastJSON, forecastETACtx, forecastErr := buildExportForecastPayload(exportContext, exportIssues, fullStats, exportContext.DataHash, exportNow)
+				if forecastErr != nil {
+					fmt.Printf("  → Warning: failed to build forecast data: %v\n", forecastErr)
+				}
 				var historyJSON []byte
 				var historyCommitCount int
 				if *pagesIncludeHistory {
 					fmt.Println("  → Generating time-travel history data...")
-					if historyReport, err := generateHistoryForExportContext(exportContext); err == nil && historyReport != nil {
+					historyCtx := exportContext
+					historyCtx.Issues = exportIssues
+					if historyReport, err := generateHistoryForExportContext(historyCtx); err == nil && historyReport != nil {
 						if encoded, mErr := json.MarshalIndent(historyReport, "", "  "); mErr == nil {
 							historyJSON = encoded
 							historyCommitCount = len(historyReport.Commits)
@@ -4102,8 +4114,11 @@ func main() {
 						fmt.Printf("  → Warning: failed to generate history: %v\n", err)
 					}
 				}
+				exporter.Config.ETAContext = forecastETACtx
 				exporter.Config.HasSprints = sprintCount > 0 && len(sprintsJSON) > 0
 				exporter.Config.HasSuggestions = suggestionCount > 0 && len(suggestionsJSON) > 0
+				exporter.Config.HasLabels = labelCount > 0 && len(labelsJSON) > 0
+				exporter.Config.HasForecast = len(forecastJSON) > 0
 				exporter.Config.HasHistory = len(historyJSON) > 0
 
 				// Prepare optional WASM scorer assets before ExportBundle so
@@ -4129,6 +4144,20 @@ func main() {
 						fmt.Printf("  → Warning: failed to write suggestions.json: %v\n", err)
 					} else {
 						fmt.Printf("  → suggestions.json (%d suggestions)\n", suggestionCount)
+					}
+				}
+				if exporter.Config.HasLabels {
+					if err := bundle.WriteFile("data/labels.json", labelsJSON, 0644); err != nil {
+						fmt.Printf("  → Warning: failed to write labels.json: %v\n", err)
+					} else {
+						fmt.Printf("  → labels.json (%d labels)\n", labelCount)
+					}
+				}
+				if exporter.Config.HasForecast {
+					if err := bundle.WriteFile("data/forecast.json", forecastJSON, 0644); err != nil {
+						fmt.Printf("  → Warning: failed to write forecast.json: %v\n", err)
+					} else {
+						fmt.Println("  → forecast.json")
 					}
 				}
 				if exporter.Config.HasHistory {
@@ -4587,6 +4616,11 @@ func main() {
 				if !robotDispatchContext.claimsProven() {
 					suppressUnprovenTriageClaims(&triage)
 				}
+				if robotDispatchContext.ActiveRecipe == nil && robotDispatchContext.CandidateIDs == nil {
+					attachDriftAlertsToTriage(&triage, robotDispatchContext, analyzer, &stats, exportIssues, *forceFullAnalysis)
+				} else {
+					attachDriftAlertsToTriage(&triage, robotDispatchContext, nil, nil, robotDispatchContext.GraphIssues(), *forceFullAnalysis)
+				}
 				envelope, err := withEnvelope(robotDispatchContext.Envelope(), struct{}{})
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Error encoding graph source authority: %v\n", err)
@@ -4594,19 +4628,24 @@ func main() {
 				}
 
 				opts := export.InteractiveGraphOptions{
-					Issues:        exportIssues,
-					Stats:         &stats,
-					Readiness:     robotDispatchContext.Readiness,
-					Triage:        &triage,
-					History:       historyReport,
-					Title:         title,
-					DataHash:      dataHash,
-					Path:          resolvedGraphExportPath,
-					ProjectName:   projectName,
-					ExportedAt:    graphExportNow,
-					GitHash:       asOfResolved,
-					WorkDir:       projectDir,
-					RobotEnvelope: envelope,
+					Issues:            exportIssues,
+					VelocityIssues:    robotDispatchContext.VelocityIssues(),
+					Stats:             &stats,
+					Readiness:         robotDispatchContext.Readiness,
+					CandidateIDs:      robotDispatchContext.CandidateIDs,
+					UnblockIDs:        robotDispatchContext.RecipeUnblockIDs,
+					Weights:           graphFeedbackWeights,
+					ForceFullAnalysis: *forceFullAnalysis,
+					Triage:            &triage,
+					History:           historyReport,
+					Title:             title,
+					DataHash:          dataHash,
+					Path:              resolvedGraphExportPath,
+					ProjectName:       projectName,
+					ExportedAt:        graphExportNow,
+					GitHash:           asOfResolved,
+					WorkDir:           projectDir,
+					RobotEnvelope:     envelope,
 				}
 				outputPath, err := export.GenerateInteractiveGraphHTML(opts)
 				if err != nil {
@@ -5049,6 +5088,7 @@ func main() {
 			if !robotDispatchContext.claimsProven() {
 				suppressUnprovenTriageClaims(&triage)
 			}
+			attachDriftAlertsToTriage(&triage, robotDispatchContext, nil, nil, robotDispatchContext.GraphIssues(), *forceFullAnalysis)
 
 			// Marshal triage to JSON for the export function
 			triageJSON, err := json.Marshal(triage)
@@ -5144,6 +5184,8 @@ func main() {
 				UnblockIDs:        robotDispatchContext.RecipeUnblockIDs,
 				VelocityIssues:    robotDispatchContext.VelocityIssues(),
 				History:           agentHistory,
+				GroupByTrack:      true,
+				GroupByLabel:      true,
 				ForceFullAnalysis: *forceFullAnalysis,
 				NotReadyLabels:    resolveNotReadyLabels(phaseThreeRobotHandlerConfig{NotReadyLabels: robotNotReadyLabels}),
 				Weights:           agentFeedbackWeights,
@@ -5152,6 +5194,7 @@ func main() {
 			if !robotDispatchContext.claimsProven() {
 				suppressUnprovenTriageClaims(&triage)
 			}
+			attachDriftAlertsToTriage(&triage, robotDispatchContext, nil, nil, robotDispatchContext.GraphIssues(), *forceFullAnalysis)
 			triagePayload, err := withEnvelope(robotDispatchContext.Envelope(), triage)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error encoding triage authority: %v\n", err)
@@ -8118,6 +8161,7 @@ func runPagesWizard(beadsPath string, dispatchCtx RobotContext, activeRecipe *re
 	driftCtx := scopedSourceCtx
 	driftCtx.ProjectDir = wizardProjectDir
 	driftCtx.WorkDir = wizardProjectDir
+	driftCtx.ForceFullAnalysis = forceFullAnalysis
 	if driftCtx.DataHash == "" {
 		driftCtx.DataHash = analysis.ComputeDataHash(source.Issues)
 	}
@@ -8161,8 +8205,9 @@ func runPagesWizard(beadsPath string, dispatchCtx RobotContext, activeRecipe *re
 	if !exportContext.claimsProven() {
 		suppressUnprovenTriageClaims(&triage)
 	}
+	wizardFullAnalyzer, wizardFullStats := resolveExportFullGraphStats(driftCtx, exportIssues, analyzer, stats, forceFullAnalysis)
 	if !config.IncludeClosed || driftCtx.ActiveRecipe != nil || driftCtx.CandidateIDs != nil {
-		attachDriftAlertsToTriage(&triage, driftCtx, nil, nil, driftCtx.GraphIssues(), forceFullAnalysis)
+		attachDriftAlertsToTriage(&triage, driftCtx, wizardFullAnalyzer, wizardFullStats, driftCtx.GraphIssues(), forceFullAnalysis)
 	} else {
 		attachDriftAlertsToTriage(&triage, driftCtx, analyzer, stats, exportIssues, forceFullAnalysis)
 	}
@@ -8209,15 +8254,23 @@ func runPagesWizard(beadsPath string, dispatchCtx RobotContext, activeRecipe *re
 		}
 	}
 
-	// Precompute optional sprints, hygiene suggestions, & history artifacts before ExportBundle
-	// so beads.sqlite3 and data/meta.json accurately record has_sprints / has_suggestions / has_history.
-	wizardSprintsJSON, wizardSprintCount, wizardSprintsErr := buildExportSprintsPayload(driftCtx, wizardProjectDir, exportIssues, stats, wizardNow)
+	// Precompute optional sprints, hygiene suggestions, labels intelligence, & history artifacts before ExportBundle
+	// so beads.sqlite3 and data/meta.json accurately record has_sprints / has_suggestions / has_labels / has_history.
+	wizardSprintsJSON, wizardSprintCount, wizardSprintsErr := buildExportSprintsPayload(driftCtx, wizardProjectDir, exportIssues, wizardFullStats, wizardNow)
 	if wizardSprintsErr != nil {
 		fmt.Printf("  -> Warning: failed to build sprints data: %v\n", wizardSprintsErr)
 	}
 	wizardSuggestionsJSON, wizardSuggestionCount, wizardSuggestionsErr := buildExportSuggestionsPayload(driftCtx, exportIssues, driftCtx.DataHash, wizardNow)
 	if wizardSuggestionsErr != nil {
 		fmt.Printf("  -> Warning: failed to build hygiene suggestions: %v\n", wizardSuggestionsErr)
+	}
+	wizardLabelsJSON, wizardLabelCount, wizardLabelsErr := buildExportLabelsPayload(driftCtx, exportIssues, wizardFullStats, driftCtx.DataHash, wizardNow)
+	if wizardLabelsErr != nil {
+		fmt.Printf("  -> Warning: failed to build label intelligence: %v\n", wizardLabelsErr)
+	}
+	wizardForecastJSON, wizardETACtx, wizardForecastErr := buildExportForecastPayload(driftCtx, exportIssues, wizardFullStats, driftCtx.DataHash, wizardNow)
+	if wizardForecastErr != nil {
+		fmt.Printf("  -> Warning: failed to build forecast data: %v\n", wizardForecastErr)
 	}
 	var wizardHistoryJSON []byte
 	var wizardHistoryCommitCount int
@@ -8232,8 +8285,11 @@ func runPagesWizard(beadsPath string, dispatchCtx RobotContext, activeRecipe *re
 			fmt.Printf("  -> Warning: failed to generate history: %v\n", err)
 		}
 	}
+	exporter.Config.ETAContext = wizardETACtx
 	exporter.Config.HasSprints = wizardSprintCount > 0 && len(wizardSprintsJSON) > 0
 	exporter.Config.HasSuggestions = wizardSuggestionCount > 0 && len(wizardSuggestionsJSON) > 0
+	exporter.Config.HasLabels = wizardLabelCount > 0 && len(wizardLabelsJSON) > 0
+	exporter.Config.HasForecast = len(wizardForecastJSON) > 0
 	exporter.Config.HasHistory = len(wizardHistoryJSON) > 0
 
 	// Prepare optional WASM scorer assets before ExportBundle so
@@ -8259,6 +8315,20 @@ func runPagesWizard(beadsPath string, dispatchCtx RobotContext, activeRecipe *re
 			fmt.Printf("  -> Warning: failed to write suggestions.json: %v\n", err)
 		} else {
 			fmt.Printf("  -> suggestions.json (%d suggestions)\n", wizardSuggestionCount)
+		}
+	}
+	if exporter.Config.HasLabels {
+		if err := bundle.WriteFile("data/labels.json", wizardLabelsJSON, 0644); err != nil {
+			fmt.Printf("  -> Warning: failed to write labels.json: %v\n", err)
+		} else {
+			fmt.Printf("  -> labels.json (%d labels)\n", wizardLabelCount)
+		}
+	}
+	if exporter.Config.HasForecast {
+		if err := bundle.WriteFile("data/forecast.json", wizardForecastJSON, 0644); err != nil {
+			fmt.Printf("  -> Warning: failed to write forecast.json: %v\n", err)
+		} else {
+			fmt.Println("  -> forecast.json")
 		}
 	}
 	if exporter.Config.HasHistory {
@@ -13189,6 +13259,13 @@ func buildExportSprintsPayload(ctx RobotContext, workDir string, exportIssues []
 	if readiness == nil {
 		readiness = model.NewReadinessIndex(graphIssues)
 	}
+	// Preserve identical-units velocity invariant (pkg/analysis/eta.go): when exportIssues
+	// is a strict subset of velocityIssues/graphIssues (e.g., --pages-include-closed=false or
+	// --recipe), pair velocityIssues with full-graph stats rather than exportIssues-only stats.
+	// Reuse caller-supplied stats when already computed over the full graph.
+	capStats := stats
+	capStatsResolved := !(scopeFiltered || len(exportIssues) < len(velocityIssues)) ||
+		(stats != nil && stats.NodeCount >= len(graphIssues))
 
 	entries := make([]exportSprintEntry, 0, len(sprints))
 	activeSprintID := ""
@@ -13238,10 +13315,21 @@ func buildExportSprintsPayload(ctx RobotContext, workDir string, exportIssues []
 		}
 		var capInfo *exportSprintCapacity
 		if len(openSprintIssues) > 0 {
-			g1 := analysis.ComputeGrahamBounds(openSprintIssues, velocityIssues, stats, 1, now)
+			if !capStatsResolved {
+				if capAnalyzer := ctx.GraphAnalyzer(); capAnalyzer != nil {
+					if ctx.ForceFullAnalysis {
+						fullCfg := analysis.FullAnalysisConfig()
+						capAnalyzer.SetConfig(&fullCfg)
+					}
+					s := capAnalyzer.Analyze()
+					capStats = &s
+				}
+				capStatsResolved = true
+			}
+			g1 := analysis.ComputeGrahamBounds(openSprintIssues, velocityIssues, capStats, 1, now)
 			if g1.TotalMinutes > 0 {
-				g2 := analysis.ComputeGrahamBounds(openSprintIssues, velocityIssues, stats, 2, now)
-				g4 := analysis.ComputeGrahamBounds(openSprintIssues, velocityIssues, stats, 4, now)
+				g2 := analysis.ComputeGrahamBounds(openSprintIssues, velocityIssues, capStats, 2, now)
+				g4 := analysis.ComputeGrahamBounds(openSprintIssues, velocityIssues, capStats, 4, now)
 				capInfo = &exportSprintCapacity{
 					TotalMinutes:        g1.TotalMinutes,
 					CriticalPathMinutes: g1.CriticalPathMinutes,
@@ -13334,4 +13422,402 @@ func buildExportSuggestionsPayload(ctx RobotContext, exportIssues []model.Issue,
 		return nil, 0, err
 	}
 	return raw, len(set.Suggestions), nil
+}
+
+type exportLabelIntelEntry struct {
+	Label             string                      `json:"label"`
+	IssueCount        int                         `json:"issue_count"`
+	OpenCount         int                         `json:"open_count"`
+	ClosedCount       int                         `json:"closed_count"`
+	BlockedCount      int                         `json:"blocked_count"`
+	Health            int                         `json:"health"`
+	HealthLevel       string                      `json:"health_level"`
+	AttentionScore    float64                     `json:"attention_score"`
+	NormalizedScore   float64                     `json:"normalized_score"`
+	AttentionRank     int                         `json:"attention_rank"`
+	ClosedLast7Days   int                         `json:"closed_last_7_days"`
+	ClosedLast30Days  int                         `json:"closed_last_30_days"`
+	TrendDirection    string                      `json:"trend_direction"`
+	StaleCount        int                         `json:"stale_count"`
+	IncomingDeps      int                         `json:"incoming_deps"`
+	OutgoingDeps      int                         `json:"outgoing_deps"`
+	IncomingLabels    []string                    `json:"incoming_labels,omitempty"`
+	OutgoingLabels    []string                    `json:"outgoing_labels,omitempty"`
+	CriticalPathCount int                         `json:"critical_path_count"`
+	Velocity          analysis.VelocityMetrics    `json:"velocity"`
+	Freshness         analysis.FreshnessMetrics   `json:"freshness"`
+	Flow              analysis.FlowMetrics        `json:"flow"`
+	Criticality       analysis.CriticalityMetrics `json:"criticality"`
+}
+
+type exportLabelsDocument struct {
+	GeneratedAt   time.Time               `json:"generated_at"`
+	TotalLabels   int                     `json:"total_labels"`
+	HealthyCount  int                     `json:"healthy_count"`
+	WarningCount  int                     `json:"warning_count"`
+	CriticalCount int                     `json:"critical_count"`
+	Labels        []exportLabelIntelEntry `json:"labels"`
+	Flow          analysis.CrossLabelFlow `json:"flow"`
+}
+
+// resolveExportFullGraphStats computes a full-graph Analyzer + GraphStats ONCE
+// when exportIssues is a strict subset of ctx.GraphIssues() or ctx.VelocityIssues()
+// (e.g., --pages-include-closed=false, --recipe, --label), eliminating duplicate
+// full-graph analyses across drift alerts, sprints, labels, and forecast builders.
+func resolveExportFullGraphStats(ctx RobotContext, exportIssues []model.Issue, exportAnalyzer *analysis.Analyzer, exportStats *analysis.GraphStats, forceFullAnalysis bool) (*analysis.Analyzer, *analysis.GraphStats) {
+	graphIssues := ctx.GraphIssues()
+	velocityIssues := ctx.VelocityIssues()
+	needsFull := ctx.CandidateIDs != nil || len(exportIssues) < len(graphIssues) || len(exportIssues) < len(velocityIssues)
+	if !needsFull && exportStats != nil {
+		return exportAnalyzer, exportStats
+	}
+	fullAnalyzer := ctx.GraphAnalyzer()
+	if fullAnalyzer == nil {
+		return exportAnalyzer, exportStats
+	}
+	if forceFullAnalysis {
+		fullCfg := analysis.FullAnalysisConfig()
+		fullAnalyzer.SetConfig(&fullCfg)
+	}
+	s := fullAnalyzer.Analyze()
+	return fullAnalyzer, &s
+}
+
+func buildExportLabelsPayload(ctx RobotContext, exportIssues []model.Issue, stats *analysis.GraphStats, dataHash string, now time.Time) ([]byte, int, error) {
+	if len(exportIssues) == 0 {
+		return nil, 0, nil
+	}
+	exportedLabels := make(map[string]bool)
+	for _, iss := range exportIssues {
+		for _, lbl := range iss.Labels {
+			if lbl != "" {
+				exportedLabels[lbl] = true
+			}
+		}
+	}
+	if len(exportedLabels) == 0 {
+		return nil, 0, nil
+	}
+	graphIssues := ctx.GraphIssues()
+	if len(graphIssues) == 0 {
+		graphIssues = exportIssues
+	}
+	readiness := ctx.Readiness
+	if readiness == nil {
+		readiness = model.NewReadinessIndex(graphIssues)
+	}
+	labelStats := stats
+	if labelStats == nil || (len(exportIssues) < len(graphIssues) && labelStats.NodeCount < len(graphIssues)) {
+		if fullAnalyzer := ctx.GraphAnalyzer(); fullAnalyzer != nil {
+			if ctx.ForceFullAnalysis {
+				fullCfg := analysis.FullAnalysisConfig()
+				fullAnalyzer.SetConfig(&fullCfg)
+			}
+			s := fullAnalyzer.Analyze()
+			labelStats = &s
+		}
+	}
+
+	cfg := analysis.DefaultLabelHealthConfig()
+	healthRes := analysis.ComputeAllLabelHealthWithScope(graphIssues, cfg, now.UTC(), labelStats, readiness, ctx.CandidateIDs)
+	flowRes := analysis.ComputeCrossLabelFlowWithScope(graphIssues, cfg, ctx.CandidateIDs)
+	attentionRes := analysis.ComputeLabelAttentionScoresWithScope(graphIssues, cfg, now.UTC(), readiness, ctx.CandidateIDs)
+
+	attByLabel := make(map[string]analysis.LabelAttentionScore, len(attentionRes.Labels))
+	for _, att := range attentionRes.Labels {
+		attByLabel[att.Label] = att
+	}
+
+	// Filter cross-label flow edges to labels present in this export so every
+	// clickable label pill resolves cleanly in #/issues, and derive consistent
+	// per-label incoming/outgoing metrics and bottleneck_labels from filteredDeps.
+	filteredDeps := make([]analysis.LabelDependency, 0, len(flowRes.Dependencies))
+	totalCross := 0
+	outgoingByLabel := make(map[string]int)
+	incomingByLabel := make(map[string]int)
+	outgoingTargets := make(map[string]map[string]bool)
+	incomingSources := make(map[string]map[string]bool)
+	for _, dep := range flowRes.Dependencies {
+		if exportedLabels[dep.FromLabel] && exportedLabels[dep.ToLabel] {
+			filteredDeps = append(filteredDeps, dep)
+			totalCross += dep.IssueCount
+			outgoingByLabel[dep.FromLabel] += dep.IssueCount
+			incomingByLabel[dep.ToLabel] += dep.IssueCount
+			if outgoingTargets[dep.FromLabel] == nil {
+				outgoingTargets[dep.FromLabel] = make(map[string]bool)
+			}
+			outgoingTargets[dep.FromLabel][dep.ToLabel] = true
+			if incomingSources[dep.ToLabel] == nil {
+				incomingSources[dep.ToLabel] = make(map[string]bool)
+			}
+			incomingSources[dep.ToLabel][dep.FromLabel] = true
+		}
+	}
+	maxOut := 0
+	for _, cnt := range outgoingByLabel {
+		if cnt > maxOut {
+			maxOut = cnt
+		}
+	}
+	filteredBottlenecks := make([]string, 0)
+	if maxOut > 0 {
+		for lbl, cnt := range outgoingByLabel {
+			if cnt == maxOut {
+				filteredBottlenecks = append(filteredBottlenecks, lbl)
+			}
+		}
+		sort.Strings(filteredBottlenecks)
+	}
+	filteredFlowLabels := make([]string, 0, len(flowRes.Labels))
+	for _, l := range flowRes.Labels {
+		if exportedLabels[l] {
+			filteredFlowLabels = append(filteredFlowLabels, l)
+		}
+	}
+	flowOut := analysis.CrossLabelFlow{
+		Labels:              filteredFlowLabels,
+		Dependencies:        filteredDeps,
+		BottleneckLabels:    filteredBottlenecks,
+		TotalCrossLabelDeps: totalCross,
+	}
+	sortedKeys := func(m map[string]bool) []string {
+		if len(m) == 0 {
+			return nil
+		}
+		out := make([]string, 0, len(m))
+		for k := range m {
+			out = append(out, k)
+		}
+		sort.Strings(out)
+		return out
+	}
+
+	entries := make([]exportLabelIntelEntry, 0, len(healthRes.Labels))
+	healthyCount, warningCount, criticalCount := 0, 0, 0
+	for _, lh := range healthRes.Labels {
+		if !exportedLabels[lh.Label] {
+			continue
+		}
+		switch lh.HealthLevel {
+		case analysis.HealthLevelHealthy:
+			healthyCount++
+		case analysis.HealthLevelWarning:
+			warningCount++
+		case analysis.HealthLevelCritical:
+			criticalCount++
+		}
+		att := attByLabel[lh.Label]
+		inLabels := sortedKeys(incomingSources[lh.Label])
+		outLabels := sortedKeys(outgoingTargets[lh.Label])
+		inDeps := incomingByLabel[lh.Label]
+		outDeps := outgoingByLabel[lh.Label]
+		scopedFlow := lh.Flow
+		scopedFlow.IncomingDeps = inDeps
+		scopedFlow.OutgoingDeps = outDeps
+		scopedFlow.IncomingLabels = inLabels
+		scopedFlow.OutgoingLabels = outLabels
+		entries = append(entries, exportLabelIntelEntry{
+			Label:             lh.Label,
+			IssueCount:        lh.IssueCount,
+			OpenCount:         lh.OpenCount,
+			ClosedCount:       lh.ClosedCount,
+			BlockedCount:      lh.Blocked,
+			Health:            lh.Health,
+			HealthLevel:       lh.HealthLevel,
+			AttentionScore:    att.AttentionScore,
+			NormalizedScore:   att.NormalizedScore,
+			AttentionRank:     att.Rank,
+			ClosedLast7Days:   lh.Velocity.ClosedLast7Days,
+			ClosedLast30Days:  lh.Velocity.ClosedLast30Days,
+			TrendDirection:    lh.Velocity.TrendDirection,
+			StaleCount:        lh.Freshness.StaleCount,
+			IncomingDeps:      inDeps,
+			OutgoingDeps:      outDeps,
+			IncomingLabels:    inLabels,
+			OutgoingLabels:    outLabels,
+			CriticalPathCount: lh.Criticality.CriticalPathCount,
+			Velocity:          lh.Velocity,
+			Freshness:         lh.Freshness,
+			Flow:              scopedFlow,
+			Criticality:       lh.Criticality,
+		})
+	}
+	if len(entries) == 0 {
+		return nil, 0, nil
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		ri, rj := entries[i].AttentionRank, entries[j].AttentionRank
+		if ri > 0 && rj > 0 && ri != rj {
+			return ri < rj
+		}
+		if entries[i].Health != entries[j].Health {
+			return entries[i].Health < entries[j].Health
+		}
+		return entries[i].Label < entries[j].Label
+	})
+	// Reassign contiguous 1..N attention ranks after filtering to exported labels.
+	for i := range entries {
+		entries[i].AttentionRank = i + 1
+	}
+
+	if dataHash == "" {
+		dataHash = analysis.ComputeDataHash(exportIssues)
+	}
+	doc := exportLabelsDocument{
+		GeneratedAt:   now.UTC(),
+		TotalLabels:   len(entries),
+		HealthyCount:  healthyCount,
+		WarningCount:  warningCount,
+		CriticalCount: criticalCount,
+		Labels:        entries,
+		Flow:          flowOut,
+	}
+	envCtx := ctx
+	envCtx.Command = "robot-label-health"
+	wrapped, err := withEnvelope(envCtx.EnvelopeWithHash(dataHash), doc)
+	if err != nil {
+		return nil, 0, err
+	}
+	raw, err := json.MarshalIndent(wrapped, "", "  ")
+	if err != nil {
+		return nil, 0, err
+	}
+	return raw, len(entries), nil
+}
+
+type exportGlobalCapacity struct {
+	OpenCount             int      `json:"open_count"`
+	TotalMinutes          int      `json:"total_minutes"`
+	CriticalPathMinutes   int      `json:"critical_path_minutes"`
+	ParallelizablePct     float64  `json:"parallelizable_pct"`
+	VelocityMinutesPerDay float64  `json:"velocity_minutes_per_day"`
+	Days1Agent            float64  `json:"days_1_agent"`
+	Days2AgentsMin        float64  `json:"days_2_agents_min"`
+	Days2AgentsMax        float64  `json:"days_2_agents_max"`
+	Days4AgentsMin        float64  `json:"days_4_agents_min"`
+	Days4AgentsMax        float64  `json:"days_4_agents_max"`
+	CriticalPathIDs       []string `json:"critical_path_ids,omitempty"`
+}
+
+type exportForecastDocument struct {
+	GeneratedAt             time.Time                         `json:"generated_at"`
+	GlobalCapacity          *exportGlobalCapacity             `json:"global_capacity,omitempty"`
+	PriorityRecommendations []analysis.PriorityRecommendation `json:"priority_recommendations,omitempty"`
+}
+
+func buildExportForecastPayload(ctx RobotContext, exportIssues []model.Issue, stats *analysis.GraphStats, dataHash string, now time.Time) ([]byte, *analysis.ETAContext, error) {
+	if len(exportIssues) == 0 {
+		return nil, nil, nil
+	}
+	graphIssues := ctx.GraphIssues()
+	if len(graphIssues) == 0 {
+		graphIssues = exportIssues
+	}
+	velocityIssues := ctx.VelocityIssues()
+	if len(velocityIssues) == 0 {
+		velocityIssues = graphIssues
+	}
+	readiness := ctx.Readiness
+	if readiness == nil {
+		readiness = model.NewReadinessIndex(graphIssues)
+	}
+
+	// Preserve identical-units velocity invariant when exportIssues omits closed or neighbor issues;
+	// reuse caller-supplied fullStats when already computed over the full graph.
+	capStats := stats
+	if capStats == nil || ((len(exportIssues) < len(velocityIssues) || len(exportIssues) < len(graphIssues)) && capStats.NodeCount < len(graphIssues)) {
+		if fullAnalyzer := ctx.GraphAnalyzer(); fullAnalyzer != nil {
+			if ctx.ForceFullAnalysis {
+				fullCfg := analysis.FullAnalysisConfig()
+				fullAnalyzer.SetConfig(&fullCfg)
+			}
+			s := fullAnalyzer.Analyze()
+			capStats = &s
+		}
+	}
+	etaCtx := analysis.NewETAContext(velocityIssues, capStats, now.UTC())
+
+	visibleIDs := make(map[string]bool, len(exportIssues))
+	openIssues := make([]model.Issue, 0, len(exportIssues))
+	for _, iss := range exportIssues {
+		visibleIDs[iss.ID] = true
+		if !iss.Status.IsClosed() && !iss.Status.IsTombstone() {
+			openIssues = append(openIssues, iss)
+		}
+	}
+
+	var globalCap *exportGlobalCapacity
+	if len(openIssues) > 0 {
+		g1 := analysis.ComputeGrahamBounds(openIssues, velocityIssues, capStats, 1, now.UTC())
+		if g1.TotalMinutes > 0 {
+			g2 := analysis.ComputeGrahamBounds(openIssues, velocityIssues, capStats, 2, now.UTC())
+			g4 := analysis.ComputeGrahamBounds(openIssues, velocityIssues, capStats, 4, now.UTC())
+			parPct := 0.0
+			if g1.TotalMinutes > 0 {
+				parMin := max(0, g1.TotalMinutes-g1.CriticalPathMinutes)
+				parPct = float64(parMin) / float64(g1.TotalMinutes) * 100.0
+			}
+			critIDs := g1.CriticalPathIDs
+			if len(critIDs) > 8 {
+				critIDs = critIDs[:8]
+			}
+			globalCap = &exportGlobalCapacity{
+				OpenCount:             len(openIssues),
+				TotalMinutes:          g1.TotalMinutes,
+				CriticalPathMinutes:   g1.CriticalPathMinutes,
+				ParallelizablePct:     parPct,
+				VelocityMinutesPerDay: g1.VelocityMinutesPerDay,
+				Days1Agent:            g1.GrahamMinDays,
+				Days2AgentsMin:        g2.GrahamMinDays,
+				Days2AgentsMax:        g2.GrahamMaxDays,
+				Days4AgentsMin:        g4.GrahamMinDays,
+				Days4AgentsMax:        g4.GrahamMaxDays,
+				CriticalPathIDs:       critIDs,
+			}
+		}
+	}
+
+	recAnalyzer := analysis.NewAnalyzer(graphIssues)
+	recAnalyzer.SetNow(now.UTC())
+	recAnalyzer.SetReadinessScope(readiness, visibleIDs)
+	if ctx.RecipeUnblockIDs != nil {
+		recAnalyzer.SetUnblockScope(ctx.RecipeUnblockIDs)
+	}
+	if _, fbWeights := loadRobotFeedbackForContext(ctx); fbWeights != nil {
+		recAnalyzer.SetWeights(*fbWeights)
+	}
+	recs := recAnalyzer.GenerateRecommendationsFromStats(capStats, analysis.DefaultThresholds())
+	filteredRecs := make([]analysis.PriorityRecommendation, 0, min(len(recs), 20))
+	for _, rec := range recs {
+		if !visibleIDs[rec.IssueID] || rec.CurrentPriority == rec.SuggestedPriority {
+			continue
+		}
+		filteredRecs = append(filteredRecs, rec)
+		if len(filteredRecs) >= 20 {
+			break
+		}
+	}
+
+	if globalCap == nil && len(filteredRecs) == 0 {
+		return nil, etaCtx, nil
+	}
+	if dataHash == "" {
+		dataHash = analysis.ComputeDataHash(exportIssues)
+	}
+	doc := exportForecastDocument{
+		GeneratedAt:             now.UTC(),
+		GlobalCapacity:          globalCap,
+		PriorityRecommendations: filteredRecs,
+	}
+	envCtx := ctx
+	envCtx.Command = "robot-forecast"
+	wrapped, err := withEnvelope(envCtx.EnvelopeWithHash(dataHash), doc)
+	if err != nil {
+		return nil, etaCtx, err
+	}
+	raw, err := json.MarshalIndent(wrapped, "", "  ")
+	if err != nil {
+		return nil, etaCtx, err
+	}
+	return raw, etaCtx, nil
 }

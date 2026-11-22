@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -10338,5 +10339,279 @@ func TestExportPages_SprintsAndSuggestionsArtifactsAndMetaGating(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(outClosedFiltered, "data", "sprints.json")); !os.IsNotExist(err) {
 		t.Fatalf("expected no ghost data/sprints.json when all sprint beads are filtered out, err=%v", err)
+	}
+}
+
+func TestWave26_ExportPages_Labels_Forecast_ETA_HistoryScope_AndSprintCapacity(t *testing.T) {
+	exe := buildTestBinary(t)
+
+	proj := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(proj, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	issuesJSONL := strings.Join([]string{
+		`{"id":"W26-ROOT","title":"Core auth foundation","status":"open","priority":3,"issue_type":"feature","labels":["backend","auth"],"estimated_minutes":120,"created_at":"2026-09-01T12:00:00Z","updated_at":"2026-09-02T12:00:00Z"}`,
+		`{"id":"W26-MID","title":"Session middleware","status":"open","priority":1,"issue_type":"task","labels":["backend"],"estimated_minutes":90,"dependencies":[{"issue_id":"W26-MID","depends_on_id":"W26-ROOT","type":"blocks"}],"created_at":"2026-09-02T12:00:00Z","updated_at":"2026-10-10T12:00:00Z"}`,
+		`{"id":"W26-UI","title":"Login screen polish","status":"open","priority":1,"issue_type":"feature","labels":["frontend"],"estimated_minutes":60,"dependencies":[{"issue_id":"W26-UI","depends_on_id":"W26-MID","type":"blocks"}],"created_at":"2026-09-03T12:00:00Z","updated_at":"2026-10-12T12:00:00Z"}`,
+		`{"id":"W26-CLOSED","title":"Closed migration work","status":"closed","priority":2,"issue_type":"task","labels":["backend","legacy-only"],"estimated_minutes":180,"created_at":"2026-09-25T12:00:00Z","updated_at":"2026-10-11T12:00:00Z","closed_at":"2026-10-11T12:00:00Z"}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(filepath.Join(proj, ".beads", "issues.jsonl"), []byte(issuesJSONL), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sprintJSONL := `{"id":"sp-w26","name":"Wave 26 Sprint","start_date":"2026-10-01T00:00:00Z","end_date":"2026-10-20T00:00:00Z","bead_ids":["W26-ROOT","W26-MID","W26-CLOSED"]}` + "\n"
+	if err := os.WriteFile(filepath.Join(proj, ".beads", "sprints.jsonl"), []byte(sprintJSONL), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Initialize a small git repo with commits referencing both open and closed beads (tests A9-1 history scoping).
+	runGit := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = proj
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=Tester",
+			"GIT_AUTHOR_EMAIL=tester@example.com",
+			"GIT_COMMITTER_NAME=Tester",
+			"GIT_COMMITTER_EMAIL=tester@example.com",
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %v\n%s", args, err, string(out))
+		}
+	}
+	runGit("init", "-b", "main")
+	runGit("add", ".")
+	runGit("commit", "-m", "feat(W26-ROOT): seed open bead")
+	if err := os.WriteFile(filepath.Join(proj, "closed.txt"), []byte("done\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "closed.txt")
+	runGit("commit", "-m", "fix(W26-CLOSED): finish closed bead")
+
+	// Export with --pages-include-closed=false and --pages-include-history=true.
+	outOpen := filepath.Join(t.TempDir(), "bundle-open")
+	if _, stderrOut, err := runCommandWithTimeout(t, proj, exe,
+		"--export-pages", outOpen,
+		"--pages-include-closed=false",
+		"--pages-include-history=true",
+		"--pages-title", "Wave 26 Open",
+	); err != nil {
+		t.Fatalf("--export-pages failed: %v\nstderr=%s", err, stderrOut)
+	}
+
+	// Verify meta.json records has_labels=true, has_forecast=true, has_sprints=true, has_history=true.
+	metaRaw, err := os.ReadFile(filepath.Join(outOpen, "data", "meta.json"))
+	if err != nil {
+		t.Fatalf("read meta.json: %v", err)
+	}
+	var meta struct {
+		HasSprints  bool `json:"has_sprints"`
+		HasHistory  bool `json:"has_history"`
+		HasLabels   bool `json:"has_labels"`
+		HasForecast bool `json:"has_forecast"`
+	}
+	if err := json.Unmarshal(metaRaw, &meta); err != nil {
+		t.Fatalf("unmarshal meta.json: %v", err)
+	}
+	if !meta.HasLabels || !meta.HasForecast || !meta.HasSprints || !meta.HasHistory {
+		t.Fatalf("expected all optional export flags true, got %+v (%s)", meta, string(metaRaw))
+	}
+
+	// A9-1: history.json must NOT leak excluded closed bead W26-CLOSED.
+	histRaw, err := os.ReadFile(filepath.Join(outOpen, "data", "history.json"))
+	if err != nil {
+		t.Fatalf("read history.json: %v", err)
+	}
+	var histDoc struct {
+		Histories map[string]json.RawMessage `json:"histories"`
+	}
+	if err := json.Unmarshal(histRaw, &histDoc); err != nil {
+		t.Fatalf("unmarshal history.json: %v", err)
+	}
+	if _, leaked := histDoc.Histories["W26-CLOSED"]; leaked {
+		t.Fatalf("A9-1 regression: excluded closed bead W26-CLOSED leaked into data/history.json")
+	}
+
+	// Gap W26-2: labels.json must include backend/frontend/auth, preserve cross-label flow backend->frontend,
+	// and omit closed-only label "legacy-only" so every clickable label resolves in #/issues.
+	labelsRaw, err := os.ReadFile(filepath.Join(outOpen, "data", "labels.json"))
+	if err != nil {
+		t.Fatalf("read labels.json: %v", err)
+	}
+	var labelsDoc struct {
+		TotalLabels int `json:"total_labels"`
+		Labels      []struct {
+			Label            string `json:"label"`
+			ClosedLast30Days int    `json:"closed_last_30_days"`
+		} `json:"labels"`
+		Flow struct {
+			TotalCrossLabelDeps int `json:"total_cross_label_deps"`
+		} `json:"flow"`
+	}
+	if err := json.Unmarshal(labelsRaw, &labelsDoc); err != nil {
+		t.Fatalf("unmarshal labels.json: %v", err)
+	}
+	foundBackend, foundLegacyOnly := false, false
+	for _, l := range labelsDoc.Labels {
+		if l.Label == "backend" {
+			foundBackend = true
+		}
+		if l.Label == "legacy-only" {
+			foundLegacyOnly = true
+		}
+	}
+	if !foundBackend || foundLegacyOnly {
+		t.Fatalf("labels.json scoping error: foundBackend=%v foundLegacyOnly=%v labels=%+v", foundBackend, foundLegacyOnly, labelsDoc.Labels)
+	}
+	if labelsDoc.Flow.TotalCrossLabelDeps < 1 {
+		t.Fatalf("expected cross-label flow deps >= 1 (backend -> frontend), got %+v", labelsDoc.Flow)
+	}
+
+	// Gap W26-4: forecast.json must emit global_capacity even without sprints, and SQLite issue_overview_mv must carry eta_days/eta_date.
+	forecastRaw, err := os.ReadFile(filepath.Join(outOpen, "data", "forecast.json"))
+	if err != nil {
+		t.Fatalf("read forecast.json: %v", err)
+	}
+	var forecastDoc struct {
+		GlobalCapacity *struct {
+			OpenCount           int     `json:"open_count"`
+			TotalMinutes        int     `json:"total_minutes"`
+			CriticalPathMinutes int     `json:"critical_path_minutes"`
+			Days1Agent          float64 `json:"days_1_agent"`
+		} `json:"global_capacity"`
+	}
+	if err := json.Unmarshal(forecastRaw, &forecastDoc); err != nil {
+		t.Fatalf("unmarshal forecast.json: %v", err)
+	}
+	if forecastDoc.GlobalCapacity == nil || forecastDoc.GlobalCapacity.OpenCount != 3 || forecastDoc.GlobalCapacity.Days1Agent <= 0 {
+		t.Fatalf("unexpected global_capacity in forecast.json: %+v", forecastDoc.GlobalCapacity)
+	}
+
+	// A9-2: compare sprint capacity under --pages-include-closed=false vs --pages-include-closed=true -> identical Days1Agent.
+	outAll := filepath.Join(t.TempDir(), "bundle-all")
+	if _, stderrAll, err := runCommandWithTimeout(t, proj, exe, "--export-pages", outAll, "--pages-include-closed=true"); err != nil {
+		t.Fatalf("--export-pages (all) failed: %v\nstderr=%s", err, stderrAll)
+	}
+	readSprintDays := func(bundleDir string) float64 {
+		t.Helper()
+		raw, err := os.ReadFile(filepath.Join(bundleDir, "data", "sprints.json"))
+		if err != nil {
+			t.Fatalf("read sprints.json in %s: %v", bundleDir, err)
+		}
+		var doc struct {
+			Sprints []struct {
+				Capacity *struct {
+					Days1Agent float64 `json:"days_1_agent"`
+				} `json:"capacity"`
+			} `json:"sprints"`
+		}
+		if err := json.Unmarshal(raw, &doc); err != nil || len(doc.Sprints) == 0 || doc.Sprints[0].Capacity == nil {
+			t.Fatalf("invalid sprints.json in %s: %v", bundleDir, err)
+		}
+		return doc.Sprints[0].Capacity.Days1Agent
+	}
+	daysOpenOnly := readSprintDays(outOpen)
+	daysAll := readSprintDays(outAll)
+	if math.Abs(daysOpenOnly-daysAll) > 1e-6 {
+		t.Fatalf("A9-2 regression: --pages-include-closed=false sprint Days1Agent=%.4f drifted from full export %.4f", daysOpenOnly, daysAll)
+	}
+
+	// Verify SQLite issue_overview_mv has non-null eta_days/eta_date for open issues and NULL for closed issues.
+	db, err := sql.Open("sqlite", filepath.Join(outAll, "beads.sqlite3"))
+	if err != nil {
+		t.Fatalf("open beads.sqlite3: %v", err)
+	}
+	defer db.Close()
+	var openETADays sql.NullFloat64
+	var openETADate sql.NullString
+	if err := db.QueryRow(`SELECT eta_days, eta_date FROM issue_overview_mv WHERE id = 'W26-ROOT'`).Scan(&openETADays, &openETADate); err != nil {
+		t.Fatalf("query open issue ETA: %v", err)
+	}
+	if !openETADays.Valid || openETADays.Float64 <= 0 || !openETADate.Valid || openETADate.String == "" {
+		t.Fatalf("expected valid ETA for open W26-ROOT, got days=%+v date=%+v", openETADays, openETADate)
+	}
+	var closedETADays sql.NullFloat64
+	if err := db.QueryRow(`SELECT eta_days FROM issue_overview_mv WHERE id = 'W26-CLOSED'`).Scan(&closedETADays); err != nil {
+		t.Fatalf("query closed issue ETA: %v", err)
+	}
+	if closedETADays.Valid {
+		t.Fatalf("expected NULL eta_days for closed W26-CLOSED, got %+v", closedETADays)
+	}
+}
+
+func TestWave26_DriftAlertsParity_PriorityBrief_AgentBrief_AndExportGraph(t *testing.T) {
+	exe := buildTestBinary(t)
+	proj := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(proj, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Very stale open issue triggers pkg/drift stale_issue alert cleanly.
+	issuesJSONL := strings.Join([]string{
+		`{"id":"DRIFT-1","title":"Very stale foundation task","status":"open","priority":1,"issue_type":"task","labels":["core"],"created_at":"2024-01-01T00:00:00Z","updated_at":"2024-01-02T00:00:00Z"}`,
+		`{"id":"DRIFT-2","title":"Downstream task","status":"open","priority":2,"issue_type":"task","labels":["ui"],"dependencies":[{"issue_id":"DRIFT-2","depends_on_id":"DRIFT-1","type":"blocks"}],"created_at":"2026-10-01T00:00:00Z","updated_at":"2026-10-01T00:00:00Z"}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(filepath.Join(proj, ".beads", "issues.jsonl"), []byte(issuesJSONL), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. --agent-brief must include pkg/drift alerts AND track/label groupings in triage.json.
+	briefDir := filepath.Join(t.TempDir(), "agent-brief")
+	if _, stderrOut, err := runCommandWithTimeout(t, proj, exe, "--agent-brief", briefDir); err != nil {
+		t.Fatalf("--agent-brief failed: %v\nstderr=%s", err, stderrOut)
+	}
+	triageRaw, err := os.ReadFile(filepath.Join(briefDir, "triage.json"))
+	if err != nil {
+		t.Fatalf("read agent-brief triage.json: %v", err)
+	}
+	var briefTriage struct {
+		Alerts []struct {
+			Type    string `json:"type"`
+			IssueID string `json:"issue_id"`
+		} `json:"alerts"`
+		RecommendationsByTrack []json.RawMessage `json:"recommendations_by_track"`
+		RecommendationsByLabel []json.RawMessage `json:"recommendations_by_label"`
+	}
+	if err := json.Unmarshal(triageRaw, &briefTriage); err != nil {
+		t.Fatalf("unmarshal agent-brief triage.json: %v", err)
+	}
+	hasStaleAlert := false
+	for _, a := range briefTriage.Alerts {
+		if a.Type == "stale_issue" && a.IssueID == "DRIFT-1" {
+			hasStaleAlert = true
+			break
+		}
+	}
+	if !hasStaleAlert {
+		t.Fatalf("Gap W26-1 regression: --agent-brief triage.json missing pkg/drift stale_issue alert for DRIFT-1: %+v", briefTriage.Alerts)
+	}
+	if len(briefTriage.RecommendationsByTrack) == 0 || len(briefTriage.RecommendationsByLabel) == 0 {
+		t.Fatalf("Gap W26-1 regression: --agent-brief triage.json missing track/label groupings: tracks=%d labels=%d",
+			len(briefTriage.RecommendationsByTrack), len(briefTriage.RecommendationsByLabel))
+	}
+
+	// 2. --export-graph *.html must include pkg/drift stale_issue alert in DATA.triage.alerts.
+	htmlPath := filepath.Join(t.TempDir(), "drift_graph.html")
+	if _, stderrOut, err := runCommandWithTimeout(t, proj, exe, "--export-graph", htmlPath); err != nil {
+		t.Fatalf("--export-graph html failed: %v\nstderr=%s", err, stderrOut)
+	}
+	htmlBytes, err := os.ReadFile(htmlPath)
+	if err != nil {
+		t.Fatalf("read exported html: %v", err)
+	}
+	if !strings.Contains(string(htmlBytes), `"type":"stale_issue"`) || !strings.Contains(string(htmlBytes), `"DRIFT-1"`) {
+		t.Fatalf("Gap W26-1 regression: --export-graph HTML missing pkg/drift stale_issue alert for DRIFT-1")
+	}
+
+	// 3. --priority-brief must succeed and carry pkg/drift alerts under "## ⚠️ Alerts" (non-tautological).
+	mdPath := filepath.Join(t.TempDir(), "priority_brief.md")
+	if _, stderrOut, err := runCommandWithTimeout(t, proj, exe, "--priority-brief", mdPath); err != nil {
+		t.Fatalf("--priority-brief failed: %v\nstderr=%s", err, stderrOut)
+	}
+	mdBytes, err := os.ReadFile(mdPath)
+	if err != nil {
+		t.Fatalf("read priority_brief.md: %v", err)
+	}
+	mdStr := string(mdBytes)
+	if !strings.Contains(mdStr, "## ⚠️ Alerts") || (!strings.Contains(mdStr, "stale_issue") && !strings.Contains(mdStr, `stale\_issue`)) || (!strings.Contains(mdStr, "DRIFT-1") && !strings.Contains(mdStr, `DRIFT\-1`)) {
+		t.Fatalf("Gap W26-1 regression: --priority-brief missing pkg/drift Alerts section / stale_issue for DRIFT-1:\n%s", mdStr)
 	}
 }
