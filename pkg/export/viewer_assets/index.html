@@ -3603,7 +3603,7 @@
                      :class="(activeSprint.at_risk?.length || 0) > 0 ? 'text-amber-600 dark:text-amber-400' : 'text-emerald-600 dark:text-emerald-400'"
                      x-text="activeSprint.at_risk?.length || 0"></div>
                 <div class="text-xs text-gray-500 dark:text-gray-400 mt-1"
-                     x-text="activeSprint.burndown?.projected_complete ? ('Projected ' + formatDate(activeSprint.burndown.projected_complete)) : 'Status: ' + (activeSprint.status || 'active')"></div>
+                     x-text="activeSprint.burndown?.projected_complete ? ('Projected ' + formatCalendarDateUTC(activeSprint.burndown.projected_complete)) : 'Status: ' + (activeSprint.status || 'active')"></div>
               </div>
             </div>
 
@@ -3625,14 +3625,14 @@
             </div>
 
             <!-- Burndown Chart -->
-            <div class="bg-white dark:bg-gray-800 rounded-2xl border border-gray-200 dark:border-gray-700 p-4 sm:p-5">
+            <div class="bg-white dark:bg-gray-800 rounded-2xl border border-gray-200 dark:border-gray-700 p-4 sm:p-5 overflow-hidden">
               <div class="flex flex-wrap items-center justify-between gap-2 mb-3">
                 <h3 class="text-sm font-semibold text-gray-900 dark:text-white">Ideal vs Actual Burndown</h3>
                 <span class="text-xs text-gray-500 dark:text-gray-400 font-mono"
-                      x-text="formatDate(activeSprint.start_date) + ' → ' + formatDate(activeSprint.end_date)"></span>
+                      x-text="formatCalendarDateUTC(activeSprint.start_date) + ' → ' + formatCalendarDateUTC(activeSprint.end_date)"></span>
               </div>
-              <div class="relative h-64 sm:h-72 w-full">
-                <canvas id="sprint-burndown-chart"></canvas>
+              <div class="relative h-64 sm:h-72 w-full max-w-full overflow-hidden">
+                <canvas id="sprint-burndown-chart" class="max-w-full"></canvas>
               </div>
             </div>
 
@@ -3655,7 +3655,7 @@
                       </div>
                       <p class="text-[11px] text-amber-800 dark:text-amber-300 mt-0.5" x-text="item.detail"></p>
                     </div>
-                    <div class="flex flex-wrap gap-1 shrink-0">
+                    <div class="flex flex-wrap gap-1 min-w-0 max-w-full">
                       <template x-for="sig in (item.signals || [])" :key="item.id + '-' + sig">
                         <span class="px-1.5 py-0.5 rounded bg-amber-100 dark:bg-amber-900/50 text-amber-800 dark:text-amber-200 text-[10px] font-semibold uppercase"
                               x-text="String(sig).replace(/_/g, ' ')"></span>
@@ -4590,7 +4590,7 @@
                   </div>
                   <div x-show="selectedIssue.eigenvector > 0" class="bg-gradient-to-br from-sky-50 to-sky-100/50 dark:from-sky-900/30 dark:to-sky-900/10 rounded-lg p-3 text-center border border-sky-200/50 dark:border-sky-800/30">
                     <div class="text-[10px] text-sky-600 dark:text-sky-400 uppercase tracking-wider font-medium mb-1">Eigenvector</div>
-                    <div class="text-lg font-bold text-sky-700 dark:text-sky-300 font-mono" x-text="selectedIssue.eigenvector.toFixed(4)"></div>
+                    <div class="text-lg font-bold text-sky-700 dark:text-sky-300 font-mono" x-text="selectedIssue.eigenvector ? Number(selectedIssue.eigenvector).toFixed(4) : '—'"></div>
                   </div>
                   <div x-show="selectedIssue.kcore !== null && selectedIssue.kcore !== undefined" class="bg-gradient-to-br from-indigo-50 to-indigo-100/50 dark:from-indigo-900/30 dark:to-indigo-900/10 rounded-lg p-3 text-center border border-indigo-200/50 dark:border-indigo-800/30">
                     <div class="text-[10px] text-indigo-600 dark:text-indigo-400 uppercase tracking-wider font-medium mb-1">K-Core</div>

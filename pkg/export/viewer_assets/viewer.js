@@ -962,6 +962,7 @@ async function initGraphEngine() {
     GRAPH_STATE.nodeMap = new Map();
     GRAPH_STATE.activeGraph = new wasmModule.DiGraph();
     GRAPH_STATE.activeNodeMap = new Map();
+    GRAPH_STATE._issueMetricsCache = null;
 
     // Load graph data from SQLite
     if (!DB_STATE.db) {
@@ -2225,7 +2226,7 @@ function buildFilterClauses(filters = {}, tableAlias = '') {
   // Overdue filter (open issues whose due_date precedes reference snapshot clock)
   if (filters.overdue === true || filters.overdue === 'true') {
     if (getOverviewColumnSet().has('due_date')) {
-      clauses.push(`${col('due_date')} IS NOT NULL AND ${col('due_date')} <> '' AND LOWER(${col('status')}) NOT IN ('closed', 'tombstone') AND ${col('due_date')} < ?`);
+      clauses.push(`${col('due_date')} IS NOT NULL AND ${col('due_date')} <> '' AND LOWER(${col('status')}) NOT IN ('closed', 'tombstone') AND julianday(${col('due_date')}) < julianday(?)`);
       params.push(new Date(getReferenceNowMs()).toISOString());
     } else {
       clauses.push('1 = 0');
@@ -2321,7 +2322,7 @@ function queryIssues(filters = {}, sort = 'priority', limit = 50, offset = 0) {
     'pagerank': 'COALESCE(pagerank, 0) DESC, priority ASC',
     'betweenness': 'COALESCE(betweenness, 0) DESC, priority ASC',
     'due': mvCols.has('due_date')
-      ? "CASE WHEN due_date IS NULL OR due_date = '' THEN 1 ELSE 0 END ASC, due_date ASC, priority ASC"
+      ? "CASE WHEN due_date IS NULL OR due_date = '' THEN 1 ELSE 0 END ASC, julianday(due_date) ASC, priority ASC"
       : 'priority ASC',
     'estimate': mvCols.has('estimated_minutes')
       ? 'CASE WHEN estimated_minutes IS NULL OR estimated_minutes <= 0 THEN 1 ELSE 0 END ASC, estimated_minutes ASC, priority ASC'
@@ -2440,20 +2441,72 @@ function getActiveCycleIssueIDs(cycleInfoOverride = null) {
   return [...ids];
 }
 
-function isIssueInCycle(id) {
-  const activeGraph = GRAPH_STATE.activeGraph || GRAPH_STATE.graph;
-  const activeMap = GRAPH_STATE.activeNodeMap || GRAPH_STATE.nodeMap;
-  if (!id || !GRAPH_STATE.ready || !activeGraph || !activeMap) return false;
-  try {
-    if (!activeGraph.hasCycles()) return false;
-    const idx = activeMap.get(id);
-    if (idx === undefined) return false;
-    const enumRes = activeGraph.enumerateCycles?.(100);
-    if (!Array.isArray(enumRes?.cycles)) return false;
-    return enumRes.cycles.some(cycle => Array.from(cycle).includes(idx));
-  } catch {
-    return false;
+function getGraphIssueMetricsCache() {
+  const g = GRAPH_STATE.activeGraph || GRAPH_STATE.graph;
+  const nMap = GRAPH_STATE.activeNodeMap || GRAPH_STATE.nodeMap;
+  if (!GRAPH_STATE.ready || !g || !nMap) return null;
+  if (GRAPH_STATE._issueMetricsCache && GRAPH_STATE._issueMetricsCache.graph === g && GRAPH_STATE._issueMetricsCache.nodeMap === nMap) {
+    return GRAPH_STATE._issueMetricsCache;
   }
+  const cache = {
+    graph: g,
+    nodeMap: nMap,
+    kcore: null,
+    slack: null,
+    slackAvailable: false,
+    articulationSet: new Set(),
+    cycleIdxSet: new Set(),
+  };
+  try {
+    if (typeof g.kcore === 'function') {
+      cache.kcore = g.kcore();
+    }
+    const hasCycles = typeof g.hasCycles === 'function' ? g.hasCycles() : false;
+    if (!hasCycles && typeof g.slack === 'function') {
+      cache.slack = g.slack();
+      cache.slackAvailable = Boolean(cache.slack);
+    }
+    if (hasCycles) {
+      if (typeof g.tarjanScc === 'function') {
+        const scc = g.tarjanScc();
+        const comps = Array.isArray(scc?.components) ? scc.components : [];
+        for (const comp of comps) {
+          if (!Array.isArray(comp) || comp.length === 0) continue;
+          if (comp.length > 1) {
+            for (const u of comp) cache.cycleIdxSet.add(u);
+          } else {
+            const u = comp[0];
+            const succ = typeof g.successors === 'function' ? g.successors(u) : [];
+            if (Array.isArray(succ) && succ.includes(u)) cache.cycleIdxSet.add(u);
+          }
+        }
+      } else if (typeof g.enumerateCycles === 'function') {
+        const enumRes = g.enumerateCycles(100);
+        if (Array.isArray(enumRes?.cycles)) {
+          for (const cyc of enumRes.cycles) {
+            for (const u of Array.from(cyc)) cache.cycleIdxSet.add(u);
+          }
+        }
+      }
+    }
+    if (typeof g.articulationPoints === 'function') {
+      for (const ap of Array.from(g.articulationPoints() || [])) {
+        cache.articulationSet.add(ap);
+      }
+    }
+  } catch {
+    // Keep partial defaults if optional WASM metrics fail
+  }
+  GRAPH_STATE._issueMetricsCache = cache;
+  return cache;
+}
+
+function isIssueInCycle(id) {
+  if (!id) return false;
+  const cache = getGraphIssueMetricsCache();
+  if (!cache) return false;
+  const idx = cache.nodeMap.get(id);
+  return idx !== undefined && cache.cycleIdxSet.has(idx);
 }
 
 function getTriageRecommendation(id) {
@@ -2511,36 +2564,28 @@ function getIssue(id) {
       depGroups.children.length ||
       depGroups.related.length
     );
-    issue.in_cycle = Boolean(issue.in_cycle || isIssueInCycle(id));
+    const statusNorm = String(issue.status || '').trim().toLowerCase();
+    const isResolvedStatus = statusNorm === 'closed' || statusNorm === 'tombstone';
+    issue.in_cycle = isResolvedStatus ? false : Boolean(issue.in_cycle || isIssueInCycle(id));
     issue.is_overdue = isIssueOverdue(issue);
     issue.kcore = null;
     issue.slack = null;
     issue.slack_available = false;
     issue.is_articulation_point = false;
-    if (GRAPH_STATE.ready && GRAPH_STATE.graph) {
-      try {
-        const g = GRAPH_STATE.activeGraph || GRAPH_STATE.graph;
-        const nMap = GRAPH_STATE.activeNodeMap || GRAPH_STATE.nodeMap;
-        const idx = nMap?.get(id);
+    if (!isResolvedStatus) {
+      const cache = getGraphIssueMetricsCache();
+      if (cache) {
+        const idx = cache.nodeMap.get(id);
         if (idx !== undefined) {
-          if (typeof g.kcore === 'function') {
-            const kc = g.kcore();
-            if (kc && idx < kc.length) issue.kcore = Number(kc[idx]);
+          if (cache.kcore && idx < cache.kcore.length) {
+            issue.kcore = Number(cache.kcore[idx]);
           }
-          if (typeof g.hasCycles === 'function' && !g.hasCycles() && typeof g.slack === 'function') {
-            const sl = g.slack();
-            if (sl && idx < sl.length && Number.isFinite(Number(sl[idx]))) {
-              issue.slack = Number(sl[idx]);
-              issue.slack_available = true;
-            }
+          if (cache.slackAvailable && cache.slack && idx < cache.slack.length && Number.isFinite(Number(cache.slack[idx]))) {
+            issue.slack = Number(cache.slack[idx]);
+            issue.slack_available = true;
           }
-          if (typeof g.articulationPoints === 'function') {
-            const aps = Array.from(g.articulationPoints() || []);
-            issue.is_articulation_point = aps.includes(idx);
-          }
+          issue.is_articulation_point = cache.articulationSet.has(idx);
         }
-      } catch {
-        // Keep defaults if optional WASM metrics unavailable
       }
     }
   }
@@ -4445,6 +4490,26 @@ function formatDate(isoString) {
 }
 
 /**
+ * Format an ISO calendar date string (e.g. sprint start/end/projected date) in UTC
+ * without relative wording or negative-UTC timezone day shifts.
+ */
+function formatCalendarDateUTC(isoString) {
+  if (!isoString) return '';
+  try {
+    const date = new Date(isoString);
+    if (Number.isNaN(date.getTime())) return String(isoString);
+    return date.toLocaleDateString('en-US', {
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+      timeZone: 'UTC',
+    });
+  } catch {
+    return String(isoString);
+  }
+}
+
+/**
  * Format ISO date to full readable string (always absolute, with time)
  */
 function formatDateFull(isoString) {
@@ -5003,6 +5068,9 @@ function beadsApp() {
           if (this.showDepGraph && this.selectedIssue) {
             this.renderDepGraph();
           }
+          if (this.view === 'sprints' && this.activeSprint) {
+            this.$nextTick(() => this.renderSelectedSprintChart());
+          }
         }
       });
 
@@ -5441,6 +5509,9 @@ function beadsApp() {
             if (!this.graphReady) {
               this.cycleInfo = getCycleInfo(this.triageData);
               this.totalCycles = this.cycleInfo?.cycleCount || 0;
+              if (this.view === 'issues' && this.filters.inCycle) {
+                this.loadIssues();
+              }
             }
             console.log('[Viewer] Triage data loaded:', this.triageData?.meta?.issue_count, 'issues');
           }
@@ -5458,9 +5529,6 @@ function beadsApp() {
               this.hasSprints = list.length > 0;
               if (this.hasSprints) {
                 this.selectedSprintId = this.sprintsData.active_sprint_id || list[0].id || '';
-                if (this.view === 'sprints') {
-                  this.$nextTick(() => this.renderSelectedSprintChart());
-                }
               }
             }
           } catch (sprintsErr) {
@@ -5481,7 +5549,23 @@ function beadsApp() {
           }
         }
 
+        // Load optional history.json when meta.has_history is true so Issue Detail Modal
+        // Correlated Commits work immediately on every view (zero 404s when absent).
+        if (this.meta?.has_history === true || this.meta?.has_history === 'true') {
+          try {
+            const histResp = await fetch(`./data/history.json?_t=${Date.now()}`);
+            if (histResp.ok) {
+              this.historyData = await histResp.json();
+            }
+          } catch (histErr) {
+            console.log('[Viewer] Optional history.json unavailable:', histErr);
+          }
+        }
+
         this.loading = false;
+        if (this.view === 'sprints' && this.hasSprints) {
+          this.$nextTick(() => this.renderSelectedSprintChart());
+        }
       } catch (err) {
         console.error('Init failed:', err);
         this.error = err.message || 'Failed to load database';
@@ -6993,6 +7077,7 @@ function beadsApp() {
      */
     formatDate,
     formatDateFull,
+    formatCalendarDateUTC,
     formatEstimatedMinutes,
     formatCriticalPathHops,
 
@@ -7185,9 +7270,33 @@ function beadsApp() {
     },
 
     getIssueCommits(id) {
-      if (!id || !this.historyData?.histories) return [];
-      const h = this.historyData.histories[id];
-      return Array.isArray(h?.commits) ? h.commits : [];
+      if (!id || !this.historyData) return [];
+      const h = this.historyData.histories?.[id];
+      if (Array.isArray(h?.commits) && h.commits.length > 0) {
+        return h.commits;
+      }
+      const commits = Array.isArray(this.historyData.commits) ? this.historyData.commits : [];
+      if (commits.length === 0) return [];
+      const derived = [];
+      for (const c of commits) {
+        if (!c?.sha) continue;
+        let method = '';
+        if (Array.isArray(c.beads_closed) && c.beads_closed.includes(id)) method = 'lifecycle:closed';
+        else if (Array.isArray(c.beads_added) && c.beads_added.includes(id)) method = 'lifecycle:created';
+        else if (Array.isArray(c.beads_removed) && c.beads_removed.includes(id)) method = 'lifecycle:deleted';
+        if (method) {
+          derived.push({
+            sha: c.sha,
+            short_sha: String(c.sha).slice(0, 7),
+            message: c.message || '',
+            author: c.author || '',
+            timestamp: c.date || '',
+            method,
+            confidence: 1.0,
+          });
+        }
+      }
+      return derived.reverse();
     },
 
     getTriageRecommendationsByTrack() {
