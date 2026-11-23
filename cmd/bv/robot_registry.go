@@ -1544,11 +1544,12 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 			}
 
 			config := export.GraphExportConfig{
-				Format:    format,
-				DataHash:  ctx.DataHash,
-				Readiness: ctx.Readiness,
-				Root:      rootIssueID,
-				Depth:     graphDepth,
+				Format:       format,
+				DataHash:     ctx.DataHash,
+				Readiness:    ctx.Readiness,
+				ReferenceNow: ctx.ReferenceNow(),
+				Root:         rootIssueID,
+				Depth:        graphDepth,
 			}
 
 			result, err := export.ExportGraph(exportIssues, &stats, config)

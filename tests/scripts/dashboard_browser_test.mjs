@@ -2784,6 +2784,23 @@ async function capabilitiesJourney(page) {
       sparklineWorks: ${app}.formatVelocitySparkline([0, 1, 3, 2]).length === 4 && ${app}.formatVelocitySparkline([0, 0, 0, 0]) === '',
       trendArrowWorks: ${app}.formatLabelTrend('accelerating') === '↗' && ${app}.formatLabelTrend('decelerating') === '↘',
       labelsHaveWeeklyClosed: sortedLbls.some(l => Array.isArray(l.weekly_closed) && l.weekly_closed.length === 4),
+      // B13-2 + B14-4: charts.js computeBurndownData must be loaded (fail-closed) and ignore Go zero-time without hanging.
+      zeroTimeBurndownFast: (() => {
+        if (!window.bvCharts || typeof computeBurndownData !== 'function') return false;
+        const orig = chartsState.issues;
+        try {
+          chartsState.issues = [
+            { id: 'z-1', status: 'open', created_at: '0001-01-01T00:00:00Z', updated_at: '0001-01-01T00:00:00Z' },
+            { id: 'z-2', status: 'open', created_at: '2026-09-01T12:00:00Z', updated_at: '2026-09-01T12:00:00Z' },
+          ];
+          const t0 = performance.now();
+          const bd = computeBurndownData();
+          const dt = performance.now() - t0;
+          return dt < 250 && Array.isArray(bd.labels) && bd.labels.length < 1000 && bd.labels.every(k => !String(k).startsWith('0001'));
+        } finally {
+          chartsState.issues = orig;
+        }
+      })(),
     };
   })()`);
   assert.equal(wave26InsightsCheck.hasLabelsMeta, true, 'Wave 26 meta.has_labels=true');
@@ -2801,6 +2818,64 @@ async function capabilitiesJourney(page) {
   assert.equal(wave26InsightsCheck.sparklineWorks, true, 'W27-4 formatVelocitySparkline renders 4-week mini-bars and hides all-zero');
   assert.equal(wave26InsightsCheck.trendArrowWorks, true, 'W27-4 formatLabelTrend maps accelerating/decelerating arrows');
   assert.equal(wave26InsightsCheck.labelsHaveWeeklyClosed, true, 'W27-4 data/labels.json exports 4-week chronological weekly_closed arrays');
+  assert.equal(wave26InsightsCheck.zeroTimeBurndownFast, true, 'B13-2 charts.js computeBurndownData ignores Go zero-time without hanging');
+
+  // B13-4 + B14-4 + B14-8 + W28-2 + W28-4: Real DOM click on label sort buttons + live DOM verification of
+  // #insights-impact-clusters, #insights-orphan-commits (incl. provisional authority gating), co_changed pills,
+  // and [data-triage-risk-detail] / [data-modal-risk-detail] (with valid sm:pl-[4.5rem], never invalid pl-18).
+  const labelSortFlip = await evaluate(page, `(async () => {
+    const btns = [...document.querySelectorAll('#insights-label-intelligence [role="group"] button')];
+    const healthBtn = btns.find(b => /health/i.test(b.textContent || ''));
+    if (!healthBtn) return { ok: false };
+    healthBtn.click();
+    await new Promise(r => setTimeout(r, 40));
+    const appData = ${app};
+    const origHistory = appData.historyData;
+    const origTriageData = appData.triageData;
+    try {
+      appData.historyData = {
+        ...(origHistory || {}),
+        file_hotspots: [{ path: 'pkg/auth/gateway.go', open_beads: 2, total_beads: 2, commits: 3, bead_ids: ['cap-auth-root', 'cap-auth-ui'], co_changed: ['pkg/auth/callback.go'] }],
+        clusters: [{ id: 1, bead_ids: ['cap-auth-root', 'cap-auth-ui'], files: ['pkg/auth/gateway.go'], commit_count: 3, internal_connectivity: 0.75 }],
+        orphan_ratio: 0.25,
+        orphans: [{ sha: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', short_sha: 'aaaaaaa', message: 'fix: auth timeout', author: 'alice', suspicion_score: 72, probable_bead_id: 'cap-auth-root', probable_confidence: 65, confirm_command: 'bv --robot-confirm-correlation aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:cap-auth-root' }],
+      };
+      await new Promise(r => setTimeout(r, 60));
+      const clustersVis = Boolean(document.getElementById('insights-impact-clusters') && (${visible})(document.getElementById('insights-impact-clusters')));
+      const orphansVis = Boolean(document.getElementById('insights-orphan-commits') && (${visible})(document.getElementById('insights-orphan-commits')));
+      const coChangedShown = (document.getElementById('insights-code-hotspots')?.textContent || '').includes('callback.go');
+      const confirmBtn = document.querySelector('#insights-orphan-commits button[title*="robot-confirm-correlation"]');
+      const confirmVisClaimSafe = Boolean(confirmBtn && (${visible})(confirmBtn));
+      // B14-2: provisional source authority (triageData.source_authority.claim_safe === false) hides orphan confirm copy button.
+      appData.triageData = { ...(origTriageData || {}), source_authority: { claim_safe: false, trust_level: 'provisional' } };
+      await new Promise(r => setTimeout(r, 40));
+      const confirmHiddenProvisional = !confirmBtn || !(${visible})(confirmBtn);
+      return {
+        ok: true,
+        pressedAfter: healthBtn.getAttribute('aria-pressed'),
+        activeCount: document.querySelectorAll('#insights-label-intelligence [role="group"] button[aria-pressed="true"]').length,
+        clustersVis,
+        orphansVis,
+        coChangedShown,
+        confirmVisClaimSafe,
+        confirmHiddenProvisional,
+      };
+    } finally {
+      appData.historyData = origHistory;
+      appData.triageData = origTriageData;
+      await new Promise(r => setTimeout(r, 40));
+    }
+  })()`);
+  assert.deepEqual(labelSortFlip, {
+    ok: true,
+    pressedAfter: 'true',
+    activeCount: 1,
+    clustersVis: true,
+    orphansVis: true,
+    coChangedShown: true,
+    confirmVisClaimSafe: true,
+    confirmHiddenProvisional: true,
+  }, `B13-4 + B14-2 + W28-4 label sort flip, clusters/orphans/co_changed rendering & provisional confirm gating verified: ${JSON.stringify(labelSortFlip)}`);
 
   // Wave 25: Issues quick filters (#filter-in-cycle-btn, #filter-articulation-btn), new sorts (pagerank/betweenness/due/estimate), and Detail Modal K-Core/Slack/Correlated Commits
   await click(page, 'a[href="#/issues"]');
@@ -2858,10 +2933,78 @@ async function capabilitiesJourney(page) {
     rootChainSuppressedOnClosed: true,
   }, `Issues new sorts (incl. eta), active-only structural metrics, ETA pills, root blocker chain, and non-empty correlated commits verified: ${JSON.stringify(wave25DetailMetrics)}`);
 
-  // Wave 27 B11-1 + B11-2 + W27-2: fast-path & fallback parity on external/missing blockers and self-loops + Graph Detail Drawer ETA/Root Blockers/Commits
-  const wave27RootAndGraphAudit = await evaluate(page, `(() => {
-    const savedModel = GRAPH_STATE.whatIfModel;
-    // B11-2: self-loop on fallback path (when whatIfModel is null)
+  // Wave 27/28 B11-1 + B11-2 + B13-1 + B13-4 + B13-5 + B13-6 + B13-7 + B14-3 + B14-4 + B14-8 + B14-9 + W27-2 + W28-2:
+  // Real non-tautological WASM fast-path & fallback parity, real 'eta' sort with closed/non-numeric/negative tie-break,
+  // modal closed priority-hint suppression + risk-detail rendering, and live #/graph Detail Drawer + hidden root-blocker modal!
+  const wave28RootAndEtaAudit = await evaluate(page, `(async () => {
+    // B13-7 + B14-9: verify real ascending eta_days order with closed (0.01), negative (-1), and non-numeric ('bad')
+    // rows all sunk after active ETAs AND tie-broken uniformly by priority ASC (not raw eta_days).
+    const origRows = execQuery("SELECT id, eta_days, priority FROM issue_overview_mv WHERE id IN ('cap-closed-prereq', 'cap-billing-a', 'cap-billing-b')");
+    DB_STATE.db.run("UPDATE issue_overview_mv SET eta_days = 0.01, priority = 4 WHERE id = 'cap-closed-prereq'");
+    DB_STATE.db.run("UPDATE issue_overview_mv SET eta_days = 'bad', priority = 0 WHERE id = 'cap-billing-a'");
+    DB_STATE.db.run("UPDATE issue_overview_mv SET eta_days = -1, priority = 2 WHERE id = 'cap-billing-b'");
+    const etaSorted = queryIssues({}, 'eta', 20, 0);
+    for (const r of origRows) {
+      DB_STATE.db.run("UPDATE issue_overview_mv SET eta_days = ?, priority = ? WHERE id = ?", [r.eta_days, r.priority, r.id]);
+    }
+    const sunkIds = etaSorted.slice(-3).map(r => r.id);
+    // Sunk order MUST be priority ASC: cap-billing-a (P0, 'bad'), cap-billing-b (P2, -1), cap-closed-prereq (P4, 0.01).
+    const sunkTieBreakByPriority = JSON.stringify(sunkIds) === JSON.stringify(['cap-billing-a', 'cap-billing-b', 'cap-closed-prereq']);
+    const validSlice = etaSorted.slice(0, etaSorted.length - 3);
+    const activeEtas = validSlice.map(r => Number(r.eta_days));
+    const activeEtasAscending = activeEtas.length >= 2 && activeEtas.every((v, i) => Number.isFinite(v) && v >= 0 && (i === 0 || activeEtas[i - 1] <= v));
+
+    // B13-6 + B14-4 + B14-8 + W28-2: Verify open modal DOES show priority hint pill (positive control),
+    // closed modal suppresses priority hint pill, and risk detail renders on modal with valid sm:pl-[4.5rem] on triage.
+    const appData = ${app};
+    const origForecastData = appData.forecastData;
+    let activeHintVisible = false;
+    let closedHintSuppressed = false;
+    let modalRiskDetailRendered = false;
+    let triageRiskClassValid = false;
+    try {
+      appData.forecastData = {
+        ...(origForecastData || {}),
+        priority_recommendations: [
+          { issue_id: 'cap-auth-root', current_priority: 2, suggested_priority: 0, direction: 'increase', confidence: 0.9, reasoning: ['Blocks chain'] },
+          { issue_id: 'cap-closed-prereq', current_priority: 3, suggested_priority: 1, direction: 'increase', confidence: 0.9, reasoning: ['Stale hint'] },
+        ],
+      };
+      appData.selectIssue('cap-auth-root');
+      await new Promise(r => setTimeout(r, 40));
+      const openHintEl = document.querySelector('[data-priority-hint-pill]');
+      activeHintVisible = Boolean(openHintEl && (${visible})(openHintEl));
+      // Inject risk breakdown + score_breakdown_bars on selectedIssue to verify [data-modal-risk-detail] renders live.
+      appData.selectedIssue = {
+        ...appData.selectedIssue,
+        score_breakdown_bars: [{ key: 'risk', name: 'Risk', value: 0.62, colorClass: 'bg-purple-500', widthClass: 'w-1/2' }],
+        triage_breakdown: {
+          pagerank: 0.25,
+          risk_norm: 0.62,
+          risk_explanation: 'Cross-repo fan risk',
+          risk_signals: { composite_risk: 0.62, fan_variance: 0.5, activity_churn: 0.4, cross_repo_risk: 0.8, status_risk: 0.2 },
+        },
+      };
+      await new Promise(r => setTimeout(r, 40));
+      const modalRiskEl = document.querySelector('[data-modal-risk-detail]');
+      modalRiskDetailRendered = Boolean(modalRiskEl && (${visible})(modalRiskEl) && modalRiskEl.textContent.includes('Cross-Repo 80%'));
+      appData.closeIssue();
+      await new Promise(r => setTimeout(r, 30));
+
+      appData.selectIssue('cap-closed-prereq');
+      await new Promise(r => setTimeout(r, 40));
+      const closedHintEl = document.querySelector('[data-priority-hint-pill]');
+      closedHintSuppressed = !closedHintEl || !(${visible})(closedHintEl);
+      appData.closeIssue();
+      await new Promise(r => setTimeout(r, 30));
+
+      triageRiskClassValid = !document.documentElement.innerHTML.includes('class="pl-18 ') && document.documentElement.innerHTML.includes('sm:pl-[4.5rem]');
+    } finally {
+      appData.forecastData = origForecastData;
+    }
+
+    // B11-1 + B11-2 + B13-4 + B14-3: Reset GRAPH_STATE.ready=false so initGraphEngine ACTUALLY rebuilds
+    // whatIfModel & nodeMap (proving WASM fast path genuinely executes and matches SQLite fallback!).
     DB_STATE.db.run("INSERT INTO issues (id, title, status, priority, issue_type, labels, created_at, updated_at) VALUES ('cap-self-loop', 'Self loop probe', 'open', 1, 'task', '[]', '2026-09-01T12:00:00Z', '2026-09-01T12:00:00Z')");
     DB_STATE.db.run("INSERT INTO issue_overview_mv (id, title, status, priority, issue_type, labels, created_at, updated_at, dependency_state, is_actionable, pagerank, betweenness, eigenvector, critical_path_depth, triage_score, blocks_count, blocked_by_count, blocker_count, dependent_count, critical_depth, in_cycle, comment_count) VALUES ('cap-self-loop', 'Self loop probe', 'open', 1, 'task', '[]', '2026-09-01T12:00:00Z', '2026-09-01T12:00:00Z', 'blocked', 0, 0, 0, 0, 0, 0.1, 1, 1, 1, 1, 0, 1, 0)");
     DB_STATE.db.run("INSERT INTO dependencies (issue_id, depends_on_id, type) VALUES ('cap-self-loop', 'cap-self-loop', 'blocks')");
@@ -2869,26 +3012,158 @@ async function capabilitiesJourney(page) {
     DB_STATE.db.run("INSERT INTO issue_overview_mv (id, title, status, priority, issue_type, labels, created_at, updated_at, dependency_state, is_actionable, pagerank, betweenness, eigenvector, critical_path_depth, triage_score, blocks_count, blocked_by_count, blocker_count, dependent_count, critical_depth, in_cycle, comment_count) VALUES ('cap-ext-only', 'Missing blocker only', 'open', 1, 'task', '[]', '2026-09-01T12:00:00Z', '2026-09-01T12:00:00Z', 'blocked', 0, 0, 0, 0, 0, 0.1, 0, 1, 1, 0, 0, 0, 0)");
     DB_STATE.db.run("INSERT INTO dependencies (issue_id, depends_on_id, type) VALUES ('cap-ext-only', 'cap-nonexistent-ext', 'blocks')");
     try {
+      GRAPH_STATE.ready = false;
+      await initGraphEngine();
+      const fastPathArmed = Boolean(GRAPH_STATE.whatIfModel && GRAPH_STATE.nodeMap?.has('cap-self-loop') && GRAPH_STATE.nodeMap?.has('cap-ext-only'));
+      ROOT_BLOCKERS_CACHE?.entries?.clear();
+      const fastSelf = computeRootBlockerChain('cap-self-loop');
+      const fastExtOnly = computeRootBlockerChain('cap-ext-only');
+
       GRAPH_STATE.whatIfModel = null;
+      ROOT_BLOCKERS_CACHE?.entries?.clear();
       const fallbackSelf = computeRootBlockerChain('cap-self-loop');
       const fallbackExtOnly = computeRootBlockerChain('cap-ext-only');
       return {
+        sunkTieBreakByPriority,
+        activeEtasAscending,
+        activeHintVisible,
+        closedHintSuppressed,
+        modalRiskDetailRendered,
+        triageRiskClassValid,
+        fastPathArmed,
+        fastSelfHasCycle: Boolean(fastSelf?.isBlocked && fastSelf?.hasCycle && fastSelf?.chainLength === 0),
+        fastExtOnlyNull: fastExtOnly === null,
         fallbackSelfHasCycle: Boolean(fallbackSelf?.isBlocked && fallbackSelf?.hasCycle && fallbackSelf?.chainLength === 0),
         fallbackExtOnlyNull: fallbackExtOnly === null,
         graphDataHasETA: getGraphViewData().issues.some(i => i.id === 'cap-auth-root' && i.eta_days != null && Boolean(i.eta_date)),
       };
     } finally {
-      GRAPH_STATE.whatIfModel = savedModel;
       DB_STATE.db.run("DELETE FROM dependencies WHERE issue_id IN ('cap-self-loop', 'cap-ext-only')");
       DB_STATE.db.run("DELETE FROM issue_overview_mv WHERE id IN ('cap-self-loop', 'cap-ext-only')");
       DB_STATE.db.run("DELETE FROM issues WHERE id IN ('cap-self-loop', 'cap-ext-only')");
+      GRAPH_STATE.ready = false;
+      await initGraphEngine();
+      ROOT_BLOCKERS_CACHE?.entries?.clear();
     }
   })()`);
-  assert.deepEqual(wave27RootAndGraphAudit, {
+  assert.deepEqual(wave28RootAndEtaAudit, {
+    sunkTieBreakByPriority: true,
+    activeEtasAscending: true,
+    activeHintVisible: true,
+    closedHintSuppressed: true,
+    modalRiskDetailRendered: true,
+    triageRiskClassValid: true,
+    fastPathArmed: true,
+    fastSelfHasCycle: true,
+    fastExtOnlyNull: true,
     fallbackSelfHasCycle: true,
     fallbackExtOnlyNull: true,
     graphDataHasETA: true,
-  }, `Wave 27 B11-1/B11-2/W27-2 root-blocker self-loop, missing-blocker, and graph ETA data verified: ${JSON.stringify(wave27RootAndGraphAudit)}`);
+  }, `Wave 28 B11/B13/B14 fast+fallback parity, eta tie-break, closed hint suppression, and risk detail verified: ${JSON.stringify(wave28RootAndEtaAudit)}`);
+
+  // B13-1 + B13-4 + B13-5 + W27-2: Navigate to #/graph, filter to label=['frontend'] (keeps cap-auth-ui, hides cap-auth-root),
+  // verify Graph Detail Drawer ETA / Root Blockers / Commits, click hidden root blocker -> stays on #/graph!
+  await click(page, 'a[href="#/graph"]');
+  // handleRoute schedules initForceGraphView on $nextTick (which awaits container layout + loadData);
+  // wait for that load cycle to settle before applying graph filters.
+  await delay(250);
+  await waitFor(page, `${app}.view === 'graph' && ${app}.forceGraphReady && !${app}.forceGraphLoading && !!${app}.forceGraphModule?.getGraph?.()`, 'navigated to #/graph for B13-1/B13-5/W27-2 check');
+  const graphDrawerAudit = await evaluate(page, `(async () => {
+    const mod = ${app}.forceGraphModule;
+    mod.setFilter('labels', ['frontend']);
+    await new Promise(r => setTimeout(r, 40));
+    const visNodes = mod.getGraph()?.graphData?.()?.nodes || [];
+    const blockedUi = visNodes.find(n => n.id === 'cap-auth-ui');
+    if (blockedUi) {
+      mod.focusNode('cap-auth-ui');
+    }
+    await new Promise(r => setTimeout(r, 40));
+    return {
+      foundBlockedUi: Boolean(blockedUi),
+      detailId: ${app}.graphDetailNode?.id || null,
+      rootHiddenByFilter: !visNodes.some(n => n.id === 'cap-auth-root'),
+    };
+  })()`);
+  assert.equal(graphDrawerAudit.foundBlockedUi && graphDrawerAudit.detailId === 'cap-auth-ui' && graphDrawerAudit.rootHiddenByFilter, true,
+    `W27-2 graph detail drawer opened for cap-auth-ui with cap-auth-root filtered out: ${JSON.stringify(graphDrawerAudit)}`);
+  await delay(120);
+  const graphDrawerDOM = await evaluate(page, `(async () => {
+    const etaEl = document.getElementById('graph-detail-eta');
+    const rbEl = document.getElementById('graph-detail-root-blockers');
+    const commitsEl = document.getElementById('graph-detail-commits');
+    const etaVisible = Boolean(etaEl && (${visible})(etaEl));
+    const rbVisible = Boolean(rbEl && (${visible})(rbEl));
+    const commitsVisible = Boolean(commitsEl && (${visible})(commitsEl));
+    // B13-1: call focusOrShowGraphNode for filtered-out node cap-auth-root -> opens modal in-place without leaving #/graph!
+    ${app}.focusOrShowGraphNode('cap-auth-root');
+    await new Promise(r => setTimeout(r, 40));
+    const stayedOnGraph = ${app}.view === 'graph';
+    const modalOpenedId = ${app}.selectedIssue?.id || null;
+    ${app}.closeIssue();
+    await new Promise(r => setTimeout(r, 40));
+    const stillOnGraphAfterClose = ${app}.view === 'graph';
+    // B13-1 + B14-4: missing issue ID must show warning toast without throwing and keep selectedIssue null.
+    ${app}.focusOrShowGraphNode('nonexistent-graph-node-id');
+    await new Promise(r => setTimeout(r, 30));
+    const missingToastShown = (document.body.textContent || '').includes('nonexistent-graph-node-id') && ${app}.selectedIssue === null;
+    // B13-5: Shift+Click-like nodeClick with no selectedNode, then filter hides graphDetailNode -> drawer must close!
+    const mod = ${app}.forceGraphModule;
+    mod.clearSelection();
+    ${app}.graphDetailNode = { id: 'cap-auth-ui', title: 'Auth UI', status: 'open', priority: 1 };
+    mod.setFilter('status', 'closed');
+    await new Promise(r => setTimeout(r, 40));
+    const clearedHiddenDetail = ${app}.graphDetailNode === null;
+    mod.clearFilters();
+    await new Promise(r => setTimeout(r, 40));
+    return {
+      etaVisible,
+      rbVisible,
+      commitsVisible,
+      stayedOnGraph,
+      modalOpenedId,
+      stillOnGraphAfterClose,
+      missingToastShown,
+      clearedHiddenDetail,
+    };
+  })()`);
+  assert.deepEqual(graphDrawerDOM, {
+    etaVisible: true,
+    rbVisible: true,
+    commitsVisible: true,
+    stayedOnGraph: true,
+    modalOpenedId: 'cap-auth-root',
+    stillOnGraphAfterClose: true,
+    missingToastShown: true,
+    clearedHiddenDetail: true,
+  }, `Wave 28 B13-1/B13-4/B13-5/W27-2 Graph Detail Drawer & hidden root-blocker modal isolation verified: ${JSON.stringify(graphDrawerDOM)}`);
+
+  // B13-4 + B14-4: 360px mobile overflow audit across capabilitiesBundle (#/insights, #/issues, Issue Modal, #/graph Drawer)
+  await send('Emulation.setDeviceMetricsOverride', { width: 360, height: 800, deviceScaleFactor: 2, mobile: true }, page.session);
+  await evaluate(page, `window.location.hash = '#/insights'`);
+  await waitFor(page, `${app}.view === 'insights'`, 'mobile 360 insights');
+  await delay(120);
+  const mobInsightsOverflow = await evaluate(page, `document.documentElement.scrollWidth <= 361`);
+  assert.equal(mobInsightsOverflow, true, 'B13-4 360px mobile capabilitiesBundle #/insights has zero horizontal overflow');
+  await evaluate(page, `window.location.hash = '#/issues'`);
+  await waitFor(page, `${app}.view === 'issues'`, 'mobile 360 issues');
+  await delay(120);
+  const mobIssuesOverflow = await evaluate(page, `document.documentElement.scrollWidth <= 361`);
+  assert.equal(mobIssuesOverflow, true, 'B13-4 360px mobile capabilitiesBundle #/issues has zero horizontal overflow');
+  await evaluate(page, `${app}.selectIssue('cap-auth-ui')`);
+  await waitFor(page, `${app}.selectedIssue?.id === 'cap-auth-ui'`, 'mobile 360 issue modal open');
+  await delay(100);
+  const mobModalOverflow = await evaluate(page, `document.documentElement.scrollWidth <= 361`);
+  assert.equal(mobModalOverflow, true, 'B13-4 360px mobile capabilitiesBundle Issue Detail Modal has zero horizontal overflow');
+  await evaluate(page, `${app}.closeIssue()`);
+  await delay(80);
+  await evaluate(page, `window.location.hash = '#/graph'`);
+  await delay(250);
+  await waitFor(page, `${app}.view === 'graph' && ${app}.forceGraphReady && !${app}.forceGraphLoading`, 'mobile 360 graph ready');
+  await evaluate(page, `${app}.forceGraphModule.focusNode('cap-auth-ui')`);
+  await delay(100);
+  const mobGraphDrawerOverflow = await evaluate(page, `${app}.graphDetailNode?.id === 'cap-auth-ui' && document.documentElement.scrollWidth <= 361`);
+  assert.equal(mobGraphDrawerOverflow, true, 'B14-4 360px mobile capabilitiesBundle #/graph Detail Drawer has zero horizontal overflow');
+  await send('Emulation.setDeviceMetricsOverride', { width: 1280, height: 900, deviceScaleFactor: 1, mobile: false }, page.session);
 
   // Corpus-global MAX(blocks_count) hybrid impact normalization, [C-1] template/pinned hybrid status parity, & exact-ID substring search.
   await click(page, 'a[href="#/issues"]');
@@ -4127,6 +4402,80 @@ async function standaloneGraphJourney(page) {
     stSel.value = 'all';
     stSel.onchange({ target: stSel });
 
+    // B13-3 + B13-4 + B14-5 + B14-6 + B14-7: Standalone hover highlight clearing, context-menu hide on filter & Escape,
+    // hidden-cycle guard + btn-cycle-prev stepping backward past hidden cycle, performSearch hidden-node guard,
+    // ctx-details activePanelNode clearing & selectedNode preservation, and self-loop computeStandaloneRootBlockers parity.
+    const rootNode = DATA.nodes.find(n => n.id === 'cap-auth-root');
+    const b147ClosedNode = DATA.nodes.find(n => n.id === 'cap-closed-prereq');
+    // Escape closes context menu cleanly (B14-4)
+    showContextMenu(rootNode, { clientX: 100, clientY: 100 });
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    const b144EscapeHidCtx = !document.getElementById('context-menu')?.classList.contains('visible') && contextNode === null;
+    // B14-7: ctx-details opens docked panel without selecting; filtering out that node MUST hide docked panel.
+    showContextMenu(rootNode, { clientX: 100, clientY: 100 });
+    document.getElementById('ctx-details').onclick();
+    stSel.value = 'closed';
+    stSel.onchange({ target: stSel });
+    const b147CtxDetailsCleared = !document.getElementById('docked-panel')?.classList.contains('visible') && activePanelNode === null;
+    // B14-7: visible selectedNode stays shown in panel when a DIFFERENT hidden hoveredNode is filtered out.
+    stSel.value = 'all';
+    stSel.onchange({ target: stSel });
+    selectNode(b147ClosedNode);
+    handleNodeHover(rootNode);
+    stSel.value = 'closed';
+    stSel.onchange({ target: stSel });
+    const b147SelectedPanelKept = selectedNode?.id === 'cap-closed-prereq' && document.getElementById('docked-panel')?.classList.contains('visible');
+    selectNode(null);
+    // B14-6: performSearch click on a filtered-out node while status=closed must NOT select it and must toast.
+    performSearch('cap-auth-root');
+    const hiddenSearchItem = document.querySelector('#search-results .search-result-item[data-id="cap-auth-root"]');
+    hiddenSearchItem?.click();
+    const b146SearchHiddenGuarded = selectedNode === null && (document.getElementById('toast')?.textContent || '').includes('hidden');
+    // Original B13-3 filter clear check
+    stSel.value = 'all';
+    stSel.onchange({ target: stSel });
+    handleNodeHover(rootNode);
+    showContextMenu(rootNode, { clientX: 100, clientY: 100 });
+    stSel.value = 'closed';
+    stSel.onchange({ target: stSel });
+    const b133HoverAndCtxCleared = hoveredNode === null && highlightedNodes.size === 0 &&
+      !document.getElementById('context-menu')?.classList.contains('visible') && b144EscapeHidCtx && b147CtxDetailsCleared && b147SelectedPanelKept && b146SearchHiddenGuarded;
+    // Activating cycle inspector when all cycle nodes are filtered out must NOT open banner or dim visible closed node.
+    showCycleInspector(0);
+    const b133HiddenCycleBlocked = activeCycleIndex === -1 && highlightedNodes.size === 0 &&
+      !document.getElementById('cycle-banner')?.classList.contains('visible');
+    // B14-5: btn-cycle-prev must step backward past a hidden middle cycle [C0(vis), C1(hidden), C2(vis)] from 2 -> 0.
+    stSel.value = 'all';
+    stSel.onchange({ target: stSel });
+    const origCyclesB145 = DATA.cycles;
+    let b145PrevSkipsHidden = false;
+    try {
+      DATA.cycles = [['cap-closed-prereq'], ['cap-auth-root', 'cap-auth-ui'], ['cap-closed-prereq']];
+      stSel.value = 'closed';
+      stSel.onchange({ target: stSel });
+      showCycleInspector(2, 1);
+      document.getElementById('btn-cycle-prev').onclick();
+      b145PrevSkipsHidden = activeCycleIndex === 0;
+      closeCycleInspector();
+    } finally {
+      DATA.cycles = origCyclesB145;
+      stSel.value = 'all';
+      stSel.onchange({ target: stSel });
+    }
+    // Self-loop standalone root blocker check
+    const origNodes2 = DATA.nodes;
+    const origLinks2 = DATA.links;
+    let b134SelfLoopCycleOk = false;
+    try {
+      DATA.nodes = [{ id: 'SL-1', title: 'Self loop', status: 'open', priority: 1 }];
+      DATA.links = [{ source: 'SL-1', target: 'SL-1', type: 'blocks' }];
+      const slChain = computeStandaloneRootBlockers('SL-1');
+      b134SelfLoopCycleOk = Boolean(slChain && slChain.hasCycle && slChain.roots.length === 0) && b145PrevSkipsHidden;
+    } finally {
+      DATA.nodes = origNodes2;
+      DATA.links = origLinks2;
+    }
+
     return {
       cyclesCount,
       cycleBreaksCount,
@@ -4149,6 +4498,9 @@ async function standaloneGraphJourney(page) {
       closedNodeNoETA,
       b114ClearedOverlay,
       b121PathFinderCancelled,
+      b133HoverAndCtxCleared,
+      b133HiddenCycleBlocked,
+      b134SelfLoopCycleOk,
     };
   })()`);
   assert.equal(wave25StandaloneAudit.cyclesCount, 2, 'standalone HTML DATA.cycles exports both active cycles');
@@ -4174,6 +4526,9 @@ async function standaloneGraphJourney(page) {
   assert.equal(wave25StandaloneAudit.closedNodeNoETA, true, 'Wave 26 W26-4 standalone closed nodes suppress ETA forecasts');
   assert.equal(wave25StandaloneAudit.b114ClearedOverlay, true, 'Wave 27 B11-4/B12-2 standalone applyFilters clears hidden selection, docked panel, and zero-visible What-If overlay');
   assert.equal(wave25StandaloneAudit.b121PathFinderCancelled, true, 'Wave 27 B12-1 standalone applyFilters cancels Path Finder when pathStart is filtered out');
+  assert.equal(wave25StandaloneAudit.b133HoverAndCtxCleared, true, 'Wave 28 B13-3 standalone applyFilters clears stale hover highlights and hidden context-menu');
+  assert.equal(wave25StandaloneAudit.b133HiddenCycleBlocked, true, 'Wave 28 B13-3 standalone showCycleInspector skips hidden-by-filter cycles without dimming visible nodes');
+  assert.equal(wave25StandaloneAudit.b134SelfLoopCycleOk, true, 'Wave 28 B13-4 standalone computeStandaloneRootBlockers detects self-loop cycles');
 
   await capture(page, 'standalone-graph');
   clean(page);

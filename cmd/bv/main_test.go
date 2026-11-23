@@ -10723,7 +10723,7 @@ func TestWave27_Pass11ExportFixes_Hotspots_Cascades_And_ExecutiveBriefs(t *testi
 	}
 
 	// Forecast payload excludes L-TMPL and L-PIN from global_capacity.open_count (L-DB-ROOT, L-BE-1, L-FE-1 = 3).
-	rawForecast, _, err := buildExportForecastPayload(ctx, exportIssues, nil, "hash-w27", now)
+	rawForecast, _, err := buildExportForecastPayload(ctx, exportIssues, nil, "hash-w27", false, now)
 	if err != nil {
 		t.Fatalf("buildExportForecastPayload: %v", err)
 	}
@@ -10738,6 +10738,79 @@ func TestWave27_Pass11ExportFixes_Hotspots_Cascades_And_ExecutiveBriefs(t *testi
 	}
 	if parsedForecast.GlobalCapacity.OpenCount != 3 || parsedForecast.GlobalCapacity.TotalMinutes <= 0 || parsedForecast.GlobalCapacity.TotalMinutes >= 300 {
 		t.Fatalf("A11-4 regression: forecast global_capacity included template/pinned issues: %+v (want open_count=3, total_minutes<300)", parsedForecast.GlobalCapacity)
+	}
+	// A13-1 + A14-10: positive control proving default buildExportForecastPayload (includeInactive=false)
+	// suppresses misaligned blocked issues in priority_recommendations while includeInactive=true surfaces them.
+	est60 := 60
+	inactForecastIssues := []model.Issue{
+		{ID: "F-ROOT", Title: "Root", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, EstimatedMinutes: &est60, CreatedAt: now, UpdatedAt: now},
+		{ID: "F-BLK-HUB", Title: "Blocked hub P4", Status: model.StatusOpen, Priority: 4, IssueType: model.TypeTask, EstimatedMinutes: &est60, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "F-BLK-HUB", DependsOnID: "F-ROOT", Type: model.DepBlocks}}},
+		{ID: "F-L1", Title: "P0 leaf 1", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeBug, EstimatedMinutes: &est60, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "F-L1", DependsOnID: "F-BLK-HUB", Type: model.DepBlocks}}},
+		{ID: "F-L2", Title: "P0 leaf 2", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeBug, EstimatedMinutes: &est60, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "F-L2", DependsOnID: "F-BLK-HUB", Type: model.DepBlocks}}},
+		{ID: "F-L3", Title: "P0 leaf 3", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeBug, EstimatedMinutes: &est60, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "F-L3", DependsOnID: "F-BLK-HUB", Type: model.DepBlocks}}},
+		{ID: "F-L4", Title: "P0 leaf 4", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeBug, EstimatedMinutes: &est60, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "F-L4", DependsOnID: "F-BLK-HUB", Type: model.DepBlocks}}},
+	}
+	inactForecastCtx := RobotContext{
+		Issues:     inactForecastIssues,
+		FullIssues: inactForecastIssues,
+		Readiness:  model.NewReadinessIndex(inactForecastIssues),
+	}
+	rawFDefault, _, err := buildExportForecastPayload(inactForecastCtx, inactForecastIssues, nil, "hash-a13-def", false, now)
+	if err != nil {
+		t.Fatalf("buildExportForecastPayload(default): %v", err)
+	}
+	rawFInact, _, err := buildExportForecastPayload(inactForecastCtx, inactForecastIssues, nil, "hash-a13-inact", true, now)
+	if err != nil {
+		t.Fatalf("buildExportForecastPayload(includeInactive=true): %v", err)
+	}
+	var parsedFDefault, parsedFInact struct {
+		PriorityRecommendations []analysis.PriorityRecommendation `json:"priority_recommendations"`
+	}
+	if err := json.Unmarshal(rawFDefault, &parsedFDefault); err != nil {
+		t.Fatalf("unmarshal default recs: %v", err)
+	}
+	if err := json.Unmarshal(rawFInact, &parsedFInact); err != nil {
+		t.Fatalf("unmarshal inactive recs: %v", err)
+	}
+	for _, r := range parsedFDefault.PriorityRecommendations {
+		if r.IssueID == "F-BLK-HUB" {
+			t.Fatalf("A13-1 regression: default forecast.json leaked blocked F-BLK-HUB in priority_recommendations")
+		}
+	}
+	foundBlkHubInact := false
+	for _, r := range parsedFInact.PriorityRecommendations {
+		if r.IssueID == "F-BLK-HUB" {
+			foundBlkHubInact = true
+		}
+	}
+	if !foundBlkHubInact {
+		t.Fatalf("A13-1 positive control failed: includeInactive=true must surface misaligned blocked F-BLK-HUB, got %+v", parsedFInact.PriorityRecommendations)
+	}
+
+	// A13-12: populatePriorityBriefExecutiveData with a 6-node cycle and maxResults=1 + CandidateIDs
+	// must raise CycleBreakLimit >= totalEdges (6) so an in-scope edge ranked 5th/6th is still returned.
+	sixCycleIssues := []model.Issue{
+		{ID: "C-A", Title: "A", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now, Dependencies: []*model.Dependency{{IssueID: "C-A", DependsOnID: "C-B", Type: model.DepBlocks}}},
+		{ID: "C-B", Title: "B", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now, Dependencies: []*model.Dependency{{IssueID: "C-B", DependsOnID: "C-C", Type: model.DepBlocks}}},
+		{ID: "C-C", Title: "C", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now, Dependencies: []*model.Dependency{{IssueID: "C-C", DependsOnID: "C-D", Type: model.DepBlocks}}},
+		{ID: "C-D", Title: "D", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now, Dependencies: []*model.Dependency{{IssueID: "C-D", DependsOnID: "C-E", Type: model.DepBlocks}}},
+		{ID: "C-E", Title: "E", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now, Dependencies: []*model.Dependency{{IssueID: "C-E", DependsOnID: "C-F", Type: model.DepBlocks}}},
+		{ID: "C-F", Title: "F", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now, Dependencies: []*model.Dependency{{IssueID: "C-F", DependsOnID: "C-A", Type: model.DepBlocks}}},
+	}
+	sixCfg := export.DefaultPriorityBriefConfig()
+	populatePriorityBriefExecutiveData(&sixCfg, RobotContext{
+		Issues:       sixCycleIssues,
+		FullIssues:   sixCycleIssues,
+		CandidateIDs: map[string]bool{"C-E": true, "C-F": true},
+		Readiness:    model.NewReadinessIndex(sixCycleIssues),
+	}, nil, false, true, 1, now)
+	if len(sixCfg.CycleBreaks) != 1 || sixCfg.CycleBreaks[0].EdgeFrom != "C-E" || sixCfg.CycleBreaks[0].EdgeTo != "C-F" {
+		t.Fatalf("A13-12 regression: 6-node cycle with maxResults=1 & CandidateIDs={C-E,C-F} missed in-scope edge: %+v", sixCfg.CycleBreaks)
 	}
 
 	// 2. W27-1 + W27-5 CLI E2E: real temp git repo with shared-file hotspot + cycle ->
@@ -10772,6 +10845,7 @@ func TestWave27_Pass11ExportFixes_Hotspots_Cascades_And_ExecutiveBriefs(t *testi
 		`{"id":"HS-2","title":"Auth middleware","status":"open","priority":1,"issue_type":"task","estimated_minutes":60,"dependencies":[{"issue_id":"HS-2","depends_on_id":"HS-1","type":"blocks"}],"created_at":"2026-11-18T10:00:00Z","updated_at":"2026-11-20T10:00:00Z"}`,
 		`{"id":"CYC-1","title":"Cycle one","status":"open","priority":1,"issue_type":"bug","estimated_minutes":60,"dependencies":[{"issue_id":"CYC-1","depends_on_id":"CYC-2","type":"blocks"}],"created_at":"2026-11-18T10:00:00Z","updated_at":"2026-11-20T10:00:00Z"}`,
 		`{"id":"CYC-2","title":"Cycle two","status":"open","priority":1,"issue_type":"bug","estimated_minutes":60,"dependencies":[{"issue_id":"CYC-2","depends_on_id":"CYC-1","type":"blocks"}],"created_at":"2026-11-18T10:00:00Z","updated_at":"2026-11-20T10:00:00Z"}`,
+		`{"id":"HS-CLOSED","title":"Completed billing feature","status":"closed","closed_at":"2026-11-19T10:00:00Z","priority":2,"issue_type":"task","estimated_minutes":60,"created_at":"2026-11-18T10:00:00Z","updated_at":"2026-11-19T10:00:00Z"}`,
 	}, "\n") + "\n"
 	if err := os.WriteFile(filepath.Join(proj, ".beads", "issues.jsonl"), []byte(repoIssues), 0o644); err != nil {
 		t.Fatal(err)
@@ -10779,13 +10853,30 @@ func TestWave27_Pass11ExportFixes_Hotspots_Cascades_And_ExecutiveBriefs(t *testi
 	if err := os.WriteFile(filepath.Join(proj, "pkg", "core", "shared.go"), []byte("package core\nconst V = 1\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(proj, "pkg", "core", "companion.go"), []byte("package core\nconst C = 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	runGit("add", ".")
 	runGit("commit", "-m", "feat: implement HS-1 core auth")
+	if err := os.WriteFile(filepath.Join(proj, "pkg", "core", "closed_only.go"), []byte("package core\nconst Done = true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "pkg/core/closed_only.go")
+	runGit("commit", "-m", "feat: complete HS-CLOSED billing feature")
 	if err := os.WriteFile(filepath.Join(proj, "pkg", "core", "shared.go"), []byte("package core\nconst V = 2\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	runGit("add", "pkg/core/shared.go")
+	if err := os.WriteFile(filepath.Join(proj, "pkg", "core", "companion.go"), []byte("package core\nconst C = 2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "pkg/core/shared.go", "pkg/core/companion.go")
 	runGit("commit", "-m", "feat: wire HS-2 auth middleware")
+	// Unlinked commit touching shared.go with action verb to exercise OrphanDetector in history.json (W28-4)
+	if err := os.WriteFile(filepath.Join(proj, "pkg", "core", "shared.go"), []byte("package core\nconst V = 3\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "pkg/core/shared.go")
+	runGit("commit", "-m", "fix: patch token check #42")
 
 	loaded, err := loader.LoadIssuesFromFile(filepath.Join(proj, ".beads", "issues.jsonl"))
 	if err != nil {
@@ -10800,20 +10891,73 @@ func TestWave27_Pass11ExportFixes_Hotspots_Cascades_And_ExecutiveBriefs(t *testi
 		t.Fatalf("generateHistoryForExportContext: %v", err)
 	}
 	foundHotspot := false
+	foundCoChanged := false
 	for _, hs := range hist.FileHotspots {
-		if hs.Path == "pkg/core/shared.go" && hs.OpenBeads == 2 && hs.TotalBeads == 2 {
+		if hs.Path == "pkg/core/shared.go" && hs.OpenBeads == 2 && hs.TotalBeads >= 2 {
 			foundHotspot = true
+			for _, cf := range hs.CoChanged {
+				if cf == "pkg/core/companion.go" {
+					foundCoChanged = true
+				}
+			}
 			break
 		}
 	}
 	if !foundHotspot {
 		t.Fatalf("W27-1 regression: history.json missing pkg/core/shared.go hotspot with 2 open beads: %+v", hist.FileHotspots)
 	}
+	if !foundCoChanged {
+		t.Fatalf("W28-4 regression: history.json shared.go hotspot missing co_changed companion.go: %+v", hist.FileHotspots)
+	}
+	if len(hist.Clusters) == 0 || len(hist.Clusters[0].BeadIDs) < 2 {
+		t.Fatalf("W28-4 regression: history.json missing multi-bead ImpactNetwork cluster: %+v", hist.Clusters)
+	}
+	if len(hist.Orphans) == 0 || hist.Orphans[0].ConfirmCommand == "" {
+		t.Fatalf("W28-4 regression: history.json missing scoped OrphanDetector candidate with confirm_command: %+v", hist.Orphans)
+	}
+	// A14-5 / B14-1: Excluding closed beads (--pages-include-closed=false) must NOT falsely flag HS-CLOSED's commit as an orphan!
+	var openOnly []model.Issue
+	for _, iss := range loaded {
+		if iss.Status != model.StatusClosed {
+			openOnly = append(openOnly, iss)
+		}
+	}
+	histOpenOnly, err := generateHistoryForExportContext(RobotContext{
+		Issues:         openOnly,
+		FullIssues:     loaded,
+		ProjectDir:     proj,
+		AsOfCommitTime: now,
+	})
+	if err != nil {
+		t.Fatalf("generateHistoryForExportContext(openOnly): %v", err)
+	}
+	for _, orph := range histOpenOnly.Orphans {
+		if strings.Contains(orph.Message, "HS-CLOSED") {
+			t.Fatalf("A14-5/B14-1 regression: closed-bead commit falsely flagged as orphan when closed beads excluded: %+v", orph)
+		}
+	}
+	// B14-2: --as-of / non-ClaimSafe exports must suppress ConfirmCommand.
+	histAsOf, err := generateHistoryForExportContext(RobotContext{
+		Issues:         loaded,
+		FullIssues:     loaded,
+		ProjectDir:     proj,
+		AsOf:           "HEAD",
+		AsOfCommitTime: now,
+	})
+	if err != nil {
+		t.Fatalf("generateHistoryForExportContext(asOf): %v", err)
+	}
+	for _, orph := range histAsOf.Orphans {
+		if orph.ConfirmCommand != "" {
+			t.Fatalf("B14-2 regression: --as-of export must suppress ConfirmCommand, got %q", orph.ConfirmCommand)
+		}
+	}
 	if h1 := hist.Histories["HS-1"]; h1 == nil || len(h1.Related) == 0 || h1.Related[0].BeadID != "HS-2" {
 		t.Fatalf("W27-1 regression: history.json HS-1 missing Related link to HS-2: %+v", h1)
 	}
 
-	// CLI W27-5: --priority-brief & --export-md
+	// CLI W27-5 + A13-3 + A13-14 + W28-6: --priority-brief (default & --robot-include-inactive),
+	// --agent-brief rich bundle, --export-md (--export-include-graph=false!), and --robot-graph JSON metrics.
 	exe := buildTestBinary(t)
 	briefPath := filepath.Join(t.TempDir(), "exec_brief.md")
 	if _, stderrOut, err := runCommandWithTimeout(t, proj, exe, "--priority-brief", briefPath); err != nil {
@@ -10832,10 +10976,62 @@ func TestWave27_Pass11ExportFixes_Hotspots_Cascades_And_ExecutiveBriefs(t *testi
 	if strings.Contains(string(briefBytes), "**HS-2**") {
 		t.Fatalf("W27-5 regression: default --priority-brief leaked blocked HS-2 as primary row:\n%s", string(briefBytes))
 	}
+	// A13-14 positive control: --priority-brief --robot-include-inactive DOES include blocked HS-2 diagnostics.
+	inactBriefPath := filepath.Join(t.TempDir(), "exec_brief_inact.md")
+	if _, stderrOut, err := runCommandWithTimeout(t, proj, exe, "--priority-brief", inactBriefPath, "--robot-include-inactive"); err != nil {
+		t.Fatalf("--priority-brief --robot-include-inactive failed: %v\nstderr=%s", err, stderrOut)
+	}
+	inactBriefBytes, err := os.ReadFile(inactBriefPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(inactBriefBytes), "**HS-2**") {
+		t.Fatalf("A13-14 positive control failed: --priority-brief --robot-include-inactive should surface blocked HS-2:\n%s", string(inactBriefBytes))
+	}
 
-	mdOutPath := filepath.Join(t.TempDir(), "exec_report.md")
-	if _, stderrOut, err := runCommandWithTimeout(t, proj, exe, "--export-md", mdOutPath); err != nil {
-		t.Fatalf("--export-md failed: %v\nstderr=%s", err, stderrOut)
+	// W28-6: --agent-brief bundle writes executive brief.md + forecast.json + updated meta.json + helpers.md.
+	agentDir := filepath.Join(t.TempDir(), "agent-brief-w28")
+	if _, stderrOut, err := runCommandWithTimeout(t, proj, exe, "--agent-brief", agentDir); err != nil {
+		t.Fatalf("--agent-brief failed: %v\nstderr=%s", err, stderrOut)
+	}
+	agentBriefMD, err := os.ReadFile(filepath.Join(agentDir, "brief.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(agentBriefMD), "## ⚡ Global Backlog Capacity (Graham Bounds)") || !strings.Contains(string(agentBriefMD), "## ↻ Cycle Break Suggestions") {
+		t.Fatalf("A13-14/W28-6 regression: --agent-brief brief.md missing executive sections:\n%s", string(agentBriefMD))
+	}
+	if _, err := os.Stat(filepath.Join(agentDir, "forecast.json")); err != nil {
+		t.Fatalf("W28-6 regression: --agent-brief missing forecast.json: %v", err)
+	}
+	metaBytes, err := os.ReadFile(filepath.Join(agentDir, "meta.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(metaBytes), `"forecast.json"`) {
+		t.Fatalf("W28-6 regression: --agent-brief meta.json missing forecast.json in files list:\n%s", string(metaBytes))
+	}
+	// A14-6: helpers.md jq queries must use exact JSON field names (blocked_count, total_impact, remaining_issues).
+	helpersBytes, err := os.ReadFile(filepath.Join(agentDir, "helpers.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	helpersStr := string(helpersBytes)
+	for _, want := range []string{"blocked_count", "total_impact", ".burndown.remaining_issues"} {
+		if !strings.Contains(helpersStr, want) {
+			t.Fatalf("A14-6 regression: --agent-brief helpers.md missing exact JSON field %q:\n%s", want, helpersStr)
+		}
+	}
+	for _, bad := range []string{"total_blocked", ".burndown.remaining}"} {
+		if strings.Contains(helpersStr, bad) {
+			t.Fatalf("A14-6 regression: --agent-brief helpers.md contains nonexistent JSON field %q:\n%s", bad, helpersStr)
+		}
+	}
+
+	// A13-3: --export-md --export-include-graph=false MUST still emit ETA Forecast & Start Here (Root Blockers).
+	mdOutPath := filepath.Join(t.TempDir(), "exec_report_nograph.md")
+	if _, stderrOut, err := runCommandWithTimeout(t, proj, exe, "--export-md", mdOutPath, "--export-include-graph=false"); err != nil {
+		t.Fatalf("--export-md --export-include-graph=false failed: %v\nstderr=%s", err, stderrOut)
 	}
 	mdOutBytes, err := os.ReadFile(mdOutPath)
 	if err != nil {
@@ -10843,7 +11039,34 @@ func TestWave27_Pass11ExportFixes_Hotspots_Cascades_And_ExecutiveBriefs(t *testi
 	}
 	for _, want := range []string{"| **ETA Forecast** |", "| **Start Here (Root Blockers)** | `HS-1` (P0) |"} {
 		if !strings.Contains(string(mdOutBytes), want) {
-			t.Fatalf("W27-5 regression: --export-md missing %q:\n%s", want, string(mdOutBytes))
+			t.Fatalf("A13-3 regression: --export-md --export-include-graph=false missing %q:\n%s", want, string(mdOutBytes))
 		}
+	}
+
+	// W28-6: --robot-graph --graph-format json emits enriched actionable & structural fields on nodes.
+	graphJSONOut, stderrOut, err := runCommandWithTimeout(t, proj, exe, "--robot-graph", "--graph-format=json")
+	if err != nil {
+		t.Fatalf("--robot-graph --graph-format=json failed: %v\nstderr=%s", err, stderrOut)
+	}
+	var parsedGraph struct {
+		Adjacency struct {
+			Nodes []struct {
+				ID         string `json:"id"`
+				Actionable *bool  `json:"actionable"`
+			} `json:"nodes"`
+		} `json:"adjacency"`
+	}
+	if err := json.Unmarshal([]byte(graphJSONOut), &parsedGraph); err != nil {
+		t.Fatalf("unmarshal --robot-graph json: %v\n%s", err, graphJSONOut)
+	}
+	actMap := map[string]bool{}
+	for _, n := range parsedGraph.Adjacency.Nodes {
+		if n.Actionable == nil {
+			t.Fatalf("W28-6 regression: --robot-graph node %s missing actionable flag", n.ID)
+		}
+		actMap[n.ID] = *n.Actionable
+	}
+	if !actMap["HS-1"] || actMap["HS-2"] {
+		t.Fatalf("W28-6 regression: expected HS-1 actionable=true, HS-2 actionable=false, got %+v", actMap)
 	}
 }

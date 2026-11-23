@@ -4399,6 +4399,9 @@ bv has a comprehensive built-in help system:
 |  | `J` | Detail scroll down |
 |  | `K` | Detail scroll up |
 |  | `y` | Copy commit SHA |
+|  | `+` | Confirm commit correlation |
+|  | `-` | Reject commit correlation |
+|  | `x` | Ignore commit correlation |
 |  | `o` | Open in browser |
 |  | `h` | Close history view |
 | **flow** | `g` | Go to top |

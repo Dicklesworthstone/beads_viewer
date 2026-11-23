@@ -4095,7 +4095,7 @@ func main() {
 				if labelsErr != nil {
 					fmt.Printf("  → Warning: failed to build label intelligence: %v\n", labelsErr)
 				}
-				forecastJSON, forecastETACtx, forecastErr := buildExportForecastPayload(exportContext, exportIssues, fullStats, exportContext.DataHash, exportNow)
+				forecastJSON, forecastETACtx, forecastErr := buildExportForecastPayload(exportContext, exportIssues, fullStats, exportContext.DataHash, *robotIncludeInactive, exportNow)
 				if forecastErr != nil {
 					fmt.Printf("  → Warning: failed to build forecast data: %v\n", forecastErr)
 				}
@@ -4104,6 +4104,9 @@ func main() {
 				if *pagesIncludeHistory {
 					fmt.Println("  → Generating time-travel history data...")
 					historyCtx := exportContext
+					if len(historyCtx.FullIssues) == 0 {
+						historyCtx.FullIssues = exportContext.GraphIssues()
+					}
 					historyCtx.Issues = exportIssues
 					if historyReport, err := generateHistoryForExportContext(historyCtx); err == nil && historyReport != nil {
 						if encoded, mErr := json.MarshalIndent(historyReport, "", "  "); mErr == nil {
@@ -4635,6 +4638,7 @@ func main() {
 					CandidateIDs:      robotDispatchContext.CandidateIDs,
 					UnblockIDs:        robotDispatchContext.RecipeUnblockIDs,
 					Weights:           graphFeedbackWeights,
+					IncludeInactive:   *robotIncludeInactive,
 					ForceFullAnalysis: *forceFullAnalysis,
 					Triage:            &triage,
 					History:           historyReport,
@@ -5264,6 +5268,55 @@ func main() {
 			}
 			fmt.Println("  → helpers.md")
 
+			// Generate optional analytical companions (suggestions, labels, forecast, sprints)
+			// reusing one full-graph analysis pass (W28-6).
+			bundleFiles := []string{"triage.json", "insights.json", "brief.md", "helpers.md"}
+			agentScopedIssues := issues
+			if candidateIDs != nil {
+				agentScopedIssues = make([]model.Issue, 0, len(candidateIDs))
+				for _, iss := range issues {
+					if candidateIDs[iss.ID] {
+						agentScopedIssues = append(agentScopedIssues, iss)
+					}
+				}
+			}
+			agentExportCtx := robotDispatchContext
+			agentExportCtx.ForceFullAnalysis = *forceFullAnalysis
+			var agentFullStats *analysis.GraphStats
+			if agentAn := agentExportCtx.GraphAnalyzer(); agentAn != nil {
+				if *forceFullAnalysis {
+					fullCfg := analysis.FullAnalysisConfig()
+					agentAn.SetConfig(&fullCfg)
+				}
+				s := agentAn.Analyze()
+				agentFullStats = &s
+			}
+			if suggJSON, suggCnt, sErr := buildExportSuggestionsPayload(agentExportCtx, agentScopedIssues, dataHash, agentBriefNow); sErr == nil && suggCnt > 0 && len(suggJSON) > 0 {
+				if wErr := export.SafeWriteOutput(filepath.Join(*agentBrief, "suggestions.json"), suggJSON, 0644); wErr == nil {
+					bundleFiles = append(bundleFiles, "suggestions.json")
+					fmt.Printf("  → suggestions.json (%d suggestions)\n", suggCnt)
+				}
+			}
+			if lblJSON, lblCnt, lErr := buildExportLabelsPayload(agentExportCtx, agentScopedIssues, agentFullStats, dataHash, agentBriefNow); lErr == nil && lblCnt > 0 && len(lblJSON) > 0 {
+				if wErr := export.SafeWriteOutput(filepath.Join(*agentBrief, "labels.json"), lblJSON, 0644); wErr == nil {
+					bundleFiles = append(bundleFiles, "labels.json")
+					fmt.Printf("  → labels.json (%d labels)\n", lblCnt)
+				}
+			}
+			if fcJSON, _, fErr := buildExportForecastPayload(agentExportCtx, agentScopedIssues, agentFullStats, dataHash, *robotIncludeInactive, agentBriefNow); fErr == nil && len(fcJSON) > 0 {
+				if wErr := export.SafeWriteOutput(filepath.Join(*agentBrief, "forecast.json"), fcJSON, 0644); wErr == nil {
+					bundleFiles = append(bundleFiles, "forecast.json")
+					fmt.Println("  → forecast.json")
+				}
+			}
+			if spJSON, spCnt, spErr := buildExportSprintsPayload(agentExportCtx, projectDir, agentScopedIssues, agentFullStats, agentBriefNow); spErr == nil && spCnt > 0 && len(spJSON) > 0 {
+				if wErr := export.SafeWriteOutput(filepath.Join(*agentBrief, "sprints.json"), spJSON, 0644); wErr == nil {
+					bundleFiles = append(bundleFiles, "sprints.json")
+					fmt.Printf("  → sprints.json (%d sprints)\n", spCnt)
+				}
+			}
+			bundleFiles = append(bundleFiles, "meta.json")
+
 			// Generate meta.json with hash and config
 			scopedIssueCount := len(issues)
 			if candidateIDs != nil {
@@ -5276,7 +5329,7 @@ func main() {
 			}{
 				RobotEnvelope: robotDispatchContext.Envelope(),
 				IssueCount:    scopedIssueCount,
-				Files:         []string{"triage.json", "insights.json", "brief.md", "helpers.md", "meta.json"},
+				Files:         bundleFiles,
 			}
 			metaJSON, _ := json.MarshalIndent(meta, "", "  ")
 			if err := export.SafeWriteOutput(filepath.Join(*agentBrief, "meta.json"), metaJSON, 0644); err != nil {
@@ -5624,20 +5677,29 @@ func main() {
 					}
 				}
 			}
-			if needsReportStats && len(issuesForSearch) > 0 {
-				reportAnalyzer := analysis.NewAnalyzer(issuesForSearch)
+			graphIssuesForReport := robotDispatchContext.GraphIssues()
+			if len(graphIssuesForReport) == 0 {
+				graphIssuesForReport = issuesForSearch
+			}
+			if (needsReportStats || options.Format == "markdown") && len(graphIssuesForReport) > 0 {
+				reportAnalyzer := analysis.NewAnalyzer(graphIssuesForReport)
 				reportAnalyzer.SetNow(options.GeneratedAt)
 				reportAnalyzer.SetReadinessScope(readiness, candidateIDs)
-				if *forceFullAnalysis {
-					fullCfg := analysis.FullAnalysisConfig()
-					reportAnalyzer.SetConfig(&fullCfg)
-					stats := reportAnalyzer.AnalyzeAsyncWithConfig(context.Background(), fullCfg)
-					stats.WaitForPhase2()
-					options.GraphStats = stats
-				} else {
-					stats := reportAnalyzer.AnalyzeAsync(context.Background())
-					stats.WaitForPhase2()
-					options.GraphStats = stats
+				if robotDispatchContext.RecipeUnblockIDs != nil {
+					reportAnalyzer.SetUnblockScope(robotDispatchContext.RecipeUnblockIDs)
+				}
+				if needsReportStats {
+					if *forceFullAnalysis {
+						fullCfg := analysis.FullAnalysisConfig()
+						reportAnalyzer.SetConfig(&fullCfg)
+						stats := reportAnalyzer.AnalyzeAsyncWithConfig(context.Background(), fullCfg)
+						stats.WaitForPhase2()
+						options.GraphStats = stats
+					} else {
+						stats := reportAnalyzer.AnalyzeAsync(context.Background())
+						stats.WaitForPhase2()
+						options.GraphStats = stats
+					}
 				}
 				if options.Format == "markdown" {
 					options.Analyzer = reportAnalyzer
@@ -5648,13 +5710,20 @@ func main() {
 					options.VisibleIDs = visIDs
 					velIssues := robotDispatchContext.VelocityIssues()
 					if len(velIssues) == 0 {
-						velIssues = issuesForSearch
+						velIssues = graphIssuesForReport
 					}
 					etaStats := options.GraphStats
-					if len(issuesForSearch) < len(velIssues) {
-						_, fullStats := resolveExportFullGraphStats(robotDispatchContext, issuesForSearch, reportAnalyzer, options.GraphStats, *forceFullAnalysis)
+					if etaStats == nil || len(graphIssuesForReport) < len(velIssues) {
+						_, fullStats := resolveExportFullGraphStats(robotDispatchContext, graphIssuesForReport, reportAnalyzer, options.GraphStats, *forceFullAnalysis)
 						if fullStats != nil {
 							etaStats = fullStats
+						} else if etaStats == nil {
+							if *forceFullAnalysis {
+								fullCfg := analysis.FullAnalysisConfig()
+								reportAnalyzer.SetConfig(&fullCfg)
+							}
+							s := reportAnalyzer.Analyze()
+							etaStats = &s
 						}
 					}
 					options.ETAContext = analysis.NewETAContext(velIssues, etaStats, options.GeneratedAt.UTC())
@@ -8290,7 +8359,7 @@ func runPagesWizard(beadsPath string, dispatchCtx RobotContext, activeRecipe *re
 	if wizardLabelsErr != nil {
 		fmt.Printf("  -> Warning: failed to build label intelligence: %v\n", wizardLabelsErr)
 	}
-	wizardForecastJSON, wizardETACtx, wizardForecastErr := buildExportForecastPayload(driftCtx, exportIssues, wizardFullStats, driftCtx.DataHash, wizardNow)
+	wizardForecastJSON, wizardETACtx, wizardForecastErr := buildExportForecastPayload(driftCtx, exportIssues, wizardFullStats, driftCtx.DataHash, includeInactive, wizardNow)
 	if wizardForecastErr != nil {
 		fmt.Printf("  -> Warning: failed to build forecast data: %v\n", wizardForecastErr)
 	}
@@ -8298,7 +8367,12 @@ func runPagesWizard(beadsPath string, dispatchCtx RobotContext, activeRecipe *re
 	var wizardHistoryCommitCount int
 	if config.IncludeHistory {
 		fmt.Println("  -> Generating time-travel history data...")
-		if historyReport, err := generateHistoryForExportContext(exportContext); err == nil && historyReport != nil {
+		wizardHistoryCtx := driftCtx
+		if len(wizardHistoryCtx.FullIssues) == 0 {
+			wizardHistoryCtx.FullIssues = driftCtx.GraphIssues()
+		}
+		wizardHistoryCtx.Issues = exportIssues
+		if historyReport, err := generateHistoryForExportContext(wizardHistoryCtx); err == nil && historyReport != nil {
 			if encoded, mErr := json.MarshalIndent(historyReport, "", "  "); mErr == nil {
 				wizardHistoryJSON = encoded
 				wizardHistoryCommitCount = len(historyReport.Commits)
@@ -9383,6 +9457,23 @@ jq '.Velocity' insights.json
 jq '.Keystones[:5]' insights.json
 ` + "```" + `
 
+## Additional Analytical Files (emitted when applicable)
+` + "```bash" + `
+# Hygiene suggestions (duplicates, missing deps, cycle breaks)
+jq '.suggestions[] | {type, confidence, target_bead, action_command}' suggestions.json
+
+# Label health, 4-week velocity & blockage cascades
+jq '.labels[] | {label, health, health_level, blocked_count, trend: .trend_direction}' labels.json
+jq '.cascades[] | {source: .source_label, blocked_count, total_impact, affected: .affected_labels}' labels.json
+
+# Global Graham capacity bounds & priority misalignment alerts
+jq '.global_capacity' forecast.json
+jq '.priority_recommendations[] | {id: .issue_id, from: .current_priority, to: .suggested_priority, conf: .confidence}' forecast.json
+
+# Active sprints & burndown
+jq '.sprints[] | {id, name, on_track: .burndown.on_track, remaining: .burndown.remaining_issues}' sprints.json
+` + "```" + `
+
 ## Combining Files
 ` + "```bash" + `
 # Cross-reference top picks with insights
@@ -9425,6 +9516,32 @@ type TimeTravelFileHotspot struct {
 	OpenBeads   int      `json:"open_beads"`
 	ClosedBeads int      `json:"closed_beads"`
 	OpenBeadIDs []string `json:"open_bead_ids,omitempty"`
+	CoChanged   []string `json:"co_changed,omitempty"`
+}
+
+// TimeTravelCluster summarizes a tightly coupled group of beads detected via ImpactNetwork.
+type TimeTravelCluster struct {
+	ClusterID     int      `json:"cluster_id"`
+	Label         string   `json:"label"`
+	CentralBead   string   `json:"central_bead,omitempty"`
+	BeadIDs       []string `json:"bead_ids"`
+	InternalEdges int      `json:"internal_edges"`
+	Connectivity  float64  `json:"connectivity"`
+	SharedFiles   []string `json:"shared_files,omitempty"`
+}
+
+// TimeTravelOrphan summarizes a suspicious unlinked commit detected via OrphanDetector.
+type TimeTravelOrphan struct {
+	SHA                string `json:"sha"`
+	ShortSHA           string `json:"short_sha"`
+	Message            string `json:"message"`
+	Author             string `json:"author,omitempty"`
+	Timestamp          string `json:"timestamp,omitempty"`
+	SuspicionScore     int    `json:"suspicion_score"`
+	ProbableBeadID     string `json:"probable_bead_id,omitempty"`
+	ProbableBeadTitle  string `json:"probable_bead_title,omitempty"`
+	ProbableConfidence int    `json:"probable_confidence,omitempty"`
+	ConfirmCommand     string `json:"confirm_command,omitempty"`
 }
 
 // TimeTravelBeadHistory holds correlated commits and related work for one bead in history.json.
@@ -9442,6 +9559,9 @@ type TimeTravelHistory struct {
 	Sprints      []model.Sprint                    `json:"sprints,omitempty"`
 	Histories    map[string]*TimeTravelBeadHistory `json:"histories,omitempty"`
 	FileHotspots []TimeTravelFileHotspot           `json:"file_hotspots,omitempty"`
+	Clusters     []TimeTravelCluster               `json:"clusters,omitempty"`
+	Orphans      []TimeTravelOrphan                `json:"orphans,omitempty"`
+	OrphanRatio  float64                           `json:"orphan_ratio,omitempty"`
 }
 
 // TimeTravelCommit represents a single commit in the time-travel history
@@ -9477,9 +9597,10 @@ func generateHistoryForExportContext(ctx RobotContext) (*TimeTravelHistory, erro
 		rev  string
 	}
 	var (
-		report    *correlation.HistoryReport
-		repoRoots []repoRootOrderTarget
-		err       error
+		report               *correlation.HistoryReport
+		singleRepoCorrelator *correlation.Correlator
+		repoRoots            []repoRootOrderTarget
+		err                  error
 	)
 	if ctx.SourceKind == "workspace" && ctx.SourceAuthority != nil {
 		report, err = generateWorkspaceCorrelationReport(ctx, correlation.CorrelatorOptions{
@@ -9547,6 +9668,7 @@ func generateHistoryForExportContext(ctx RobotContext) (*TimeTravelHistory, erro
 			}
 			correlator = correlator.WithFeedbackStore(feedbackStore)
 		}
+		singleRepoCorrelator = correlator
 		report, err = correlator.GenerateReportCached(beadInfos, correlation.CorrelatorOptions{
 			Limit:    commitLimit,
 			Revision: ctx.AsOfCommit,
@@ -9732,12 +9854,21 @@ func generateHistoryForExportContext(ctx RobotContext) (*TimeTravelHistory, erro
 				openIDs = openIDs[:6]
 			}
 		}
+		var coChanged []string
+		if co := fileLookup.GetRelatedFiles(hs.FilePath, 0.3, 3); co != nil {
+			for _, rf := range co.RelatedFiles {
+				if strings.TrimSpace(rf.FilePath) != "" {
+					coChanged = append(coChanged, rf.FilePath)
+				}
+			}
+		}
 		fileHotspots = append(fileHotspots, TimeTravelFileHotspot{
 			Path:        hs.FilePath,
 			TotalBeads:  hs.TotalBeads,
 			OpenBeads:   hs.OpenBeads,
 			ClosedBeads: hs.ClosedBeads,
 			OpenBeadIDs: openIDs,
+			CoChanged:   coChanged,
 		})
 		if len(fileHotspots) >= 15 {
 			break
@@ -9745,6 +9876,157 @@ func generateHistoryForExportContext(ctx RobotContext) (*TimeTravelHistory, erro
 	}
 
 	relNow := ctx.ReferenceNow()
+
+	// Build scoped ImpactNetwork clusters (W28-4)
+	var exportClusters []TimeTravelCluster
+	if len(scopedHistories) >= 2 {
+		if net := correlation.NewNetworkBuilderWithIssues(scopedReport, issues).BuildAt(relNow); net != nil && len(net.Clusters) > 0 {
+			for _, cl := range net.Clusters {
+				var scopedIDs []string
+				for _, bid := range cl.BeadIDs {
+					if len(exportedIDSet) == 0 || exportedIDSet[bid] {
+						scopedIDs = append(scopedIDs, bid)
+					}
+				}
+				if len(scopedIDs) < 2 {
+					continue
+				}
+				sort.Strings(scopedIDs)
+				central := cl.CentralBead
+				if len(exportedIDSet) > 0 && !exportedIDSet[central] {
+					central = scopedIDs[0]
+				}
+				sharedFiles := append([]string(nil), cl.SharedFiles...)
+				sort.Strings(sharedFiles)
+				if len(sharedFiles) > 5 {
+					sharedFiles = sharedFiles[:5]
+				}
+				exportClusters = append(exportClusters, TimeTravelCluster{
+					ClusterID:     cl.ClusterID,
+					Label:         cl.Label,
+					CentralBead:   central,
+					BeadIDs:       scopedIDs,
+					InternalEdges: cl.InternalEdges,
+					Connectivity:  cl.InternalConnectivity,
+					SharedFiles:   sharedFiles,
+				})
+			}
+			sort.Slice(exportClusters, func(i, j int) bool {
+				if len(exportClusters[i].BeadIDs) != len(exportClusters[j].BeadIDs) {
+					return len(exportClusters[i].BeadIDs) > len(exportClusters[j].BeadIDs)
+				}
+				if exportClusters[i].InternalEdges != exportClusters[j].InternalEdges {
+					return exportClusters[i].InternalEdges > exportClusters[j].InternalEdges
+				}
+				return exportClusters[i].CentralBead < exportClusters[j].CentralBead
+			})
+			if len(exportClusters) > 8 {
+				exportClusters = exportClusters[:8]
+			}
+		}
+	}
+
+	// Detect suspicious unlinked commits (OrphanDetector, W28-4), strictly scoped to exportedIDSet.
+	var exportOrphans []TimeTravelOrphan
+	var orphanRatio float64
+	var rawOrphanReport *correlation.OrphanReport
+	if ctx.SourceKind == "workspace" && ctx.SourceAuthority != nil {
+		if rep, oErr := detectWorkspaceOrphans(ctx, commitLimit); oErr == nil && rep != nil {
+			rawOrphanReport = rep
+		}
+	} else if len(repoRoots) > 0 && repoRoots[0].root != "" {
+		orphanGitRoot := repoRoots[0].root
+		if gitRoot, grErr := correlation.FindGitRoot(orphanGitRoot); grErr == nil && gitRoot != "" {
+			orphanGitRoot = gitRoot
+		}
+		var orphanStoreDirs []string
+		workDir := ctx.ProjectDir
+		if workDir == "" {
+			workDir = repoRoots[0].root
+		}
+		if resolvedBP, bpErr := resolveCorrelationBeadsPathForContext(ctx, workDir); bpErr == nil && resolvedBP != "" {
+			storeDir := filepath.Clean(filepath.Dir(resolvedBP))
+			if !filepath.IsAbs(storeDir) {
+				storeDir = filepath.Clean(filepath.Join(workDir, storeDir))
+			}
+			if rel, relErr := filepath.Rel(filepath.Clean(orphanGitRoot), storeDir); relErr == nil && rel != "." && rel != "" && !strings.HasPrefix(rel, "..") {
+				orphanStoreDirs = append(orphanStoreDirs, filepath.ToSlash(rel))
+			}
+		}
+		orphanBaseReport := report
+		if fullIssues := ctx.GraphIssues(); singleRepoCorrelator != nil && len(fullIssues) > len(issues) {
+			fullBeadInfos := make([]correlation.BeadInfo, len(fullIssues))
+			for i, issue := range fullIssues {
+				fullBeadInfos[i] = correlation.BeadInfo{
+					ID:     issue.ID,
+					Title:  issue.Title,
+					Status: string(issue.Status),
+				}
+			}
+			if fullRep, fErr := singleRepoCorrelator.GenerateReportCached(fullBeadInfos, correlation.CorrelatorOptions{
+				Limit:    commitLimit,
+				Revision: ctx.AsOfCommit,
+			}); fErr == nil && fullRep != nil {
+				orphanBaseReport = fullRep
+			}
+		}
+		if rep, oErr := correlation.NewOrphanDetectorAt(orphanBaseReport, orphanGitRoot, relNow).
+			WithStoreDirs(orphanStoreDirs...).
+			DetectOrphans(correlation.ExtractOptions{Limit: commitLimit, Revision: ctx.AsOfCommit}); oErr == nil && rep != nil {
+			rawOrphanReport = rep
+		}
+	}
+	if rawOrphanReport != nil {
+		orphanRatio = rawOrphanReport.Stats.OrphanRatio
+		candidates := make([]correlation.OrphanCandidate, 0, len(rawOrphanReport.Candidates))
+		for _, cand := range rawOrphanReport.Candidates {
+			if cand.SuspicionScore < 30 {
+				continue
+			}
+			candidates = append(candidates, cand)
+		}
+		sort.Slice(candidates, func(i, j int) bool {
+			if candidates[i].SuspicionScore != candidates[j].SuspicionScore {
+				return candidates[i].SuspicionScore > candidates[j].SuspicionScore
+			}
+			if !candidates[i].Timestamp.Equal(candidates[j].Timestamp) {
+				return candidates[i].Timestamp.After(candidates[j].Timestamp)
+			}
+			return candidates[i].SHA < candidates[j].SHA
+		})
+		for _, cand := range candidates {
+			item := TimeTravelOrphan{
+				SHA:            cand.SHA,
+				ShortSHA:       cand.ShortSHA,
+				Message:        cand.Message,
+				Author:         cand.Author,
+				SuspicionScore: cand.SuspicionScore,
+			}
+			if item.ShortSHA == "" && len(item.SHA) >= 7 {
+				item.ShortSHA = item.SHA[:7]
+			}
+			if !cand.Timestamp.IsZero() {
+				item.Timestamp = cand.Timestamp.UTC().Format(time.RFC3339)
+			}
+			for _, pb := range cand.ProbableBeads {
+				if len(exportedIDSet) > 0 && !exportedIDSet[pb.BeadID] {
+					continue
+				}
+				item.ProbableBeadID = pb.BeadID
+				item.ProbableBeadTitle = pb.BeadTitle
+				item.ProbableConfidence = pb.Confidence
+				canConfirm := ctx.AsOf == "" && ctx.AsOfCommit == "" && (ctx.SourceAuthority == nil || ctx.SourceAuthority.ClaimSafe)
+				if canConfirm && item.SHA != "" && pb.BeadID != "" {
+					item.ConfirmCommand = fmt.Sprintf("bv --robot-confirm-correlation %s", shellQuoteWord(item.SHA+":"+pb.BeadID))
+				}
+				break
+			}
+			exportOrphans = append(exportOrphans, item)
+			if len(exportOrphans) >= 10 {
+				break
+			}
+		}
+	}
 	relOpts := correlation.RelatedWorkOptions{
 		MinRelevance:  20,
 		MaxResults:    5,
@@ -9882,6 +10164,9 @@ func generateHistoryForExportContext(ctx RobotContext) (*TimeTravelHistory, erro
 		Sprints:      sprints,
 		Histories:    beadHistories,
 		FileHotspots: fileHotspots,
+		Clusters:     exportClusters,
+		Orphans:      exportOrphans,
+		OrphanRatio:  orphanRatio,
 	}, nil
 }
 
@@ -11451,7 +11736,28 @@ func generateRobotSchemas() RobotSchemas {
 				"adjacency": map[string]interface{}{
 					"type": "object",
 					"properties": map[string]interface{}{
-						"nodes": map[string]interface{}{"type": "array"},
+						"nodes": map[string]interface{}{
+							"type": "array",
+							"items": map[string]interface{}{
+								"type": "object",
+								"properties": map[string]interface{}{
+									"id":              map[string]interface{}{"type": "string"},
+									"title":           map[string]interface{}{"type": "string"},
+									"status":          map[string]interface{}{"type": "string"},
+									"priority":        map[string]interface{}{"type": "integer"},
+									"labels":          map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+									"source_repo":     map[string]interface{}{"type": "string"},
+									"pagerank":        map[string]interface{}{"type": "number"},
+									"betweenness":     map[string]interface{}{"type": "number"},
+									"critical_path":   map[string]interface{}{"type": "number"},
+									"slack":           map[string]interface{}{"type": "number"},
+									"kcore":           map[string]interface{}{"type": "integer"},
+									"is_articulation": map[string]interface{}{"type": "boolean"},
+									"actionable":      map[string]interface{}{"type": "boolean"},
+								},
+								"required": []string{"id", "title", "status", "priority"},
+							},
+						},
 						"edges": map[string]interface{}{"type": "array"},
 					},
 				},
@@ -13741,7 +14047,11 @@ func populatePriorityBriefExecutiveData(config *export.PriorityBriefConfig, ctx 
 		advCfg := analysis.DefaultAdvancedInsightsConfig()
 		advCfg.CycleBreakLimit = limit
 		if ctx.CandidateIDs != nil {
-			advCfg.CycleBreakLimit = max(limit, len(cycles)*4)
+			totalEdges := 0
+			for _, c := range cycles {
+				totalEdges += len(c)
+			}
+			advCfg.CycleBreakLimit = max(limit, totalEdges)
 		}
 		if adv := analyzer.GenerateAdvancedInsightsFromStats(&stats, advCfg); adv != nil && adv.CycleBreak != nil {
 			for _, cb := range adv.CycleBreak.Suggestions {
@@ -14133,7 +14443,7 @@ type exportForecastDocument struct {
 	PriorityRecommendations []analysis.PriorityRecommendation `json:"priority_recommendations,omitempty"`
 }
 
-func buildExportForecastPayload(ctx RobotContext, exportIssues []model.Issue, stats *analysis.GraphStats, dataHash string, now time.Time) ([]byte, *analysis.ETAContext, error) {
+func buildExportForecastPayload(ctx RobotContext, exportIssues []model.Issue, stats *analysis.GraphStats, dataHash string, includeInactive bool, now time.Time) ([]byte, *analysis.ETAContext, error) {
 	if len(exportIssues) == 0 {
 		return nil, nil, nil
 	}
@@ -14214,10 +14524,15 @@ func buildExportForecastPayload(ctx RobotContext, exportIssues []model.Issue, st
 	if _, fbWeights := loadRobotFeedbackForContext(ctx); fbWeights != nil {
 		recAnalyzer.SetWeights(*fbWeights)
 	}
+	selectionMode := analysis.SelectionReadyLeaf
+	if includeInactive {
+		selectionMode = analysis.SelectionAllScopedCandidates
+	}
+	eligibleRecIDs := recAnalyzer.CandidateIssueSet(selectionMode)
 	recs := recAnalyzer.GenerateRecommendationsFromStats(capStats, analysis.DefaultThresholds())
 	filteredRecs := make([]analysis.PriorityRecommendation, 0, min(len(recs), 20))
 	for _, rec := range recs {
-		if !visibleIDs[rec.IssueID] || rec.CurrentPriority == rec.SuggestedPriority {
+		if !visibleIDs[rec.IssueID] || !eligibleRecIDs[rec.IssueID] || rec.CurrentPriority == rec.SuggestedPriority {
 			continue
 		}
 		filteredRecs = append(filteredRecs, rec)
