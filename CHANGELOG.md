@@ -63,7 +63,7 @@ sources.
 
 ### Static Pages Export and Viewer
 
-- Publish operational risk and collateral-aware cycle cuts, draw bridge and
+- Publish operational risk (excluding null/non-numeric/negative scores from overview ranking) and collateral-ranked cycle cuts (`6c679b2b`), draw bridge and
   cycle-break overlays, sort real root blockers ahead of synthetic ones, keep
   what-if unlocks on active resolvable blockers, and collect SCC cycle IDs
   without repeated closers (`57f50143`, `102f88f9`, `41e24fa7`, `668e3d96`,
