@@ -5100,6 +5100,7 @@ func main() {
 			// Generate the brief
 			config := export.DefaultPriorityBriefConfig()
 			config.DataHash = dataHash
+			populatePriorityBriefExecutiveData(&config, robotDispatchContext, *forceFullAnalysis, briefNow)
 			if *robotMaxResults > 0 {
 				config.MaxRecommendations = *robotMaxResults
 				if *robotMaxResults < config.MaxQuickWins {
@@ -5231,6 +5232,7 @@ func main() {
 			// Generate priority brief
 			config := export.DefaultPriorityBriefConfig()
 			config.DataHash = dataHash
+			populatePriorityBriefExecutiveData(&config, robotDispatchContext, *forceFullAnalysis, agentBriefNow)
 			if *robotMaxResults > 0 {
 				config.MaxRecommendations = *robotMaxResults
 				if config.MaxQuickWins > *robotMaxResults {
@@ -5636,6 +5638,26 @@ func main() {
 					stats := reportAnalyzer.AnalyzeAsync(context.Background())
 					stats.WaitForPhase2()
 					options.GraphStats = stats
+				}
+				if options.Format == "markdown" {
+					options.Analyzer = reportAnalyzer
+					visIDs := make(map[string]bool, len(reportIssues))
+					for _, iss := range reportIssues {
+						visIDs[iss.ID] = true
+					}
+					options.VisibleIDs = visIDs
+					velIssues := robotDispatchContext.VelocityIssues()
+					if len(velIssues) == 0 {
+						velIssues = issuesForSearch
+					}
+					etaStats := options.GraphStats
+					if len(issuesForSearch) < len(velIssues) {
+						_, fullStats := resolveExportFullGraphStats(robotDispatchContext, issuesForSearch, reportAnalyzer, options.GraphStats, *forceFullAnalysis)
+						if fullStats != nil {
+							etaStats = fullStats
+						}
+					}
+					options.ETAContext = analysis.NewETAContext(velIssues, etaStats, options.GeneratedAt.UTC())
 				}
 			}
 			envelope := robotDispatchContext.Envelope()
@@ -9384,9 +9406,31 @@ type TimeTravelBeadCommit struct {
 	Confidence float64 `json:"confidence,omitempty"`
 }
 
-// TimeTravelBeadHistory holds correlated commits for one bead in history.json.
+// TimeTravelRelatedBead is a compact related-work link (file/commit overlap) attached
+// to a bead's history record in history.json for Issue Detail Modal display.
+type TimeTravelRelatedBead struct {
+	BeadID        string   `json:"bead_id"`
+	Title         string   `json:"title"`
+	Status        string   `json:"status"`
+	RelationType  string   `json:"relation_type"`
+	Relevance     int      `json:"relevance"`
+	SharedFiles   []string `json:"shared_files,omitempty"`
+	SharedCommits int      `json:"shared_commits,omitempty"`
+}
+
+// TimeTravelFileHotspot summarizes a high-contention file touched by multiple exported beads.
+type TimeTravelFileHotspot struct {
+	Path        string   `json:"path"`
+	TotalBeads  int      `json:"total_beads"`
+	OpenBeads   int      `json:"open_beads"`
+	ClosedBeads int      `json:"closed_beads"`
+	OpenBeadIDs []string `json:"open_bead_ids,omitempty"`
+}
+
+// TimeTravelBeadHistory holds correlated commits and related work for one bead in history.json.
 type TimeTravelBeadHistory struct {
-	Commits []TimeTravelBeadCommit `json:"commits"`
+	Commits []TimeTravelBeadCommit  `json:"commits"`
+	Related []TimeTravelRelatedBead `json:"related,omitempty"`
 }
 
 // TimeTravelHistory represents the history data format for time-travel animation (bv-z38b)
@@ -9397,6 +9441,7 @@ type TimeTravelHistory struct {
 	InitialBeads []string                          `json:"initial_beads,omitempty"`
 	Sprints      []model.Sprint                    `json:"sprints,omitempty"`
 	Histories    map[string]*TimeTravelBeadHistory `json:"histories,omitempty"`
+	FileHotspots []TimeTravelFileHotspot           `json:"file_hotspots,omitempty"`
 }
 
 // TimeTravelCommit represents a single commit in the time-travel history
@@ -9642,8 +9687,73 @@ func generateHistoryForExportContext(ctx RobotContext) (*TimeTravelHistory, erro
 		return sprints[i].ID < sprints[j].ID
 	})
 
-	beadHistories := make(map[string]*TimeTravelBeadHistory)
+	exportedIDSet := make(map[string]bool, len(issues))
+	for _, iss := range issues {
+		exportedIDSet[iss.ID] = true
+	}
+
+	scopedHistories := make(map[string]correlation.BeadHistory, len(report.Histories))
 	for beadID, history := range report.Histories {
+		if len(exportedIDSet) > 0 && !exportedIDSet[beadID] {
+			continue
+		}
+		scopedHistories[beadID] = history
+	}
+	scopedReport := &correlation.HistoryReport{
+		Histories:   scopedHistories,
+		CommitIndex: report.CommitIndex,
+	}
+	fileLookup := correlation.NewFileLookup(scopedReport)
+	rawHotspots := fileLookup.GetHotspots(50)
+	sort.Slice(rawHotspots, func(i, j int) bool {
+		if rawHotspots[i].OpenBeads != rawHotspots[j].OpenBeads {
+			return rawHotspots[i].OpenBeads > rawHotspots[j].OpenBeads
+		}
+		if rawHotspots[i].TotalBeads != rawHotspots[j].TotalBeads {
+			return rawHotspots[i].TotalBeads > rawHotspots[j].TotalBeads
+		}
+		return rawHotspots[i].FilePath < rawHotspots[j].FilePath
+	})
+	var fileHotspots []TimeTravelFileHotspot
+	for _, hs := range rawHotspots {
+		if hs.TotalBeads < 2 && hs.OpenBeads < 1 {
+			continue
+		}
+		var openIDs []string
+		if lookup := fileLookup.LookupByFile(hs.FilePath); lookup != nil {
+			for _, ref := range lookup.OpenBeads {
+				if len(exportedIDSet) > 0 && !exportedIDSet[ref.BeadID] {
+					continue
+				}
+				openIDs = append(openIDs, ref.BeadID)
+			}
+			sort.Strings(openIDs)
+			if len(openIDs) > 6 {
+				openIDs = openIDs[:6]
+			}
+		}
+		fileHotspots = append(fileHotspots, TimeTravelFileHotspot{
+			Path:        hs.FilePath,
+			TotalBeads:  hs.TotalBeads,
+			OpenBeads:   hs.OpenBeads,
+			ClosedBeads: hs.ClosedBeads,
+			OpenBeadIDs: openIDs,
+		})
+		if len(fileHotspots) >= 15 {
+			break
+		}
+	}
+
+	relNow := ctx.ReferenceNow()
+	relOpts := correlation.RelatedWorkOptions{
+		MinRelevance:  20,
+		MaxResults:    5,
+		IncludeClosed: true,
+		FileLookup:    fileLookup,
+	}
+
+	beadHistories := make(map[string]*TimeTravelBeadHistory)
+	for beadID, history := range scopedHistories {
 		seenSHA := make(map[string]bool)
 		var list []TimeTravelBeadCommit
 		for _, c := range history.Commits {
@@ -9702,7 +9812,66 @@ func generateHistoryForExportContext(ctx RobotContext) (*TimeTravelHistory, erro
 			if len(list) > 20 {
 				list = list[:20]
 			}
-			beadHistories[beadID] = &TimeTravelBeadHistory{Commits: list}
+		}
+
+		var related []TimeTravelRelatedBead
+		if len(history.Commits) > 0 {
+			if relRes := scopedReport.FindRelatedWorkAt(beadID, relOpts, relNow); relRes != nil {
+				byID := make(map[string]TimeTravelRelatedBead)
+				addRel := func(items []correlation.RelatedWorkBead) {
+					for _, rb := range items {
+						if rb.BeadID == "" || rb.BeadID == beadID {
+							continue
+						}
+						if len(exportedIDSet) > 0 && !exportedIDSet[rb.BeadID] {
+							continue
+						}
+						files := rb.SharedFiles
+						if len(files) > 3 {
+							files = files[:3]
+						}
+						cand := TimeTravelRelatedBead{
+							BeadID:        rb.BeadID,
+							Title:         rb.Title,
+							Status:        rb.Status,
+							RelationType:  string(rb.RelationType),
+							Relevance:     rb.Relevance,
+							SharedFiles:   files,
+							SharedCommits: len(rb.SharedCommits),
+						}
+						if existing, ok := byID[rb.BeadID]; !ok || cand.Relevance > existing.Relevance {
+							if ok && len(cand.SharedFiles) == 0 && len(existing.SharedFiles) > 0 {
+								cand.SharedFiles = existing.SharedFiles
+							}
+							if ok && cand.SharedCommits == 0 && existing.SharedCommits > 0 {
+								cand.SharedCommits = existing.SharedCommits
+							}
+							byID[rb.BeadID] = cand
+						}
+					}
+				}
+				addRel(relRes.CommitOverlap)
+				addRel(relRes.FileOverlap)
+				for _, item := range byID {
+					related = append(related, item)
+				}
+				sort.Slice(related, func(i, j int) bool {
+					if related[i].Relevance != related[j].Relevance {
+						return related[i].Relevance > related[j].Relevance
+					}
+					return related[i].BeadID < related[j].BeadID
+				})
+				if len(related) > 5 {
+					related = related[:5]
+				}
+			}
+		}
+
+		if len(list) > 0 || len(related) > 0 {
+			beadHistories[beadID] = &TimeTravelBeadHistory{
+				Commits: list,
+				Related: related,
+			}
 		}
 	}
 
@@ -9712,6 +9881,7 @@ func generateHistoryForExportContext(ctx RobotContext) (*TimeTravelHistory, erro
 		InitialBeads: initialBeads,
 		Sprints:      sprints,
 		Histories:    beadHistories,
+		FileHotspots: fileHotspots,
 	}, nil
 }
 
@@ -13264,8 +13434,8 @@ func buildExportSprintsPayload(ctx RobotContext, workDir string, exportIssues []
 	// --recipe), pair velocityIssues with full-graph stats rather than exportIssues-only stats.
 	// Reuse caller-supplied stats when already computed over the full graph.
 	capStats := stats
-	capStatsResolved := !(scopeFiltered || len(exportIssues) < len(velocityIssues)) ||
-		(stats != nil && stats.NodeCount >= len(graphIssues))
+	capStatsResolved := stats != nil && (!(scopeFiltered || len(exportIssues) < len(velocityIssues)) ||
+		stats.NodeCount >= countUniqueIssueIDs(graphIssues))
 
 	entries := make([]exportSprintEntry, 0, len(sprints))
 	activeSprintID := ""
@@ -13288,7 +13458,7 @@ func buildExportSprintsPayload(ctx RobotContext, workDir string, exportIssues []
 			scopedBeadIDs = append(scopedBeadIDs, id)
 			sprintIssues = append(sprintIssues, iss)
 			isClosed := iss.Status.IsClosed() || iss.Status.IsTombstone()
-			if !isClosed {
+			if !isClosed && !iss.IsTemplate && !iss.Pinned && iss.Status != model.StatusPinned {
 				openSprintIssues = append(openSprintIssues, iss)
 			}
 			isBlocked := !isClosed && (iss.Status == model.StatusBlocked || len(readiness.Blockers(iss.ID)) > 0)
@@ -13438,6 +13608,7 @@ type exportLabelIntelEntry struct {
 	ClosedLast7Days   int                         `json:"closed_last_7_days"`
 	ClosedLast30Days  int                         `json:"closed_last_30_days"`
 	TrendDirection    string                      `json:"trend_direction"`
+	WeeklyClosed      []int                       `json:"weekly_closed,omitempty"`
 	StaleCount        int                         `json:"stale_count"`
 	IncomingDeps      int                         `json:"incoming_deps"`
 	OutgoingDeps      int                         `json:"outgoing_deps"`
@@ -13450,6 +13621,14 @@ type exportLabelIntelEntry struct {
 	Criticality       analysis.CriticalityMetrics `json:"criticality"`
 }
 
+type exportLabelCascade struct {
+	SourceLabel    string   `json:"source_label"`
+	BlockedCount   int      `json:"blocked_count"`
+	TotalImpact    int      `json:"total_impact"`
+	MaxDepth       int      `json:"max_depth"`
+	AffectedLabels []string `json:"affected_labels,omitempty"`
+}
+
 type exportLabelsDocument struct {
 	GeneratedAt   time.Time               `json:"generated_at"`
 	TotalLabels   int                     `json:"total_labels"`
@@ -13458,6 +13637,105 @@ type exportLabelsDocument struct {
 	CriticalCount int                     `json:"critical_count"`
 	Labels        []exportLabelIntelEntry `json:"labels"`
 	Flow          analysis.CrossLabelFlow `json:"flow"`
+	Cascades      []exportLabelCascade    `json:"cascades,omitempty"`
+}
+
+func countUniqueIssueIDs(issues []model.Issue) int {
+	seen := make(map[string]struct{}, len(issues))
+	for _, iss := range issues {
+		seen[iss.ID] = struct{}{}
+	}
+	return len(seen)
+}
+
+// populatePriorityBriefExecutiveData attaches scoped Global Backlog Capacity (Graham bounds),
+// Priority Misalignment Alerts, and Cycle Break Suggestions to priority/agent brief configs.
+func populatePriorityBriefExecutiveData(config *export.PriorityBriefConfig, ctx RobotContext, forceFullAnalysis bool, now time.Time) {
+	if config == nil {
+		return
+	}
+	graphIssues := ctx.GraphIssues()
+	if len(graphIssues) == 0 {
+		return
+	}
+	velocityIssues := ctx.VelocityIssues()
+	if len(velocityIssues) == 0 {
+		velocityIssues = graphIssues
+	}
+	analyzer := ctx.GraphAnalyzer()
+	if analyzer == nil {
+		return
+	}
+	analyzer.SetNow(now)
+	if forceFullAnalysis {
+		fullCfg := analysis.FullAnalysisConfig()
+		analyzer.SetConfig(&fullCfg)
+	}
+	stats := analyzer.Analyze()
+
+	visibleIDs := make(map[string]bool, len(graphIssues))
+	openIssues := make([]model.Issue, 0, len(graphIssues))
+	for _, iss := range graphIssues {
+		if ctx.CandidateIDs != nil && !ctx.CandidateIDs[iss.ID] {
+			continue
+		}
+		visibleIDs[iss.ID] = true
+		if !iss.Status.IsClosed() && !iss.Status.IsTombstone() && !iss.IsTemplate && !iss.Pinned && iss.Status != model.StatusPinned {
+			openIssues = append(openIssues, iss)
+		}
+	}
+
+	if len(openIssues) > 0 {
+		g1 := analysis.ComputeGrahamBounds(openIssues, velocityIssues, &stats, 1, now.UTC())
+		if g1.TotalMinutes > 0 {
+			g2 := analysis.ComputeGrahamBounds(openIssues, velocityIssues, &stats, 2, now.UTC())
+			g4 := analysis.ComputeGrahamBounds(openIssues, velocityIssues, &stats, 4, now.UTC())
+			parPct := float64(max(0, g1.TotalMinutes-g1.CriticalPathMinutes)) / float64(g1.TotalMinutes) * 100.0
+			var critIDs []string
+			for _, id := range g1.CriticalPathIDs {
+				if visibleIDs[id] {
+					critIDs = append(critIDs, id)
+				}
+			}
+			config.GlobalCapacity = &export.PriorityBriefCapacity{
+				OpenCount:           len(openIssues),
+				TotalMinutes:        g1.TotalMinutes,
+				CriticalPathMinutes: g1.CriticalPathMinutes,
+				ParallelizablePct:   parPct,
+				Days1Agent:          g1.GrahamMinDays,
+				Days2AgentsMin:      g2.GrahamMinDays,
+				Days2AgentsMax:      g2.GrahamMaxDays,
+				Days4AgentsMin:      g4.GrahamMinDays,
+				Days4AgentsMax:      g4.GrahamMaxDays,
+				CriticalPathIDs:     critIDs,
+			}
+		}
+	}
+
+	recs := analyzer.GenerateRecommendationsFromStats(&stats, analysis.DefaultThresholds())
+	for _, rec := range recs {
+		if visibleIDs[rec.IssueID] {
+			config.PriorityRecommendations = append(config.PriorityRecommendations, rec)
+			if len(config.PriorityRecommendations) >= 5 {
+				break
+			}
+		}
+	}
+
+	if len(stats.Cycles()) > 0 {
+		advCfg := analysis.DefaultAdvancedInsightsConfig()
+		advCfg.CycleBreakLimit = 5
+		if adv := analyzer.GenerateAdvancedInsightsFromStats(&stats, advCfg); adv != nil && adv.CycleBreak != nil {
+			for _, cb := range adv.CycleBreak.Suggestions {
+				if visibleIDs[cb.EdgeFrom] && visibleIDs[cb.EdgeTo] {
+					config.CycleBreaks = append(config.CycleBreaks, cb)
+					if len(config.CycleBreaks) >= 5 {
+						break
+					}
+				}
+			}
+		}
+	}
 }
 
 // resolveExportFullGraphStats computes a full-graph Analyzer + GraphStats ONCE
@@ -13487,8 +13765,10 @@ func buildExportLabelsPayload(ctx RobotContext, exportIssues []model.Issue, stat
 	if len(exportIssues) == 0 {
 		return nil, 0, nil
 	}
+	visibleIDs := make(map[string]bool, len(exportIssues))
 	exportedLabels := make(map[string]bool)
 	for _, iss := range exportIssues {
+		visibleIDs[iss.ID] = true
 		for _, lbl := range iss.Labels {
 			if lbl != "" {
 				exportedLabels[lbl] = true
@@ -13502,12 +13782,16 @@ func buildExportLabelsPayload(ctx RobotContext, exportIssues []model.Issue, stat
 	if len(graphIssues) == 0 {
 		graphIssues = exportIssues
 	}
+	velocityIssues := ctx.VelocityIssues()
+	if len(velocityIssues) == 0 {
+		velocityIssues = graphIssues
+	}
 	readiness := ctx.Readiness
 	if readiness == nil {
 		readiness = model.NewReadinessIndex(graphIssues)
 	}
 	labelStats := stats
-	if labelStats == nil || (len(exportIssues) < len(graphIssues) && labelStats.NodeCount < len(graphIssues)) {
+	if labelStats == nil || (len(exportIssues) < len(graphIssues) && labelStats.NodeCount < countUniqueIssueIDs(graphIssues)) {
 		if fullAnalyzer := ctx.GraphAnalyzer(); fullAnalyzer != nil {
 			if ctx.ForceFullAnalysis {
 				fullCfg := analysis.FullAnalysisConfig()
@@ -13522,36 +13806,81 @@ func buildExportLabelsPayload(ctx RobotContext, exportIssues []model.Issue, stat
 	healthRes := analysis.ComputeAllLabelHealthWithScope(graphIssues, cfg, now.UTC(), labelStats, readiness, ctx.CandidateIDs)
 	flowRes := analysis.ComputeCrossLabelFlowWithScope(graphIssues, cfg, ctx.CandidateIDs)
 	attentionRes := analysis.ComputeLabelAttentionScoresWithScope(graphIssues, cfg, now.UTC(), readiness, ctx.CandidateIDs)
+	histVelocity := analysis.ComputeAllHistoricalVelocity(velocityIssues, 4, now.UTC())
 
 	attByLabel := make(map[string]analysis.LabelAttentionScore, len(attentionRes.Labels))
 	for _, att := range attentionRes.Labels {
 		attByLabel[att.Label] = att
 	}
 
-	// Filter cross-label flow edges to labels present in this export so every
-	// clickable label pill resolves cleanly in #/issues, and derive consistent
-	// per-label incoming/outgoing metrics and bottleneck_labels from filteredDeps.
+	// Filter cross-label flow edges strictly to exported labels AND exported issue IDs so
+	// no excluded issue ID leaks into data/labels.json and every Flow/Health metric stays
+	// internally consistent with the exported flow edges.
 	filteredDeps := make([]analysis.LabelDependency, 0, len(flowRes.Dependencies))
 	totalCross := 0
 	outgoingByLabel := make(map[string]int)
 	incomingByLabel := make(map[string]int)
 	outgoingTargets := make(map[string]map[string]bool)
 	incomingSources := make(map[string]map[string]bool)
+	blockedExtIssues := make(map[string]map[string]bool)
+	blockingExtIssues := make(map[string]map[string]bool)
 	for _, dep := range flowRes.Dependencies {
-		if exportedLabels[dep.FromLabel] && exportedLabels[dep.ToLabel] {
-			filteredDeps = append(filteredDeps, dep)
-			totalCross += dep.IssueCount
-			outgoingByLabel[dep.FromLabel] += dep.IssueCount
-			incomingByLabel[dep.ToLabel] += dep.IssueCount
-			if outgoingTargets[dep.FromLabel] == nil {
-				outgoingTargets[dep.FromLabel] = make(map[string]bool)
-			}
-			outgoingTargets[dep.FromLabel][dep.ToLabel] = true
-			if incomingSources[dep.ToLabel] == nil {
-				incomingSources[dep.ToLabel] = make(map[string]bool)
-			}
-			incomingSources[dep.ToLabel][dep.FromLabel] = true
+		if !exportedLabels[dep.FromLabel] || !exportedLabels[dep.ToLabel] {
+			continue
 		}
+		var keptPairs []analysis.BlockingPair
+		keptBlockedSet := make(map[string]bool)
+		if len(dep.BlockingPairs) > 0 {
+			for _, pair := range dep.BlockingPairs {
+				if !visibleIDs[pair.BlockerID] || !visibleIDs[pair.BlockedID] {
+					continue
+				}
+				keptPairs = append(keptPairs, pair)
+				keptBlockedSet[pair.BlockedID] = true
+				if blockedExtIssues[dep.ToLabel] == nil {
+					blockedExtIssues[dep.ToLabel] = make(map[string]bool)
+				}
+				blockedExtIssues[dep.ToLabel][pair.BlockedID] = true
+				if blockingExtIssues[dep.FromLabel] == nil {
+					blockingExtIssues[dep.FromLabel] = make(map[string]bool)
+				}
+				blockingExtIssues[dep.FromLabel][pair.BlockerID] = true
+			}
+		} else {
+			for _, id := range dep.IssueIDs {
+				if visibleIDs[id] {
+					keptBlockedSet[id] = true
+					if blockedExtIssues[dep.ToLabel] == nil {
+						blockedExtIssues[dep.ToLabel] = make(map[string]bool)
+					}
+					blockedExtIssues[dep.ToLabel][id] = true
+				}
+			}
+		}
+		if len(keptBlockedSet) == 0 {
+			continue
+		}
+		keptIDs := make([]string, 0, len(keptBlockedSet))
+		for id := range keptBlockedSet {
+			keptIDs = append(keptIDs, id)
+		}
+		sort.Strings(keptIDs)
+		scopedDep := dep
+		scopedDep.IssueIDs = keptIDs
+		scopedDep.BlockingPairs = keptPairs
+		scopedDep.IssueCount = len(keptIDs)
+		filteredDeps = append(filteredDeps, scopedDep)
+		totalCross += scopedDep.IssueCount
+		outgoingByLabel[scopedDep.FromLabel] += scopedDep.IssueCount
+		incomingByLabel[scopedDep.ToLabel] += scopedDep.IssueCount
+		if outgoingTargets[scopedDep.FromLabel] == nil {
+			outgoingTargets[scopedDep.FromLabel] = make(map[string]bool)
+		}
+		outgoingTargets[scopedDep.FromLabel][scopedDep.ToLabel] = true
+		if incomingSources[scopedDep.ToLabel] == nil {
+			incomingSources[scopedDep.ToLabel] = make(map[string]bool)
+		}
+		incomingSources[scopedDep.ToLabel][scopedDep.FromLabel] = true
 	}
 	maxOut := 0
 	for _, cnt := range outgoingByLabel {
@@ -13580,6 +13909,41 @@ func buildExportLabelsPayload(ctx RobotContext, exportIssues []model.Issue, stat
 		BottleneckLabels:    filteredBottlenecks,
 		TotalCrossLabelDeps: totalCross,
 	}
+
+	cascadeRes := analysis.ComputeBlockageCascadeAtWithScope(graphIssues, flowOut, cfg, now.UTC(), readiness, ctx.CandidateIDs)
+	var exportCascades []exportLabelCascade
+	for _, c := range cascadeRes.Cascades {
+		if !exportedLabels[c.SourceLabel] || c.TotalImpact <= 0 {
+			continue
+		}
+		affectedSet := make(map[string]bool)
+		for _, lvl := range c.CascadeLevels {
+			for _, le := range lvl.Labels {
+				if exportedLabels[le.Label] && le.Label != c.SourceLabel {
+					affectedSet[le.Label] = true
+				}
+			}
+		}
+		if len(affectedSet) == 0 {
+			continue
+		}
+		affected := make([]string, 0, len(affectedSet))
+		for lbl := range affectedSet {
+			affected = append(affected, lbl)
+		}
+		sort.Strings(affected)
+		exportCascades = append(exportCascades, exportLabelCascade{
+			SourceLabel:    c.SourceLabel,
+			BlockedCount:   c.BlockedCount,
+			TotalImpact:    c.TotalImpact,
+			MaxDepth:       len(c.CascadeLevels),
+			AffectedLabels: affected,
+		})
+		if len(exportCascades) >= 6 {
+			break
+		}
+	}
+
 	sortedKeys := func(m map[string]bool) []string {
 		if len(m) == 0 {
 			return nil
@@ -13598,14 +13962,6 @@ func buildExportLabelsPayload(ctx RobotContext, exportIssues []model.Issue, stat
 		if !exportedLabels[lh.Label] {
 			continue
 		}
-		switch lh.HealthLevel {
-		case analysis.HealthLevelHealthy:
-			healthyCount++
-		case analysis.HealthLevelWarning:
-			warningCount++
-		case analysis.HealthLevelCritical:
-			criticalCount++
-		}
 		att := attByLabel[lh.Label]
 		inLabels := sortedKeys(incomingSources[lh.Label])
 		outLabels := sortedKeys(outgoingTargets[lh.Label])
@@ -13616,20 +13972,48 @@ func buildExportLabelsPayload(ctx RobotContext, exportIssues []model.Issue, stat
 		scopedFlow.OutgoingDeps = outDeps
 		scopedFlow.IncomingLabels = inLabels
 		scopedFlow.OutgoingLabels = outLabels
+		scopedFlow.BlockedByExternal = len(blockedExtIssues[lh.Label])
+		scopedFlow.BlockingExternal = len(blockingExtIssues[lh.Label])
+		flowScore := 100 - (inDeps * 5)
+		if flowScore < 0 {
+			flowScore = 0
+		} else if flowScore > 100 {
+			flowScore = 100
+		}
+		scopedFlow.FlowScore = flowScore
+		healthScore := analysis.ComputeCompositeHealth(lh.Velocity.VelocityScore, lh.Freshness.FreshnessScore, scopedFlow.FlowScore, lh.Criticality.CriticalityScore, cfg)
+		healthLevel := analysis.HealthLevelFromScore(healthScore)
+		switch healthLevel {
+		case analysis.HealthLevelHealthy:
+			healthyCount++
+		case analysis.HealthLevelWarning:
+			warningCount++
+		case analysis.HealthLevelCritical:
+			criticalCount++
+		}
+		var weeklyClosed []int
+		if hv, ok := histVelocity[lh.Label]; ok && len(hv.WeeklyVelocity) > 0 {
+			// WeeklyVelocity is newest-first (index 0 = current week); reverse to chronological left-to-right.
+			weeklyClosed = make([]int, len(hv.WeeklyVelocity))
+			for idx := range hv.WeeklyVelocity {
+				weeklyClosed[len(hv.WeeklyVelocity)-1-idx] = hv.WeeklyVelocity[idx].Closed
+			}
+		}
 		entries = append(entries, exportLabelIntelEntry{
 			Label:             lh.Label,
 			IssueCount:        lh.IssueCount,
 			OpenCount:         lh.OpenCount,
 			ClosedCount:       lh.ClosedCount,
 			BlockedCount:      lh.Blocked,
-			Health:            lh.Health,
-			HealthLevel:       lh.HealthLevel,
+			Health:            healthScore,
+			HealthLevel:       healthLevel,
 			AttentionScore:    att.AttentionScore,
 			NormalizedScore:   att.NormalizedScore,
 			AttentionRank:     att.Rank,
 			ClosedLast7Days:   lh.Velocity.ClosedLast7Days,
 			ClosedLast30Days:  lh.Velocity.ClosedLast30Days,
 			TrendDirection:    lh.Velocity.TrendDirection,
+			WeeklyClosed:      weeklyClosed,
 			StaleCount:        lh.Freshness.StaleCount,
 			IncomingDeps:      inDeps,
 			OutgoingDeps:      outDeps,
@@ -13671,6 +14055,7 @@ func buildExportLabelsPayload(ctx RobotContext, exportIssues []model.Issue, stat
 		CriticalCount: criticalCount,
 		Labels:        entries,
 		Flow:          flowOut,
+		Cascades:      exportCascades,
 	}
 	envCtx := ctx
 	envCtx.Command = "robot-label-health"
@@ -13725,7 +14110,7 @@ func buildExportForecastPayload(ctx RobotContext, exportIssues []model.Issue, st
 	// Preserve identical-units velocity invariant when exportIssues omits closed or neighbor issues;
 	// reuse caller-supplied fullStats when already computed over the full graph.
 	capStats := stats
-	if capStats == nil || ((len(exportIssues) < len(velocityIssues) || len(exportIssues) < len(graphIssues)) && capStats.NodeCount < len(graphIssues)) {
+	if capStats == nil || ((len(exportIssues) < len(velocityIssues) || len(exportIssues) < len(graphIssues)) && capStats.NodeCount < countUniqueIssueIDs(graphIssues)) {
 		if fullAnalyzer := ctx.GraphAnalyzer(); fullAnalyzer != nil {
 			if ctx.ForceFullAnalysis {
 				fullCfg := analysis.FullAnalysisConfig()
@@ -13741,7 +14126,7 @@ func buildExportForecastPayload(ctx RobotContext, exportIssues []model.Issue, st
 	openIssues := make([]model.Issue, 0, len(exportIssues))
 	for _, iss := range exportIssues {
 		visibleIDs[iss.ID] = true
-		if !iss.Status.IsClosed() && !iss.Status.IsTombstone() {
+		if !iss.Status.IsClosed() && !iss.Status.IsTombstone() && !iss.IsTemplate && !iss.Pinned && iss.Status != model.StatusPinned {
 			openIssues = append(openIssues, iss)
 		}
 	}

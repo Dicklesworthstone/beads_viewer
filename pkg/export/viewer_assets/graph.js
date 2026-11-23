@@ -2119,6 +2119,12 @@ function prepareGraphData(layout = null) {
             sourceRepo: issue.source_repo || '',
             createdAt: issue.created_at,
             updatedAt: issue.updated_at,
+            triageScore: issue.triage_score ?? null,
+            estimatedMinutes: issue.estimated_minutes ?? null,
+            dueDate: issue.due_date || null,
+            eta_days: issue.eta_days ?? null,
+            eta_date: issue.eta_date || null,
+            eta_confidence: issue.eta_confidence ?? null,
 
             // Metrics computed on the currently loaded graph.
             pagerank: idx !== undefined && metrics.pagerank ? metrics.pagerank[idx] : 0,

@@ -1436,6 +1436,24 @@ function getIssueSummaryRow(issueId) {
  * ("Start Here") for a single open issue, respecting parent-child inheritance
  * and cycle detection without any extra network fetch.
  */
+// Non-reactive cache for transitive root-blocker chains keyed on (DB instance, whatIfModel instance)
+let ROOT_BLOCKERS_CACHE = null;
+
+function getCachedRootBlockerChain(issueId) {
+  if (!issueId) return null;
+  const dbRef = DB_STATE.db;
+  const modelRef = GRAPH_STATE.whatIfModel;
+  if (!ROOT_BLOCKERS_CACHE || ROOT_BLOCKERS_CACHE.db !== dbRef || ROOT_BLOCKERS_CACHE.model !== modelRef) {
+    ROOT_BLOCKERS_CACHE = { db: dbRef, model: modelRef, entries: new Map() };
+  }
+  if (ROOT_BLOCKERS_CACHE.entries.has(issueId)) {
+    return ROOT_BLOCKERS_CACHE.entries.get(issueId);
+  }
+  const value = computeRootBlockerChain(issueId);
+  ROOT_BLOCKERS_CACHE.entries.set(issueId, value);
+  return value;
+}
+
 function computeRootBlockerChain(issueId) {
   if (!issueId) return null;
   const targetIssue = getIssueSummaryRow(issueId);
@@ -1451,17 +1469,25 @@ function computeRootBlockerChain(issueId) {
     const startIdx = nodeMap.get(issueId);
     if (startIdx >= model.realCount || model.baseClosed[startIdx]) return null;
     const depsOk = createWhatIfDepsEvaluator(model, model.baseClosed);
+    const hasDirectMissingBlocker = idx => {
+      for (const bIdx of (model.directBlockers[idx] || [])) {
+        if (!model.baseClosed[bIdx] && !(model.isKnownIssue && model.isKnownIssue[bIdx])) {
+          return true;
+        }
+      }
+      return false;
+    };
     const openBlockersOf = idx => {
       const out = [];
       const seen = new Set();
       for (const bIdx of (model.directBlockers[idx] || [])) {
-        if (!model.baseClosed[bIdx] && !seen.has(bIdx)) {
+        if (!model.baseClosed[bIdx] && model.isKnownIssue && model.isKnownIssue[bIdx] && !seen.has(bIdx)) {
           seen.add(bIdx);
           out.push(bIdx);
         }
       }
       for (const pIdx of (model.openParents[idx] || [])) {
-        if (!model.baseClosed[pIdx] && !depsOk(pIdx) && !seen.has(pIdx)) {
+        if (!model.baseClosed[pIdx] && model.isKnownIssue && model.isKnownIssue[pIdx] && !depsOk(pIdx) && !seen.has(pIdx)) {
           seen.add(pIdx);
           out.push(pIdx);
         }
@@ -1489,7 +1515,7 @@ function computeRootBlockerChain(issueId) {
       const d = minDepth.get(u);
       if (d > maxDepth) maxDepth = d;
       const next = openBlockersOf(u);
-      if (next.length === 0 && !model.hasDirectMissingParent[u]) {
+      if (next.length === 0 && !model.hasDirectMissingParent[u] && !hasDirectMissingBlocker(u)) {
         if (!seenRoot.has(u)) {
           seenRoot.add(u);
           const id = baseGraph.nodeId(u);
@@ -1519,6 +1545,9 @@ function computeRootBlockerChain(issueId) {
 
     let hasCycle = firstHop.includes(startIdx);
     const cycleIds = [];
+    if (hasCycle) {
+      cycleIds.push(issueId);
+    }
     if (!hasCycle) {
       const visitState = new Uint8Array(model.realCount);
       const dfs = u => {
@@ -1570,6 +1599,7 @@ function computeRootBlockerChain(issueId) {
   const directBlockers = new Map();
   const openParents = new Map();
   const unresolvable = new Set();
+  const selfLoops = new Set();
   for (const dep of (dependencies || [])) {
     const src = dep?.issue_id;
     const tgt = dep?.depends_on_id;
@@ -1578,6 +1608,7 @@ function computeRootBlockerChain(issueId) {
     if (dtype === 'parent-child') {
       if (src === tgt) {
         unresolvable.add(src);
+        selfLoops.add(src);
       } else if (!resolvedIds.has(tgt)) {
         if (issueById.has(tgt)) {
           if (!openParents.has(src)) openParents.set(src, []);
@@ -1590,7 +1621,10 @@ function computeRootBlockerChain(issueId) {
     }
     if (dtype !== 'blocks' && dtype !== 'conditional-blocks' && dtype !== 'waits-for') continue;
     if (!resolvedIds.has(tgt)) {
-      if (src === tgt || !issueById.has(tgt)) {
+      if (src === tgt) {
+        unresolvable.add(src);
+        selfLoops.add(src);
+      } else if (!issueById.has(tgt)) {
         unresolvable.add(src);
       } else {
         if (!directBlockers.has(src)) directBlockers.set(src, []);
@@ -1628,7 +1662,7 @@ function computeRootBlockerChain(issueId) {
     return out;
   };
   const firstHop = openBlockersOf(issueId);
-  if (firstHop.length === 0) return null;
+  if (firstHop.length === 0 && !selfLoops.has(issueId)) return null;
   const refNowMs = getReferenceNowMs();
   const minDepth = new Map();
   const queue = [];
@@ -1671,12 +1705,20 @@ function computeRootBlockerChain(issueId) {
       }
     }
   }
-  let hasCycle = firstHop.includes(issueId);
+  let hasCycle = firstHop.includes(issueId) || selfLoops.has(issueId);
   const cycleIds = [];
+  if (hasCycle) {
+    cycleIds.push(issueId);
+  }
   if (!hasCycle) {
     const state = new Map();
     const dfs = u => {
       state.set(u, 1);
+      if (selfLoops.has(u)) {
+        hasCycle = true;
+        if (!cycleIds.includes(u)) cycleIds.push(u);
+        return;
+      }
       for (const nxt of openBlockersOf(u)) {
         if (nxt === issueId || state.get(nxt) === 1) {
           hasCycle = true;
@@ -7748,6 +7790,42 @@ function beadsApp() {
         }
       }
       return derived.reverse();
+    },
+
+    getFileHotspots() {
+      const list = Array.isArray(this.historyData?.file_hotspots) ? this.historyData.file_hotspots : [];
+      return list.slice(0, 12);
+    },
+
+    getIssueRelatedWork(id) {
+      if (!id || !this.historyData) return [];
+      const h = this.historyData.histories?.[id];
+      return Array.isArray(h?.related) ? h.related : [];
+    },
+
+    getLabelCascades() {
+      const list = Array.isArray(this.labelsData?.cascades) ? this.labelsData.cascades : [];
+      return list.slice(0, 6);
+    },
+
+    formatLabelTrend(dir) {
+      if (dir === 'accelerating') return '↗';
+      if (dir === 'decelerating') return '↘';
+      if (dir === 'stable') return '→';
+      return '';
+    },
+
+    formatVelocitySparkline(weekly) {
+      if (!Array.isArray(weekly) || weekly.length === 0) return '';
+      const nums = weekly.map(v => Math.max(0, Number(v) || 0));
+      const maxVal = Math.max(...nums);
+      if (maxVal <= 0) return '';
+      const blocks = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+      return nums.map(n => {
+        if (n <= 0) return '·';
+        const idx = Math.min(blocks.length - 1, Math.max(0, Math.round((n / maxVal) * (blocks.length - 1))));
+        return blocks[idx];
+      }).join('');
     },
 
     getTriageRecommendationsByTrack() {

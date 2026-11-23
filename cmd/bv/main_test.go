@@ -10615,3 +10615,203 @@ func TestWave26_DriftAlertsParity_PriorityBrief_AgentBrief_AndExportGraph(t *tes
 		t.Fatalf("Gap W26-1 regression: --priority-brief missing pkg/drift Alerts section / stale_issue for DRIFT-1:\n%s", mdStr)
 	}
 }
+
+func TestWave27_Pass11ExportFixes_Hotspots_Cascades_And_ExecutiveBriefs(t *testing.T) {
+	now := time.Date(2026, 11, 22, 12, 0, 0, 0, time.UTC)
+	est := 60
+	closedRecent := now.Add(-2 * 24 * time.Hour)
+
+	// 1. A11-3 + A11-4 + A11-10 + W27-4:
+	// - Excluded issue IDs must NOT leak into data/labels.json flow.dependencies.
+	// - FlowScore/Health stay consistent with filtered deps.
+	// - WeeklyClosed sparkline & Cascades are populated cleanly.
+	// - Templates & pinned issues are excluded from forecast/sprint Graham capacity bounds.
+	allIssues := []model.Issue{
+		{ID: "L-BE-1", Title: "Backend root", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask, Labels: []string{"backend"}, EstimatedMinutes: &est, CreatedAt: now.Add(-14 * 24 * time.Hour), UpdatedAt: now},
+		{ID: "L-FE-1", Title: "Frontend blocked by backend", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, Labels: []string{"frontend"}, EstimatedMinutes: &est, CreatedAt: now.Add(-14 * 24 * time.Hour), UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "L-FE-1", DependsOnID: "L-BE-1", Type: model.DepBlocks}}},
+		{ID: "L-FE-HIDDEN", Title: "Excluded frontend issue", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, Labels: []string{"frontend"}, EstimatedMinutes: &est, CreatedAt: now.Add(-14 * 24 * time.Hour), UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "L-FE-HIDDEN", DependsOnID: "L-BE-1", Type: model.DepBlocks}}},
+		{ID: "L-BE-DONE", Title: "Closed backend item", Status: model.StatusClosed, Priority: 2, IssueType: model.TypeTask, Labels: []string{"backend"}, EstimatedMinutes: &est, CreatedAt: now.Add(-10 * 24 * time.Hour), UpdatedAt: closedRecent, ClosedAt: &closedRecent},
+		{ID: "L-TMPL", Title: "Template issue", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, IsTemplate: true, EstimatedMinutes: &est, CreatedAt: now, UpdatedAt: now},
+		{ID: "L-PIN", Title: "Pinned issue", Status: model.StatusPinned, Priority: 2, IssueType: model.TypeTask, Pinned: true, EstimatedMinutes: &est, CreatedAt: now, UpdatedAt: now},
+	}
+	exportIssues := []model.Issue{allIssues[0], allIssues[1], allIssues[4], allIssues[5]} // omits L-FE-HIDDEN & L-BE-DONE
+	candIDs := map[string]bool{"L-BE-1": true, "L-FE-1": true, "L-TMPL": true, "L-PIN": true}
+	ctx := RobotContext{
+		Issues:                 exportIssues,
+		FullIssues:             allIssues,
+		PreRecipeIssues:        allIssues,
+		RecipeVelocityIssues:   allIssues,
+		HasRecipeVelocityScope: true,
+		CandidateIDs:           candIDs,
+		Readiness:              model.NewReadinessIndex(allIssues),
+		AsOfCommitTime:         now,
+	}
+
+	rawLabels, labelCount, err := buildExportLabelsPayload(ctx, exportIssues, nil, "hash-w27", now)
+	if err != nil || labelCount < 2 {
+		t.Fatalf("buildExportLabelsPayload failed: count=%d err=%v", labelCount, err)
+	}
+	if strings.Contains(string(rawLabels), "L-FE-HIDDEN") {
+		t.Fatalf("A11-3 regression: data/labels.json leaked excluded issue ID L-FE-HIDDEN:\n%s", string(rawLabels))
+	}
+	var parsedLabels struct {
+		Labels []struct {
+			Label        string `json:"label"`
+			WeeklyClosed []int  `json:"weekly_closed"`
+			Flow         struct {
+				IncomingDeps      int `json:"incoming_deps"`
+				BlockedByExternal int `json:"blocked_by_external"`
+				FlowScore         int `json:"flow_score"`
+			} `json:"flow"`
+		} `json:"labels"`
+		Flow struct {
+			TotalCrossLabelDeps int `json:"total_cross_label_deps"`
+		} `json:"flow"`
+		Cascades []struct {
+			SourceLabel    string   `json:"source_label"`
+			AffectedLabels []string `json:"affected_labels"`
+			TotalImpact    int      `json:"total_impact"`
+		} `json:"cascades"`
+	}
+	if err := json.Unmarshal(rawLabels, &parsedLabels); err != nil {
+		t.Fatalf("unmarshal labels payload: %v", err)
+	}
+	if parsedLabels.Flow.TotalCrossLabelDeps != 1 {
+		t.Fatalf("A11-3 regression: expected 1 scoped cross-label dep (L-BE-1->L-FE-1), got %d", parsedLabels.Flow.TotalCrossLabelDeps)
+	}
+	foundBackendSpark := false
+	for _, lbl := range parsedLabels.Labels {
+		if lbl.Label == "backend" && len(lbl.WeeklyClosed) == 4 && lbl.WeeklyClosed[3] == 1 {
+			foundBackendSpark = true
+		}
+		if lbl.Label == "frontend" && (lbl.Flow.IncomingDeps != 1 || lbl.Flow.BlockedByExternal != 1 || lbl.Flow.FlowScore != 95) {
+			t.Fatalf("A11-3 regression: frontend Flow metrics inconsistent: %+v", lbl.Flow)
+		}
+	}
+	if !foundBackendSpark {
+		t.Fatalf("W27-4 regression: expected backend chronological 4-week sparkline ending with 1 closure (from VelocityIssues), got %+v", parsedLabels.Labels)
+	}
+
+	// Forecast payload excludes L-TMPL and L-PIN from global_capacity.open_count (only L-BE-1 and L-FE-1 count = 2).
+	rawForecast, _, err := buildExportForecastPayload(ctx, exportIssues, nil, "hash-w27", now)
+	if err != nil {
+		t.Fatalf("buildExportForecastPayload: %v", err)
+	}
+	var parsedForecast struct {
+		GlobalCapacity struct {
+			OpenCount    int `json:"open_count"`
+			TotalMinutes int `json:"total_minutes"`
+		} `json:"global_capacity"`
+	}
+	if err := json.Unmarshal(rawForecast, &parsedForecast); err != nil {
+		t.Fatalf("unmarshal forecast payload: %v", err)
+	}
+	if parsedForecast.GlobalCapacity.OpenCount != 2 || parsedForecast.GlobalCapacity.TotalMinutes <= 0 || parsedForecast.GlobalCapacity.TotalMinutes >= 200 {
+		t.Fatalf("A11-4 regression: forecast global_capacity included template/pinned issues: %+v (want open_count=2, total_minutes<200)", parsedForecast.GlobalCapacity)
+	}
+
+	// 2. W27-1 + W27-5 CLI E2E: real temp git repo with shared-file hotspot + cycle ->
+	//    --priority-brief, --agent-brief, --export-md, and generateHistoryForExportContext.
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	proj := t.TempDir()
+	runGit := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = proj
+		cmd.Env = append(sanitizedGitEnvForCLI(),
+			"GIT_AUTHOR_DATE=2026-11-20T10:00:00Z",
+			"GIT_COMMITTER_DATE=2026-11-20T10:00:00Z",
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %v\n%s", args, err, out)
+		}
+	}
+	runGit("init")
+	runGit("config", "user.email", "test@example.com")
+	runGit("config", "user.name", "Test User")
+	if err := os.MkdirAll(filepath.Join(proj, ".beads"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(proj, "pkg", "core"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	repoIssues := strings.Join([]string{
+		`{"id":"HS-1","title":"Auth core","status":"open","priority":0,"issue_type":"task","estimated_minutes":60,"created_at":"2026-11-18T10:00:00Z","updated_at":"2026-11-20T10:00:00Z"}`,
+		`{"id":"HS-2","title":"Auth middleware","status":"open","priority":1,"issue_type":"task","estimated_minutes":60,"dependencies":[{"issue_id":"HS-2","depends_on_id":"HS-1","type":"blocks"}],"created_at":"2026-11-18T10:00:00Z","updated_at":"2026-11-20T10:00:00Z"}`,
+		`{"id":"CYC-1","title":"Cycle one","status":"open","priority":1,"issue_type":"bug","estimated_minutes":60,"dependencies":[{"issue_id":"CYC-1","depends_on_id":"CYC-2","type":"blocks"}],"created_at":"2026-11-18T10:00:00Z","updated_at":"2026-11-20T10:00:00Z"}`,
+		`{"id":"CYC-2","title":"Cycle two","status":"open","priority":1,"issue_type":"bug","estimated_minutes":60,"dependencies":[{"issue_id":"CYC-2","depends_on_id":"CYC-1","type":"blocks"}],"created_at":"2026-11-18T10:00:00Z","updated_at":"2026-11-20T10:00:00Z"}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(filepath.Join(proj, ".beads", "issues.jsonl"), []byte(repoIssues), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(proj, "pkg", "core", "shared.go"), []byte("package core\nconst V = 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", ".")
+	runGit("commit", "-m", "feat: implement HS-1 core auth")
+	if err := os.WriteFile(filepath.Join(proj, "pkg", "core", "shared.go"), []byte("package core\nconst V = 2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit("add", "pkg/core/shared.go")
+	runGit("commit", "-m", "feat: wire HS-2 auth middleware")
+
+	loaded, err := loader.LoadIssuesFromFile(filepath.Join(proj, ".beads", "issues.jsonl"))
+	if err != nil {
+		t.Fatalf("load repo issues: %v", err)
+	}
+	hist, err := generateHistoryForExportContext(RobotContext{
+		Issues:         loaded,
+		ProjectDir:     proj,
+		AsOfCommitTime: now,
+	})
+	if err != nil {
+		t.Fatalf("generateHistoryForExportContext: %v", err)
+	}
+	foundHotspot := false
+	for _, hs := range hist.FileHotspots {
+		if hs.Path == "pkg/core/shared.go" && hs.OpenBeads == 2 && hs.TotalBeads == 2 {
+			foundHotspot = true
+			break
+		}
+	}
+	if !foundHotspot {
+		t.Fatalf("W27-1 regression: history.json missing pkg/core/shared.go hotspot with 2 open beads: %+v", hist.FileHotspots)
+	}
+	if h1 := hist.Histories["HS-1"]; h1 == nil || len(h1.Related) == 0 || h1.Related[0].BeadID != "HS-2" {
+		t.Fatalf("W27-1 regression: history.json HS-1 missing Related link to HS-2: %+v", h1)
+	}
+
+	// CLI W27-5: --priority-brief & --export-md
+	exe := buildTestBinary(t)
+	briefPath := filepath.Join(t.TempDir(), "exec_brief.md")
+	if _, stderrOut, err := runCommandWithTimeout(t, proj, exe, "--priority-brief", briefPath); err != nil {
+		t.Fatalf("--priority-brief failed: %v\nstderr=%s", err, stderrOut)
+	}
+	briefBytes, err := os.ReadFile(briefPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"## ⚡ Global Backlog Capacity (Graham Bounds)", "## ↻ Cycle Break Suggestions"} {
+		if !strings.Contains(string(briefBytes), want) {
+			t.Fatalf("W27-5 regression: --priority-brief missing %q:\n%s", want, string(briefBytes))
+		}
+	}
+
+	mdOutPath := filepath.Join(t.TempDir(), "exec_report.md")
+	if _, stderrOut, err := runCommandWithTimeout(t, proj, exe, "--export-md", mdOutPath); err != nil {
+		t.Fatalf("--export-md failed: %v\nstderr=%s", err, stderrOut)
+	}
+	mdOutBytes, err := os.ReadFile(mdOutPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"| **ETA Forecast** |", "| **Start Here (Root Blockers)** | `HS-1` (P0) |"} {
+		if !strings.Contains(string(mdOutBytes), want) {
+			t.Fatalf("W27-5 regression: --export-md missing %q:\n%s", want, string(mdOutBytes))
+		}
+	}
+}

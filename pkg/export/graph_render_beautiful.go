@@ -2102,6 +2102,7 @@ function buildStandaloneWhatIfModel() {
     const openParents = new Map();
     const openChildren = new Map();
     const unresolvableBlockers = new Set();
+    const selfLoops = new Set();
     activeNodes.forEach((_, id) => {
         directBlockers.set(id, new Set());
         directDependents.set(id, new Set());
@@ -2116,6 +2117,7 @@ function buildStandaloneWhatIfModel() {
         if (ltype === 'parent-child') {
             if (src === tgt) {
                 unresolvableBlockers.add(src);
+                selfLoops.add(src);
             } else if (activeNodes.has(tgt)) {
                 openParents.get(src).add(tgt);
                 openChildren.get(tgt).add(src);
@@ -2127,6 +2129,7 @@ function buildStandaloneWhatIfModel() {
         if (ltype !== 'blocks' && ltype !== 'conditional-blocks' && ltype !== 'waits-for') return;
         if (src === tgt) {
             unresolvableBlockers.add(src);
+            selfLoops.add(src);
             return;
         }
         if (activeNodes.has(tgt)) {
@@ -2147,6 +2150,7 @@ function buildStandaloneWhatIfModel() {
             for (const bId of n.blocked_by) {
                 if (bId === id) {
                     unresolvableBlockers.add(id);
+                    selfLoops.add(id);
                 } else if (parents && parents.has(bId)) {
                     // Inherited via openParents; do not flatten parent itself into directBlockers.
                     continue;
@@ -2162,7 +2166,7 @@ function buildStandaloneWhatIfModel() {
             }
         }
     });
-    const model = { allNodes, activeNodes, directBlockers, directDependents, openParents, openChildren, unresolvableBlockers };
+    const model = { allNodes, activeNodes, directBlockers, directDependents, openParents, openChildren, unresolvableBlockers, selfLoops };
     _standaloneWhatIfCache = {
         nodesRef: DATA.nodes,
         linksRef: DATA.links,
@@ -2280,7 +2284,7 @@ function computeStandaloneRootBlockers(targetId) {
         return out;
     };
     const firstHop = openBlockersOf(targetId);
-    if (firstHop.length === 0) return null;
+    if (firstHop.length === 0 && !model.selfLoops.has(targetId)) return null;
     const minDepth = new Map();
     const queue = [];
     for (const b of firstHop) {
@@ -2321,11 +2325,15 @@ function computeStandaloneRootBlockers(targetId) {
         }
     }
     // Cycle check across reachable upstream blockers
-    let hasCycle = firstHop.includes(targetId);
+    let hasCycle = firstHop.includes(targetId) || model.selfLoops.has(targetId);
     if (!hasCycle) {
         const state = new Map(); // 1=visiting, 2=done
         const dfs = u => {
             state.set(u, 1);
+            if (model.selfLoops.has(u)) {
+                hasCycle = true;
+                return;
+            }
             for (const nxt of openBlockersOf(u)) {
                 if (nxt === targetId || state.get(nxt) === 1) {
                     hasCycle = true;
@@ -2623,6 +2631,19 @@ function applyFilters() {
         return true;
     };
     Graph.nodeVisibility(currentVisibilityFilter);
+    const visibleIds = new Set(DATA.nodes.filter(currentVisibilityFilter).map(n => n.id));
+    if (selectedNode && !visibleIds.has(selectedNode.id)) {
+        selectedNode = null;
+        document.getElementById('node-detail').classList.remove('visible');
+        document.getElementById('no-selection').style.display = 'block';
+    }
+    if (highlightedNodes.size > 0 && ![...highlightedNodes].some(id => visibleIds.has(id))) {
+        closeCycleInspector();
+        clearWhatIfSimulation();
+        activePathNodes = null;
+        highlightedNodes = new Set();
+        Graph.nodeColor(computeNodeColor).linkColor(Graph.linkColor()).linkWidth(Graph.linkWidth());
+    }
     updateVisibleCount();
 }
 

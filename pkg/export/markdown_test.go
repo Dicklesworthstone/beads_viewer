@@ -3288,3 +3288,105 @@ func TestGenerateReport_SourceRepoParityAcrossMarkdownHTMLAndCSV(t *testing.T) {
 		}
 	}
 }
+
+func TestWave27_PriorityBriefAndMarkdownReportExecutiveSections(t *testing.T) {
+	now := time.Date(2026, 11, 22, 12, 0, 0, 0, time.UTC)
+	est := 120
+	closedAt := now.Add(-24 * time.Hour)
+	issues := []model.Issue{
+		{ID: "EX-ROOT", Title: "Foundation API", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask, EstimatedMinutes: &est, CreatedAt: now.Add(-48 * time.Hour), UpdatedAt: now},
+		{ID: "EX-MID", Title: "Service Layer", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, EstimatedMinutes: &est, CreatedAt: now.Add(-48 * time.Hour), UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "EX-MID", DependsOnID: "EX-ROOT", Type: model.DepBlocks}}},
+		{ID: "EX-DONE", Title: "Shipped Base", Status: model.StatusClosed, Priority: 2, IssueType: model.TypeTask, EstimatedMinutes: &est, CreatedAt: now.Add(-72 * time.Hour), UpdatedAt: closedAt, ClosedAt: &closedAt},
+	}
+
+	// 1. Priority brief with optional GlobalCapacity, PriorityRecommendations, and CycleBreaks (escaping pipes).
+	briefJSON := `{"meta":{"version":"1.0","generated_at":"2026-11-22T12:00:00Z","phase2_ready":true,"issue_count":3},"quick_ref":{"open_count":2,"actionable_count":1,"blocked_count":1,"in_progress_count":0},"recommendations":[],"quick_wins":[],"blockers_to_clear":[]}`
+	cfg := DefaultPriorityBriefConfig()
+	cfg.GlobalCapacity = &PriorityBriefCapacity{
+		OpenCount:           2,
+		TotalMinutes:        240,
+		CriticalPathMinutes: 240,
+		ParallelizablePct:   0,
+		Days1Agent:          4.0,
+		Days2AgentsMin:      2.0,
+		Days2AgentsMax:      4.0,
+		Days4AgentsMin:      2.0,
+		Days4AgentsMax:      4.0,
+		CriticalPathIDs:     []string{"EX-ROOT", "EX-MID"},
+	}
+	cfg.PriorityRecommendations = []analysis.PriorityRecommendation{{
+		IssueID: "PR|1", Title: "Misaligned|Task", CurrentPriority: 3, SuggestedPriority: 1,
+		Direction: "increase", Confidence: 0.85, Reasoning: []string{"High PR|BW impact"},
+	}}
+	cfg.CycleBreaks = []analysis.CycleBreakItem{{
+		EdgeFrom: "CYC|A", EdgeTo: "CYC|B", Impact: 2, Collateral: 1, Rationale: "Lowest|collateral edge",
+	}}
+	brief, err := GeneratePriorityBriefFromTriageJSON([]byte(briefJSON), cfg)
+	if err != nil {
+		t.Fatalf("GeneratePriorityBriefFromTriageJSON: %v", err)
+	}
+	for _, want := range []string{
+		"## ⚡ Global Backlog Capacity (Graham Bounds)",
+		"**Critical Chain:** `EX-ROOT` → `EX-MID`",
+		"## ⚖️ Priority Misalignment Alerts",
+		`**PR\|1** Misaligned\|Task`,
+		`High PR\|BW impact`,
+		"## ↻ Cycle Break Suggestions",
+		"`CYC\\|A` → `CYC\\|B`",
+		`Lowest\|collateral edge`,
+	} {
+		if !strings.Contains(brief, want) {
+			t.Fatalf("W27-5 regression: priority brief missing %q:\n%s", want, brief)
+		}
+	}
+
+	// 2. GenerateMarkdown per-issue ETA Forecast + scoped Start Here Root Blockers (suppressed on closed; hidden IDs omitted).
+	an := analysis.NewAnalyzer(issues)
+	an.SetNow(now)
+	stats := an.Analyze()
+	etaCtx := analysis.NewETAContext(issues, &stats, now)
+	md, err := GenerateMarkdown(issues, "Exec Report", ReportOptions{
+		GeneratedAt:  now,
+		IncludeGraph: false,
+		Analyzer:     an,
+		ETAContext:   etaCtx,
+		VisibleIDs:   map[string]bool{"EX-ROOT": true, "EX-MID": true, "EX-DONE": true},
+	})
+	if err != nil {
+		t.Fatalf("GenerateMarkdown: %v", err)
+	}
+	for _, want := range []string{
+		"| **ETA Forecast** |",
+		"| **Start Here (Root Blockers)** | `EX-ROOT` (P0) |",
+	} {
+		if !strings.Contains(md, want) {
+			t.Fatalf("W27-5 regression: markdown report missing %q:\n%s", want, md)
+		}
+	}
+	// Verify closed issue EX-DONE does NOT emit ETA Forecast.
+	doneIdx := strings.Index(md, "EX-DONE Shipped Base")
+	if doneIdx < 0 {
+		t.Fatalf("missing EX-DONE section in markdown:\n%s", md)
+	}
+	// Jump to the actual section body (second occurrence after TOC)
+	if bodyIdx := strings.Index(md[doneIdx+1:], "EX-DONE Shipped Base"); bodyIdx >= 0 {
+		doneIdx = doneIdx + 1 + bodyIdx
+	}
+	if strings.Contains(md[doneIdx:], "**ETA Forecast**") {
+		t.Fatalf("W27-5 regression: closed issue EX-DONE should not emit ETA Forecast:\n%s", md[doneIdx:])
+	}
+	// Verify VisibleIDs scope filter hides EX-ROOT when excluded from VisibleIDs.
+	scopedMD, err := GenerateMarkdown([]model.Issue{issues[1]}, "Scoped Report", ReportOptions{
+		GeneratedAt:  now,
+		IncludeGraph: false,
+		Analyzer:     an,
+		VisibleIDs:   map[string]bool{"EX-MID": true},
+	})
+	if err != nil {
+		t.Fatalf("GenerateMarkdown(scoped): %v", err)
+	}
+	if strings.Contains(scopedMD, "| **Start Here (Root Blockers)** | `EX-ROOT`") {
+		t.Fatalf("W27-5 regression: VisibleIDs filter leaked excluded root blocker EX-ROOT:\n%s", scopedMD)
+	}
+}

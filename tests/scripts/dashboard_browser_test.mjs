@@ -2776,10 +2776,14 @@ async function capabilitiesJourney(page) {
       fcCardVisible: Boolean(fcCard && (${visible})(fcCard)),
       capOpenCount: ${app}.forecastData?.global_capacity?.open_count || 0,
       capDays1a: Number(${app}.forecastData?.global_capacity?.days_1_agent || 0),
-      // B9-2 & B10-P2-7: non-UTC fixed offset ISO date preserves literal calendar day, Go zero time & impossible dates return ''
+      // B9-2 & B10-P2-7 & B11-5: non-UTC fixed offset ISO date preserves literal calendar day; zero/impossible/malformed times return ''
       offsetDatePreserved: formatCalendarDateUTC('2026-03-08T00:00:00+02:00') === 'Mar 8, 2026',
       zeroDateBlank: formatCalendarDateUTC('0001-01-01T00:00:00Z') === '',
-      impossibleDateBlank: formatCalendarDateUTC('2026-02-30') === '' && formatCalendarDateUTC('2026-13-01') === '' && formatCalendarDateUTC('2026-03-08foo') === '',
+      impossibleDateBlank: formatCalendarDateUTC('2026-02-30') === '' && formatCalendarDateUTC('2026-13-01') === '' && formatCalendarDateUTC('2026-03-08foo') === '' && formatCalendarDateUTC('2026-03-08T99:99:99Z') === '' && formatCalendarDateUTC('2026-03-08 garbage') === '',
+      labelSortAriaPressedOk: document.querySelectorAll('#insights-label-intelligence [role="group"] button[aria-pressed="true"]').length === 1,
+      sparklineWorks: ${app}.formatVelocitySparkline([0, 1, 3, 2]).length === 4 && ${app}.formatVelocitySparkline([0, 0, 0, 0]) === '',
+      trendArrowWorks: ${app}.formatLabelTrend('accelerating') === '↗' && ${app}.formatLabelTrend('decelerating') === '↘',
+      labelsHaveWeeklyClosed: sortedLbls.some(l => Array.isArray(l.weekly_closed) && l.weekly_closed.length === 4),
     };
   })()`);
   assert.equal(wave26InsightsCheck.hasLabelsMeta, true, 'Wave 26 meta.has_labels=true');
@@ -2792,7 +2796,11 @@ async function capabilitiesJourney(page) {
   assert.ok(wave26InsightsCheck.capOpenCount > 0 && wave26InsightsCheck.capDays1a > 0, `Wave 26 global capacity populated: ${JSON.stringify(wave26InsightsCheck)}`);
   assert.equal(wave26InsightsCheck.offsetDatePreserved, true, 'B9-2 non-UTC fixed offset ISO date preserves literal calendar day');
   assert.equal(wave26InsightsCheck.zeroDateBlank, true, 'B9-2 Go zero time formats as empty string');
-  assert.equal(wave26InsightsCheck.impossibleDateBlank, true, 'B10-P2-7 impossible/malformed ISO dates reject rollover and return empty string');
+  assert.equal(wave26InsightsCheck.impossibleDateBlank, true, 'B10-P2-7 & B11-5 impossible/malformed ISO dates and invalid time suffixes reject and return empty string');
+  assert.equal(wave26InsightsCheck.labelSortAriaPressedOk, true, 'B11-5 #insights-label-intelligence sort buttons expose role=group + aria-pressed');
+  assert.equal(wave26InsightsCheck.sparklineWorks, true, 'W27-4 formatVelocitySparkline renders 4-week mini-bars and hides all-zero');
+  assert.equal(wave26InsightsCheck.trendArrowWorks, true, 'W27-4 formatLabelTrend maps accelerating/decelerating arrows');
+  assert.equal(wave26InsightsCheck.labelsHaveWeeklyClosed, true, 'W27-4 data/labels.json exports 4-week chronological weekly_closed arrays');
 
   // Wave 25: Issues quick filters (#filter-in-cycle-btn, #filter-articulation-btn), new sorts (pagerank/betweenness/due/estimate), and Detail Modal K-Core/Slack/Correlated Commits
   await click(page, 'a[href="#/issues"]');
@@ -2821,8 +2829,8 @@ async function capabilitiesJourney(page) {
     const closedIssue = getIssue('cap-closed-prereq');
     const commits = ${app}.getIssueCommits('cap-auth-root');
     return {
-      hasNewSorts: ['pagerank', 'betweenness', 'due', 'estimate'].every(v => sortVals.includes(v)),
-      sortsReturnAll6: prIssues.length === 6 && bwIssues.length === 6 && dueIssues.length === 6,
+      hasNewSorts: ['pagerank', 'betweenness', 'due', 'estimate', 'eta'].every(v => sortVals.includes(v)),
+      sortsReturnAll6: prIssues.length === 6 && bwIssues.length === 6 && dueIssues.length === 6 && queryIssues({}, 'eta', 10, 0).length === 6,
       kcoreType: typeof issue?.kcore,
       isCutVertex: issue?.is_articulation_point === true,
       closedSuppressesCutVertex: closedIssue?.is_articulation_point === false && closedIssue?.kcore === null,
@@ -2848,7 +2856,39 @@ async function capabilitiesJourney(page) {
     closedSuppressesETAPill: true,
     rootChainOnBlocked: true,
     rootChainSuppressedOnClosed: true,
-  }, `Issues new sorts, active-only structural metrics, ETA pills, root blocker chain, and non-empty correlated commits verified: ${JSON.stringify(wave25DetailMetrics)}`);
+  }, `Issues new sorts (incl. eta), active-only structural metrics, ETA pills, root blocker chain, and non-empty correlated commits verified: ${JSON.stringify(wave25DetailMetrics)}`);
+
+  // Wave 27 B11-1 + B11-2 + W27-2: fast-path & fallback parity on external/missing blockers and self-loops + Graph Detail Drawer ETA/Root Blockers/Commits
+  const wave27RootAndGraphAudit = await evaluate(page, `(() => {
+    const savedModel = GRAPH_STATE.whatIfModel;
+    // B11-2: self-loop on fallback path (when whatIfModel is null)
+    DB_STATE.db.run("INSERT INTO issues (id, title, status, priority, issue_type, labels, created_at, updated_at) VALUES ('cap-self-loop', 'Self loop probe', 'open', 1, 'task', '[]', '2026-09-01T12:00:00Z', '2026-09-01T12:00:00Z')");
+    DB_STATE.db.run("INSERT INTO issue_overview_mv (id, title, status, priority, issue_type, labels, created_at, updated_at, dependency_state, is_actionable, pagerank, betweenness, eigenvector, critical_path_depth, triage_score, blocks_count, blocked_by_count, blocker_count, dependent_count, critical_depth, in_cycle, comment_count) VALUES ('cap-self-loop', 'Self loop probe', 'open', 1, 'task', '[]', '2026-09-01T12:00:00Z', '2026-09-01T12:00:00Z', 'blocked', 0, 0, 0, 0, 0, 0.1, 1, 1, 1, 1, 0, 1, 0)");
+    DB_STATE.db.run("INSERT INTO dependencies (issue_id, depends_on_id, type) VALUES ('cap-self-loop', 'cap-self-loop', 'blocks')");
+    DB_STATE.db.run("INSERT INTO issues (id, title, status, priority, issue_type, labels, created_at, updated_at) VALUES ('cap-ext-only', 'Missing blocker only', 'open', 1, 'task', '[]', '2026-09-01T12:00:00Z', '2026-09-01T12:00:00Z')");
+    DB_STATE.db.run("INSERT INTO issue_overview_mv (id, title, status, priority, issue_type, labels, created_at, updated_at, dependency_state, is_actionable, pagerank, betweenness, eigenvector, critical_path_depth, triage_score, blocks_count, blocked_by_count, blocker_count, dependent_count, critical_depth, in_cycle, comment_count) VALUES ('cap-ext-only', 'Missing blocker only', 'open', 1, 'task', '[]', '2026-09-01T12:00:00Z', '2026-09-01T12:00:00Z', 'blocked', 0, 0, 0, 0, 0, 0.1, 0, 1, 1, 0, 0, 0, 0)");
+    DB_STATE.db.run("INSERT INTO dependencies (issue_id, depends_on_id, type) VALUES ('cap-ext-only', 'cap-nonexistent-ext', 'blocks')");
+    try {
+      GRAPH_STATE.whatIfModel = null;
+      const fallbackSelf = computeRootBlockerChain('cap-self-loop');
+      const fallbackExtOnly = computeRootBlockerChain('cap-ext-only');
+      return {
+        fallbackSelfHasCycle: Boolean(fallbackSelf?.isBlocked && fallbackSelf?.hasCycle && fallbackSelf?.chainLength === 0),
+        fallbackExtOnlyNull: fallbackExtOnly === null,
+        graphDataHasETA: getGraphViewData().issues.some(i => i.id === 'cap-auth-root' && i.eta_days != null && Boolean(i.eta_date)),
+      };
+    } finally {
+      GRAPH_STATE.whatIfModel = savedModel;
+      DB_STATE.db.run("DELETE FROM dependencies WHERE issue_id IN ('cap-self-loop', 'cap-ext-only')");
+      DB_STATE.db.run("DELETE FROM issue_overview_mv WHERE id IN ('cap-self-loop', 'cap-ext-only')");
+      DB_STATE.db.run("DELETE FROM issues WHERE id IN ('cap-self-loop', 'cap-ext-only')");
+    }
+  })()`);
+  assert.deepEqual(wave27RootAndGraphAudit, {
+    fallbackSelfHasCycle: true,
+    fallbackExtOnlyNull: true,
+    graphDataHasETA: true,
+  }, `Wave 27 B11-1/B11-2/W27-2 root-blocker self-loop, missing-blocker, and graph ETA data verified: ${JSON.stringify(wave27RootAndGraphAudit)}`);
 
   // Corpus-global MAX(blocks_count) hybrid impact normalization, [C-1] template/pinned hybrid status parity, & exact-ID substring search.
   await click(page, 'a[href="#/issues"]');
@@ -4065,6 +4105,16 @@ async function standaloneGraphJourney(page) {
     const openNodeHasETA = DATA.nodes.some(n => isActiveNodeStatus(n.status) && n.eta_days != null && Boolean(n.eta_date));
     const closedNodeNoETA = DATA.nodes.filter(n => !isActiveNodeStatus(n.status)).every(n => n.eta_days == null);
 
+    // B11-4: Filtering out all What-If highlighted nodes clears stale banner, hidden selection, and dimming.
+    selectNode(DATA.nodes.find(n => n.id === 'cap-auth-root'));
+    runWhatIfSimulation('cap-auth-root');
+    const stSel = document.getElementById('filter-status');
+    stSel.value = 'closed';
+    stSel.onchange({ target: stSel });
+    const b114ClearedOverlay = selectedNode === null && highlightedNodes.size === 0 && !document.getElementById('whatif-banner')?.classList.contains('visible');
+    stSel.value = 'all';
+    stSel.onchange({ target: stSel });
+
     return {
       cyclesCount,
       cycleBreaksCount,
@@ -4085,6 +4135,7 @@ async function standaloneGraphJourney(page) {
       b91ParentChildOk,
       openNodeHasETA,
       closedNodeNoETA,
+      b114ClearedOverlay,
     };
   })()`);
   assert.equal(wave25StandaloneAudit.cyclesCount, 2, 'standalone HTML DATA.cycles exports both active cycles');
@@ -4108,6 +4159,7 @@ async function standaloneGraphJourney(page) {
   assert.equal(wave25StandaloneAudit.b91ParentChildOk, true, 'Wave 26 B9-1/W26-3 standalone parent-child What-If & root blocker accuracy verified');
   assert.equal(wave25StandaloneAudit.openNodeHasETA, true, 'Wave 26 W26-4 standalone open nodes carry ETA forecasts');
   assert.equal(wave25StandaloneAudit.closedNodeNoETA, true, 'Wave 26 W26-4 standalone closed nodes suppress ETA forecasts');
+  assert.equal(wave25StandaloneAudit.b114ClearedOverlay, true, 'Wave 27 B11-4 standalone applyFilters clears hidden selection and zero-visible What-If overlay');
 
   await capture(page, 'standalone-graph');
   clean(page);

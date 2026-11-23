@@ -42,6 +42,9 @@ type ReportOptions struct {
 	View              recipe.ViewConfig
 	Metrics           []string
 	GraphStats        *analysis.GraphStats
+	ETAContext        *analysis.ETAContext
+	Analyzer          *analysis.Analyzer
+	VisibleIDs        map[string]bool
 	Title             string
 	GeneratedAt       time.Time
 	Readiness         *model.ReadinessIndex
@@ -1482,6 +1485,40 @@ func writeMarkdownIssueSection(sb *strings.Builder, i model.Issue, slug string, 
 			sb.WriteString(fmt.Sprintf("| **%s** | %s |\n", reportMetricHeader(mKey), metricsAcc.formatValue(mKey, i.ID)))
 		}
 	}
+	if !isClosedLikeStatus(i.Status) {
+		if opts.ETAContext != nil {
+			eta := opts.ETAContext.EstimateForIssue(i, 1)
+			if eta.EstimatedDays > 0 && !eta.ETADate.IsZero() {
+				sb.WriteString(fmt.Sprintf("| **ETA Forecast** | ~%.1fd (%s, %.0f%% conf) |\n",
+					eta.EstimatedDays, eta.ETADate.UTC().Format("2006-01-02"), eta.Confidence*100))
+			}
+		}
+		if opts.Analyzer != nil {
+			if chain := opts.Analyzer.GetBlockerChain(i.ID); chain != nil && chain.IsBlocked && (len(chain.RootBlockers) > 0 || chain.HasCycle) {
+				var rootParts []string
+				for _, rb := range chain.RootBlockers {
+					if opts.VisibleIDs != nil && !opts.VisibleIDs[rb.ID] {
+						continue
+					}
+					if len(rootParts) >= 4 {
+						break
+					}
+					rootParts = append(rootParts, fmt.Sprintf("`%s` (P%d)", escapeTableText(rb.ID), rb.Priority))
+				}
+				if len(rootParts) > 0 || chain.HasCycle {
+					val := strings.Join(rootParts, ", ")
+					if chain.HasCycle {
+						if val != "" {
+							val += " · ⚠ cycle detected"
+						} else {
+							val = "⚠ dependency cycle detected"
+						}
+					}
+					sb.WriteString(fmt.Sprintf("| **Start Here (Root Blockers)** | %s |\n", val))
+				}
+			}
+		}
+	}
 	sb.WriteString("\n")
 
 	if i.Description != "" {
@@ -2148,14 +2185,32 @@ func isShellSafeChar(r rune) bool {
 // Priority Brief Export (bv-96)
 // ============================================================================
 
+// PriorityBriefCapacity holds optional Graham-bound parallel capacity metrics
+// rendered into priority/agent briefs when non-nil.
+type PriorityBriefCapacity struct {
+	OpenCount           int
+	TotalMinutes        int
+	CriticalPathMinutes int
+	ParallelizablePct   float64
+	Days1Agent          float64
+	Days2AgentsMin      float64
+	Days2AgentsMax      float64
+	Days4AgentsMin      float64
+	Days4AgentsMax      float64
+	CriticalPathIDs     []string
+}
+
 // PriorityBriefConfig configures the priority brief generation
 type PriorityBriefConfig struct {
-	MaxRecommendations int    // Max recommendations to include (default: 5)
-	MaxQuickWins       int    // Max quick wins to include (default: 3)
-	MaxBlockers        int    // Max blockers to include (default: 3)
-	IncludeWhatIf      bool   // Include what-if deltas
-	IncludeLegend      bool   // Include metric legend
-	DataHash           string // Optional data hash for verification
+	MaxRecommendations      int                               // Max recommendations to include (default: 5)
+	MaxQuickWins            int                               // Max quick wins to include (default: 3)
+	MaxBlockers             int                               // Max blockers to include (default: 3)
+	IncludeWhatIf           bool                              // Include what-if deltas
+	IncludeLegend           bool                              // Include metric legend
+	DataHash                string                            // Optional data hash for verification
+	GlobalCapacity          *PriorityBriefCapacity            // Optional global Graham-bound capacity summary
+	PriorityRecommendations []analysis.PriorityRecommendation // Optional priority misalignment alerts
+	CycleBreaks             []analysis.CycleBreakItem         // Optional cycle-break edge suggestions
 }
 
 // DefaultPriorityBriefConfig returns sensible defaults for the priority brief
@@ -2415,6 +2470,79 @@ func GeneratePriorityBriefFromTriageJSON(triageJSON []byte, config PriorityBrief
 			}
 			sb.WriteString("\n")
 		}
+	}
+
+	// Global Backlog Capacity (Graham Bounds)
+	if config.GlobalCapacity != nil && config.GlobalCapacity.TotalMinutes > 0 {
+		cap := config.GlobalCapacity
+		sb.WriteString("## ⚡ Global Backlog Capacity (Graham Bounds)\n\n")
+		sb.WriteString("| Open | Total Work | Critical Path | Parallelizable | 1 Agent | 2 Agents | 4 Agents |\n")
+		sb.WriteString("|:----:|:----------:|:-------------:|:--------------:|:-------:|:--------:|:--------:|\n")
+		sb.WriteString(fmt.Sprintf("| %d | %s | %s | %.0f%% | %.1fd | %.1f–%.1fd | %.1f–%.1fd |\n\n",
+			cap.OpenCount,
+			formatEstimatedDuration(cap.TotalMinutes),
+			formatEstimatedDuration(cap.CriticalPathMinutes),
+			cap.ParallelizablePct,
+			cap.Days1Agent,
+			cap.Days2AgentsMin, cap.Days2AgentsMax,
+			cap.Days4AgentsMin, cap.Days4AgentsMax,
+		))
+		if len(cap.CriticalPathIDs) > 0 {
+			escapedCP := make([]string, 0, min(len(cap.CriticalPathIDs), 6))
+			for _, id := range cap.CriticalPathIDs {
+				if len(escapedCP) >= 6 {
+					break
+				}
+				escapedCP = append(escapedCP, "`"+escapeTableText(id)+"`")
+			}
+			sb.WriteString(fmt.Sprintf("**Critical Chain:** %s\n\n", strings.Join(escapedCP, " → ")))
+		}
+	}
+
+	// Priority Misalignment Alerts
+	if len(config.PriorityRecommendations) > 0 {
+		sb.WriteString("## ⚖️ Priority Misalignment Alerts\n\n")
+		sb.WriteString("| Issue | Change | Confidence | Primary Signal |\n")
+		sb.WriteString("|-------|:------:|:----------:|----------------|\n")
+		limit := min(len(config.PriorityRecommendations), 5)
+		for i := 0; i < limit; i++ {
+			pr := config.PriorityRecommendations[i]
+			arrow := "↓"
+			if pr.Direction == "increase" {
+				arrow = "↑"
+			}
+			reason := "-"
+			if len(pr.Reasoning) > 0 {
+				reason = truncateString(pr.Reasoning[0], 45)
+			}
+			sb.WriteString(fmt.Sprintf("| **%s** %s | %s P%d→P%d | %.0f%% | %s |\n",
+				escapeTableText(pr.IssueID),
+				escapeTableText(truncateString(pr.Title, 28)),
+				arrow, pr.CurrentPriority, pr.SuggestedPriority,
+				pr.Confidence*100,
+				escapeTableText(reason),
+			))
+		}
+		sb.WriteString("\n")
+	}
+
+	// Cycle Break Suggestions
+	if len(config.CycleBreaks) > 0 {
+		sb.WriteString("## ↻ Cycle Break Suggestions\n\n")
+		sb.WriteString("| Remove Edge | Cycles Broken | Collateral | Rationale |\n")
+		sb.WriteString("|-------------|:-------------:|:----------:|-----------|\n")
+		limit := min(len(config.CycleBreaks), 5)
+		for i := 0; i < limit; i++ {
+			cb := config.CycleBreaks[i]
+			sb.WriteString(fmt.Sprintf("| `%s` → `%s` | %d | %d | %s |\n",
+				escapeTableText(cb.EdgeFrom),
+				escapeTableText(cb.EdgeTo),
+				cb.Impact,
+				cb.Collateral,
+				escapeTableText(truncateString(cb.Rationale, 45)),
+			))
+		}
+		sb.WriteString("\n")
 	}
 
 	// Legend
