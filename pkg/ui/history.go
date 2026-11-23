@@ -3,6 +3,7 @@ package ui
 
 import (
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -3168,9 +3169,53 @@ func (h *HistoryModel) renderFileTreePanel(width, height int) string {
 		h.rebuildFlatFileList()
 	}
 
-	visibleItems := height - 5
+	// Compute optional file intelligence footer (blast-radius impact + co-changed files, W28-1)
+	var intelLines []string
+	if h.fileLookup != nil && height >= 12 {
+		if sel := h.SelectedFileNode(); sel != nil && !sel.IsDir && sel.Path != "" {
+			innerW := max(10, width-4)
+			if impact := h.fileLookup.ImpactAnalysisAt([]string{sel.Path}, h.effectiveNow()); impact != nil && len(impact.AffectedBeads) > 0 {
+				riskColor := t.Open
+				switch strings.ToLower(impact.RiskLevel) {
+				case "high", "critical":
+					riskColor = t.Blocked
+				case "medium":
+					riskColor = t.Feature
+				}
+				riskBadge := t.Renderer.NewStyle().Foreground(riskColor).Bold(true).Render(strings.ToUpper(impact.RiskLevel))
+				ids := make([]string, 0, min(3, len(impact.AffectedBeads)))
+				for i, ab := range impact.AffectedBeads {
+					if i >= 3 {
+						break
+					}
+					ids = append(ids, ab.BeadID)
+				}
+				more := ""
+				if len(impact.AffectedBeads) > len(ids) {
+					more = fmt.Sprintf(" +%d", len(impact.AffectedBeads)-len(ids))
+				}
+				riskLine := fmt.Sprintf("Blast: %s (%d open: %s%s)", riskBadge, len(impact.AffectedBeads), strings.Join(ids, ", "), more)
+				intelLines = append(intelLines, ansi.Truncate(riskLine, innerW, "…"))
+			}
+			if co := h.fileLookup.GetRelatedFiles(sel.Path, 0.3, 3); co != nil && len(co.RelatedFiles) > 0 {
+				var relParts []string
+				for _, rf := range co.RelatedFiles {
+					relParts = append(relParts, fmt.Sprintf("%s %.0f%%", filepath.Base(rf.FilePath), rf.Correlation*100))
+				}
+				coLine := t.Renderer.NewStyle().Foreground(t.Secondary).Render("Co-change: " + strings.Join(relParts, ", "))
+				intelLines = append(intelLines, ansi.Truncate(coLine, innerW, "…"))
+			}
+		}
+	}
+
+	footerReserve := 0
+	if len(intelLines) > 0 {
+		footerReserve = len(intelLines) + 1 // separator + intel lines
+	}
+	visibleItems := height - 5 - footerReserve
 	if visibleItems < 1 {
 		visibleItems = 1
+		intelLines = nil
 	}
 
 	// Adjust scroll to keep selection visible
@@ -3185,6 +3230,11 @@ func (h *HistoryModel) renderFileTreePanel(width, height int) string {
 		node := h.flatFileList[i]
 		line := h.renderFileTreeLine(i, node, width-4)
 		lines = append(lines, line)
+	}
+
+	if len(intelLines) > 0 {
+		lines = append(lines, strings.Repeat("─", sepWidth))
+		lines = append(lines, intelLines...)
 	}
 
 	// Pad with empty lines
@@ -3494,9 +3544,9 @@ func (h *HistoryModel) renderDetailPanel(width, height int) string {
 	statsLine := statsStyle.Render(strings.Join(statsItems, " • "))
 	lines = append(lines, statsLine)
 
-	// Navigation hint (bv-xf4p: added o and g keys)
+	// Navigation hint (bv-xf4p: added o and g keys; W28-1: added +/-/x correlation feedback)
 	hintStyle := t.Renderer.NewStyle().Foreground(ColorFooterHint).Italic(true)
-	lines = append(lines, hintStyle.Render("J/K:nav  y:copy  o:open  g:graph"))
+	lines = append(lines, hintStyle.Render("J/K:nav  +/-:confirm/reject  x:ignore  y:copy  o:open  g:graph"))
 
 	content := clampHistoryPanelContent(lines, width-2, height-2)
 	return panelStyle.Render(content)
@@ -3611,9 +3661,14 @@ func (h *HistoryModel) renderCommitDetail(commit correlation.CorrelatedCommit, w
 	}
 
 	methodStr := methodLabel(commit.Method)
-	confLine := fmt.Sprintf("    %s %s",
+	confirmedBadge := ""
+	if commit.Confirmed {
+		confirmedBadge = " " + t.Renderer.NewStyle().Foreground(t.Open).Bold(true).Render("✓ confirmed")
+	}
+	confLine := fmt.Sprintf("    %s %s%s",
 		confStyle.Render(fmt.Sprintf("%.0f%% confidence", commit.Confidence*100)),
 		t.Renderer.NewStyle().Foreground(t.Muted).Render(methodStr),
+		confirmedBadge,
 	)
 	lines = append(lines, confLine)
 
@@ -4382,10 +4437,10 @@ func (h *HistoryModel) renderGitDetailPanel(width, height int) string {
 		lines = lines[:contentHeight]
 	}
 
-	// Add footer hint (bv-xf4p)
+	// Add footer hint (bv-xf4p, W28-1)
 	lines = append(lines, strings.Repeat("─", detailSepWidth))
 	hintStyle := t.Renderer.NewStyle().Foreground(ColorFooterHint).Italic(true)
-	lines = append(lines, hintStyle.Render("J/K:bead  y:copy  o:open  g:graph"))
+	lines = append(lines, hintStyle.Render("J/K:bead  +/-:confirm/reject  x:ignore  y:copy  o:open  g:graph"))
 
 	content := clampHistoryPanelContent(lines, width-2, height-2)
 	return panelStyle.Render(content)

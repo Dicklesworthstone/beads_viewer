@@ -7,6 +7,7 @@ import (
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 )
 
 type actionableWhatIf struct {
@@ -346,7 +347,7 @@ func (m *ActionableModel) Render() string {
 		}
 		reasonText := truncateRunesHelper(track.Reason, maxReasonWidth, "…")
 
-		trackLine := badge + " " + trackReasonStyle.Render(reasonText)
+		trackLine := ansi.Truncate(badge+" "+trackReasonStyle.Render(reasonText), max(1, m.width-2), "…")
 		lines = append(lines, trackLine)
 
 		// Subtle divider
@@ -410,18 +411,17 @@ func (m *ActionableModel) Render() string {
 				etaWidth = 0
 				maxTitleLen = lineBudget - prefixWidth - unblockWidth
 			}
-			if maxTitleLen < 1 {
-				maxTitleLen = 1
-			}
-			title := truncateRunesHelper(item.Title, maxTitleLen, "…")
+			if maxTitleLen > 0 {
+				title := truncateRunesHelper(item.Title, maxTitleLen, "…")
 
-			titleStyle := t.Renderer.NewStyle()
-			if isSelected {
-				titleStyle = titleStyle.Foreground(t.Primary).Bold(true)
-			} else {
-				titleStyle = titleStyle.Foreground(lipgloss.AdaptiveColor{Light: "#333333", Dark: "#E8E8E8"})
+				titleStyle := t.Renderer.NewStyle()
+				if isSelected {
+					titleStyle = titleStyle.Foreground(t.Primary).Bold(true)
+				} else {
+					titleStyle = titleStyle.Foreground(lipgloss.AdaptiveColor{Light: "#333333", Dark: "#E8E8E8"})
+				}
+				itemLine.WriteString(titleStyle.Render(title))
 			}
-			itemLine.WriteString(titleStyle.Render(title))
 
 			if etaLabel != "" {
 				etaBadge := t.Renderer.NewStyle().
@@ -439,13 +439,13 @@ func (m *ActionableModel) Render() string {
 				itemLine.WriteString(unblockBadge)
 			}
 
-			// Style the line with background if selected
+			// Style the line with background if selected (strictly single physical line for ensureVisible)
 			lineStyle := t.Renderer.NewStyle().Width(lineBudget)
 			if isSelected {
 				lineStyle = lineStyle.Background(t.Highlight)
 			}
 
-			lines = append(lines, lineStyle.Render(itemLine.String()))
+			lines = append(lines, lineStyle.Render(ansi.Truncate(itemLine.String(), lineBudget, "…")))
 
 			// Show unblocks detail for selected item
 			if isSelected && len(item.UnblocksIDs) > 0 {
@@ -466,7 +466,7 @@ func (m *ActionableModel) Render() string {
 						unblocksText += " (" + strings.Join(extra, ", ") + ")"
 					}
 				}
-				unblocksText = truncateRunesHelper(unblocksText, max(4, m.width-12), "...")
+				unblocksText = ansi.Truncate(unblocksText, max(1, m.width-10), "…")
 				lines = append(lines, unblocksStyle.Render(unblocksText))
 			}
 		}

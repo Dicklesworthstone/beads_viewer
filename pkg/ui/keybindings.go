@@ -365,6 +365,9 @@ func GetKeyBindingDocs() []KeyBindingDoc {
 		{"J", "Detail scroll down", "History", "history"},
 		{"K", "Detail scroll up", "History", "history"},
 		{"y", "Copy commit SHA", "History", "history"},
+		{"+", "Confirm commit correlation", "History", "history"},
+		{"-", "Reject commit correlation", "History", "history"},
+		{"x", "Ignore commit correlation", "History", "history"},
 		{"o", "Open in browser", "History", "history"},
 		{"h", "Close history view", "History", "history"},
 

@@ -153,6 +153,7 @@ type InsightsModel struct {
 	advancedInsights *analysis.AdvancedInsights
 	globalCapacity   *GlobalCapacitySummary
 	feedbackSummary  *analysis.FeedbackJSON
+	priorityHints    map[string]*analysis.PriorityRecommendation
 	issueMap         map[string]*model.Issue
 	theme            Theme
 	labelFlow        *analysis.CrossLabelFlow
@@ -346,6 +347,12 @@ func (m *InsightsModel) SetFeedbackSummary(fb *analysis.FeedbackJSON) {
 	}
 }
 
+// SetPriorityHints attaches priority misalignment recommendations for display in issue details.
+func (m *InsightsModel) SetPriorityHints(hints map[string]*analysis.PriorityRecommendation) {
+	m.priorityHints = hints
+	m.detailContent = ""
+}
+
 // SetIssueMap updates the issue lookup map used when rendering panel items and details.
 func (m *InsightsModel) SetIssueMap(issueMap map[string]*model.Issue) {
 	m.issueMap = issueMap
@@ -535,14 +542,28 @@ func (m *InsightsModel) ScrollDetailDown() {
 // updateDetailContent updates the viewport with current selection's markdown
 func (m *InsightsModel) updateDetailContent() {
 	selectedID := m.SelectedIssueID()
+	var mdContent string
 	if selectedID == "" {
-		m.detailContent = ""
-		m.detailVP.SetContent("")
-		m.detailVP.GotoTop()
-		return
-	}
+		mdContent = `
+## Select a Bead
 
-	mdContent := m.buildDetailMarkdown(selectedID)
+Navigate to a metric panel and select an item to view its details here.
+
+**Navigation:**
+- ← → to switch panels
+- ↑ ↓ to select items
+- Ctrl+j/k scroll details
+- Enter to view in main view
+`
+		if advMD := m.renderAdvancedInsightsMD(); advMD != "" {
+			mdContent += "\n---\n\n" + advMD
+		}
+		if extraMD := m.renderPriorityExtrasMD(); extraMD != "" {
+			mdContent += "\n---\n\n" + extraMD
+		}
+	} else {
+		mdContent = m.buildDetailMarkdown(selectedID)
+	}
 	if m.mdRenderer != nil {
 		rendered, err := m.mdRenderer.Render(mdContent)
 		if err == nil {
@@ -2107,6 +2128,61 @@ func (m *InsightsModel) buildDetailMarkdown(selectedID string) string {
 	if strings.TrimSpace(issue.CloseReason) != "" {
 		meta("Close Reason", strings.TrimSpace(issue.CloseReason))
 	}
+	if !isClosedLikeStatus(issue.Status) && m.priorityHints != nil {
+		if hint := m.priorityHints[selectedID]; hint != nil && hint.SuggestedPriority != issue.Priority {
+			arrow := "↓"
+			if hint.Direction == "increase" {
+				arrow = "↑"
+			}
+			reasonSuffix := ""
+			if len(hint.Reasoning) > 0 {
+				reasonSuffix = " — " + strings.Join(hint.Reasoning[:min(2, len(hint.Reasoning))], "; ")
+			}
+			meta("Priority Hint", fmt.Sprintf("%s **P%d → P%d** (%.0f%% conf)%s",
+				arrow, hint.CurrentPriority, hint.SuggestedPriority, hint.Confidence*100, reasonSuffix))
+		}
+	}
+	if !isClosedLikeStatus(issue.Status) && len(m.recommendations) > 0 {
+		for _, rec := range m.recommendations {
+			if rec.ID != selectedID {
+				continue
+			}
+			rs := rec.Breakdown.RiskSignals
+			if rec.Breakdown.RiskExplanation != "" || (rs != nil && rs.CompositeRisk > 0.25) {
+				var parts []string
+				if rs != nil {
+					if rs.FanVariance > 0 {
+						parts = append(parts, fmt.Sprintf("fan %.0f%%", rs.FanVariance*100))
+					}
+					if rs.ActivityChurn > 0 {
+						parts = append(parts, fmt.Sprintf("churn %.0f%%", rs.ActivityChurn*100))
+					}
+					if rs.CrossRepoRisk > 0 {
+						parts = append(parts, fmt.Sprintf("cross-repo %.0f%%", rs.CrossRepoRisk*100))
+					}
+					if rs.StatusRisk > 0 {
+						parts = append(parts, fmt.Sprintf("status %.0f%%", rs.StatusRisk*100))
+					}
+				}
+				expl := rec.Breakdown.RiskExplanation
+				if expl == "" && rs != nil {
+					expl = rs.Explanation
+				}
+				riskVal := fmt.Sprintf("%.0f%%", rec.Breakdown.RiskNorm*100)
+				if rs != nil && rs.CompositeRisk > 0 {
+					riskVal = fmt.Sprintf("%.0f%%", rs.CompositeRisk*100)
+				}
+				if expl != "" {
+					riskVal += " — " + expl
+				}
+				if len(parts) > 0 {
+					riskVal += " (" + strings.Join(parts, " • ") + ")"
+				}
+				meta("Risk Signals", riskVal)
+			}
+			break
+		}
+	}
 	sb.WriteString("\n")
 
 	// === Labels ===
@@ -2408,6 +2484,44 @@ func (m *InsightsModel) renderAdvancedInsightsMD() string {
 			sb.WriteString("\n")
 		}
 
+	case PanelKeystones, PanelSlack:
+		if adv.KPaths != nil && len(adv.KPaths.Paths) > 0 {
+			var visiblePaths [][]string
+			for _, cp := range adv.KPaths.Paths {
+				if len(visiblePaths) >= 4 {
+					break
+				}
+				if len(cp.IssueIDs) < 2 {
+					continue
+				}
+				// Only render paths whose every node is in the current view scope so we never
+				// splice out hidden intermediate nodes and fabricate nonexistent direct edges.
+				intact := true
+				for _, id := range cp.IssueIDs {
+					if m.issueMap[id] == nil {
+						intact = false
+						break
+					}
+				}
+				if intact {
+					visiblePaths = append(visiblePaths, cp.IssueIDs)
+				}
+			}
+			if len(visiblePaths) > 0 {
+				sb.WriteString("### 🛤️ Top Critical Paths\n\n")
+				for i, chain := range visiblePaths {
+					shown := chain
+					suffix := ""
+					if len(shown) > 6 {
+						suffix = fmt.Sprintf(" … (+%d)", len(shown)-6)
+						shown = shown[:6]
+					}
+					sb.WriteString(fmt.Sprintf("%d. `%s`%s _(len %d)_\n", i+1, strings.Join(shown, "` → `"), suffix, len(chain)))
+				}
+				sb.WriteString("\n")
+			}
+		}
+
 	case PanelArticulation:
 		if adv.CoverageSet != nil && (adv.CoverageSet.TotalEdges > 0 || len(adv.CoverageSet.Items) > 0) {
 			sb.WriteString("### 🛡️ Vertex Coverage Set\n\n")
@@ -2508,35 +2622,8 @@ func (m *InsightsModel) renderDetailPanel(width, height int, t Theme) string {
 	}
 	m.detailVP.Height = vpHeight
 
-	selectedID := m.SelectedIssueID()
-	if selectedID == "" {
-		emptyContent := `
-## Select a Bead
-
-Navigate to a metric panel and select an item to view its details here.
-
-**Navigation:**
-- ← → to switch panels
-- ↑ ↓ to select items
-- Ctrl+j/k scroll details
-- Enter to view in main view
-`
-		if advMD := m.renderAdvancedInsightsMD(); advMD != "" {
-			emptyContent += "\n---\n\n" + advMD
-		}
-		if extraMD := m.renderPriorityExtrasMD(); extraMD != "" {
-			emptyContent += "\n---\n\n" + extraMD
-		}
-		if m.mdRenderer != nil {
-			rendered, err := m.mdRenderer.Render(emptyContent)
-			if err == nil {
-				m.detailVP.SetContent(rendered)
-			}
-		} else {
-			m.detailVP.SetContent(emptyContent)
-		}
-	} else if m.detailContent == "" {
-		// Ensure content is populated if not already
+	if m.detailContent == "" {
+		// Ensure content (including empty-selection extras) is populated and cached.
 		m.updateDetailContent()
 	}
 

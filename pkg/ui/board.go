@@ -2283,11 +2283,12 @@ func (b *BoardModel) syncDetailContent() {
 	phase2Ready := b.analysis != nil && b.analysis.IsPhase2Ready()
 	issue := b.SelectedIssue()
 	if issue == nil {
-		if prevID == "_none_" && b.lastDetailWidth == curWidth {
+		if prevID == "_none_" && b.lastDetailWidth == curWidth && b.lastDetailDark == wantDark {
 			return
 		}
 		b.lastDetailID = "_none_"
 		b.lastDetailWidth = curWidth
+		b.lastDetailDark = wantDark
 		var rendered string
 		if b.detailCache != nil && b.detailCache.issueID == "_none_" && b.detailCache.width == curWidth && b.detailCache.darkMode == wantDark {
 			rendered = b.detailCache.rendered
@@ -2378,7 +2379,7 @@ func (b *BoardModel) syncDetailContent() {
 	}
 
 	isActive := !isClosedLikeStatus(issue.Status)
-	if isActive && b.etaCtx != nil {
+	if isActive && !issue.IsTemplate && !issue.Pinned && issue.Status != model.StatusPinned && b.etaCtx != nil {
 		eta := b.etaCtx.EstimateForIssue(*issue, 1)
 		if eta.EstimatedDays > 0 && !eta.ETADate.IsZero() {
 			content.WriteString(fmt.Sprintf("**ETA Forecast:** ~%.1fd (est. %s, %.0f%% conf)\n\n",
@@ -2391,7 +2392,7 @@ func (b *BoardModel) syncDetailContent() {
 		if pr := b.analysis.GetPageRankScore(issue.ID); pr > 0 {
 			metricParts = append(metricParts, fmt.Sprintf("PR %.3f", pr))
 		}
-		if kcore := b.analysis.CoreNumber()[issue.ID]; kcore > 0 {
+		if kcore := b.analysis.ActiveCoreNumber()[issue.ID]; kcore > 0 {
 			metricParts = append(metricParts, fmt.Sprintf("K-Core k=%d", kcore))
 		}
 		if len(b.analysis.Cycles()) == 0 {
@@ -2476,10 +2477,13 @@ func (b *BoardModel) syncDetailContent() {
 
 	// Show what this issue blocks (bv-kklp) + real What-If close cascade when analyzer is attached
 	var whatIfDelta *analysis.WhatIfDelta
+	whatIfEvaluated := false
 	if isActive && b.analyzer != nil {
-		if delta, err := b.analyzer.ComputeWhatIfDeltaFromStats(issue.ID, b.analysis); err == nil && delta != nil &&
-			(delta.DirectUnblocks > 0 || delta.TransitiveUnblocks > 0) {
-			whatIfDelta = delta
+		if delta, err := b.analyzer.ComputeWhatIfDeltaFromStats(issue.ID, b.analysis); err == nil && delta != nil {
+			whatIfEvaluated = true
+			if delta.DirectUnblocks > 0 || delta.TransitiveUnblocks > 0 {
+				whatIfDelta = delta
+			}
 		}
 	}
 	if blockedIDs, ok := b.blocksIndex[issue.ID]; ok && len(blockedIDs) > 0 {
@@ -2498,8 +2502,10 @@ func (b *BoardModel) syncDetailContent() {
 			}
 			content.WriteString(fmt.Sprintf("\n💡 **What-If Close:** Unblocks %d direct / %d total%s\n\n",
 				whatIfDelta.DirectUnblocks, whatIfDelta.TransitiveUnblocks, daysHint))
-		} else {
+		} else if isActive && !whatIfEvaluated {
 			content.WriteString(fmt.Sprintf("\n💡 Completing this would unblock %d issue(s)\n\n", len(blockedIDs)))
+		} else {
+			content.WriteString("\n")
 		}
 	} else if whatIfDelta != nil {
 		daysHint := ""

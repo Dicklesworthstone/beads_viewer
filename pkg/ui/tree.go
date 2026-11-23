@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/debug"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 	"github.com/charmbracelet/lipgloss"
@@ -305,6 +306,13 @@ type IssueTreeNode struct {
 	SharedRef bool             // True when attached as a non-reexpanded shared DAG target
 }
 
+type treeNodeTelemetry struct {
+	directUnblocks int
+	activeBlockers int
+	etaDays        float64
+	hasETA         bool
+}
+
 // TreeModel manages the hierarchical tree view state
 type TreeModel struct {
 	roots          []*IssueTreeNode          // Root nodes (issues with no parent)
@@ -328,9 +336,40 @@ type TreeModel struct {
 	hasParentChildEdges bool          // True when ≥1 parent-child edge exists in issues
 	hasBlockingEdges    bool          // True when ≥1 blocking edge exists in issues
 
+	// Optional enrichment telemetry (W28-3)
+	workspaceMode     bool
+	showPriorityHints bool
+	priorityHints     map[string]*analysis.PriorityRecommendation
+	analyzer          *analysis.Analyzer
+	analysis          *analysis.GraphStats
+	etaCtx            *analysis.ETAContext
+	rollupCache       map[string][2]int
+	telemetryCache    map[string]treeNodeTelemetry
+
 	// Persistence state (bv-19vz)
 	beadsDir string // Directory containing .beads (for tree-state.json)
 	readOnly bool   // When true, saveState is a strict no-op (e.g., --as-of / time-travel)
+}
+
+// SetWorkspaceMode enables multi-repo source_repo badges on tree rows.
+func (t *TreeModel) SetWorkspaceMode(enabled bool) {
+	t.workspaceMode = enabled
+}
+
+// SetPriorityHints injects priority misalignment hints for compact arrow badges.
+func (t *TreeModel) SetPriorityHints(hints map[string]*analysis.PriorityRecommendation, show bool) {
+	t.priorityHints = hints
+	t.showPriorityHints = show
+}
+
+// SetTelemetry injects scoped graph analyzer, stats, and ETA context for tree badges.
+func (t *TreeModel) SetTelemetry(analyzer *analysis.Analyzer, stats *analysis.GraphStats, etaCtx *analysis.ETAContext) {
+	if t.analyzer != analyzer || t.analysis != stats || t.etaCtx != etaCtx {
+		t.analyzer = analyzer
+		t.analysis = stats
+		t.etaCtx = etaCtx
+		t.telemetryCache = nil
+	}
 }
 
 // NewTreeModel creates an empty tree model
@@ -783,6 +822,8 @@ func (t *TreeModel) Build(issues []model.Issue) {
 	t.roots = nil
 	t.flatList = nil
 	t.issueMap = make(map[string]*IssueTreeNode)
+	t.rollupCache = nil
+	t.telemetryCache = nil
 	t.cursor = 0
 	t.viewportOffset = 0
 	t.lastHash = ""
@@ -863,6 +904,8 @@ func (t *TreeModel) BuildFromSnapshot(snapshot *DataSnapshot) {
 	// Deep-copy precomputed hierarchy roots and rebuild t.issueMap over the copied
 	// nodes so ToggleExpand/ExpandAll/CollapseAll never mutate shared DataSnapshot.TreeRoots.
 	t.roots, t.issueMap = deepCopyTree(snapshot.TreeRoots, snapshot.TreeNodeMap, snapshot.IssueMap)
+	t.rollupCache = nil
+	t.telemetryCache = nil
 	if len(t.roots) > 0 && len(t.issueMap) == 0 {
 		t.issueMap = make(map[string]*IssueTreeNode)
 		var indexCopied func([]*IssueTreeNode)
@@ -1176,6 +1219,74 @@ func (t *TreeModel) renderEmptyState() string {
 	return strings.Join(lines, "\n")
 }
 
+func (t *TreeModel) subtreeRollup(node *IssueTreeNode) (closed, total int) {
+	if node == nil || node.Issue == nil || len(node.Children) == 0 {
+		return 0, 0
+	}
+	if t.rollupCache != nil {
+		if pair, ok := t.rollupCache[node.Issue.ID]; ok {
+			return pair[0], pair[1]
+		}
+	} else {
+		t.rollupCache = make(map[string][2]int)
+	}
+	seen := map[string]bool{node.Issue.ID: true}
+	var walk func(children []*IssueTreeNode)
+	walk = func(children []*IssueTreeNode) {
+		for _, ch := range children {
+			if ch == nil || ch.Issue == nil || seen[ch.Issue.ID] {
+				continue
+			}
+			seen[ch.Issue.ID] = true
+			total++
+			if isClosedLikeStatus(ch.Issue.Status) || ch.Issue.Status == model.StatusTombstone {
+				closed++
+			}
+			if !ch.SharedRef && len(ch.Children) > 0 {
+				walk(ch.Children)
+			}
+		}
+	}
+	walk(node.Children)
+	t.rollupCache[node.Issue.ID] = [2]int{closed, total}
+	return closed, total
+}
+
+func (t *TreeModel) nodeTelemetry(issue *model.Issue) treeNodeTelemetry {
+	if issue == nil || isClosedLikeStatus(issue.Status) || issue.Status == model.StatusTombstone {
+		return treeNodeTelemetry{}
+	}
+	if t.telemetryCache != nil {
+		if cached, ok := t.telemetryCache[issue.ID]; ok {
+			return cached
+		}
+	} else {
+		t.telemetryCache = make(map[string]treeNodeTelemetry)
+	}
+	var res treeNodeTelemetry
+	if t.analyzer != nil {
+		if r := t.analyzer.Readiness(); r != nil {
+			for _, bid := range r.Blockers(issue.ID) {
+				if _, inTree := t.issueMap[bid]; inTree {
+					res.activeBlockers++
+				}
+			}
+		}
+		if delta, err := t.analyzer.ComputeWhatIfDeltaFromStats(issue.ID, t.analysis); err == nil && delta != nil {
+			res.directUnblocks = delta.DirectUnblocks
+		}
+	}
+	if t.etaCtx != nil && !issue.IsTemplate && !issue.Pinned && issue.Status != model.StatusPinned {
+		est := t.etaCtx.EstimateForIssue(*issue, 1)
+		if est.EstimatedDays > 0 && !est.ETADate.IsZero() {
+			res.etaDays = est.EstimatedDays
+			res.hasETA = true
+		}
+	}
+	t.telemetryCache[issue.ID] = res
+	return res
+}
+
 // renderNode renders a single tree node with tree characters and styling.
 func (t *TreeModel) renderNode(node *IssueTreeNode, isSelected bool) string {
 	if node == nil || node.Issue == nil {
@@ -1219,13 +1330,62 @@ func (t *TreeModel) renderNode(node *IssueTreeNode, isSelected bool) string {
 	leftBuilder.WriteString(idStyle.Render(cleanID))
 	leftBuilder.WriteString(" ")
 
-	leftPart := leftBuilder.String()
+	leftBase := leftBuilder.String()
+
+	// Optional workspace repo badge (dropped gracefully on narrow terminals)
+	repoSeg := ""
+	if t.workspaceMode && strings.TrimSpace(issue.SourceRepo) != "" {
+		repoSeg = RenderRepoBadge(strings.TrimSpace(issue.SourceRepo)) + " "
+	}
+
+	// Optional right-side decision-intelligence segments (dropped gracefully on narrow terminals)
+	rollupSeg := ""
+	if t.mode == TreeModeHierarchy && len(node.Children) > 0 {
+		closedCnt, totalCnt := t.subtreeRollup(node)
+		if totalCnt > 0 {
+			rStyle := r.NewStyle().Foreground(t.theme.Muted)
+			if closedCnt == totalCnt {
+				rStyle = r.NewStyle().Foreground(t.theme.Closed)
+			}
+			rollupSeg = " " + rStyle.Render(fmt.Sprintf("[%d/%d]", closedCnt, totalCnt))
+		}
+	}
+
+	prioHintSeg := ""
+	if !isClosedLikeStatus(issue.Status) && t.showPriorityHints && t.priorityHints != nil {
+		if hint := t.priorityHints[issue.ID]; hint != nil && hint.SuggestedPriority != issue.Priority {
+			if hint.Direction == "increase" {
+				prioHintSeg = " " + r.NewStyle().Foreground(t.theme.Primary).Bold(true).Render("↑")
+			} else {
+				prioHintSeg = " " + r.NewStyle().Foreground(t.theme.Secondary).Render("↓")
+			}
+		}
+	}
+
+	graphSeg := ""
+	etaSeg := ""
+	if !isClosedLikeStatus(issue.Status) && issue.Status != model.StatusTombstone {
+		tel := t.nodeTelemetry(issue)
+		var gParts []string
+		if tel.directUnblocks > 0 {
+			gParts = append(gParts, r.NewStyle().Foreground(t.theme.Open).Bold(true).Render(fmt.Sprintf("⚡+%d", tel.directUnblocks)))
+		}
+		if tel.activeBlockers > 0 {
+			gParts = append(gParts, r.NewStyle().Foreground(t.theme.Blocked).Render(fmt.Sprintf("🔒%d", tel.activeBlockers)))
+		}
+		if len(gParts) > 0 {
+			graphSeg = " " + strings.Join(gParts, " ")
+		}
+		if tel.hasETA {
+			etaSeg = " " + r.NewStyle().Foreground(t.theme.Muted).Render(fmt.Sprintf("~%.1fd", tel.etaDays))
+		}
+	}
 
 	// Status indicator (colored dot at end)
 	statusColor := t.theme.GetStatusColor(string(issue.Status))
 	statusDot := " " + GetStatusIcon(string(issue.Status))
 	statusStyle := r.NewStyle().Foreground(statusColor)
-	rightPart := statusStyle.Render(statusDot)
+	statusPart := statusStyle.Render(statusDot)
 
 	// Compute cell-width budget from actual rendered node chrome (using node.Depth
 	// prefix width + selected row border/padding chrome, with zero minimum floor).
@@ -1239,9 +1399,33 @@ func (t *TreeModel) renderNode(node *IssueTreeNode, isSelected bool) string {
 		if availRowWidth <= 0 {
 			return ""
 		}
-		leftWidth := lipgloss.Width(leftPart)
-		rightWidth := lipgloss.Width(rightPart)
-		maxTitleLen := availRowWidth - leftWidth - rightWidth
+		buildParts := func() (string, string, int) {
+			lp := leftBase + repoSeg
+			rp := rollupSeg + prioHintSeg + graphSeg + etaSeg + statusPart
+			return lp, rp, availRowWidth - lipgloss.Width(lp) - lipgloss.Width(rp)
+		}
+		leftPart, rightPart, maxTitleLen := buildParts()
+		// Progressively shed optional badges so narrow terminals keep ID + Title + Status legible.
+		if maxTitleLen < 12 && etaSeg != "" {
+			etaSeg = ""
+			leftPart, rightPart, maxTitleLen = buildParts()
+		}
+		if maxTitleLen < 12 && graphSeg != "" {
+			graphSeg = ""
+			leftPart, rightPart, maxTitleLen = buildParts()
+		}
+		if maxTitleLen < 12 && prioHintSeg != "" {
+			prioHintSeg = ""
+			leftPart, rightPart, maxTitleLen = buildParts()
+		}
+		if maxTitleLen < 12 && rollupSeg != "" {
+			rollupSeg = ""
+			leftPart, rightPart, maxTitleLen = buildParts()
+		}
+		if maxTitleLen < 10 && repoSeg != "" {
+			repoSeg = ""
+			leftPart, rightPart, maxTitleLen = buildParts()
+		}
 		if maxTitleLen > 0 {
 			title = t.truncateTitle(title, maxTitleLen)
 		} else {
@@ -1258,6 +1442,8 @@ func (t *TreeModel) renderNode(node *IssueTreeNode, isSelected bool) string {
 		return line
 	}
 
+	leftPart := leftBase + repoSeg
+	rightPart := rollupSeg + prioHintSeg + graphSeg + etaSeg + statusPart
 	title = t.truncateTitle(title, 80)
 	return leftPart + title + rightPart
 }

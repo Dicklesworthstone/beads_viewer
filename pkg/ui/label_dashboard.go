@@ -11,14 +11,26 @@ import (
 	"github.com/charmbracelet/x/ansi"
 )
 
+type labelDashboardExtra struct {
+	Sparkline      string
+	TrendSymbol    string
+	AttentionRank  int
+	AttentionScore float64
+}
+
 // LabelDashboardModel renders a lightweight table of label health
 type LabelDashboardModel struct {
 	labels       []analysis.LabelHealth
+	extras       map[string]labelDashboardExtra
 	cursor       int
 	scrollOffset int // Index of the first visible row
 	width        int
 	height       int
 	theme        Theme
+}
+
+func (m *LabelDashboardModel) SetExtras(extras map[string]labelDashboardExtra) {
+	m.extras = extras
 }
 
 func NewLabelDashboardModel(theme Theme) LabelDashboardModel {
@@ -206,12 +218,19 @@ func (m *LabelDashboardModel) Update(msg tea.KeyMsg) (string, tea.Cmd) {
 	return "", nil
 }
 
+func (m LabelDashboardModel) showExtendedColumns() bool {
+	return len(m.extras) > 0 && (m.width == 0 || m.width >= 78)
+}
+
 func (m LabelDashboardModel) View() string {
 	if len(m.labels) == 0 {
 		return "No labels found"
 	}
 
 	headers := []string{"Label", "Health", "Blocked", "Velocity 7d/30d", "Stale"}
+	if m.showExtendedColumns() {
+		headers = []string{"Label", "Health", "Blocked", "Vel 7d/30d", "Trend 4w", "Attn", "Stale"}
+	}
 	widths := m.computeColumnWidths(headers)
 
 	var b strings.Builder
@@ -254,6 +273,29 @@ func (m LabelDashboardModel) View() string {
 
 // getRowCells returns the fully rendered (colored) cells for a label row
 func (m LabelDashboardModel) getRowCells(lh analysis.LabelHealth) []string {
+	if m.showExtendedColumns() {
+		extra := m.extras[lh.Label]
+		trendCell := "-"
+		if extra.Sparkline != "" {
+			trendCell = extra.Sparkline
+			if extra.TrendSymbol != "" {
+				trendCell += " " + extra.TrendSymbol
+			}
+		}
+		attnCell := "-"
+		if extra.AttentionRank > 0 {
+			attnCell = fmt.Sprintf("#%d (%.2f)", extra.AttentionRank, extra.AttentionScore)
+		}
+		return []string{
+			m.renderLabelCell(lh),
+			m.renderHealthCell(lh),
+			m.renderBlockedCell(lh),
+			fmt.Sprintf("%d/%d", lh.Velocity.ClosedLast7Days, lh.Velocity.ClosedLast30Days),
+			trendCell,
+			attnCell,
+			fmt.Sprintf("%d", lh.Freshness.StaleCount),
+		}
+	}
 	return []string{
 		m.renderLabelCell(lh),
 		m.renderHealthCell(lh),

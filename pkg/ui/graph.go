@@ -21,6 +21,7 @@ type GraphModel struct {
 	insights       *analysis.Insights
 	analyzer       *analysis.Analyzer
 	etaCtx         *analysis.ETAContext
+	priorityHints  map[string]*analysis.PriorityRecommendation
 	nowFunc        func() time.Time
 	selectedIdx    int
 	scrollOffset   int
@@ -152,6 +153,12 @@ func (g *GraphModel) SetETAContext(ctx *analysis.ETAContext) {
 		g.etaCtx = ctx
 		g.canvasLines = nil
 	}
+}
+
+// SetPriorityHints injects priority misalignment hints so the Graph metrics
+// panel surfaces suggested priority changes alongside What-If & ETA.
+func (g *GraphModel) SetPriorityHints(hints map[string]*analysis.PriorityRecommendation) {
+	g.priorityHints = hints
 }
 
 // SetIssues updates the graph data preserving the selected issue if possible
@@ -1209,8 +1216,14 @@ func (g *GraphModel) renderMetricsPanel(id string, width int, t Theme) string {
 		hasRootBlockers := blockerChain != nil && blockerChain.IsBlocked && (len(visibleRoots) > 0 || blockerChain.HasCycle)
 		var eta analysis.ETAEstimate
 		var etaErr error
-		if g.etaCtx != nil {
+		etaEligible := !selIssue.IsTemplate && !selIssue.Pinned && selIssue.Status != model.StatusPinned
+		if !etaEligible {
+			etaErr = fmt.Errorf("not eta-eligible")
+		} else if g.etaCtx != nil {
 			eta = g.etaCtx.EstimateForIssue(*selIssue, 1)
+			if eta.EstimatedDays <= 0 || eta.ETADate.IsZero() {
+				etaErr = fmt.Errorf("no eta")
+			}
 		} else {
 			now := g.analyzer.Now()
 			if g.nowFunc != nil {
@@ -1218,11 +1231,28 @@ func (g *GraphModel) renderMetricsPanel(id string, width int, t Theme) string {
 			}
 			eta, etaErr = analysis.EstimateETAForIssue(g.issues, stats, id, 1, now)
 		}
-		if (whatIf != nil && (whatIf.Delta.DirectUnblocks > 0 || whatIf.Delta.TransitiveUnblocks > 0)) || hasRootBlockers || etaErr == nil {
+		var prioHint *analysis.PriorityRecommendation
+		if g.priorityHints != nil {
+			if h := g.priorityHints[id]; h != nil && h.SuggestedPriority != selIssue.Priority {
+				prioHint = h
+			}
+		}
+		if (whatIf != nil && (whatIf.Delta.DirectUnblocks > 0 || whatIf.Delta.TransitiveUnblocks > 0)) || hasRootBlockers || etaErr == nil || prioHint != nil {
 			rows = append(rows, "")
 			rows = append(rows, sectionStyle.Render("What-If & Forecast"))
 			detailStyle := t.Renderer.NewStyle().Foreground(ColorText)
 			mutedStyle := t.Renderer.NewStyle().Foreground(ColorMuted)
+			if prioHint != nil {
+				arrow := "↓"
+				if prioHint.Direction == "increase" {
+					arrow = "↑"
+				}
+				hintLine := fmt.Sprintf("  Priority hint: %s P%d→P%d (%.0f%%)", arrow, prioHint.CurrentPriority, prioHint.SuggestedPriority, prioHint.Confidence*100)
+				if len(prioHint.Reasoning) > 0 {
+					hintLine += " — " + prioHint.Reasoning[0]
+				}
+				rows = append(rows, detailStyle.Render(truncateRunesHelper(hintLine, max(20, width-4), "…")))
+			}
 			if hasRootBlockers {
 				if len(visibleRoots) > 0 {
 					rootLabels := make([]string, 0, min(3, len(visibleRoots)))

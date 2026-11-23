@@ -2245,11 +2245,11 @@ type ReadinessScope struct {
 }
 
 type advancedInsightsCacheKey struct {
-	stats        *analysis.GraphStats
-	dataGen      uint64
-	recipeName   string
-	activeRepos  string
-	candidateLen int
+	stats       *analysis.GraphStats
+	dataGen     uint64
+	recipeName  string
+	activeRepos string
+	scopeKey    string
 }
 
 // Model is the main Bubble Tea model for the beads viewer
@@ -2327,39 +2327,43 @@ type Model struct {
 	updateURL       string
 
 	// Focus and View State
-	focused                  focus
-	focusBeforeHelp          focus // Stores focus before opening help overlay
-	embeddedTextInputSession embeddedTextInputSession
-	embeddedTextInputGen     uint64
-	isSplitView              bool
-	splitViewUserOverride    bool
-	splitViewUserWant        bool
-	splitPaneRatio           float64 // Ratio of list pane width (0.2-0.8), default 0.4
-	isBoardView              bool
-	isGraphView              bool
-	isActionableView         bool
-	isHistoryView            bool
-	showDetails              bool
-	showHelp                 bool
-	helpScroll               int // Scroll offset for help overlay
-	showQuitConfirm          bool
-	ready                    bool
-	width                    int
-	height                   int
-	showLabelHealthDetail    bool
-	showLabelDrilldown       bool
-	showVelocityComparison   bool
-	labelHealthDetail        *analysis.LabelHealth
-	labelHealthDetailFlow    labelFlowSummary
-	labelDrilldownLabel      string
-	labelDrilldownIssues     []model.Issue
-	labelDrilldownCache      map[string][]model.Issue
-	showLabelGraphAnalysis   bool
-	labelGraphAnalysisResult *LabelGraphAnalysisResult
-	attentionView            AttentionModel // ] ranked label attention view (bv-117)
-	attentionCache           analysis.LabelAttentionResult
-	attentionCached          bool
-	showShortcutsSidebar     bool // bv-3qi5 toggleable shortcuts sidebar
+	focused                    focus
+	focusBeforeHelp            focus // Stores focus before opening help overlay
+	embeddedTextInputSession   embeddedTextInputSession
+	embeddedTextInputGen       uint64
+	isSplitView                bool
+	splitViewUserOverride      bool
+	splitViewUserWant          bool
+	splitPaneRatio             float64 // Ratio of list pane width (0.2-0.8), default 0.4
+	isBoardView                bool
+	isGraphView                bool
+	isActionableView           bool
+	isHistoryView              bool
+	showDetails                bool
+	showHelp                   bool
+	helpScroll                 int // Scroll offset for help overlay
+	showQuitConfirm            bool
+	ready                      bool
+	width                      int
+	height                     int
+	showLabelHealthDetail      bool
+	showLabelDrilldown         bool
+	showVelocityComparison     bool
+	labelHealthDetail          *analysis.LabelHealth
+	labelHealthDetailFlow      labelFlowSummary
+	labelHealthDetailSparkline string
+	labelHealthDetailTrendSym  string
+	labelHealthDetailAttention *analysis.LabelAttentionScore
+	labelHealthDetailCascade   *analysis.BlockageCascadeResult
+	labelDrilldownLabel        string
+	labelDrilldownIssues       []model.Issue
+	labelDrilldownCache        map[string][]model.Issue
+	showLabelGraphAnalysis     bool
+	labelGraphAnalysisResult   *LabelGraphAnalysisResult
+	attentionView              AttentionModel // ] ranked label attention view (bv-117)
+	attentionCache             analysis.LabelAttentionResult
+	attentionCached            bool
+	showShortcutsSidebar       bool // bv-3qi5 toggleable shortcuts sidebar
 
 	// Key combo state (bv-6fm0)
 	pendingComboKey   string    // Key waiting for potential combo (e.g., "g" for gg)
@@ -2520,18 +2524,21 @@ type Model struct {
 	sprintAtRiskThresholds analysis.AtRiskThresholds
 
 	// Cached dataset-level ETA context (O(1+L) per-issue forecasts on cursor move)
-	etaCtx              *analysis.ETAContext
-	etaCtxStats         *analysis.GraphStats
-	etaCtxPhase2Ready   bool
-	etaCtxDataGen       uint64
-	etaCtxScopeKey      string
-	etaCtxCount         int
-	etaCtxMinute        int64
-	boardScopedAnalyzer *analysis.Analyzer
-	boardScopedAnalysis *analysis.GraphStats
-	boardScopedStatsRef *analysis.GraphStats
-	boardScopedDataGen  uint64
-	boardScopedScopeKey string
+	etaCtx               *analysis.ETAContext
+	etaCtxStats          *analysis.GraphStats
+	etaCtxPhase2Ready    bool
+	etaCtxDataGen        uint64
+	etaCtxScopeKey       string
+	etaCtxCount          int
+	etaCtxMinute         int64
+	boardScopedAnalyzer  *analysis.Analyzer
+	boardScopedAnalysis  *analysis.GraphStats
+	boardScopedETACtx    *analysis.ETAContext
+	boardScopedPrioHints map[string]*analysis.PriorityRecommendation
+	boardScopedStatsRef  *analysis.GraphStats
+	boardScopedDataGen   uint64
+	boardScopedScopeKey  string
+	boardScopedRefNow    int64
 
 	// Concurrently readable active internal watcher/worker path for external sibling watcher Sync.
 	internalWatchedPath *atomic.Pointer[string]
@@ -3312,14 +3319,20 @@ func (m *Model) issuesForAsync() []model.Issue {
 // finish well after a snapshot swap, so an untagged result must never replace
 // the view for newer issues.
 func (m *Model) startHistoryLoad() tea.Cmd {
+	return m.startHistoryLoadForce(false)
+}
+
+func (m *Model) startHistoryLoadForce(force bool) tea.Cmd {
 	if m == nil {
 		return nil
 	}
 	// Repeated startup/snapshot notifications for the same semantic dataset
-	// share the in-flight git walk. Only a request with an owned cancellation
+	// share the in-flight git walk unless force=true (e.g. after persisting
+	// interactive correlation feedback). Only a request with an owned cancellation
 	// context is eligible: NewModel marks historyLoading before Init schedules
 	// the first real command.
-	if len(m.issues) > 0 &&
+	if !force &&
+		len(m.issues) > 0 &&
 		m.historyLoading &&
 		m.historyLoadCancel != nil &&
 		m.historyLoadDataGeneration == m.semanticDataGeneration {
@@ -4186,6 +4199,250 @@ func (m *Model) computeGlobalCapacitySummary(scoped []model.Issue, scopedStats *
 	}
 }
 
+// recordCorrelationFeedback persists interactive confirm ("+"), reject ("-"),
+// or ignore ("x") correlation feedback for the currently selected (commit, bead)
+// pair in the History view and triggers a cursor-preserving history reload (W28-1).
+func (m *Model) recordCorrelationFeedback(action string) tea.Cmd {
+	if m.timeTravelMode || strings.TrimSpace(m.asOfRevision) != "" || isHistoricalGitBeadsPath(m.beadsPath) {
+		m.statusMsg = "Correlation feedback disabled in time-travel / historical snapshot mode"
+		m.statusIsError = false
+		return nil
+	}
+	if savedConfigDisabled() {
+		m.statusMsg = "Correlation feedback persistence disabled (BV_NO_SAVED_CONFIG)"
+		m.statusIsError = false
+		return nil
+	}
+	if !m.workspaceMode && m.isExplicitDB && filepath.Base(filepath.Dir(m.beadsPath)) != ".beads" {
+		m.statusMsg = "Correlation feedback disabled for standalone --db outside a .beads directory"
+		m.statusIsError = false
+		return nil
+	}
+
+	var sha, shortSHA, beadID string
+	var origConf float64
+	if m.historyView.IsGitMode() {
+		if commit := m.historyView.SelectedGitCommit(); commit != nil {
+			sha = strings.TrimSpace(commit.SHA)
+			shortSHA = strings.TrimSpace(commit.ShortSHA)
+		}
+		beadID = strings.TrimSpace(m.historyView.SelectedRelatedBeadID())
+		if sha != "" && beadID != "" && m.historyView.report != nil {
+			if hist, ok := m.historyView.report.Histories[beadID]; ok {
+				for _, c := range hist.Commits {
+					if strings.EqualFold(c.SHA, sha) {
+						origConf = c.Confidence
+						break
+					}
+				}
+			}
+		}
+	} else {
+		if commit := m.historyView.SelectedCommit(); commit != nil {
+			sha = strings.TrimSpace(commit.SHA)
+			shortSHA = strings.TrimSpace(commit.ShortSHA)
+			origConf = commit.Confidence
+		}
+		beadID = strings.TrimSpace(m.historyView.SelectedBeadID())
+	}
+	if sha == "" || beadID == "" {
+		m.statusMsg = "❌ Select a commit and bead pair to record feedback"
+		m.statusIsError = true
+		return nil
+	}
+	if shortSHA == "" {
+		if len(sha) > 7 {
+			shortSHA = sha[:7]
+		} else {
+			shortSHA = sha
+		}
+	}
+
+	feedbackDir, localBeadID := m.resolveCorrelationFeedbackTarget(beadID)
+	if feedbackDir == "" || localBeadID == "" {
+		m.statusMsg = "❌ Correlation feedback unavailable: cannot locate target .beads directory"
+		m.statusIsError = true
+		return nil
+	}
+
+	fs := correlation.NewFeedbackStore(feedbackDir)
+	if err := fs.Load(); err != nil {
+		debug.Log("history: feedback load before write: %v", err)
+	}
+	var (
+		label   string
+		saveErr error
+	)
+	switch action {
+	case "confirm":
+		saveErr = fs.Confirm(sha, localBeadID, "tui", origConf, "confirmed in TUI")
+		label = fmt.Sprintf("✓ Confirmed correlation %s ↔ %s", shortSHA, beadID)
+	case "reject":
+		saveErr = fs.Reject(sha, localBeadID, "tui", origConf, "rejected in TUI")
+		label = fmt.Sprintf("✕ Rejected correlation %s ↔ %s", shortSHA, beadID)
+	case "ignore":
+		saveErr = fs.Ignore(sha, localBeadID, "tui", origConf, "ignored in TUI")
+		label = fmt.Sprintf("⊘ Ignored correlation %s ↔ %s", shortSHA, beadID)
+	default:
+		return nil
+	}
+	if saveErr != nil {
+		m.statusMsg = fmt.Sprintf("❌ Failed to save correlation feedback: %v", saveErr)
+		m.statusIsError = true
+		return nil
+	}
+	m.statusMsg = label
+	m.statusIsError = false
+	return m.startHistoryLoadForce(true)
+}
+
+func (m *Model) resolveCorrelationFeedbackTarget(beadID string) (feedbackDir string, localBeadID string) {
+	localBeadID = beadID
+	resolveDirPath := func(base, raw string) string {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" {
+			return ""
+		}
+		if !filepath.IsAbs(trimmed) {
+			if base != "" {
+				trimmed = filepath.Join(base, trimmed)
+			} else if strings.TrimSpace(m.workDir) != "" {
+				trimmed = filepath.Join(strings.TrimSpace(m.workDir), trimmed)
+			}
+		}
+		return filepath.Clean(trimmed)
+	}
+	effectiveDir := func(repoWorkDir, rawBeadsDir string) string {
+		trimmed := strings.TrimSpace(rawBeadsDir)
+		if trimmed == "" {
+			if repoWorkDir == "" {
+				return ""
+			}
+			return filepath.Clean(filepath.Join(repoWorkDir, ".beads"))
+		}
+		resolved := resolveDirPath(repoWorkDir, trimmed)
+		ext := strings.ToLower(filepath.Ext(resolved))
+		if ext == ".jsonl" || ext == ".db" || ext == ".sqlite" || ext == ".sqlite3" {
+			resolved = filepath.Dir(resolved)
+		} else if info, err := os.Stat(resolved); err == nil && !info.IsDir() {
+			resolved = filepath.Dir(resolved)
+		}
+		return filepath.Clean(resolved)
+	}
+
+	if m.workspaceMode {
+		if len(m.workspaceInfo.Repos) == 0 && !m.hasWorkspaceOrigins() {
+			return "", ""
+		}
+		var sourceRepo, originLocalID, originTrackerDir, originWorkDir string
+		if iss := m.issueMap[beadID]; iss != nil {
+			sourceRepo = normalizeRepoKey(iss.SourceRepo)
+			if iss.Origin != nil {
+				originLocalID = strings.TrimSpace(iss.Origin.LocalID)
+				originTrackerDir = strings.TrimSpace(iss.Origin.TrackerDirectory)
+				originWorkDir = strings.TrimSpace(iss.Origin.WorkingDirectory)
+			}
+		}
+		if originWorkDir != "" {
+			originWorkDir = resolveDirPath(strings.TrimSpace(m.workDir), originWorkDir)
+		}
+		originEffBeads := ""
+		if originTrackerDir != "" {
+			originEffBeads = effectiveDir(originWorkDir, originTrackerDir)
+		} else if originWorkDir != "" {
+			originEffBeads = effectiveDir(originWorkDir, "")
+		}
+
+		var best *WorkspaceRepoTarget
+		var bestPrefix string
+		bestPrefixLen := -1
+		for i := range m.workspaceInfo.Repos {
+			repo := &m.workspaceInfo.Repos[i]
+			repoWork := resolveDirPath(strings.TrimSpace(m.workDir), repo.Path)
+			p := strings.TrimSpace(repo.Prefix)
+			if p == "" {
+				name := strings.TrimSpace(repo.Name)
+				if name == "" && repoWork != "" {
+					name = filepath.Base(repoWork)
+				}
+				if name != "" {
+					p = strings.ToLower(name) + "-"
+				}
+			}
+			// Match loadWorkspaceHistoryAtRevisionCmd precedence: normalizeRepoKey(prefix) first, then repo.Name.
+			repoKey := normalizeRepoKey(p)
+			if repoKey == "" {
+				repoKey = normalizeRepoKey(repo.Name)
+			}
+			if sourceRepo != "" {
+				if repoKey != sourceRepo {
+					continue
+				}
+				if best == nil {
+					best = repo
+					bestPrefix = p
+				}
+				repoEffBeads := effectiveDir(repoWork, repo.BeadsDir)
+				if (originEffBeads != "" && repoEffBeads == originEffBeads) || (originWorkDir != "" && repoWork == originWorkDir) {
+					best = repo
+					bestPrefix = p
+					break
+				}
+				continue
+			}
+			if p != "" && len(beadID) > len(p) && strings.EqualFold(beadID[:len(p)], p) && len(p) > bestPrefixLen {
+				bestPrefixLen = len(p)
+				best = repo
+				bestPrefix = p
+			}
+		}
+
+		// Pinned-revision workspace repos are read-only (matching loadWorkspaceHistoryAtRevisionCmd).
+		if best != nil && strings.TrimSpace(best.Revision) != "" {
+			return "", ""
+		}
+
+		if originLocalID != "" {
+			localBeadID = originLocalID
+		} else if bestPrefix != "" && len(beadID) > len(bestPrefix) && strings.EqualFold(beadID[:len(bestPrefix)], bestPrefix) {
+			localBeadID = beadID[len(bestPrefix):]
+		} else if sourceRepo != "" {
+			if rp := ExtractRepoPrefix(beadID); rp != "" && normalizeRepoKey(rp) == sourceRepo && len(beadID) > len(rp)+1 {
+				localBeadID = beadID[len(rp)+1:]
+			}
+		}
+
+		if originEffBeads != "" {
+			return originEffBeads, localBeadID
+		}
+		if best != nil {
+			repoWork := resolveDirPath(strings.TrimSpace(m.workDir), best.Path)
+			if dir := effectiveDir(repoWork, best.BeadsDir); dir != "" {
+				return dir, localBeadID
+			}
+		}
+		return "", ""
+	}
+
+	fsBeadsPath := strings.TrimSpace(m.beadsPath)
+	if fsBeadsPath == "" {
+		return "", ""
+	}
+	repoPath := ""
+	if absPath, err := filepath.Abs(fsBeadsPath); err == nil {
+		dir := filepath.Dir(absPath)
+		if filepath.Base(dir) == ".beads" {
+			repoPath = filepath.Dir(dir)
+		} else {
+			repoPath = dir
+		}
+	}
+	if corrPath := resolveHistoryCorrelationPath(fsBeadsPath, repoPath); corrPath != "" {
+		return filepath.Dir(corrPath), localBeadID
+	}
+	return filepath.Dir(fsBeadsPath), localBeadID
+}
+
 // feedbackBeadsDir returns the target .beads directory for persisting interactive
 // triage feedback, or a human-readable refusal reason when persistence must be
 // disabled (historical/time-travel snapshots, BV_NO_SAVED_CONFIG, multi-repo workspaces,
@@ -4304,6 +4561,8 @@ func (m *Model) recordTriageFeedback(action string) {
 			rec := recs[i]
 			m.priorityHints[rec.IssueID] = &rec
 		}
+		m.boardScopedAnalyzer = nil
+		m.boardScopedPrioHints = nil
 		m.updateListDelegate()
 		if m.activeRecipe != nil && m.sortMode == SortDefault {
 			m.applyRecipe(m.activeRecipe)
@@ -4366,20 +4625,29 @@ func (m *Model) syncBoardReadinessAndFullIssues() {
 	m.board.SetFullIssues(m.issues)
 }
 
-func (m *Model) boardScopeAnalysis() (*analysis.Analyzer, *analysis.GraphStats) {
+func (m *Model) activeScopeAnalysis() (*analysis.Analyzer, *analysis.GraphStats, *analysis.ETAContext) {
 	if !m.workspaceMode || m.activeRepos == nil {
-		return m.analyzer, m.analysis
+		return m.analyzer, m.analysis, m.etaContext()
 	}
 	scopeKey := m.etaScopeKey()
+	now := m.analysisReferenceTime()
+	nowBucket := now.Unix() / 60
+	if !m.referenceNow.IsZero() || m.analyzer != nil {
+		nowBucket = now.UnixNano()
+	}
 	if m.boardScopedAnalyzer != nil &&
 		m.boardScopedStatsRef == m.analysis &&
 		m.boardScopedDataGen == m.semanticDataGeneration &&
-		m.boardScopedScopeKey == scopeKey {
-		return m.boardScopedAnalyzer, m.boardScopedAnalysis
+		m.boardScopedScopeKey == scopeKey &&
+		m.boardScopedRefNow == nowBucket {
+		return m.boardScopedAnalyzer, m.boardScopedAnalysis, m.boardScopedETACtx
 	}
 	scoped := m.repoScopedIssues()
 	an := analysis.NewAnalyzer(scoped)
-	an.SetNow(m.analysisReferenceTime())
+	if m.analyzer != nil {
+		an.RestoreScoring(m.analyzer.CaptureScoring())
+	}
+	an.SetNow(now)
 	scopedSet := make(map[string]bool, len(scoped))
 	for i := range scoped {
 		scopedSet[scoped[i].ID] = true
@@ -4400,12 +4668,33 @@ func (m *Model) boardScopeAnalysis() (*analysis.Analyzer, *analysis.GraphStats) 
 		an.SetReadinessScope(model.NewReadinessIndex(m.issues), candidates)
 	}
 	stats := an.Analyze()
+	var etaCtx *analysis.ETAContext
+	if etaScoped := m.candidateScopedIssues(); len(etaScoped) > 0 {
+		etaCtx = analysis.NewETAContext(etaScoped, &stats, now)
+	}
+	scopedRecs := an.GenerateRecommendationsFromStats(&stats, analysis.DefaultThresholds())
+	scopedHints := make(map[string]*analysis.PriorityRecommendation, len(scopedRecs))
+	for i := range scopedRecs {
+		rec := scopedRecs[i]
+		scopedHints[rec.IssueID] = &rec
+	}
 	m.boardScopedAnalyzer = an
 	m.boardScopedAnalysis = &stats
+	m.boardScopedETACtx = etaCtx
+	m.boardScopedPrioHints = scopedHints
 	m.boardScopedStatsRef = m.analysis
 	m.boardScopedDataGen = m.semanticDataGeneration
 	m.boardScopedScopeKey = scopeKey
-	return m.boardScopedAnalyzer, m.boardScopedAnalysis
+	m.boardScopedRefNow = nowBucket
+	return m.boardScopedAnalyzer, m.boardScopedAnalysis, m.boardScopedETACtx
+}
+
+func (m *Model) activeScopePriorityHints() map[string]*analysis.PriorityRecommendation {
+	if !m.workspaceMode || m.activeRepos == nil {
+		return m.priorityHints
+	}
+	_, _, _ = m.activeScopeAnalysis()
+	return m.boardScopedPrioHints
 }
 
 func (m *Model) currentAdvancedInsightsKey() advancedInsightsCacheKey {
@@ -4417,16 +4706,12 @@ func (m *Model) currentAdvancedInsightsKey() advancedInsightsCacheKey {
 	if m.workspaceMode && m.activeRepos != nil {
 		reposKey = strings.Join(sortedRepoKeys(m.activeRepos), ",")
 	}
-	candLen := -1
-	if m.candidateIDs != nil {
-		candLen = len(m.candidateIDs)
-	}
 	return advancedInsightsCacheKey{
-		stats:        m.analysis,
-		dataGen:      m.semanticDataGeneration,
-		recipeName:   recipeName,
-		activeRepos:  reposKey,
-		candidateLen: candLen,
+		stats:       m.analysis,
+		dataGen:     m.semanticDataGeneration,
+		recipeName:  recipeName,
+		activeRepos: reposKey,
+		scopeKey:    m.etaScopeKey(),
 	}
 }
 
@@ -4554,6 +4839,7 @@ func (m *Model) rebuildInsightsPanel() {
 
 	panel.SetGlobalCapacity(m.computeGlobalCapacitySummary(scoped, scopedStats))
 	panel.SetFeedbackSummary(m.feedbackSummary)
+	panel.SetPriorityHints(m.activeScopePriorityHints())
 
 	panelHeight := m.height - 2
 	if panelHeight < 3 {
@@ -8145,8 +8431,8 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 							lh := m.labelDashboard.labels[idx]
 							m.showLabelHealthDetail = true
 							m.labelHealthDetail = &lh
-							// Precompute cross-label flows for this label
-							m.labelHealthDetailFlow = m.getCrossFlowsForLabel(lh.Label)
+							// Precompute cross-label flows, 4w trend, attention & blockage cascade
+							m.populateLabelHealthDetailExtras(lh.Label)
 							return m, nil
 						}
 					}
@@ -8585,12 +8871,15 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.showVelocityComparison = false
 				m.focused = focusLabelDashboard
 				// Compute label health (fast; phase1 metrics only needed) with caching
+				scopedIssues := m.repoScopedIssues()
+				refNow := m.analysisReferenceTime().UTC()
 				if !m.labelHealthCached {
 					cfg := analysis.DefaultLabelHealthConfig()
-					m.labelHealthCache = analysis.ComputeAllLabelHealthWithScope(m.repoScopedIssues(), cfg, m.analysisReferenceTime().UTC(), m.analysis, m.exportReadiness(), m.candidateIDs)
+					m.labelHealthCache = analysis.ComputeAllLabelHealthWithScope(scopedIssues, cfg, refNow, m.analysis, m.exportReadiness(), m.candidateIDs)
 					m.labelHealthCached = true
 				}
 				m.labelDashboard.SetData(m.labelHealthCache.Labels)
+				m.labelDashboard.SetExtras(m.buildLabelDashboardExtras(scopedIssues, refNow))
 				m.labelDashboard.SetSize(m.mainContentWidth(), m.height-1)
 				m.statusMsg = fmt.Sprintf("Labels: %d total • critical %d • warning %d", m.labelHealthCache.TotalLabels, m.labelHealthCache.CriticalCount, m.labelHealthCache.WarningCount)
 				m.statusIsError = false
@@ -9693,6 +9982,12 @@ func (m *Model) handleHistoryKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 			m.statusMsg = "❌ No commit selected"
 			m.statusIsError = true
 		}
+	case "+":
+		cmd = m.recordCorrelationFeedback("confirm")
+	case "-":
+		cmd = m.recordCorrelationFeedback("reject")
+	case "x":
+		cmd = m.recordCorrelationFeedback("ignore")
 	case "c":
 		// Cycle confidence threshold (applies to both Bead Mode and Git Mode)
 		m.historyView.CycleConfidence()
@@ -10175,6 +10470,10 @@ func (m *Model) refreshTreeView() {
 	if m.timeTravelMode {
 		m.tree.SetReadOnly(true)
 	}
+	m.tree.SetWorkspaceMode(m.workspaceMode)
+	m.tree.SetPriorityHints(m.activeScopePriorityHints(), m.showPriorityHints)
+	scopeAn, scopeStats, scopeETA := m.activeScopeAnalysis()
+	m.tree.SetTelemetry(scopeAn, scopeStats, scopeETA)
 	if m.workspaceMode && m.activeRepos != nil {
 		m.tree.BuildFromIssues(m.repoScopedIssues())
 	} else if m.snapshot != nil {
@@ -10187,6 +10486,7 @@ func (m *Model) refreshTreeView() {
 
 func (m *Model) syncSecondaryViewsForRepoScope(targetFocus focus) {
 	m.labelHealthCached = false
+	m.labelDashboard.SetExtras(nil)
 	m.attentionCached = false
 	m.labelDrilldownCache = make(map[string][]model.Issue)
 
@@ -11128,17 +11428,23 @@ func (m *Model) renderMainView() (body string, overlay bool) {
 		case m.focused == focusTree:
 			// Hierarchical / blocking tree view (bv-gllx). TreeModel.View()
 			// accounts for its own header and scroll indicator within t.height.
+			m.tree.SetWorkspaceMode(m.workspaceMode)
+			scopeAn, scopeStats, scopeETA := m.activeScopeAnalysis()
+			m.tree.SetPriorityHints(m.activeScopePriorityHints(), m.showPriorityHints)
+			m.tree.SetTelemetry(scopeAn, scopeStats, scopeETA)
 			m.tree.SetSize(bodyWidth, max(bodyHeight, 1))
 			body = m.tree.View()
 		case m.isGraphView:
-			m.graphView.SetAnalyzer(m.analyzer, m.analysisReferenceTime)
-			m.graphView.SetETAContext(m.etaContext())
+			graphAn, _, graphETA := m.activeScopeAnalysis()
+			m.graphView.SetAnalyzer(graphAn, m.analysisReferenceTime)
+			m.graphView.SetETAContext(graphETA)
+			m.graphView.SetPriorityHints(m.activeScopePriorityHints())
 			body = m.graphView.View(bodyWidth, bodyHeight)
 		case m.isBoardView:
-			boardAn, boardStats := m.boardScopeAnalysis()
+			boardAn, boardStats, boardETA := m.activeScopeAnalysis()
 			m.board.SetAnalyzer(boardAn)
 			m.board.SetAnalysis(boardStats)
-			m.board.SetETAContext(m.etaContext())
+			m.board.SetETAContext(boardETA)
 			m.board.SetSize(bodyWidth, bodyHeight)
 			body = m.board.View(bodyWidth, bodyHeight)
 		case m.isActionableView:
@@ -11977,6 +12283,21 @@ func (m *Model) renderLabelHealthDetail(lh analysis.LabelHealth) string {
 	sb.WriteString(valStyle.Render(fmt.Sprintf("%d/100 (7d=%d, 30d=%d, avg_close=%.1fd, trend=%s %.1f%%)", lh.Velocity.VelocityScore, lh.Velocity.ClosedLast7Days, lh.Velocity.ClosedLast30Days, lh.Velocity.AvgDaysToClose, lh.Velocity.TrendDirection, lh.Velocity.TrendPercent)))
 	sb.WriteString("\n")
 	sb.WriteString(bar(lh.Velocity.VelocityScore))
+	if m.labelHealthDetailSparkline != "" || (m.labelHealthDetailAttention != nil && m.labelHealthDetailAttention.Rank > 0) {
+		sb.WriteString("\n")
+		var parts []string
+		if m.labelHealthDetailSparkline != "" {
+			trendText := m.labelHealthDetailSparkline
+			if m.labelHealthDetailTrendSym != "" {
+				trendText += " " + m.labelHealthDetailTrendSym
+			}
+			parts = append(parts, labelStyle.Render("4w Trend: ")+valStyle.Render(trendText))
+		}
+		if attn := m.labelHealthDetailAttention; attn != nil && attn.Rank > 0 {
+			parts = append(parts, labelStyle.Render("Attention: ")+valStyle.Render(fmt.Sprintf("#%d (%.2f, norm %.2f)", attn.Rank, attn.AttentionScore, attn.NormalizedScore)))
+		}
+		sb.WriteString(strings.Join(parts, valStyle.Render("  •  ")))
+	}
 	sb.WriteString("\n\n")
 
 	sb.WriteString(labelStyle.Render("Freshness: "))
@@ -11999,18 +12320,61 @@ func (m *Model) renderLabelHealthDetail(lh analysis.LabelHealth) string {
 	sb.WriteString(bar(lh.Flow.FlowScore))
 	sb.WriteString("\n\n")
 
+	// Blockage Cascade Tree (when this label has blocked work cascading downstream)
+	if cascade := m.labelHealthDetailCascade; cascade != nil && (cascade.TotalImpact > 0 || len(cascade.CascadeLevels) > 0) {
+		treeStr := strings.TrimSpace(cascade.FormatCascadeTree())
+		if treeStr != "" {
+			sb.WriteString(labelStyle.Render("Blockage Cascade:"))
+			sb.WriteString("\n")
+			treeLines := strings.Split(treeStr, "\n")
+			maxCascadeLines := 8
+			if m.height <= 32 {
+				maxCascadeLines = 4
+			}
+			for idx, ln := range treeLines {
+				if idx >= maxCascadeLines {
+					sb.WriteString(valStyle.Render(fmt.Sprintf("  … (+%d more lines)", len(treeLines)-maxCascadeLines)))
+					sb.WriteString("\n")
+					break
+				}
+				sb.WriteString(valStyle.Render(ansi.Truncate(ln, innerWidth, "…")))
+				sb.WriteString("\n")
+			}
+			sb.WriteString("\n")
+		}
+	}
+
 	// Cross-Label Flow Table (incoming/outgoing dependencies)
 	if len(m.labelHealthDetailFlow.Incoming) > 0 || len(m.labelHealthDetailFlow.Outgoing) > 0 {
 		sb.WriteString(labelStyle.Render("Cross-label deps:"))
 		sb.WriteString("\n")
-
-		if in := flowList("  Incoming", m.labelHealthDetailFlow.Incoming, "←"); in != "" {
-			sb.WriteString(in)
+		if m.height <= 36 {
+			formatInlineFlow := func(prefix, arrow string, items []labelCount) string {
+				if len(items) == 0 {
+					return ""
+				}
+				limit := min(4, len(items))
+				parts := make([]string, 0, limit+1)
+				for i := 0; i < limit; i++ {
+					parts = append(parts, fmt.Sprintf("%s %s (%d)", arrow, items[i].Label, items[i].Count))
+				}
+				if len(items) > limit {
+					parts = append(parts, fmt.Sprintf("+%d more", len(items)-limit))
+				}
+				return labelStyle.Render("  "+prefix+": ") + valStyle.Render(ansi.Truncate(strings.Join(parts, ", "), max(10, innerWidth-len(prefix)-4), "…")) + "\n"
+			}
+			sb.WriteString(formatInlineFlow("In", "←", m.labelHealthDetailFlow.Incoming))
+			sb.WriteString(formatInlineFlow("Out", "→", m.labelHealthDetailFlow.Outgoing))
 			sb.WriteString("\n")
-		}
-		if out := flowList("  Outgoing", m.labelHealthDetailFlow.Outgoing, "→"); out != "" {
-			sb.WriteString(out)
-			sb.WriteString("\n")
+		} else {
+			if in := flowList("  Incoming", m.labelHealthDetailFlow.Incoming, "←"); in != "" {
+				sb.WriteString(in)
+				sb.WriteString("\n")
+			}
+			if out := flowList("  Outgoing", m.labelHealthDetailFlow.Outgoing, "→"); out != "" {
+				sb.WriteString(out)
+				sb.WriteString("\n")
+			}
 		}
 	}
 
@@ -14251,41 +14615,221 @@ func (m *Model) updateViewportContent() {
 		sb.WriteString("\n")
 	}
 
-	// Triage Insights (bv-151)
-	if issueItem.TriageScore > 0 || issueItem.TriageReason != "" || issueItem.UnblocksCount > 0 || issueItem.IsQuickWin || issueItem.IsBlocker {
+	// Triage Insights (bv-151) + Priority Misalignment Reasoning & Risk Signals (W28-2)
+	repoScoped := m.workspaceMode && m.activeRepos != nil
+	var scopeAn *analysis.Analyzer
+	var scopeStats *analysis.GraphStats
+	var etaCtx *analysis.ETAContext
+	var scopeWhatIf *analysis.WhatIfResult
+	if !isClosedLikeStatus(item.Status) {
+		scopeAn, scopeStats, etaCtx = m.activeScopeAnalysis()
+		if scopeAn != nil && scopeStats != nil {
+			scopeWhatIf = scopeAn.ComputeWhatIf(item.ID, scopeStats)
+		}
+	}
+
+	containsHiddenRepoID := func(text string) bool {
+		if !repoScoped || text == "" {
+			return false
+		}
+		isIDChar := func(b byte) bool {
+			return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '-' || b == '_' || b == '.'
+		}
+		for i := range m.issues {
+			iss := &m.issues[i]
+			if iss.ID == "" {
+				continue
+			}
+			rk := issueRepoKey(*iss)
+			if rk == "" || m.activeRepos[rk] {
+				continue
+			}
+			start := 0
+			for {
+				idx := strings.Index(text[start:], iss.ID)
+				if idx < 0 {
+					break
+				}
+				abs := start + idx
+				end := abs + len(iss.ID)
+				leftOK := abs == 0 || !isIDChar(text[abs-1])
+				rightOK := end == len(text) || !isIDChar(text[end])
+				if leftOK && rightOK {
+					return true
+				}
+				start = abs + 1
+			}
+		}
+		return false
+	}
+
+	var detailPrioHint *analysis.PriorityRecommendation
+	var detailPrioReasons []string
+	var detailRisk analysis.RiskSignals
+	hasDetailRisk := false
+	if !isClosedLikeStatus(item.Status) {
+		activeHints := m.activeScopePriorityHints()
+		if h := activeHints[item.ID]; h != nil && h.SuggestedPriority != item.Priority {
+			detailPrioHint = h
+			for _, r := range h.Reasoning {
+				if !containsHiddenRepoID(r) {
+					detailPrioReasons = append(detailPrioReasons, r)
+				}
+			}
+		}
+		riskStats := m.analysis
+		if repoScoped && scopeStats != nil {
+			riskStats = scopeStats
+		}
+		if riskStats != nil {
+			depMap := make(map[string]model.Issue, len(item.Dependencies)+1)
+			depMap[item.ID] = item
+			for _, dep := range item.Dependencies {
+				if dep == nil || dep.DependsOnID == "" {
+					continue
+				}
+				if blk := m.issueMap[dep.DependsOnID]; blk != nil {
+					if repoScoped {
+						if rk := issueRepoKey(*blk); rk != "" && !m.activeRepos[rk] {
+							continue
+						}
+					}
+					depMap[blk.ID] = *blk
+				}
+			}
+			var readiness *model.ReadinessIndex
+			if repoScoped && scopeAn != nil {
+				readiness = scopeAn.Readiness()
+			} else if m.analyzer != nil {
+				readiness = m.analyzer.Readiness()
+			}
+			detailRisk = analysis.ComputeRiskSignalsWithReadiness(&item, riskStats, depMap, readiness, m.analysisReferenceTime(), analysis.DefaultRiskWeights())
+			hasDetailRisk = detailRisk.CompositeRisk > 0.25 || detailRisk.CrossRepoRisk > 0 || detailRisk.FanVariance > 0.3 || detailRisk.ActivityChurn > 0.3
+		}
+	}
+
+	triageUnblocksCount := issueItem.UnblocksCount
+	triageIsBlocker := issueItem.IsBlocker
+	triageReason := issueItem.TriageReason
+	triageReasons := issueItem.TriageReasons
+	if repoScoped {
+		if scopeWhatIf != nil {
+			triageUnblocksCount = scopeWhatIf.Delta.DirectUnblocks
+		} else {
+			triageUnblocksCount = 0
+		}
+		triageIsBlocker = issueItem.IsBlocker && triageUnblocksCount > 0
+
+		isStaleUnblocksReason := func(r string) bool {
+			return containsHiddenRepoID(r) || strings.Contains(r, "Unblocks ") || strings.Contains(r, "unblocks ")
+		}
+		var scopedUnblocksLine string
+		if triageUnblocksCount > 0 && scopeWhatIf != nil && len(scopeWhatIf.Delta.UnblockedIssueIDs) > 0 {
+			shown := scopeWhatIf.Delta.UnblockedIssueIDs
+			if len(shown) > 3 {
+				shown = shown[:3]
+			}
+			scopedUnblocksLine = fmt.Sprintf("🔓 Unblocks %d item(s): %s", triageUnblocksCount, strings.Join(shown, ", "))
+		}
+		filteredReasons := make([]string, 0, len(issueItem.TriageReasons))
+		addedScopedUnblocks := false
+		for _, r := range issueItem.TriageReasons {
+			if isStaleUnblocksReason(r) {
+				if scopedUnblocksLine != "" && !addedScopedUnblocks && (strings.Contains(r, "Unblocks ") || strings.Contains(r, "unblocks ")) {
+					filteredReasons = append(filteredReasons, scopedUnblocksLine)
+					addedScopedUnblocks = true
+				}
+				continue
+			}
+			filteredReasons = append(filteredReasons, r)
+		}
+		triageReasons = filteredReasons
+		if isStaleUnblocksReason(triageReason) {
+			if scopedUnblocksLine != "" && (strings.Contains(triageReason, "Unblocks ") || strings.Contains(triageReason, "unblocks ")) {
+				triageReason = scopedUnblocksLine
+			} else if len(triageReasons) > 0 {
+				triageReason = triageReasons[0]
+			} else {
+				triageReason = ""
+			}
+		}
+	}
+
+	if issueItem.TriageScore > 0 || triageReason != "" || triageUnblocksCount > 0 || issueItem.IsQuickWin || triageIsBlocker || detailPrioHint != nil || hasDetailRisk {
 		sb.WriteString("### 🎯 Triage Insights\n")
 
 		// Score with visual indicator
-		scoreIcon := "🔵"
-		if issueItem.TriageScore >= 0.7 {
-			scoreIcon = "🔴"
-		} else if issueItem.TriageScore >= 0.4 {
-			scoreIcon = "🟠"
+		if issueItem.TriageScore > 0 {
+			scoreIcon := "🔵"
+			if issueItem.TriageScore >= 0.7 {
+				scoreIcon = "🔴"
+			} else if issueItem.TriageScore >= 0.4 {
+				scoreIcon = "🟠"
+			}
+			sb.WriteString(fmt.Sprintf("- **Triage Score:** %s %.2f/1.00\n", scoreIcon, issueItem.TriageScore))
 		}
-		sb.WriteString(fmt.Sprintf("- **Triage Score:** %s %.2f/1.00\n", scoreIcon, issueItem.TriageScore))
+
+		// Priority Misalignment Hint + Reasoning
+		if detailPrioHint != nil {
+			arrow := "↓"
+			if detailPrioHint.Direction == "increase" {
+				arrow = "↑"
+			}
+			reasonTxt := ""
+			if len(detailPrioReasons) > 0 {
+				reasonTxt = " — " + strings.Join(detailPrioReasons[:min(2, len(detailPrioReasons))], "; ")
+			}
+			sb.WriteString(fmt.Sprintf("- **Priority Hint:** %s Suggest **P%d → P%d** (%.0f%% conf)%s\n",
+				arrow, detailPrioHint.CurrentPriority, detailPrioHint.SuggestedPriority, detailPrioHint.Confidence*100, reasonTxt))
+		}
+
+		// Operational Risk Signals Breakdown
+		if hasDetailRisk {
+			var subParts []string
+			if detailRisk.FanVariance > 0 {
+				subParts = append(subParts, fmt.Sprintf("fan %.0f%%", detailRisk.FanVariance*100))
+			}
+			if detailRisk.ActivityChurn > 0 {
+				subParts = append(subParts, fmt.Sprintf("churn %.0f%%", detailRisk.ActivityChurn*100))
+			}
+			if detailRisk.CrossRepoRisk > 0 {
+				subParts = append(subParts, fmt.Sprintf("cross-repo %.0f%%", detailRisk.CrossRepoRisk*100))
+			}
+			if detailRisk.StatusRisk > 0 {
+				subParts = append(subParts, fmt.Sprintf("status %.0f%%", detailRisk.StatusRisk*100))
+			}
+			riskLine := fmt.Sprintf("- **⚠️ Risk Signals:** %.0f%%", detailRisk.CompositeRisk*100)
+			if detailRisk.Explanation != "" {
+				riskLine += " — " + detailRisk.Explanation
+			}
+			if len(subParts) > 0 {
+				riskLine += " (" + strings.Join(subParts, " • ") + ")"
+			}
+			sb.WriteString(riskLine + "\n")
+		}
 
 		// Special flags
 		if issueItem.IsQuickWin {
 			sb.WriteString("- **⭐ Quick Win** — Low effort, high impact opportunity\n")
 		}
-		if issueItem.IsBlocker {
+		if triageIsBlocker {
 			sb.WriteString("- **🔴 Critical Blocker** — Completing this unblocks significant downstream work\n")
 		}
 
 		// Unblocks count
-		if issueItem.UnblocksCount > 0 {
-			sb.WriteString(fmt.Sprintf("- **🔓 Unblocks:** %d downstream items when completed\n", issueItem.UnblocksCount))
+		if triageUnblocksCount > 0 {
+			sb.WriteString(fmt.Sprintf("- **🔓 Unblocks:** %d downstream items when completed\n", triageUnblocksCount))
 		}
 
 		// Primary reason
-		if issueItem.TriageReason != "" {
-			sb.WriteString(fmt.Sprintf("- **Primary Reason:** %s\n", issueItem.TriageReason))
+		if triageReason != "" {
+			sb.WriteString(fmt.Sprintf("- **Primary Reason:** %s\n", triageReason))
 		}
 
 		// All reasons (if multiple)
-		if len(issueItem.TriageReasons) > 1 {
+		if len(triageReasons) > 1 {
 			sb.WriteString("- **All Reasons:**\n")
-			for _, reason := range issueItem.TriageReasons {
+			for _, reason := range triageReasons {
 				sb.WriteString(fmt.Sprintf("  - %s\n", reason))
 			}
 		}
@@ -14342,16 +14886,12 @@ func (m *Model) updateViewportContent() {
 	// What-If Impact & ETA Forecast (open issues only, placed below Description so
 	// primary issue prose remains above the fold on compact split-view terminals)
 	if !isClosedLikeStatus(item.Status) {
-		var whatIf *analysis.WhatIfResult
-		if m.analyzer != nil && m.analysis != nil {
-			whatIf = m.analyzer.ComputeWhatIf(item.ID, m.analysis)
-		}
-		etaCtx := m.etaContext()
+		whatIf := scopeWhatIf
 		var eta analysis.ETAEstimate
 		hasETA := false
-		if etaCtx != nil {
+		if etaCtx != nil && !item.IsTemplate && !item.Pinned && item.Status != model.StatusPinned {
 			eta = etaCtx.EstimateForIssue(item, 1)
-			hasETA = true
+			hasETA = eta.EstimatedDays > 0 && !eta.ETADate.IsZero()
 		}
 		hasWhatIf := whatIf != nil && (whatIf.Delta.DirectUnblocks > 0 || whatIf.Delta.TransitiveUnblocks > 0)
 		if hasWhatIf || hasETA {
@@ -14399,21 +14939,25 @@ func (m *Model) updateViewportContent() {
 	// Structural Graph Metrics (Active K-Core, Active Schedule Slack, Active Cut Vertex) —
 	// suppressed for closed/tombstoned issues and placed below Description so primary issue
 	// prose remains above the fold on compact terminals.
-	if m.analysis != nil && m.analysis.IsPhase2Ready() && !isClosedLikeStatus(item.Status) {
+	structStats := m.analysis
+	if repoScoped && scopeStats != nil {
+		structStats = scopeStats
+	}
+	if structStats != nil && structStats.IsPhase2Ready() && !isClosedLikeStatus(item.Status) {
 		structParts := make([]string, 0, 3)
-		if coreMap := m.analysis.ActiveCoreNumber(); coreMap != nil {
+		if coreMap := structStats.ActiveCoreNumber(); coreMap != nil {
 			if kcore, ok := coreMap[item.ID]; ok && kcore > 0 {
 				structParts = append(structParts, fmt.Sprintf("**K-Core:** `%d`", kcore))
 			}
 		}
-		if len(m.analysis.Cycles()) == 0 {
-			if slackMap := m.analysis.ActiveSlack(); slackMap != nil {
+		if len(structStats.Cycles()) == 0 {
+			if slackMap := structStats.ActiveSlack(); slackMap != nil {
 				if sl, ok := slackMap[item.ID]; ok {
 					structParts = append(structParts, fmt.Sprintf("**Slack:** `%.1f`", sl))
 				}
 			}
 		}
-		for _, ap := range m.analysis.ActiveArticulationPoints() {
+		for _, ap := range structStats.ActiveArticulationPoints() {
 			if ap == item.ID {
 				structParts = append(structParts, "**Cut Vertex:** ⚠ Articulation Point")
 				break
@@ -14527,37 +15071,61 @@ func (m *Model) updateViewportContent() {
 		if activeBlk+resolvedBlk > 0 {
 			sb.WriteString(fmt.Sprintf("### Blocking Dependencies (%d active, %d resolved)\n", activeBlk, resolvedBlk))
 			seenDep := make(map[string]bool, len(item.Dependencies))
+			hiddenActive, hiddenResolved := 0, 0
 			for _, dep := range item.Dependencies {
 				if dep == nil || !dep.Type.IsBlocking() || dep.DependsOnID == "" || seenDep[dep.DependsOnID] {
 					continue
 				}
 				seenDep[dep.DependsOnID] = true
+				unsatisfied := m.isIssueBlockerUnsatisfied(item.ID, dep.DependsOnID)
 				stateTag := "resolved"
-				if m.isIssueBlockerUnsatisfied(item.ID, dep.DependsOnID) {
+				if unsatisfied {
 					stateTag = "active"
 				}
-				if blk := m.issueMap[dep.DependsOnID]; blk != nil {
+				blk := m.issueMap[dep.DependsOnID]
+				if m.workspaceMode && m.activeRepos != nil {
+					hidden := blk == nil
+					if !hidden {
+						if rk := issueRepoKey(*blk); rk != "" && !m.activeRepos[rk] {
+							hidden = true
+						}
+					}
+					if hidden {
+						if unsatisfied {
+							hiddenActive++
+						} else {
+							hiddenResolved++
+						}
+						continue
+					}
+				}
+				if blk != nil {
 					fmt.Fprintf(&sb, "- %s **%s** (%s) — *%s* (%s)\n",
 						GetStatusIcon(string(blk.Status)), blk.ID, blk.Status, stateTag, truncateRunesHelper(blk.Title, 48, "..."))
 				} else {
 					fmt.Fprintf(&sb, "- ❓ **%s** — *%s*\n", dep.DependsOnID, stateTag)
 				}
 			}
+			if hiddenActive+hiddenResolved > 0 {
+				fmt.Fprintf(&sb, "- *…and %d out-of-scope blocker(s) (%d active, %d resolved)*\n",
+					hiddenActive+hiddenResolved, hiddenActive, hiddenResolved)
+			}
 			sb.WriteString("\n")
 		}
 		treeMap := m.issueMap
 		if m.candidateIDs != nil || (m.workspaceMode && m.activeRepos != nil) {
+			repoScoped := m.workspaceMode && m.activeRepos != nil
 			treeMap = make(map[string]*model.Issue, len(m.issueMap))
 			for id, iss := range m.issueMap {
 				if iss == nil {
 					continue
 				}
-				if m.workspaceMode && m.activeRepos != nil {
+				if repoScoped {
 					if rk := issueRepoKey(*iss); rk != "" && !m.activeRepos[rk] {
 						continue
 					}
 				}
-				if id != item.ID && len(iss.Dependencies) > 0 {
+				if (repoScoped || id != item.ID) && len(iss.Dependencies) > 0 {
 					cloned := *iss
 					kept := make([]*model.Dependency, 0, len(iss.Dependencies))
 					for _, dep := range iss.Dependencies {
@@ -14568,7 +15136,7 @@ func (m *Model) updateViewportContent() {
 						if !exists || target == nil {
 							continue
 						}
-						if m.workspaceMode && m.activeRepos != nil {
+						if repoScoped {
 							if rk := issueRepoKey(*target); rk != "" && !m.activeRepos[rk] {
 								continue
 							}
@@ -17430,6 +17998,119 @@ func (m *Model) refreshActionableView() {
 	}
 }
 
+// buildLabelDashboardExtras computes scoped 4-week velocity sparklines and attention ranks
+// for the Label Dashboard table (W28-5).
+func (m *Model) buildLabelDashboardExtras(scopedIssues []model.Issue, refNow time.Time) map[string]labelDashboardExtra {
+	extras := make(map[string]labelDashboardExtra)
+	trendByLabel := make(map[string]string, len(m.labelHealthCache.Labels))
+	for _, lh := range m.labelHealthCache.Labels {
+		trendByLabel[lh.Label] = lh.Velocity.TrendDirection
+	}
+	velIssues := m.candidateScopedIssues()
+	if len(velIssues) == 0 {
+		velIssues = scopedIssues
+	}
+	histVel := analysis.ComputeAllHistoricalVelocity(velIssues, 4, refNow)
+	for _, lv := range histVel {
+		var counts []int
+		maxVal := 0
+		for i := len(lv.WeeklyVelocity) - 1; i >= 0; i-- {
+			c := lv.WeeklyVelocity[i].Closed
+			counts = append(counts, c)
+			if c > maxVal {
+				maxVal = c
+			}
+		}
+		sym := "→"
+		switch trendByLabel[lv.Label] {
+		case "improving", "accelerating":
+			sym = "↗"
+		case "declining", "decelerating":
+			sym = "↘"
+		case "erratic":
+			sym = "~"
+		}
+		e := extras[lv.Label]
+		e.Sparkline = buildSparkline(counts, maxVal)
+		e.TrendSymbol = sym
+		extras[lv.Label] = e
+	}
+	cfg := analysis.DefaultLabelHealthConfig()
+	attn := analysis.ComputeLabelAttentionScoresWithScope(scopedIssues, cfg, refNow, m.exportReadiness(), m.candidateIDs)
+	for _, a := range attn.Labels {
+		e := extras[a.Label]
+		e.AttentionRank = a.Rank
+		e.AttentionScore = a.NormalizedScore
+		extras[a.Label] = e
+	}
+	return extras
+}
+
+// populateLabelHealthDetailExtras computes cross-label flow, 4-week sparkline, attention rank,
+// and blockage cascade tree for the selected label health detail modal (W28-5).
+func (m *Model) populateLabelHealthDetailExtras(label string) {
+	m.labelHealthDetailFlow = m.getCrossFlowsForLabel(label)
+	m.labelHealthDetailSparkline = ""
+	m.labelHealthDetailTrendSym = ""
+	m.labelHealthDetailAttention = nil
+	m.labelHealthDetailCascade = nil
+
+	scopedIssues := m.repoScopedIssues()
+	refNow := m.analysisReferenceTime().UTC()
+	cfg := analysis.DefaultLabelHealthConfig()
+	velIssues := m.candidateScopedIssues()
+	if len(velIssues) == 0 {
+		velIssues = scopedIssues
+	}
+	trendDir := ""
+	if m.labelHealthDetail != nil && m.labelHealthDetail.Label == label {
+		trendDir = m.labelHealthDetail.Velocity.TrendDirection
+	}
+	for _, lv := range analysis.ComputeAllHistoricalVelocity(velIssues, 4, refNow) {
+		if lv.Label != label {
+			continue
+		}
+		var counts []int
+		maxVal := 0
+		for i := len(lv.WeeklyVelocity) - 1; i >= 0; i-- {
+			c := lv.WeeklyVelocity[i].Closed
+			counts = append(counts, c)
+			if c > maxVal {
+				maxVal = c
+			}
+		}
+		m.labelHealthDetailSparkline = buildSparkline(counts, maxVal)
+		switch trendDir {
+		case "improving", "accelerating":
+			m.labelHealthDetailTrendSym = "↗"
+		case "declining", "decelerating":
+			m.labelHealthDetailTrendSym = "↘"
+		case "erratic":
+			m.labelHealthDetailTrendSym = "~"
+		default:
+			m.labelHealthDetailTrendSym = "→"
+		}
+		break
+	}
+	attn := analysis.ComputeLabelAttentionScoresWithScope(scopedIssues, cfg, refNow, m.exportReadiness(), m.candidateIDs)
+	for i := range attn.Labels {
+		if attn.Labels[i].Label == label {
+			entry := attn.Labels[i]
+			m.labelHealthDetailAttention = &entry
+			break
+		}
+	}
+	flow := analysis.ComputeCrossLabelFlowWithScope(scopedIssues, cfg, m.candidateIDs)
+	cascades := analysis.ComputeBlockageCascadeAtWithScope(scopedIssues, flow, cfg, refNow, m.exportReadiness(), m.candidateIDs)
+	for i := range cascades.Cascades {
+		if cascades.Cascades[i].SourceLabel == label {
+			c := cascades.Cascades[i]
+			m.labelHealthDetailCascade = &c
+			break
+		}
+	}
+}
+
 // refreshLabelViews refreshes active label dashboard, health detail, drilldown,
 // and velocity comparison sub-views when underlying data or Phase 2 metrics update.
 func (m *Model) refreshLabelViews(underlyingFocus focus) {
@@ -17445,6 +18126,7 @@ func (m *Model) refreshLabelViews(underlyingFocus focus) {
 		m.labelHealthCache = analysis.ComputeAllLabelHealthWithScope(scopedIssues, cfg, refNow, m.analysis, m.exportReadiness(), m.candidateIDs)
 		m.labelHealthCached = true
 		m.labelDashboard.SetData(m.labelHealthCache.Labels)
+		m.labelDashboard.SetExtras(m.buildLabelDashboardExtras(scopedIssues, refNow))
 		m.labelDashboard.SetSize(m.mainContentWidth(), m.height-1)
 	}
 	if m.showLabelHealthDetail && m.labelHealthDetail != nil {
@@ -17459,10 +18141,14 @@ func (m *Model) refreshLabelViews(underlyingFocus focus) {
 		}
 		if updated != nil {
 			m.labelHealthDetail = updated
-			m.labelHealthDetailFlow = m.getCrossFlowsForLabel(target)
+			m.populateLabelHealthDetailExtras(target)
 		} else {
 			m.showLabelHealthDetail = false
 			m.labelHealthDetail = nil
+			m.labelHealthDetailSparkline = ""
+			m.labelHealthDetailTrendSym = ""
+			m.labelHealthDetailAttention = nil
+			m.labelHealthDetailCascade = nil
 		}
 	}
 	if m.showLabelDrilldown && m.labelDrilldownLabel != "" {
@@ -18056,18 +18742,89 @@ func (m *Model) renderAlertsPanel() string {
 		headerRendered = titleStyle.Render("🔔 Alerts Panel  " + activeTabStyle.Render("["+alertTabLabel+"]") + "  │  " + inactiveTabStyle.Render(suggTabLabel))
 	}
 	headerPlain := ansi.Strip(headerRendered)
-	sb.WriteString(headerRendered)
-	sb.WriteString("\n\n")
+	compactFooter := "Tab • j/k • Esc: close"
+	if lipgloss.Width(compactFooter) > innerWidth {
+		compactFooter = "j/k • Esc: close"
+	}
+	if lipgloss.Width(compactFooter) > innerWidth {
+		compactFooter = "Esc: close"
+	}
+	compactFooter = ansi.Truncate(compactFooter, innerWidth, "…")
+	writeChrome := func(summaryPlain string, summaryStyle lipgloss.Style) (lineBudget int, footerSep string) {
+		hdr := headerRendered
+		hdrPlain := headerPlain
+		sumPlain := summaryPlain
+		hdrSep := "\n\n"
+		sumSep := "\n\n"
+		footerSep = "\n"
+		calcChrome := func() int {
+			hBlank := 1
+			if hdrSep == "\n" {
+				hBlank = 0
+			}
+			sBlank := 1
+			if sumSep == "\n" {
+				sBlank = 0
+			}
+			fBlank := 1
+			if footerSep == "" {
+				fBlank = 0
+			}
+			return 4 +
+				(wrappedAlertTextLines(hdrPlain, innerWidth) + hBlank) +
+				(wrappedAlertTextLines(sumPlain, innerWidth) + sBlank) +
+				(fBlank + wrappedAlertTextLines(footerText, innerWidth))
+		}
+		chrome := calcChrome()
+		if maxBoxHeight-chrome < 1 {
+			hdrPlain = ansi.Truncate(hdrPlain, innerWidth, "…")
+			hdr = titleStyle.Render(hdrPlain)
+			sumPlain = ansi.Truncate(sumPlain, innerWidth, "…")
+			footerText = compactFooter
+			chrome = calcChrome()
+		}
+		if maxBoxHeight-chrome < 1 {
+			hdrSep = "\n"
+			sumSep = "\n"
+			footerSep = ""
+			chrome = calcChrome()
+		}
+		sb.WriteString(hdr)
+		sb.WriteString(hdrSep)
+		if sumPlain != "" {
+			sb.WriteString(summaryStyle.Render(sumPlain))
+			sb.WriteString(sumSep)
+		}
+		return max(1, maxBoxHeight-chrome), footerSep
+	}
+
+	writeEmptyState := func(msg string) string {
+		msgLines := wrappedAlertTextLines(msg, innerWidth)
+		fullHeight := 4 + wrappedAlertTextLines(headerPlain, innerWidth) + 2 + msgLines + 2 + wrappedAlertTextLines(footerText, innerWidth)
+		if fullHeight <= maxBoxHeight {
+			sb.WriteString(headerRendered)
+			sb.WriteString("\n\n")
+			sb.WriteString(t.Renderer.NewStyle().Foreground(ColorSuccess).Render(msg))
+			sb.WriteString("\n\n")
+			return "\n"
+		}
+		sb.WriteString(titleStyle.Render(ansi.Truncate(headerPlain, innerWidth, "…")))
+		sb.WriteString("\n")
+		sb.WriteString(t.Renderer.NewStyle().Foreground(ColorSuccess).Render(ansi.Truncate(msg, innerWidth, "…")))
+		sb.WriteString("\n")
+		footerText = compactFooter
+		return ""
+	}
 
 	if m.alertsTab == 1 {
+		footerSep := "\n"
 		if len(suggestions) == 0 {
-			sb.WriteString(t.Renderer.NewStyle().Foreground(ColorSuccess).Render("✓ No hygiene suggestions"))
-			sb.WriteString("\n\n")
+			footerSep = writeEmptyState("✓ No hygiene suggestions")
 		} else {
 			summaryStyle := t.Renderer.NewStyle().Foreground(t.Secondary)
 			summaryText := fmt.Sprintf("%d hygiene suggestion(s)", len(suggestions))
-			sb.WriteString(summaryStyle.Render(summaryText))
-			sb.WriteString("\n\n")
+			var lineBudget int
+			lineBudget, footerSep = writeChrome(summaryText, summaryStyle)
 			totalS := len(suggestions)
 			cur := m.suggestionsCursor
 			if cur < 0 {
@@ -18125,12 +18882,6 @@ func (m *Model) renderAlertsPanel() string {
 				}
 				return n
 			}
-
-			chromeLines := 4 +
-				(wrappedAlertTextLines(headerPlain, innerWidth) + 1) +
-				(wrappedAlertTextLines(summaryText, innerWidth) + 1) +
-				(1 + wrappedAlertTextLines(footerText, innerWidth))
-			lineBudget := max(1, maxBoxHeight-chromeLines)
 
 			startIdx := cur
 			endIdx := cur + 1
@@ -18234,15 +18985,15 @@ func (m *Model) renderAlertsPanel() string {
 			}
 		}
 
-		sb.WriteString("\n")
+		sb.WriteString(footerSep)
 		sb.WriteString(t.Renderer.NewStyle().Foreground(t.Muted).Italic(true).Render(footerText))
 		content := boxStyle.Render(sb.String())
 		return lipgloss.Place(m.width, m.height-1, lipgloss.Center, lipgloss.Center, content)
 	}
 
+	alertFooterSep := "\n"
 	if len(visibleAlerts) == 0 {
-		sb.WriteString(t.Renderer.NewStyle().Foreground(ColorSuccess).Render("✓ No active alerts"))
-		sb.WriteString("\n\n")
+		alertFooterSep = writeEmptyState("✓ No active alerts")
 	} else {
 		// Summary line computed dynamically from visibleAlerts
 		critical, warning, info := 0, 0, 0
@@ -18267,8 +19018,8 @@ func (m *Model) renderAlertsPanel() string {
 		if info > 0 {
 			summary += fmt.Sprintf(" • %d info", info)
 		}
-		sb.WriteString(summaryStyle.Render(summary))
-		sb.WriteString("\n\n")
+		var lineBudget int
+		lineBudget, alertFooterSep = writeChrome(summary, summaryStyle)
 
 		// Window alerts by rendered line height around m.alertsCursor so multi-line
 		// alerts and expanded selected details never push cursor or footer past MaxHeight.
@@ -18280,12 +19031,6 @@ func (m *Model) renderAlertsPanel() string {
 		if cursorIdx >= totalAlerts {
 			cursorIdx = totalAlerts - 1
 		}
-		// Chrome inside MaxHeight: border(2) + padding(2) + title(+1 blank) + summary(+1) + blank+footer.
-		chromeLines := 4 +
-			(wrappedAlertTextLines(headerPlain, innerWidth) + 1) +
-			(wrappedAlertTextLines(summary, innerWidth) + 1) +
-			(1 + wrappedAlertTextLines(footerText, innerWidth))
-		lineBudget := max(1, maxBoxHeight-chromeLines)
 
 		startIdx := cursorIdx
 		endIdx := cursorIdx + 1
@@ -18353,14 +19098,6 @@ func (m *Model) renderAlertsPanel() string {
 		for i := startIdx; i < endIdx; i++ {
 			a := visibleAlerts[i]
 			selected := i == cursorIdx
-			if selected {
-				if alertRenderedLineCount(a, true, innerWidth) > availSelectedLines {
-					a.Message = truncateRunesHelper(strings.ReplaceAll(a.Message, "\n", " "), max(12, innerWidth-6), "…")
-					if a.SuggestedAction != "" && alertRenderedLineCount(a, true, innerWidth) > availSelectedLines {
-						a.SuggestedAction = truncateRunesHelper(strings.ReplaceAll(a.SuggestedAction, "\n", " "), max(12, innerWidth-16), "…")
-					}
-				}
-			}
 
 			// Severity indicator
 			var severityStyle lipgloss.Style
@@ -18381,6 +19118,16 @@ func (m *Model) renderAlertsPanel() string {
 			cursor := "  "
 			if selected {
 				cursor = "▸ "
+			}
+
+			if selected {
+				if alertRenderedLineCount(a, true, innerWidth) > availSelectedLines {
+					prefixW := lipgloss.Width(cursor + severityIcon + " ")
+					a.Message = ansi.Truncate(strings.ReplaceAll(a.Message, "\n", " "), max(4, innerWidth-prefixW), "…")
+					if a.SuggestedAction != "" && alertRenderedLineCount(a, true, innerWidth) > availSelectedLines {
+						a.SuggestedAction = ansi.Truncate(strings.ReplaceAll(a.SuggestedAction, "\n", " "), max(4, innerWidth-16), "…")
+					}
+				}
 			}
 
 			// Alert line
@@ -18444,7 +19191,7 @@ func (m *Model) renderAlertsPanel() string {
 		}
 	}
 
-	sb.WriteString("\n")
+	sb.WriteString(alertFooterSep)
 	sb.WriteString(t.Renderer.NewStyle().Foreground(t.Muted).Italic(true).Render(footerText))
 
 	content := boxStyle.Render(sb.String())
@@ -18522,10 +19269,10 @@ func (m *Model) RenderDebugView(viewName string, width, height int) string {
 		m.isBoardView = true
 		m.focused = focusBoard
 		m.refreshBoardAndGraphForCurrentFilter()
-		boardAn, boardStats := m.boardScopeAnalysis()
+		boardAn, boardStats, boardETA := m.activeScopeAnalysis()
 		m.board.SetAnalyzer(boardAn)
 		m.board.SetAnalysis(boardStats)
-		m.board.SetETAContext(m.etaContext())
+		m.board.SetETAContext(boardETA)
 		m.board.SetSize(width, bodyHeight)
 		return m.board.View(width, bodyHeight)
 	case "history":
@@ -18544,8 +19291,10 @@ func (m *Model) RenderDebugView(viewName string, width, height int) string {
 		m.isGraphView = true
 		m.focused = focusGraph
 		m.refreshBoardAndGraphForCurrentFilter()
-		m.graphView.SetAnalyzer(m.analyzer, m.analysisReferenceTime)
-		m.graphView.SetETAContext(m.etaContext())
+		graphAn, _, graphETA := m.activeScopeAnalysis()
+		m.graphView.SetAnalyzer(graphAn, m.analysisReferenceTime)
+		m.graphView.SetETAContext(graphETA)
+		m.graphView.SetPriorityHints(m.activeScopePriorityHints())
 		m.graphView.SetSize(width, bodyHeight)
 		return m.graphView.View(width, bodyHeight)
 	case "tree":
@@ -18830,7 +19579,27 @@ func (m *Model) etaScopeKey() string {
 	b.WriteString(m.scopeRepoFilter)
 	b.WriteByte('\x00')
 	if m.candidateIDs != nil {
-		b.WriteString(strconv.Itoa(len(m.candidateIDs)))
+		// Order-independent zero-alloc membership fingerprint (FNV-1a XOR + sum + count).
+		var xorH, sumH uint64
+		count := 0
+		for id, ok := range m.candidateIDs {
+			if !ok {
+				continue
+			}
+			count++
+			var h uint64 = 14695981039346656037
+			for i := 0; i < len(id); i++ {
+				h ^= uint64(id[i])
+				h *= 1099511628211
+			}
+			xorH ^= h
+			sumH += h
+		}
+		b.WriteString(strconv.Itoa(count))
+		b.WriteByte(':')
+		b.WriteString(strconv.FormatUint(xorH, 16))
+		b.WriteByte(':')
+		b.WriteString(strconv.FormatUint(sumH, 16))
 	}
 	b.WriteByte('\x00')
 	if m.workspaceMode && m.activeRepos != nil {

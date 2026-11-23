@@ -324,6 +324,7 @@ func (s *ShortcutsSidebar) hardcodedSections() []shortcutSection {
 				{"t/f", "Timeline / Files"},
 				{"c", "Confidence"},
 				{"y", "Copy SHA"},
+				{"+/-/x", "Feedback"},
 				{"o", "Open in browser"},
 				{"V", "Cass sessions"},
 			},

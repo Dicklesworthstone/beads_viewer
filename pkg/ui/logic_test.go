@@ -9401,17 +9401,39 @@ func TestWave27_Pass11Fixes_And_BoardActionableHistoryParity(t *testing.T) {
 		m.analysis.WaitForPhase2()
 		m.Update(tea.WindowSizeMsg{Width: 120, Height: 35})
 
-		// A11-8: Relocate prevSelectedID when PanelPriority topPicks re-order during rebuildInsightsPanel.
+		// A11-8 / A13-14: Relocate prevSelectedID when PanelPriority topPicks genuinely reorder
+		// during rebuildInsightsPanel (I-2 at index 0 before rebuild -> I-2 moves to index 1 after rebuild),
+		// AND verify cross-cell wasHeatmapDrill relocation.
 		m.focused = focusInsights
 		m.insightsPanel.focusedPanel = PanelPriority
-		m.insightsPanel.SetTopPicks([]analysis.TopPick{{ID: "I-1", Title: "First", Score: 0.9}, {ID: "I-2", Title: "Second", Score: 0.5}})
-		m.insightsPanel.selectedIndex[PanelPriority] = 1 // I-2
+		// Intentionally place I-2 at index 0 (opposite of real score order where I-1 is index 0)
+		m.insightsPanel.SetTopPicks([]analysis.TopPick{{ID: "I-2", Title: "Second", Score: 0.9}, {ID: "I-1", Title: "First", Score: 0.5}})
+		m.insightsPanel.selectedIndex[PanelPriority] = 0 // I-2 at index 0
 		if got := m.insightsPanel.SelectedIssueID(); got != "I-2" {
 			t.Fatalf("precondition failed: got %q, want I-2", got)
 		}
 		m.rebuildInsightsPanel()
 		if got := m.insightsPanel.SelectedIssueID(); got != "I-2" {
 			t.Fatalf("A11-8 regression: rebuildInsightsPanel jumped selection from I-2 to %q", got)
+		}
+		if len(m.insightsPanel.topPicks) < 2 || m.insightsPanel.topPicks[0].ID != "I-1" || m.insightsPanel.selectedIndex[PanelPriority] != 1 {
+			t.Fatalf("A13-14 regression: expected I-1 at index 0 and I-2 relocated to index 1 after reorder, got len=%d top0=%q idx=%d",
+				len(m.insightsPanel.topPicks), func() string {
+					if len(m.insightsPanel.topPicks) > 0 {
+						return m.insightsPanel.topPicks[0].ID
+					}
+					return ""
+				}(), m.insightsPanel.selectedIndex[PanelPriority])
+		}
+		// Cross-cell heatmap drilldown relocation: set heatmapDrill on cell (0,0) with I-2 while real heatmap puts I-2 elsewhere.
+		m.insightsPanel.showHeatmap = true
+		m.insightsPanel.heatmapDrill = true
+		m.insightsPanel.heatmapRow, m.insightsPanel.heatmapCol = 0, 0
+		m.insightsPanel.heatmapIssues = []string{"I-2"}
+		m.insightsPanel.heatmapDrillIdx = 0
+		m.rebuildInsightsPanel()
+		if !m.insightsPanel.heatmapDrill || m.insightsPanel.SelectedIssueID() != "I-2" {
+			t.Fatalf("A12-6/A13-14 regression: heatmap drilldown lost I-2 across rebuild (drill=%v sel=%q)", m.insightsPanel.heatmapDrill, m.insightsPanel.SelectedIssueID())
 		}
 
 		// A11-9: Empty selection detail panel still renders globalCapacity & feedbackSummary.
@@ -9557,13 +9579,41 @@ func TestWave27_Pass11Fixes_And_BoardActionableHistoryParity(t *testing.T) {
 				t.Fatalf("W27-3 regression: Actionable view missing %q:\n%s", want, actView)
 			}
 		}
-		// A12-11: narrow 40-col Actionable view must never wrap an item onto 2 physical lines.
-		m.actionableView.SetSize(40, 20)
-		narrowAct := ansi.Strip(m.actionableView.Render())
-		for _, ln := range strings.Split(narrowAct, "\n") {
-			if w := ansi.StringWidth(ln); w > 40 {
-				t.Fatalf("A12-11 regression: narrow Actionable line exceeded 40 cols (%d): %q", w, ln)
+		// A12-11 / A13-7: narrow 36-col Actionable view with long workspace-prefixed IDs must
+		// keep every item strictly single-line (no lipgloss wrap) and stay within visibleLines.
+		longPlan := analysis.ExecutionPlan{
+			TotalActionable: 3,
+			Tracks: []analysis.ExecutionTrack{{
+				TrackID: "track-A",
+				Reason:  "Independent long-ID workspace track for narrow width testing",
+				Items: []analysis.PlanItem{
+					{ID: "beads_viewer-very-long-id-alpha-1234", Title: "First very long title that must truncate cleanly", Priority: 1, UnblocksIDs: []string{"U1", "U2"}},
+					{ID: "beads_viewer-very-long-id-beta-5678", Title: "Second very long title", Priority: 2},
+					{ID: "beads_viewer-very-long-id-gamma-9012", Title: "Third very long title", Priority: 2},
+				},
+			}},
+		}
+		narrowAM := NewActionableModel(longPlan, DefaultTheme(lipgloss.NewRenderer(os.Stdout)))
+		narrowAM.SetSize(36, 12)
+		narrowAct := ansi.Strip(narrowAM.Render())
+		narrowLines := strings.Split(narrowAct, "\n")
+		if len(narrowLines) > 12 {
+			t.Fatalf("A13-7 regression: narrow Actionable rendered %d physical lines > height 12:\n%s", len(narrowLines), narrowAct)
+		}
+		for _, ln := range narrowLines {
+			if w := ansi.StringWidth(ln); w > 36 {
+				t.Fatalf("A13-7 regression: narrow Actionable line exceeded 36 cols (%d): %q", w, ln)
 			}
+		}
+		// Count tree-connector glyphs vs total item lines: every item must occupy exactly 1 line.
+		connCount := 0
+		for _, ln := range narrowLines {
+			if strings.Contains(ln, "├─") || strings.Contains(ln, "└─") {
+				connCount++
+			}
+		}
+		if connCount != 3 {
+			t.Fatalf("A13-7 regression: expected all 3 single-line cards visible (connectors=%d):\n%s", connCount, narrowAct)
 		}
 
 		// A12-5: Workspace repo-filtered Board What-If must NOT leak hidden-repo unblock counts.
@@ -9580,13 +9630,591 @@ func TestWave27_Pass11Fixes_And_BoardActionableHistoryParity(t *testing.T) {
 		mWS.syncBoardReadinessAndFullIssues()
 		mWS.board.SetIssues(mWS.repoScopedIssues())
 		mWS.board.ToggleDetail()
-		boardAn, boardStats := mWS.boardScopeAnalysis()
+		boardAn, boardStats, boardETA := mWS.activeScopeAnalysis()
 		mWS.board.SetAnalyzer(boardAn)
 		mWS.board.SetAnalysis(boardStats)
+		mWS.board.SetETAContext(boardETA)
 		mWS.board.SetSize(140, 30)
 		wsBoardOut := ansi.Strip(mWS.board.View(140, 30))
 		if strings.Contains(wsBoardOut, "What-If Close:") || strings.Contains(wsBoardOut, "web-1") {
 			t.Fatalf("A12-5 regression: repo-filtered Board detail leaked hidden-repo web-1 unblock:\n%s", wsBoardOut)
+		}
+	})
+}
+
+func TestWave28_Pass13Fixes_And_W28_TUIParity(t *testing.T) {
+	refNow := time.Date(2026, 11, 22, 12, 0, 0, 0, time.UTC)
+
+	t.Run("A13_4_A13_9_WorkspaceScopeIsolation_DetailAndGraph", func(t *testing.T) {
+		wsIssues := []model.Issue{
+			{ID: "api-1", Title: "Secret API Root", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask, SourceRepo: "api", CreatedAt: refNow.Add(-48 * time.Hour), UpdatedAt: refNow},
+			{ID: "web-1", Title: "Web Dependent", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, SourceRepo: "web", CreatedAt: refNow.Add(-24 * time.Hour), UpdatedAt: refNow,
+				Dependencies: []*model.Dependency{{IssueID: "web-1", DependsOnID: "api-1", Type: model.DepBlocks}}},
+		}
+		m := NewModel(copyIssues(wsIssues), nil, "", ReadinessScope{ReferenceNow: refNow})
+		t.Cleanup(m.Stop)
+		m.analysis.WaitForPhase2()
+		m.EnableWorkspaceMode(WorkspaceInfo{Enabled: true, RepoCount: 2, TotalIssues: 2, RepoPrefixes: []string{"api-", "web-"}})
+		m.Update(tea.WindowSizeMsg{Width: 140, Height: 34})
+
+		// Filter to api only: Detail Pane What-If and Graph View What-If must NOT leak web-1.
+		m.activeRepos = map[string]bool{"api": true}
+		m.applyFilter()
+		m.selectListIssueByID("api-1")
+		m.updateViewportContent()
+		apiDetail := ansi.Strip(m.viewportContent)
+		if strings.Contains(apiDetail, "web-1") {
+			t.Fatalf("A13-4 regression: repo-filtered Detail Pane What-If leaked hidden web-1:\n%s", apiDetail)
+		}
+		graphOut := ansi.Strip(m.RenderDebugView("graph", 140, 34))
+		if strings.Contains(graphOut, "web-1") {
+			t.Fatalf("A13-4 regression: repo-filtered Graph View leaked hidden web-1:\n%s", graphOut)
+		}
+
+		// Filter to web only: Blocking Dependencies & Dependency Tree must NOT leak Secret API Root or api-1 (not found).
+		m.activeRepos = map[string]bool{"web": true}
+		m.applyFilter()
+		m.selectListIssueByID("web-1")
+		m.updateViewportContent()
+		webDetail := ansi.Strip(m.viewportContent)
+		if strings.Contains(webDetail, "Secret API Root") || strings.Contains(webDetail, "api-1") {
+			t.Fatalf("A13-4 regression: repo-filtered Detail Pane leaked hidden api-1 blocker:\n%s", webDetail)
+		}
+		if !strings.Contains(webDetail, "out-of-scope") {
+			t.Fatalf("A13-4 regression: repo-filtered Detail Pane should summarize hidden blocker count:\n%s", webDetail)
+		}
+
+		// A13-9: etaScopeKey detects membership change of equal-sized candidateIDs maps.
+		m.candidateIDs = map[string]bool{"api-1": true}
+		k1 := m.etaScopeKey()
+		m.candidateIDs = map[string]bool{"web-1": true}
+		k2 := m.etaScopeKey()
+		if k1 == k2 {
+			t.Fatalf("A13-9 regression: etaScopeKey collided for distinct candidate sets (%q == %q)", k1, k2)
+		}
+	})
+
+	t.Run("A13_5_A13_6_A13_11_BoardZeroWhatIf_ActiveCore_EmptyDarkMode", func(t *testing.T) {
+		closedAt := refNow.Add(-24 * time.Hour)
+		issues := []model.Issue{
+			{ID: "A", Title: "Blocker A", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: refNow, UpdatedAt: refNow},
+			{ID: "C", Title: "Co-Blocker C", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: refNow, UpdatedAt: refNow},
+			{ID: "B", Title: "Blocked by A and C", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, CreatedAt: refNow, UpdatedAt: refNow,
+				Dependencies: []*model.Dependency{
+					{IssueID: "B", DependsOnID: "A", Type: model.DepBlocks},
+					{IssueID: "B", DependsOnID: "C", Type: model.DepBlocks},
+				}},
+			// Closed triangle + open node O1 to verify ActiveCoreNumber excludes closed archive.
+			{ID: "C1", Title: "Closed 1", Status: model.StatusClosed, Priority: 2, IssueType: model.TypeTask, CreatedAt: refNow, UpdatedAt: closedAt, ClosedAt: &closedAt},
+			{ID: "C2", Title: "Closed 2", Status: model.StatusClosed, Priority: 2, IssueType: model.TypeTask, CreatedAt: refNow, UpdatedAt: closedAt, ClosedAt: &closedAt,
+				Dependencies: []*model.Dependency{{IssueID: "C2", DependsOnID: "C1", Type: model.DepBlocks}}},
+			{ID: "O1", Title: "Open leaf", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, CreatedAt: refNow, UpdatedAt: refNow,
+				Dependencies: []*model.Dependency{
+					{IssueID: "O1", DependsOnID: "C1", Type: model.DepBlocks},
+					{IssueID: "O1", DependsOnID: "C2", Type: model.DepBlocks},
+				}},
+		}
+		an := analysis.NewAnalyzer(issues)
+		an.SetNow(refNow)
+		stats := an.Analyze()
+		bm := NewBoardModel(issues, DefaultTheme(lipgloss.NewRenderer(os.Stdout)))
+		bm.SetReferenceTime(refNow)
+		bm.SetReadiness(an.Readiness())
+		bm.SetAnalyzer(an)
+		bm.SetAnalysis(&stats)
+		bm.ToggleDetail()
+		bm.SetSize(150, 30)
+
+		// A13-5: A shares dependent B with co-blocker C -> What-If proves 0 unblocks -> must NOT print false fallback.
+		if !bm.SelectIssueByID("A") {
+			t.Fatal("failed to select A on board")
+		}
+		aView := ansi.Strip(bm.View(150, 30))
+		if strings.Contains(aView, "Completing this would unblock") {
+			t.Fatalf("A13-5 regression: Board printed false raw unblock fallback when What-If proved 0:\n%s", aView)
+		}
+
+		// A13-6: O1 only touches closed C1 & C2 -> ActiveCoreNumber is 0, so K-Core k=2 must NOT appear.
+		if !bm.SelectIssueByID("O1") {
+			t.Fatal("failed to select O1 on board")
+		}
+		o1View := ansi.Strip(bm.View(150, 30))
+		if strings.Contains(o1View, "K-Core k=2") {
+			t.Fatalf("A13-6 regression: Board leaked unfiltered closed-archive CoreNumber (K-Core k=2):\n%s", o1View)
+		}
+
+		// A13-11: Empty board dark/light mode flip must re-render and update lastDetailDark/detailCache.darkMode.
+		darkRenderer := lipgloss.NewRenderer(os.Stdout)
+		darkRenderer.SetHasDarkBackground(true)
+		lightRenderer := lipgloss.NewRenderer(os.Stdout)
+		lightRenderer.SetHasDarkBackground(false)
+		emptyBM := NewBoardModel(nil, DefaultTheme(darkRenderer))
+		emptyBM.ToggleDetail()
+		emptyBM.SetSize(120, 24)
+		emptyBM.syncDetailContent()
+		if !emptyBM.lastDetailDark || !emptyBM.detailCache.darkMode || emptyBM.detailCache.renders != 1 {
+			t.Fatalf("A13-11 setup: expected dark empty detail render=1, got lastDark=%v cacheDark=%v renders=%d",
+				emptyBM.lastDetailDark, emptyBM.detailCache.darkMode, emptyBM.detailCache.renders)
+		}
+		emptyBM.theme = DefaultTheme(lightRenderer)
+		emptyBM.syncDetailContent()
+		if emptyBM.lastDetailDark || emptyBM.detailCache.darkMode || emptyBM.detailCache.renders != 2 {
+			t.Fatalf("A13-11 regression: empty board syncDetailContent failed to re-render on light theme flip (lastDark=%v cacheDark=%v renders=%d)",
+				emptyBM.lastDetailDark, emptyBM.detailCache.darkMode, emptyBM.detailCache.renders)
+		}
+		emptyBM.syncDetailContent()
+		if emptyBM.detailCache.renders != 2 {
+			t.Fatalf("A13-11 regression: unchanged empty board should hit cache (renders=%d, want 2)", emptyBM.detailCache.renders)
+		}
+	})
+
+	t.Run("A13_8_AlertsPanelCompactNarrowFooter", func(t *testing.T) {
+		m := NewModel([]model.Issue{
+			{ID: "AL-1", Title: "Alert issue", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeBug, CreatedAt: refNow, UpdatedAt: refNow},
+		}, nil, "", ReadinessScope{ReferenceNow: refNow})
+		t.Cleanup(m.Stop)
+		m.analysis.WaitForPhase2()
+		m.alerts = []drift.Alert{
+			{Type: drift.AlertStaleIssue, Severity: drift.SeverityCritical, IssueID: "AL-1", Message: "Very long alert message that wraps across multiple narrow lines", SuggestedAction: "Inspect and resolve immediately"},
+			{Type: drift.AlertBlockingCascade, Severity: drift.SeverityWarning, IssueID: "AL-1", Message: "Second warning alert"},
+			{Type: drift.AlertPotentialDuplicate, Severity: drift.SeverityInfo, IssueID: "AL-1", Message: "Third info alert"},
+		}
+		m.suggestionsCache = []analysis.Suggestion{
+			{Type: analysis.SuggestionMissingDependency, Confidence: 0.9, TargetBead: "AL-1", Summary: "Very long hygiene suggestion summary", Reason: "Mentioned in description", ActionCommand: "br dep add AL-1 AL-2"},
+		}
+		m.suggestionsCacheLoaded = true
+		for _, dims := range [][2]int{{36, 16}, {24, 14}} {
+			m.width, m.height = dims[0], dims[1]
+			for _, tab := range []int{0, 1} {
+				m.alertsTab = tab
+				out := ansi.Strip(m.renderAlertsPanel())
+				if !strings.Contains(out, "Esc: close") {
+					t.Fatalf("A13-8 regression: Alerts panel (tab=%d, %dx%d) clipped Esc: close footer:\n%s", tab, dims[0], dims[1], out)
+				}
+			}
+		}
+		// Empty states must also preserve Esc: close at ultra-narrow 24x14.
+		m.alerts = nil
+		m.suggestionsCache = nil
+		m.width, m.height = 24, 14
+		for _, tab := range []int{0, 1} {
+			m.alertsTab = tab
+			out := ansi.Strip(m.renderAlertsPanel())
+			if !strings.Contains(out, "Esc: close") {
+				t.Fatalf("A13-8 regression: empty Alerts panel (tab=%d, 24x14) clipped Esc: close footer:\n%s", tab, out)
+			}
+		}
+	})
+
+	t.Run("W28_1_HistoryCorrelationFeedback_And_FileTreeIntel", func(t *testing.T) {
+		sha1 := strings.Repeat("a", 40)
+		sha2 := strings.Repeat("b", 40)
+		tmpDir := t.TempDir()
+		beadsDir := filepath.Join(tmpDir, ".beads")
+		if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
+		if err := os.WriteFile(jsonlPath, []byte(`{"id":"FB-1","title":"Auth core","status":"open","priority":1,"issue_type":"task","created_at":"2026-11-20T00:00:00Z","updated_at":"2026-11-20T00:00:00Z"}`+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		report := &correlation.HistoryReport{
+			Histories: map[string]correlation.BeadHistory{
+				"FB-1": {
+					BeadID: "FB-1", Title: "Auth core", Status: "open",
+					Commits: []correlation.CorrelatedCommit{{
+						BeadID: "FB-1", SHA: sha1, ShortSHA: sha1[:7], Message: "feat: auth core", Author: "alice",
+						Timestamp: refNow.Add(-2 * time.Hour), Confidence: 0.75, Confirmed: true,
+						Files: []correlation.FileChange{
+							{Path: "pkg/auth/core.go", Insertions: 12},
+							{Path: "pkg/auth/tokens.go", Insertions: 5},
+						},
+					}},
+				},
+				"FB-2": {
+					BeadID: "FB-2", Title: "Auth refresh", Status: "open",
+					Commits: []correlation.CorrelatedCommit{{
+						BeadID: "FB-2", SHA: sha2, ShortSHA: sha2[:7], Message: "fix: token refresh", Author: "bob",
+						Timestamp: refNow.Add(-1 * time.Hour), Confidence: 0.80,
+						Files: []correlation.FileChange{
+							{Path: "pkg/auth/core.go", Insertions: 6},
+							{Path: "pkg/auth/tokens.go", Insertions: 4},
+						},
+					}},
+				},
+			},
+			CommitIndex: correlation.CommitIndex{sha1: {"FB-1"}, sha2: {"FB-2"}},
+		}
+
+		// 1. Confirmed badge + File Tree Blast/Co-change footer rendering.
+		hm := NewHistoryModel(report, DefaultTheme(lipgloss.NewRenderer(os.Stdout)))
+		hm.SetReferenceTime(refNow)
+		hm.SetSize(140, 32)
+		detailStr := ansi.Strip(hm.renderDetailPanel(70, 24))
+		if !strings.Contains(detailStr, "✓ confirmed") || !strings.Contains(detailStr, "+/-:confirm/reject") {
+			t.Fatalf("W28-1 regression: History detail missing confirmed badge or feedback hint:\n%s", detailStr)
+		}
+		hm.ToggleFileTree()
+		var expandAll func([]*FileTreeNode)
+		expandAll = func(nodes []*FileTreeNode) {
+			for _, n := range nodes {
+				if n.IsDir {
+					n.Expanded = true
+					expandAll(n.Children)
+				}
+			}
+		}
+		expandAll(hm.fileTree)
+		hm.rebuildFlatFileList()
+		for i, n := range hm.flatFileList {
+			if !n.IsDir && strings.HasSuffix(n.Path, "core.go") {
+				hm.selectedFileIdx = i
+				break
+			}
+		}
+		treeOut := ansi.Strip(hm.renderFileTreePanel(48, 24))
+		if !strings.Contains(treeOut, "Blast:") || !strings.Contains(treeOut, "Co-change:") || !strings.Contains(treeOut, "tokens.go") {
+			t.Fatalf("W28-1 regression: History file tree missing Blast/Co-change footer:\n%s", treeOut)
+		}
+
+		// 2. Interactive '+' confirm persists .beads/correlation_feedback.json and honors read-only guard.
+		m := NewModel([]model.Issue{{ID: "FB-1", Title: "Auth core", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: refNow, UpdatedAt: refNow}}, nil, jsonlPath, ReadinessScope{ReferenceNow: refNow})
+		t.Cleanup(m.Stop)
+		m.workDir = tmpDir
+		m.historyView = hm
+		m.focused = focusHistory
+		m.isHistoryView = true
+		// Guard check 1: BV_NO_SAVED_CONFIG=1 (set by pkg/ui TestMain) disables persistence cleanly.
+		_ = m.recordCorrelationFeedback("confirm")
+		if !strings.Contains(m.statusMsg, "disabled") {
+			t.Fatalf("W28-1 regression: expected BV_NO_SAVED_CONFIG to disable correlation feedback, got %q", m.statusMsg)
+		}
+		// Allow persistence inside temp dir for the remaining checks.
+		t.Setenv("BV_NO_SAVED_CONFIG", "")
+		// Guard check 2: time-travel disables persistence cleanly.
+		m.timeTravelMode = true
+		_ = m.recordCorrelationFeedback("confirm")
+		if !strings.Contains(m.statusMsg, "disabled") {
+			t.Fatalf("W28-1 regression: expected timeTravelMode to disable correlation feedback, got %q", m.statusMsg)
+		}
+		m.timeTravelMode = false
+		_ = m.recordCorrelationFeedback("confirm")
+		if m.statusIsError || !strings.Contains(m.statusMsg, "Confirmed") {
+			t.Fatalf("W28-1 regression: confirm correlation feedback failed: %q (err=%v)", m.statusMsg, m.statusIsError)
+		}
+		fs := correlation.NewFeedbackStore(beadsDir)
+		if err := fs.Load(); err != nil {
+			t.Fatalf("load saved correlation feedback: %v", err)
+		}
+		fb, ok := fs.Get(sha1, "FB-1")
+		if !ok || fb.Type != correlation.FeedbackConfirm {
+			t.Fatalf("W28-1 regression: expected persisted confirm entry for (%s, FB-1), got ok=%v fb=%+v", sha1, ok, fb)
+		}
+	})
+
+	t.Run("W28_2_Explainability_W28_3_Tree_And_W28_5_Labels", func(t *testing.T) {
+		est60 := 60
+		closedAt := refNow.Add(-48 * time.Hour)
+		issues := []model.Issue{
+			{ID: "EP-1", Title: "Auth Epic", Status: model.StatusOpen, Priority: 3, IssueType: model.TypeEpic, Labels: []string{"db"}, SourceRepo: "api", EstimatedMinutes: &est60, CreatedAt: refNow.Add(-72 * time.Hour), UpdatedAt: refNow},
+			{ID: "T-1", Title: "DB Migration", Status: model.StatusOpen, Priority: 3, IssueType: model.TypeTask, Labels: []string{"db"}, SourceRepo: "api", EstimatedMinutes: &est60, CreatedAt: refNow.Add(-72 * time.Hour), UpdatedAt: refNow,
+				Dependencies: []*model.Dependency{{IssueID: "T-1", DependsOnID: "EP-1", Type: model.DepParentChild}}},
+			{ID: "T-2", Title: "API Endpoint", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, Labels: []string{"backend"}, SourceRepo: "api", EstimatedMinutes: &est60, CreatedAt: refNow.Add(-48 * time.Hour), UpdatedAt: refNow,
+				Dependencies: []*model.Dependency{
+					{IssueID: "T-2", DependsOnID: "EP-1", Type: model.DepParentChild},
+					{IssueID: "T-2", DependsOnID: "T-1", Type: model.DepBlocks},
+				}},
+			{ID: "T-3", Title: "UI View", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, Labels: []string{"frontend"}, SourceRepo: "web", EstimatedMinutes: &est60, CreatedAt: refNow.Add(-24 * time.Hour), UpdatedAt: refNow,
+				Dependencies: []*model.Dependency{{IssueID: "T-3", DependsOnID: "T-2", Type: model.DepBlocks}}},
+			{ID: "T-DONE", Title: "Done Subtask", Status: model.StatusClosed, Priority: 2, IssueType: model.TypeTask, Labels: []string{"db"}, SourceRepo: "api", EstimatedMinutes: &est60, CreatedAt: refNow.Add(-96 * time.Hour), UpdatedAt: closedAt, ClosedAt: &closedAt,
+				Dependencies: []*model.Dependency{{IssueID: "T-DONE", DependsOnID: "EP-1", Type: model.DepParentChild}}},
+		}
+		m := NewModel(copyIssues(issues), nil, "", ReadinessScope{ReferenceNow: refNow})
+		t.Cleanup(m.Stop)
+		m.analysis.WaitForPhase2()
+		m.EnableWorkspaceMode(WorkspaceInfo{Enabled: true, RepoCount: 2, TotalIssues: len(issues), RepoPrefixes: []string{"api-", "web-"}})
+		m.Update(tea.WindowSizeMsg{Width: 140, Height: 36})
+
+		// Inject a deterministic priority hint to verify W28-2 across DetailPane, Insights, Graph, and Tree.
+		m.priorityHints["T-1"] = &analysis.PriorityRecommendation{
+			IssueID: "T-1", Title: "DB Migration", CurrentPriority: 3, SuggestedPriority: 1,
+			Direction: "increase", Confidence: 0.85, Reasoning: []string{"Blocks critical chain"},
+		}
+		m.showPriorityHints = true
+		m.selectListIssueByID("T-1")
+		m.updateViewportContent()
+		detailMD := ansi.Strip(m.viewport.View())
+		if !strings.Contains(detailMD, "Priority Hint:") || !strings.Contains(detailMD, "P3 → P1") {
+			t.Fatalf("W28-2 regression: DetailPane missing Priority Hint reasoning:\n%s", detailMD)
+		}
+		// T-3 has cross-repo dependency on T-2 (web -> api) -> Risk Signals breakdown must render.
+		m.selectListIssueByID("T-3")
+		m.updateViewportContent()
+		riskMD := ansi.Strip(m.viewport.View())
+		if !strings.Contains(riskMD, "Risk Signals:") || !strings.Contains(riskMD, "cross-repo") {
+			t.Fatalf("W28-2 regression: DetailPane missing Risk Signals breakdown for cross-repo blocked issue:\n%s", riskMD)
+		}
+
+		// W28-2: Insights PanelKeystones renders KPaths + Priority Hint on T-1.
+		m.focused = focusInsights
+		m.insightsPanel.focusedPanel = PanelKeystones
+		m.rebuildInsightsPanel()
+		m.insightsPanel.SetPriorityHints(m.priorityHints)
+		m.insightsPanel.updateDetailContent()
+		insDetail := ansi.Strip(m.insightsPanel.detailContent)
+		if !strings.Contains(insDetail, "Top Critical Paths") {
+			t.Fatalf("W28-2 regression: Insights PanelKeystones missing KPaths Top Critical Paths:\n%s", insDetail)
+		}
+
+		// W28-2: Graph view renders Priority hint for T-1.
+		m.graphView.SelectByID("T-1")
+		graphOut := ansi.Strip(m.RenderDebugView("graph", 140, 48))
+		if !strings.Contains(graphOut, "Priority hint:") || !strings.Contains(graphOut, "P3→P1") {
+			t.Fatalf("W28-2 regression: Graph view missing Priority hint:\n%s", graphOut)
+		}
+
+		// W28-3: Tree view renders [1/3] epic completion rollup, [API] repo badge, ⚡+1, ↑, and stays bounded at width 44.
+		m.focused = focusTree
+		m.refreshTreeView()
+		m.tree.ExpandAll()
+		treeWide := ansi.Strip(m.tree.View())
+		for _, want := range []string{"[1/3]", "[API]", "⚡+1", "↑"} {
+			if !strings.Contains(treeWide, want) {
+				t.Fatalf("W28-3 regression: Tree view missing %q:\n%s", want, treeWide)
+			}
+		}
+		m.tree.SetSize(44, 16)
+		treeNarrow := ansi.Strip(m.tree.View())
+		for _, ln := range strings.Split(treeNarrow, "\n") {
+			if w := ansi.StringWidth(ln); w > 44 {
+				t.Fatalf("W28-3 regression: narrow 44-col Tree row overflowed (%d): %q", w, ln)
+			}
+		}
+
+		// W28-5 + A14-1: Opening Label Dashboard interactively via '[' MUST populate Trend 4w & Attn immediately
+		// (without calling refreshLabelViews directly), fall back to 5-col at width 68, and refresh on repo scope change.
+		m.focused = focusList
+		m.width, m.height = 110, 30
+		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("[")})
+		lblWide := ansi.Strip(m.labelDashboard.View())
+		for _, want := range []string{"Trend 4w", "Attn", "#1"} {
+			if !strings.Contains(lblWide, want) {
+				t.Fatalf("W28-5/A14-1 regression: '[' interactive Label Dashboard missing %q:\n%s", want, lblWide)
+			}
+		}
+		m.labelDashboard.SetSize(68, 20)
+		lblNarrow := ansi.Strip(m.labelDashboard.View())
+		if strings.Contains(lblNarrow, "Trend 4w") {
+			t.Fatalf("W28-5 regression: narrow 68-col Label Dashboard should use 5-column layout:\n%s", lblNarrow)
+		}
+		// Open health detail for "db" (improving 4w trend) and "backend" (blocked T-2 cascading to frontend).
+		var dbLH, backendLH analysis.LabelHealth
+		for _, lh := range m.labelHealthCache.Labels {
+			switch lh.Label {
+			case "db":
+				dbLH = lh
+			case "backend":
+				backendLH = lh
+			}
+		}
+		m.labelHealthDetail = &dbLH
+		m.showLabelHealthDetail = true
+		m.populateLabelHealthDetailExtras("db")
+		dbModal := ansi.Strip(m.renderLabelHealthDetail(dbLH))
+		for _, want := range []string{"4w Trend:", "↗", "Attention:"} {
+			if !strings.Contains(dbModal, want) {
+				t.Fatalf("W28-5 regression: db Label Health Detail modal missing %q:\n%s", want, dbModal)
+			}
+		}
+		m.labelHealthDetail = &backendLH
+		m.populateLabelHealthDetailExtras("backend")
+		backendModal := ansi.Strip(m.renderLabelHealthDetail(backendLH))
+		for _, want := range []string{"4w Trend:", "Attention:", "Blockage Cascade:", "frontend"} {
+			if !strings.Contains(backendModal, want) {
+				t.Fatalf("W28-5 regression: backend Label Health Detail modal missing %q:\n%s", want, backendModal)
+			}
+		}
+	})
+
+	t.Run("Pass14_A14_2_A14_3_A14_4_A14_8_A14_9_AuditRemediations", func(t *testing.T) {
+		t.Setenv("BV_NO_SAVED_CONFIG", "")
+		// A14-2: Multi-repo feedback target resolution (file-path BeadsDir, Prefix!=Name precedence,
+		// pinned-revision read-only guard, workspace empty fallback refusal, single-repo explicit --db isolation).
+		wsRoot := t.TempDir()
+		apiRepo := filepath.Join(wsRoot, "api-svc")
+		apiBeads := filepath.Join(apiRepo, ".beads")
+		if err := os.MkdirAll(apiBeads, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		otherRepo := filepath.Join(wsRoot, "other-repo")
+		otherBeads := filepath.Join(otherRepo, ".beads")
+		if err := os.MkdirAll(otherBeads, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		cwdRepo := filepath.Join(wsRoot, "cwd-repo")
+		cwdBeads := filepath.Join(cwdRepo, ".beads")
+		if err := os.MkdirAll(cwdBeads, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(cwdBeads, "issues.jsonl"), []byte(`{"id":"CWD-1","title":"Wrong repo","status":"open","priority":2,"issue_type":"task"}`+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		wsIssues := []model.Issue{
+			{ID: "api-42", Title: "API Task", SourceRepo: "api", Status: model.StatusOpen, Priority: 3, IssueType: model.TypeTask, CreatedAt: refNow, UpdatedAt: refNow},
+			{ID: "pin-9", Title: "Pinned Rev Task", SourceRepo: "pin", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, CreatedAt: refNow, UpdatedAt: refNow},
+		}
+		wsModel := NewModel(copyIssues(wsIssues), nil, "", ReadinessScope{ReferenceNow: refNow})
+		t.Cleanup(wsModel.Stop)
+		wsModel.workDir = wsRoot
+		wsModel.EnableWorkspaceMode(WorkspaceInfo{
+			Enabled:   true,
+			RepoCount: 2,
+			Repos: []WorkspaceRepoTarget{
+				{Name: "backend-service", Prefix: "api-", Path: apiRepo, BeadsDir: filepath.Join(apiBeads, "beads.db")},
+				{Name: "pinned-svc", Prefix: "pin-", Path: otherRepo, BeadsDir: otherBeads, Revision: "HEAD~1"},
+			},
+		})
+		gotDir, gotLocal := wsModel.resolveCorrelationFeedbackTarget("api-42")
+		if gotDir != apiBeads || gotLocal != "42" {
+			t.Fatalf("A14-2 regression: expected (%q, %q) for file-path BeadsDir & Prefix!=Name, got (%q, %q)", apiBeads, "42", gotDir, gotLocal)
+		}
+		if pDir, _ := wsModel.resolveCorrelationFeedbackTarget("pin-9"); pDir != "" {
+			t.Fatalf("A14-2 regression: pinned historical workspace repo should refuse feedback target, got %q", pDir)
+		}
+		// Empty workspace Repos + no Origins must refuse rather than fall through to m.workDir/.beads.
+		wsModel.workspaceInfo.Repos = nil
+		if emptyDir, _ := wsModel.resolveCorrelationFeedbackTarget("api-42"); emptyDir != "" {
+			t.Fatalf("A14-2 regression: workspace mode with no repos/origins fell through to %q", emptyDir)
+		}
+
+		// Single-repo explicit --db in otherRepo while workDir is cwdRepo must target otherBeads, NEVER cwdBeads.
+		otherDB := filepath.Join(otherBeads, "beads.db")
+		if err := os.WriteFile(otherDB, []byte{}, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		srModel := NewModel([]model.Issue{{ID: "O-1", Title: "Other", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: refNow, UpdatedAt: refNow}}, nil, otherDB, ReadinessScope{ReferenceNow: refNow})
+		t.Cleanup(srModel.Stop)
+		srModel.workDir = cwdRepo
+		srDir, srLocal := srModel.resolveCorrelationFeedbackTarget("O-1")
+		if srDir != otherBeads || srLocal != "O-1" {
+			t.Fatalf("A14-2 regression: single-repo explicit --db wrote to wrong repo (%q, want %q)", srDir, otherBeads)
+		}
+
+		// A14-3: In-flight history load must be force-restarted (non-nil tea.Cmd & bumped request gen) on feedback save.
+		sha := strings.Repeat("c", 40)
+		rep := &correlation.HistoryReport{
+			Histories: map[string]correlation.BeadHistory{
+				"O-1": {BeadID: "O-1", Title: "Other", Status: "open", Commits: []correlation.CorrelatedCommit{{BeadID: "O-1", SHA: sha, ShortSHA: sha[:7], Message: "feat: O-1", Author: "alice", Timestamp: refNow, Confidence: 0.7}}},
+			},
+			CommitIndex: correlation.CommitIndex{sha: {"O-1"}},
+		}
+		srModel.historyView = NewHistoryModel(rep, DefaultTheme(lipgloss.NewRenderer(os.Stdout)))
+		srModel.historyView.SetSize(120, 28)
+		srModel.historyLoading = true
+		srModel.historyLoadDataGeneration = srModel.semanticDataGeneration
+		canceled := false
+		srModel.historyLoadCancel = func() { canceled = true }
+		prevGen := srModel.historyLoadRequestGeneration
+		cmd := srModel.recordCorrelationFeedback("confirm")
+		if cmd == nil || !canceled || srModel.historyLoadRequestGeneration <= prevGen {
+			t.Fatalf("A14-3 regression: feedback during in-flight load must cancel old walk and return reload cmd (cmd=%v canceled=%v gen=%d->%d)", cmd != nil, canceled, prevGen, srModel.historyLoadRequestGeneration)
+		}
+		// A14-9: History Git mode footer advertises +/-:confirm/reject x:ignore.
+		srModel.historyView.ToggleViewMode()
+		gitDetail := ansi.Strip(srModel.historyView.renderGitDetailPanel(70, 24))
+		if !strings.Contains(gitDetail, "+/-:confirm/reject") || !strings.Contains(gitDetail, "x:ignore") {
+			t.Fatalf("A14-9 regression: History Git mode footer missing feedback hints:\n%s", gitDetail)
+		}
+
+		// A14-4: Repo-filtered activeScopePriorityHints & Structural Metrics isolate hidden-repo misalignment & cut-vertex.
+		// api-root (P3) blocks 4 P0 web-* issues (giving it a global priority hint P3->P1 + global cut-vertex),
+		// while inside repo=api alone it is an isolated P3 node with zero in-repo dependents (no hint, no cut-vertex).
+		est60 := 60
+		isoIssues := []model.Issue{
+			{ID: "api-root", Title: "API Root", SourceRepo: "api", Status: model.StatusOpen, Priority: 3, IssueType: model.TypeTask, EstimatedMinutes: &est60, CreatedAt: refNow, UpdatedAt: refNow},
+			{ID: "api-leaf", Title: "API Leaf", SourceRepo: "api", Status: model.StatusOpen, Priority: 3, IssueType: model.TypeTask, EstimatedMinutes: &est60, CreatedAt: refNow, UpdatedAt: refNow},
+			{ID: "web-1", Title: "Web P0 1", SourceRepo: "web", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeBug, EstimatedMinutes: &est60, CreatedAt: refNow, UpdatedAt: refNow,
+				Dependencies: []*model.Dependency{{IssueID: "web-1", DependsOnID: "api-root", Type: model.DepBlocks}}},
+			{ID: "web-2", Title: "Web P0 2", SourceRepo: "web", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeBug, EstimatedMinutes: &est60, CreatedAt: refNow, UpdatedAt: refNow,
+				Dependencies: []*model.Dependency{{IssueID: "web-2", DependsOnID: "api-root", Type: model.DepBlocks}}},
+			{ID: "web-3", Title: "Web P0 3", SourceRepo: "web", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeBug, EstimatedMinutes: &est60, CreatedAt: refNow, UpdatedAt: refNow,
+				Dependencies: []*model.Dependency{{IssueID: "web-3", DependsOnID: "api-root", Type: model.DepBlocks}}},
+			{ID: "web-4", Title: "Web P0 4", SourceRepo: "web", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeBug, EstimatedMinutes: &est60, CreatedAt: refNow, UpdatedAt: refNow,
+				Dependencies: []*model.Dependency{{IssueID: "web-4", DependsOnID: "api-root", Type: model.DepBlocks}}},
+			{ID: "api-tmpl", Title: "Template", SourceRepo: "api", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, IsTemplate: true, EstimatedMinutes: &est60, CreatedAt: refNow, UpdatedAt: refNow},
+			{ID: "api-pin", Title: "Pinned", SourceRepo: "api", Status: model.StatusPinned, Priority: 2, IssueType: model.TypeTask, Pinned: true, EstimatedMinutes: &est60, CreatedAt: refNow, UpdatedAt: refNow},
+		}
+		isoM := NewModel(copyIssues(isoIssues), nil, "", ReadinessScope{ReferenceNow: refNow})
+		t.Cleanup(isoM.Stop)
+		isoM.analysis.WaitForPhase2()
+		for _, rec := range isoM.analyzer.GenerateRecommendationsFromStats(isoM.analysis, analysis.DefaultThresholds()) {
+			r := rec
+			isoM.priorityHints[r.IssueID] = &r
+		}
+		isoM.EnableWorkspaceMode(WorkspaceInfo{Enabled: true, RepoCount: 2, TotalIssues: len(isoIssues), RepoPrefixes: []string{"api-", "web-"}})
+		isoM.Update(tea.WindowSizeMsg{Width: 140, Height: 44})
+		if isoM.priorityHints["api-root"] == nil {
+			t.Fatalf("A14-4 precondition failed: expected global priority hint for api-root blocking 4 P0 web issues")
+		}
+		isoM.activeRepos = map[string]bool{"api": true}
+		isoM.applyFilter()
+		if scopedHint := isoM.activeScopePriorityHints()["api-root"]; scopedHint != nil {
+			t.Fatalf("A14-4 regression: repo-filtered activeScopePriorityHints leaked hidden-web priority hint: %+v", scopedHint)
+		}
+		isoM.selectListIssueByID("api-root")
+		isoM.updateViewportContent()
+		isoDetail := ansi.Strip(isoM.viewportContent)
+		if strings.Contains(isoDetail, "Priority Hint:") || strings.Contains(isoDetail, "Articulation Point") {
+			t.Fatalf("A14-4 regression: repo-filtered Detail Pane leaked hidden-web Priority Hint or Cut Vertex:\n%s", isoDetail)
+		}
+
+		// A14-8: Insights KPaths must NOT splice A -> HIDDEN -> B into A -> B; currentAdvancedInsightsKey uses membership hash.
+		insM := NewInsightsModel(analysis.Insights{}, map[string]*model.Issue{"A": {ID: "A"}, "B": {ID: "B"}}, isoM.theme)
+		insM.focusedPanel = PanelKeystones
+		insM.SetAdvancedInsights(&analysis.AdvancedInsights{
+			KPaths: &analysis.KPathsResult{Paths: []analysis.CriticalPath{
+				{IssueIDs: []string{"A", "HIDDEN", "B"}, Length: 3},
+			}},
+		})
+		insM.updateDetailContent()
+		if strings.Contains(ansi.Strip(insM.detailContent), "A` → `B") || strings.Contains(ansi.Strip(insM.detailContent), "A → B") {
+			t.Fatalf("A14-8 regression: Insights KPaths spliced hidden intermediate node into fabricated direct edge:\n%s", ansi.Strip(insM.detailContent))
+		}
+		isoM.candidateIDs = map[string]bool{"api-root": true}
+		ak1 := isoM.currentAdvancedInsightsKey()
+		isoM.candidateIDs = map[string]bool{"api-leaf": true}
+		ak2 := isoM.currentAdvancedInsightsKey()
+		if ak1 == ak2 {
+			t.Fatalf("A14-8 regression: currentAdvancedInsightsKey collided for distinct equal-size candidateIDs")
+		}
+
+		// A14-9: Templates & pinned issues suppress ETA Forecast in Detail Pane, Board, and Graph.
+		isoM.activeRepos = nil
+		isoM.candidateIDs = nil
+		isoM.applyFilter()
+		for _, id := range []string{"api-tmpl", "api-pin"} {
+			isoM.selectListIssueByID(id)
+			isoM.updateViewportContent()
+			if strings.Contains(ansi.Strip(isoM.viewportContent), "ETA Forecast:") {
+				t.Fatalf("A14-9 regression: Detail Pane emitted ETA Forecast for %s:\n%s", id, ansi.Strip(isoM.viewportContent))
+			}
+			isoM.graphView.SelectByID(id)
+			if strings.Contains(ansi.Strip(isoM.RenderDebugView("graph", 140, 48)), "Est. ETA:") {
+				t.Fatalf("A14-9 regression: Graph View emitted Est. ETA for %s", id)
+			}
+		}
+		bmCheck := NewBoardModel(copyIssues(isoIssues), DefaultTheme(lipgloss.NewRenderer(os.Stdout)))
+		bmCheck.SetReferenceTime(refNow)
+		bmCheck.SetAnalyzer(isoM.analyzer)
+		bmCheck.SetAnalysis(isoM.analysis)
+		bmCheck.SetETAContext(isoM.etaContext())
+		bmCheck.ToggleDetail()
+		bmCheck.SetSize(140, 30)
+		if bmCheck.SelectIssueByID("api-tmpl") {
+			if strings.Contains(ansi.Strip(bmCheck.View(140, 30)), "ETA Forecast:") {
+				t.Fatalf("A14-9 regression: Board View emitted ETA Forecast for api-tmpl")
+			}
 		}
 	})
 }
