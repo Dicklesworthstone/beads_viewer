@@ -2656,7 +2656,7 @@ function queryIssues(filters = {}, sort = 'priority', limit = 50, offset = 0) {
       ? 'CASE WHEN estimated_minutes IS NULL OR estimated_minutes <= 0 THEN 1 ELSE 0 END ASC, estimated_minutes ASC, priority ASC'
       : 'priority ASC',
     'eta': mvCols.has('eta_days')
-      ? 'CASE WHEN eta_days IS NULL THEN 1 ELSE 0 END ASC, eta_days ASC, priority ASC'
+      ? "CASE WHEN LOWER(status) IN ('closed', 'tombstone') OR eta_days IS NULL OR typeof(eta_days) NOT IN ('integer', 'real') OR eta_days < 0 THEN 1 ELSE 0 END ASC, CASE WHEN LOWER(status) IN ('closed', 'tombstone') OR eta_days IS NULL OR typeof(eta_days) NOT IN ('integer', 'real') OR eta_days < 0 THEN NULL ELSE eta_days END ASC, priority ASC"
       : 'priority ASC',
     'created': 'created_at DESC',
     'title': 'title ASC',
@@ -6243,10 +6243,14 @@ function beadsApp() {
                 showClosed: detail.filters.showClosed !== false,
               };
             }
-            if (this.graphSearchResult?.id) {
+            if (this.graphSearchResult?.id || this.graphDetailNode?.id) {
               const visibleNodes = this.forceGraphModule?.getGraph?.()?.graphData?.()?.nodes || [];
-              if (!visibleNodes.some(n => n.id === this.graphSearchResult.id)) {
+              if (this.graphSearchResult?.id && !visibleNodes.some(n => n.id === this.graphSearchResult.id)) {
                 this.graphSearchResult = null;
+              }
+              if (this.graphDetailNode?.id && !visibleNodes.some(n => n.id === this.graphDetailNode.id)) {
+                this.graphDetailNode = null;
+                setTimeout(() => this.resizeForceGraph(), 250);
               }
             }
           });
@@ -6850,7 +6854,14 @@ function beadsApp() {
         this.forceGraphModule.focusNode(nodeId);
         return;
       }
-      this.showIssue(nodeId);
+      // Open hidden/filtered-out issues in-place in the modal so we stay on #/graph
+      // and preserve active graph filters, overlays, and the detail drawer.
+      const exists = getIssue(nodeId);
+      if (!exists) {
+        showToast(`Issue "${nodeId}" is not in this export`, 'warning');
+        return;
+      }
+      this.selectIssue(nodeId);
     },
 
     isActiveNodeStatus(status) {
@@ -7795,6 +7806,22 @@ function beadsApp() {
     getFileHotspots() {
       const list = Array.isArray(this.historyData?.file_hotspots) ? this.historyData.file_hotspots : [];
       return list.filter(h => Number(h?.total_beads || 0) >= 2).slice(0, 12);
+    },
+
+    getImpactClusters() {
+      const list = Array.isArray(this.historyData?.clusters) ? this.historyData.clusters : [];
+      return list.filter(c => Array.isArray(c?.bead_ids) && c.bead_ids.length >= 2).slice(0, 8);
+    },
+
+    getOrphanCommits() {
+      const list = Array.isArray(this.historyData?.orphans) ? this.historyData.orphans : [];
+      return list.slice(0, 10);
+    },
+
+    getOrphanRatioPct() {
+      const ratio = Number(this.historyData?.orphan_ratio || 0);
+      if (!Number.isFinite(ratio) || ratio <= 0) return null;
+      return Math.round(ratio * 100);
     },
 
     getIssueRelatedWork(id) {

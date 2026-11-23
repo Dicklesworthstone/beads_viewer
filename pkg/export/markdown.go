@@ -511,9 +511,10 @@ func GenerateReport(selected, context []model.Issue, opts ReportOptions) ([]byte
 		if opts.IncludeGraph {
 			var err error
 			graph, err = ExportGraph(opts.GraphIssues, opts.GraphStats, GraphExportConfig{
-				Format:    GraphFormatJSON,
-				DataHash:  analysis.ComputeDataHash(opts.GraphIssues),
-				Readiness: opts.Readiness,
+				Format:       GraphFormatJSON,
+				DataHash:     analysis.ComputeDataHash(opts.GraphIssues),
+				Readiness:    opts.Readiness,
+				ReferenceNow: opts.GeneratedAt,
 			})
 			if err != nil {
 				return nil, err
@@ -1486,7 +1487,7 @@ func writeMarkdownIssueSection(sb *strings.Builder, i model.Issue, slug string, 
 		}
 	}
 	if !isClosedLikeStatus(i.Status) {
-		if opts.ETAContext != nil {
+		if opts.ETAContext != nil && !i.IsTemplate && !i.Pinned && i.Status != model.StatusPinned {
 			eta := opts.ETAContext.EstimateForIssue(i, 1)
 			if eta.EstimatedDays > 0 && !eta.ETADate.IsZero() {
 				sb.WriteString(fmt.Sprintf("| **ETA Forecast** | ~%.1fd (%s, %.0f%% conf) |\n",
@@ -1503,7 +1504,11 @@ func writeMarkdownIssueSection(sb *strings.Builder, i model.Issue, slug string, 
 					if len(rootParts) >= 4 {
 						break
 					}
-					rootParts = append(rootParts, fmt.Sprintf("`%s` (P%d)", escapeTableCodeSpan(rb.ID), rb.Priority))
+					if rb.Status == "missing" {
+						rootParts = append(rootParts, fmt.Sprintf("`%s` (missing)", escapeTableCodeSpan(rb.ID)))
+					} else {
+						rootParts = append(rootParts, fmt.Sprintf("`%s` (P%d)", escapeTableCodeSpan(rb.ID), rb.Priority))
+					}
 				}
 				if len(rootParts) > 0 || chain.HasCycle {
 					val := strings.Join(rootParts, ", ")

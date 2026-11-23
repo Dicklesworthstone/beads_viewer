@@ -42,6 +42,7 @@ type InteractiveGraphOptions struct {
 	CandidateIDs      map[string]bool            // Optional candidate scope (suppresses priority hints for context-only neighbors)
 	UnblockIDs        map[string]bool            // Optional recipe unblock scope (preserves WhatIf/unblock priority signals)
 	Weights           *analysis.Weights          // Optional feedback-tuned scoring weights
+	IncludeInactive   bool                       // Honor --robot-include-inactive for priority hints
 	ForceFullAnalysis bool                       // Honor --force-full-analysis when computing auxiliary ETA stats
 	Triage            *analysis.TriageResult     // Full triage output for display
 	History           *correlation.HistoryReport // Git history correlation data
@@ -519,10 +520,17 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 		if opts.Weights != nil {
 			prioAn.SetWeights(*opts.Weights)
 		}
+		selectionMode := analysis.SelectionReadyLeaf
+		if opts.IncludeInactive {
+			selectionMode = analysis.SelectionAllScopedCandidates
+		}
+		eligibleHintIDs := prioAn.CandidateIssueSet(selectionMode)
 		if recs := prioAn.GenerateRecommendationsFromStats(opts.Stats, analysis.DefaultThresholds()); len(recs) > 0 {
 			priorityHints = make(map[string]analysis.PriorityRecommendation, len(recs))
 			for _, rec := range recs {
-				priorityHints[rec.IssueID] = rec
+				if eligibleHintIDs[rec.IssueID] {
+					priorityHints[rec.IssueID] = rec
+				}
 			}
 		}
 		pageRank = opts.Stats.PageRank()
@@ -696,7 +704,7 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 			node.PageRankRank = 0
 			node.BetweennessRank = 0
 		} else {
-			if etaCtx != nil {
+			if etaCtx != nil && !iss.IsTemplate && !iss.Pinned && iss.Status != model.StatusPinned {
 				est := etaCtx.EstimateForIssue(iss, 1)
 				if !est.ETADate.IsZero() {
 					days := est.EstimatedDays

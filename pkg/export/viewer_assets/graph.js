@@ -4237,11 +4237,14 @@ export function search(term) {
 // ============================================================================
 
 export function focusNode(nodeId, zoom = 2) {
+    if (!store.graph) return;
     const graphData = store.graph.graphData();
-    const node = graphData.nodes.find(n => n.id === nodeId);
+    const node = graphData?.nodes?.find(n => n.id === nodeId);
     if (node) {
-        store.graph.centerAt(node.x, node.y, 500);
-        store.graph.zoom(zoom, 500);
+        if (Number.isFinite(node.x) && Number.isFinite(node.y)) {
+            store.graph.centerAt(node.x, node.y, 500);
+            store.graph.zoom(zoom, 500);
+        }
         selectNode(node);
     }
 }

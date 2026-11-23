@@ -3275,6 +3275,12 @@
                               x-text="bid"></button>
                     </template>
                   </div>
+                  <div x-show="(hs.co_changed?.length || 0) > 0" class="flex flex-wrap items-center gap-1 mt-1 text-[10px] text-gray-500 dark:text-gray-400">
+                    <span class="shrink-0">↔ co-changes:</span>
+                    <template x-for="cf in (hs.co_changed || [])" :key="'co-' + hs.path + '-' + cf">
+                      <code class="px-1.5 py-0.5 rounded bg-gray-100 dark:bg-gray-700/70 text-gray-700 dark:text-gray-300 font-mono break-all" x-text="cf"></code>
+                    </template>
+                  </div>
                 </div>
                 <div class="flex items-center gap-2 shrink-0 font-mono text-[11px]">
                   <span x-show="hs.open_beads > 0"
@@ -3282,6 +3288,106 @@
                         x-text="hs.open_beads + ' open'"></span>
                   <span class="px-2 py-0.5 rounded bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300"
                         x-text="hs.total_beads + ' total'"></span>
+                </div>
+              </div>
+            </template>
+          </div>
+        </div>
+
+        <!-- Coupled Work Clusters (Impact Network from data/history.json, W28-4) -->
+        <div x-show="getImpactClusters().length > 0"
+             id="insights-impact-clusters"
+             class="bg-white dark:bg-gray-800 rounded-2xl border border-indigo-200 dark:border-indigo-800/50 overflow-hidden mb-6 animate-fade-in-up" style="animation-delay: 347ms;">
+          <div class="px-4 py-3 bg-gradient-to-r from-indigo-50 to-sky-50 dark:from-indigo-900/20 dark:to-sky-900/20 border-b border-indigo-100 dark:border-indigo-800/50 flex flex-wrap items-center justify-between gap-2">
+            <div class="flex items-center gap-2 min-w-0">
+              <span class="text-xl">🕸️</span>
+              <div class="min-w-0">
+                <h3 class="text-sm font-bold text-indigo-900 dark:text-indigo-200">Coupled Work Clusters (Impact Network)</h3>
+                <p class="text-xs text-indigo-700/80 dark:text-indigo-300/80">Beads tightly coupled across shared commits, files, and dependencies</p>
+              </div>
+            </div>
+            <span class="text-xs font-mono px-2 py-0.5 rounded-full bg-indigo-100 dark:bg-indigo-900/50 text-indigo-800 dark:text-indigo-200"
+                  x-text="getImpactClusters().length + ' clusters'"></span>
+          </div>
+          <div class="divide-y divide-gray-100 dark:divide-gray-700/60">
+            <template x-for="cl in getImpactClusters()" :key="'cluster-' + cl.cluster_id + '-' + cl.central_bead">
+              <div class="px-4 py-2.5 text-xs space-y-1.5">
+                <div class="flex flex-wrap items-center justify-between gap-2">
+                  <div class="font-semibold text-gray-800 dark:text-gray-200 min-w-0 break-words" x-text="cl.label || ('Cluster #' + cl.cluster_id)"></div>
+                  <div class="flex items-center gap-1.5 font-mono text-[10px] shrink-0">
+                    <span class="px-1.5 py-0.5 rounded bg-indigo-100 dark:bg-indigo-900/40 text-indigo-800 dark:text-indigo-200"
+                          x-text="cl.bead_ids.length + ' beads'"></span>
+                    <span x-show="cl.internal_edges > 0"
+                          class="px-1.5 py-0.5 rounded bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300"
+                          x-text="cl.internal_edges + ' links'"></span>
+                    <span x-show="Number.isFinite(Number(cl.connectivity)) && cl.connectivity > 0"
+                          class="px-1.5 py-0.5 rounded bg-sky-100 dark:bg-sky-900/40 text-sky-800 dark:text-sky-200"
+                          x-text="Math.round(cl.connectivity * 100) + '% dense'"></span>
+                  </div>
+                </div>
+                <div class="flex flex-wrap gap-1">
+                  <template x-for="bid in (cl.bead_ids || []).slice(0, 10)" :key="'cl-' + cl.cluster_id + '-' + bid">
+                    <button type="button"
+                            @click="showIssue(bid)"
+                            :class="bid === cl.central_bead ? 'bg-indigo-100 dark:bg-indigo-900/50 text-indigo-900 dark:text-indigo-100 border-indigo-300 dark:border-indigo-700 font-semibold' : 'bg-gray-50 dark:bg-gray-700/60 text-gray-700 dark:text-gray-300 border-gray-200 dark:border-gray-600'"
+                            class="px-1.5 py-0.5 text-[10px] font-mono rounded border hover:opacity-80 transition-opacity"
+                            x-text="bid === cl.central_bead ? ('★ ' + bid) : bid"></button>
+                  </template>
+                </div>
+                <div x-show="(cl.shared_files?.length || 0) > 0" class="flex flex-wrap gap-1 text-[10px] text-gray-500 dark:text-gray-400">
+                  <template x-for="sf in (cl.shared_files || [])" :key="'clsf-' + cl.cluster_id + '-' + sf">
+                    <code class="px-1.5 py-0.5 rounded bg-gray-100 dark:bg-gray-700/70 font-mono break-all" x-text="sf"></code>
+                  </template>
+                </div>
+              </div>
+            </template>
+          </div>
+        </div>
+
+        <!-- Unlinked Code Commits (Orphan Detector from data/history.json, W28-4) -->
+        <div x-show="getOrphanCommits().length > 0"
+             id="insights-orphan-commits"
+             class="bg-white dark:bg-gray-800 rounded-2xl border border-amber-200 dark:border-amber-800/50 overflow-hidden mb-6 animate-fade-in-up" style="animation-delay: 349ms;">
+          <div class="px-4 py-3 bg-gradient-to-r from-amber-50 to-yellow-50 dark:from-amber-900/20 dark:to-yellow-900/20 border-b border-amber-100 dark:border-amber-800/50 flex flex-wrap items-center justify-between gap-2">
+            <div class="flex items-center gap-2 min-w-0">
+              <span class="text-xl">🕵️</span>
+              <div class="min-w-0">
+                <h3 class="text-sm font-bold text-amber-900 dark:text-amber-200">Unlinked Code Commits (Orphans)</h3>
+                <p class="text-xs text-amber-700/80 dark:text-amber-300/80">Suspicious commits without bead links — confirm probable matches to close tracking gaps</p>
+              </div>
+            </div>
+            <div class="flex items-center gap-1.5 shrink-0">
+              <span x-show="getOrphanRatioPct() !== null"
+                    class="text-xs font-mono px-2 py-0.5 rounded-full bg-amber-100 dark:bg-amber-900/50 text-amber-800 dark:text-amber-200"
+                    x-text="getOrphanRatioPct() + '% unlinked'"></span>
+              <span class="text-xs font-mono px-2 py-0.5 rounded-full bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300"
+                    x-text="getOrphanCommits().length + ' flagged'"></span>
+            </div>
+          </div>
+          <div class="divide-y divide-gray-100 dark:divide-gray-700/60">
+            <template x-for="o in getOrphanCommits()" :key="'orphan-' + o.sha">
+              <div class="px-4 py-2.5 flex flex-wrap items-start justify-between gap-2 text-xs">
+                <div class="min-w-0 flex-1 space-y-1">
+                  <div class="flex flex-wrap items-center gap-1.5">
+                    <code class="px-1.5 py-0.5 rounded bg-gray-100 dark:bg-gray-700 font-mono text-[10px] text-gray-800 dark:text-gray-200 shrink-0" x-text="o.short_sha"></code>
+                    <span class="px-1.5 py-0.5 rounded text-[10px] font-mono font-semibold bg-amber-100 dark:bg-amber-900/40 text-amber-800 dark:text-amber-200 shrink-0"
+                          x-text="'score ' + o.suspicion_score"></span>
+                    <span class="text-gray-800 dark:text-gray-200 break-words min-w-0" x-text="o.message"></span>
+                  </div>
+                  <div x-show="o.probable_bead_id" class="flex flex-wrap items-center gap-1.5 text-[10px]">
+                    <span class="text-gray-500 dark:text-gray-400">Probable bead:</span>
+                    <button type="button"
+                            @click="showIssue(o.probable_bead_id)"
+                            class="px-1.5 py-0.5 font-mono rounded bg-emerald-50 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800/60 hover:bg-emerald-100 dark:hover:bg-emerald-800/50 transition-colors"
+                            x-text="o.probable_bead_id + (o.probable_confidence ? (' (' + o.probable_confidence + '%)') : '')"></button>
+                    <button type="button"
+                            x-show="!hasProvisionalSourceAuthority() && o.confirm_command"
+                            @click="copyShellCommand(o.confirm_command)"
+                            :title="o.confirm_command"
+                            class="px-1.5 py-0.5 font-mono rounded bg-amber-50 dark:bg-amber-900/30 text-amber-800 dark:text-amber-200 border border-amber-200 dark:border-amber-800/60 hover:bg-amber-100 dark:hover:bg-amber-800/50 transition-colors">
+                      📋 Copy confirm cmd
+                    </button>
+                  </div>
                 </div>
               </div>
             </template>
@@ -3638,6 +3744,26 @@
                           <div class="h-full bg-purple-500 rounded-full transition-all" :style="'width: ' + ((selectedRec.breakdown?.risk_norm || 0) * 100) + '%'"></div>
                         </div>
                         <span class="text-[10px] font-mono text-gray-500 w-12 text-right" x-text="((selectedRec.breakdown?.risk_norm || 0) * 100).toFixed(0) + '%'"></span>
+                      </div>
+                      <div x-show="selectedRec.breakdown?.risk_explanation || (selectedRec.breakdown?.risk_signals && (selectedRec.breakdown.risk_signals.composite_risk > 0 || selectedRec.breakdown.risk_signals.fan_variance > 0 || selectedRec.breakdown.risk_signals.activity_churn > 0 || selectedRec.breakdown.risk_signals.cross_repo_risk > 0 || selectedRec.breakdown.risk_signals.status_risk > 0))"
+                           data-triage-risk-detail
+                           class="sm:pl-[4.5rem] text-[10px] text-purple-700 dark:text-purple-300 space-y-1">
+                        <div x-show="selectedRec.breakdown?.risk_explanation || selectedRec.breakdown?.risk_signals?.explanation"
+                             x-text="selectedRec.breakdown?.risk_explanation || selectedRec.breakdown?.risk_signals?.explanation"></div>
+                        <div x-show="selectedRec.breakdown?.risk_signals" class="flex flex-wrap gap-1 font-mono text-[9px]">
+                          <span x-show="(selectedRec.breakdown?.risk_signals?.fan_variance || 0) > 0"
+                                class="px-1.5 py-0.5 rounded bg-purple-100 dark:bg-purple-900/40"
+                                x-text="'Fan ' + Math.round((selectedRec.breakdown?.risk_signals?.fan_variance || 0) * 100) + '%'"></span>
+                          <span x-show="(selectedRec.breakdown?.risk_signals?.activity_churn || 0) > 0"
+                                class="px-1.5 py-0.5 rounded bg-purple-100 dark:bg-purple-900/40"
+                                x-text="'Churn ' + Math.round((selectedRec.breakdown?.risk_signals?.activity_churn || 0) * 100) + '%'"></span>
+                          <span x-show="(selectedRec.breakdown?.risk_signals?.cross_repo_risk || 0) > 0"
+                                class="px-1.5 py-0.5 rounded bg-purple-100 dark:bg-purple-900/40"
+                                x-text="'Cross-Repo ' + Math.round((selectedRec.breakdown?.risk_signals?.cross_repo_risk || 0) * 100) + '%'"></span>
+                          <span x-show="(selectedRec.breakdown?.risk_signals?.status_risk || 0) > 0"
+                                class="px-1.5 py-0.5 rounded bg-purple-100 dark:bg-purple-900/40"
+                                x-text="'Status ' + Math.round((selectedRec.breakdown?.risk_signals?.status_risk || 0) * 100) + '%'"></span>
+                        </div>
                       </div>
                       <!-- Staleness -->
                       <div class="flex items-center gap-2">
@@ -4771,10 +4897,11 @@
                             data-eta-pill
                             class="px-2 py-0.5 text-xs font-mono font-medium rounded-full bg-teal-100 dark:bg-teal-900/40 text-teal-800 dark:text-teal-200 border border-teal-200 dark:border-teal-800"
                             x-text="'⏱ ' + formatETAPill(selectedIssue)"></span>
-                      <span x-show="getIssuePriorityHint(selectedIssue.id)"
+                      <span x-show="isActiveNodeStatus(selectedIssue.status) && getIssuePriorityHint(selectedIssue.id)"
                             data-priority-hint-pill
                             :title="(getIssuePriorityHint(selectedIssue.id)?.reasoning || []).join(' · ')"
-                            class="px-2 py-0.5 text-xs font-mono font-semibold rounded-full bg-amber-100 dark:bg-amber-900/40 text-amber-800 dark:text-amber-200 border border-amber-200 dark:border-amber-800"
+                            :class="getIssuePriorityHint(selectedIssue.id)?.direction === 'increase' ? 'bg-amber-100 dark:bg-amber-900/40 text-amber-800 dark:text-amber-200 border-amber-200 dark:border-amber-800' : 'bg-sky-100 dark:bg-sky-900/40 text-sky-700 dark:text-sky-300 border-sky-200 dark:border-sky-800'"
+                            class="px-2 py-0.5 text-xs font-mono font-semibold rounded-full border"
                             x-text="getIssuePriorityHint(selectedIssue.id) ? ((getIssuePriorityHint(selectedIssue.id).direction === 'increase' ? '↑ ' : '↓ ') + 'Suggest P' + getIssuePriorityHint(selectedIssue.id).suggested_priority) : ''"></span>
                       <span x-show="(selectedIssue.comment_count || (selectedIssue.comments && selectedIssue.comments.length) || 0) > 0"
                             class="px-2 py-0.5 text-xs font-medium rounded-full bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300">
@@ -4942,6 +5069,28 @@
                       <span class="w-14 shrink-0 text-right font-mono text-[11px] text-gray-500 dark:text-gray-400" x-text="bar.value.toFixed(3)"></span>
                     </div>
                   </template>
+                  <div x-show="isActiveNodeStatus(selectedIssue.status) && (selectedIssue.triage_breakdown?.risk_explanation || (selectedIssue.triage_breakdown?.risk_signals && (selectedIssue.triage_breakdown.risk_signals.composite_risk > 0 || selectedIssue.triage_breakdown.risk_signals.fan_variance > 0 || selectedIssue.triage_breakdown.risk_signals.activity_churn > 0 || selectedIssue.triage_breakdown.risk_signals.cross_repo_risk > 0 || selectedIssue.triage_breakdown.risk_signals.status_risk > 0)))"
+                       data-modal-risk-detail
+                       class="pt-1.5 text-xs text-purple-700 dark:text-purple-300 space-y-1">
+                    <div class="flex items-start gap-1.5">
+                      <span class="shrink-0">⚠️</span>
+                      <span x-text="selectedIssue.triage_breakdown?.risk_explanation || selectedIssue.triage_breakdown?.risk_signals?.explanation || 'Elevated operational risk'"></span>
+                    </div>
+                    <div x-show="selectedIssue.triage_breakdown?.risk_signals" class="flex flex-wrap gap-1.5 font-mono text-[10px]">
+                      <span x-show="(selectedIssue.triage_breakdown?.risk_signals?.fan_variance || 0) > 0"
+                            class="px-1.5 py-0.5 rounded bg-purple-100 dark:bg-purple-900/40"
+                            x-text="'Fan ' + Math.round((selectedIssue.triage_breakdown?.risk_signals?.fan_variance || 0) * 100) + '%'"></span>
+                      <span x-show="(selectedIssue.triage_breakdown?.risk_signals?.activity_churn || 0) > 0"
+                            class="px-1.5 py-0.5 rounded bg-purple-100 dark:bg-purple-900/40"
+                            x-text="'Churn ' + Math.round((selectedIssue.triage_breakdown?.risk_signals?.activity_churn || 0) * 100) + '%'"></span>
+                      <span x-show="(selectedIssue.triage_breakdown?.risk_signals?.cross_repo_risk || 0) > 0"
+                            class="px-1.5 py-0.5 rounded bg-purple-100 dark:bg-purple-900/40"
+                            x-text="'Cross-Repo ' + Math.round((selectedIssue.triage_breakdown?.risk_signals?.cross_repo_risk || 0) * 100) + '%'"></span>
+                      <span x-show="(selectedIssue.triage_breakdown?.risk_signals?.status_risk || 0) > 0"
+                            class="px-1.5 py-0.5 rounded bg-purple-100 dark:bg-purple-900/40"
+                            x-text="'Status ' + Math.round((selectedIssue.triage_breakdown?.risk_signals?.status_risk || 0) * 100) + '%'"></span>
+                    </div>
+                  </div>
                 </div>
               </div>
 

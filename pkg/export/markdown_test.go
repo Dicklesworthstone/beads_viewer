@@ -3391,3 +3391,176 @@ func TestWave27_PriorityBriefAndMarkdownReportExecutiveSections(t *testing.T) {
 		t.Fatalf("W27-5 regression: VisibleIDs filter leaked excluded root blocker EX-ROOT:\n%s", scopedMD)
 	}
 }
+
+func TestWave28_Pass13AndW28_ExportParity(t *testing.T) {
+	now := time.Date(2026, 11, 22, 12, 0, 0, 0, time.UTC)
+	est := 60
+	closedAt := now.Add(-24 * time.Hour)
+
+	// 1. A13-10: GetBlockerChain sorts real P1 root ahead of synthetic "missing" root,
+	//    GenerateMarkdown renders `(missing)` instead of `(P0)`, and suppresses ETA on templates/pinned.
+	issues := []model.Issue{
+		{ID: "REAL-P1", Title: "Real P1 Root", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, EstimatedMinutes: &est, CreatedAt: now.Add(-48 * time.Hour), UpdatedAt: now},
+		{ID: "BLK-BOTH", Title: "Blocked by real and missing", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, EstimatedMinutes: &est, CreatedAt: now.Add(-48 * time.Hour), UpdatedAt: now,
+			Dependencies: []*model.Dependency{
+				{IssueID: "BLK-BOTH", DependsOnID: "EXT-MISSING", Type: model.DepBlocks},
+				{IssueID: "BLK-BOTH", DependsOnID: "REAL-P1", Type: model.DepBlocks},
+			}},
+		{ID: "TMPL-1", Title: "Template task", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, IsTemplate: true, EstimatedMinutes: &est, CreatedAt: now.Add(-48 * time.Hour), UpdatedAt: now},
+		{ID: "PIN-1", Title: "Pinned task", Status: model.StatusPinned, Priority: 2, IssueType: model.TypeTask, Pinned: true, EstimatedMinutes: &est, CreatedAt: now.Add(-48 * time.Hour), UpdatedAt: now},
+		{ID: "DONE-1", Title: "Closed sample", Status: model.StatusClosed, Priority: 2, IssueType: model.TypeTask, EstimatedMinutes: &est, SourceRepo: "api", CreatedAt: now.Add(-72 * time.Hour), UpdatedAt: closedAt, ClosedAt: &closedAt},
+	}
+	an := analysis.NewAnalyzer(issues)
+	an.SetNow(now)
+	stats := an.Analyze()
+	chain := an.GetBlockerChain("BLK-BOTH")
+	if chain == nil || len(chain.RootBlockers) != 2 || chain.RootBlockers[0].ID != "REAL-P1" || chain.RootBlockers[1].ID != "EXT-MISSING" {
+		t.Fatalf("A13-10 regression: expected real P1 root sorted before synthetic missing root, got %+v", chain)
+	}
+	etaCtx := analysis.NewETAContext(issues, &stats, now)
+	md, err := GenerateMarkdown(issues, "A13-10 Report", ReportOptions{
+		GeneratedAt:  now,
+		IncludeGraph: false,
+		Analyzer:     an,
+		ETAContext:   etaCtx,
+	})
+	if err != nil {
+		t.Fatalf("GenerateMarkdown: %v", err)
+	}
+	if !strings.Contains(md, "`REAL-P1` (P1), `EXT-MISSING` (missing)") {
+		t.Fatalf("A13-10 regression: expected `(missing)` after real `(P1)` root:\n%s", md)
+	}
+	if strings.Contains(md, "`EXT-MISSING` (P0)") {
+		t.Fatalf("A13-10 regression: printed false (P0) for missing root:\n%s", md)
+	}
+	// Verify TMPL-1 and PIN-1 sections do NOT emit ETA Forecast.
+	for _, excluded := range []string{"TMPL-1 Template task", "PIN-1 Pinned task"} {
+		idx := strings.LastIndex(md, excluded)
+		if idx < 0 {
+			t.Fatalf("missing section %q in markdown", excluded)
+		}
+		secEnd := strings.Index(md[idx+len(excluded):], "\n## ")
+		sec := md[idx:]
+		if secEnd > 0 {
+			sec = md[idx : idx+len(excluded)+secEnd]
+		}
+		if strings.Contains(sec, "**ETA Forecast**") {
+			t.Fatalf("A13-10 regression: %s should not emit ETA Forecast:\n%s", excluded, sec)
+		}
+	}
+
+	// 2. A13-2 + A14-10: GenerateInteractiveGraphHTML respects IncludeInactive for priority hints
+	//    (with a genuine positive control: BLK-HUB is P4, blocked by ROOT-1, and blocks 4 P0 leaves)
+	//    and skips ETA on templates/pinned regardless of IncludeInactive.
+	est60 := 60
+	inactIssues := []model.Issue{
+		{ID: "ROOT-1", Title: "Root blocker", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, EstimatedMinutes: &est60, CreatedAt: now, UpdatedAt: now},
+		{ID: "BLK-HUB", Title: "Misaligned blocked hub", Status: model.StatusOpen, Priority: 4, IssueType: model.TypeTask, EstimatedMinutes: &est60, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "BLK-HUB", DependsOnID: "ROOT-1", Type: model.DepBlocks}}},
+		{ID: "LEAF-1", Title: "P0 leaf 1", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeBug, EstimatedMinutes: &est60, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "LEAF-1", DependsOnID: "BLK-HUB", Type: model.DepBlocks}}},
+		{ID: "LEAF-2", Title: "P0 leaf 2", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeBug, EstimatedMinutes: &est60, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "LEAF-2", DependsOnID: "BLK-HUB", Type: model.DepBlocks}}},
+		{ID: "LEAF-3", Title: "P0 leaf 3", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeBug, EstimatedMinutes: &est60, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "LEAF-3", DependsOnID: "BLK-HUB", Type: model.DepBlocks}}},
+		{ID: "LEAF-4", Title: "P0 leaf 4", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeBug, EstimatedMinutes: &est60, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "LEAF-4", DependsOnID: "BLK-HUB", Type: model.DepBlocks}}},
+		{ID: "TMPL-1", Title: "Template task", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, IsTemplate: true, EstimatedMinutes: &est60, CreatedAt: now, UpdatedAt: now},
+		{ID: "PIN-1", Title: "Pinned task", Status: model.StatusPinned, Priority: 2, IssueType: model.TypeTask, Pinned: true, EstimatedMinutes: &est60, CreatedAt: now, UpdatedAt: now},
+	}
+	inactAn := analysis.NewAnalyzer(inactIssues)
+	inactAn.SetNow(now)
+	inactStats := inactAn.Analyze()
+	extractNodeJSON := func(htmlStr, id string) string {
+		t.Helper()
+		needle := `"id":"` + id + `"`
+		idx := strings.Index(htmlStr, needle)
+		if idx < 0 {
+			t.Fatalf("missing node %s in interactive HTML", id)
+		}
+		end := strings.Index(htmlStr[idx:], "}")
+		return htmlStr[idx : idx+end+1]
+	}
+
+	htmlDefaultPath := filepath.Join(t.TempDir(), "default.html")
+	if _, err := GenerateInteractiveGraphHTML(InteractiveGraphOptions{
+		Issues:          inactIssues,
+		VelocityIssues:  inactIssues,
+		Stats:           &inactStats,
+		Readiness:       inactAn.Readiness(),
+		IncludeInactive: false,
+		ExportedAt:      now,
+		Path:            htmlDefaultPath,
+	}); err != nil {
+		t.Fatalf("GenerateInteractiveGraphHTML(default): %v", err)
+	}
+	htmlDefaultBytes, err := os.ReadFile(htmlDefaultPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	htmlDefaultStr := string(htmlDefaultBytes)
+	for _, nid := range []string{"TMPL-1", "PIN-1"} {
+		nodeJSON := extractNodeJSON(htmlDefaultStr, nid)
+		if strings.Contains(nodeJSON, `"eta_days"`) || strings.Contains(nodeJSON, `"suggested_priority"`) {
+			t.Fatalf("A13-2 regression: node %s leaked eta_days or suggested_priority: %s", nid, nodeJSON)
+		}
+	}
+	if blkDefault := extractNodeJSON(htmlDefaultStr, "BLK-HUB"); strings.Contains(blkDefault, `"suggested_priority"`) {
+		t.Fatalf("A13-2 regression: default IncludeInactive=false leaked suggested_priority on blocked BLK-HUB: %s", blkDefault)
+	}
+
+	htmlInactPath := filepath.Join(t.TempDir(), "include_inactive.html")
+	if _, err := GenerateInteractiveGraphHTML(InteractiveGraphOptions{
+		Issues:          inactIssues,
+		VelocityIssues:  inactIssues,
+		Stats:           &inactStats,
+		Readiness:       inactAn.Readiness(),
+		IncludeInactive: true,
+		ExportedAt:      now,
+		Path:            htmlInactPath,
+	}); err != nil {
+		t.Fatalf("GenerateInteractiveGraphHTML(includeInactive=true): %v", err)
+	}
+	htmlInactBytes, err := os.ReadFile(htmlInactPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	htmlInactStr := string(htmlInactBytes)
+	if blkInact := extractNodeJSON(htmlInactStr, "BLK-HUB"); !strings.Contains(blkInact, `"suggested_priority"`) {
+		t.Fatalf("A13-2 positive control failed: IncludeInactive=true should emit suggested_priority on blocked BLK-HUB: %s", blkInact)
+	}
+	for _, nid := range []string{"TMPL-1", "PIN-1"} {
+		if nodeJSON := extractNodeJSON(htmlInactStr, nid); strings.Contains(nodeJSON, `"eta_days"`) {
+			t.Fatalf("A13-2 regression: IncludeInactive=true leaked eta_days on %s: %s", nid, nodeJSON)
+		}
+	}
+
+	// 3. W28-6 + A14-7: ExportGraph(GraphFormatJSON) populates active structural metrics, source_repo,
+	//    deterministic actionable, and suppresses active CriticalPath on closed nodes.
+	issues[0].SourceRepo = "core"
+	issues[1].SourceRepo = "web"
+	res, err := ExportGraph(issues, &stats, GraphExportConfig{
+		Format:       GraphFormatJSON,
+		Readiness:    an.Readiness(),
+		ReferenceNow: now,
+	})
+	if err != nil {
+		t.Fatalf("ExportGraph(json): %v", err)
+	}
+	byID := make(map[string]AdjacencyNode, len(res.Adjacency.Nodes))
+	for _, n := range res.Adjacency.Nodes {
+		byID[n.ID] = n
+	}
+	if byID["REAL-P1"].SourceRepo != "core" || byID["REAL-P1"].Actionable == nil || !*byID["REAL-P1"].Actionable {
+		t.Fatalf("W28-6 regression: REAL-P1 missing source_repo=core or actionable=true: %+v", byID["REAL-P1"])
+	}
+	if byID["REAL-P1"].Slack == nil {
+		t.Fatalf("W28-6 regression: REAL-P1 missing active slack on acyclic graph: %+v", byID["REAL-P1"])
+	}
+	if byID["BLK-BOTH"].Actionable == nil || *byID["BLK-BOTH"].Actionable {
+		t.Fatalf("W28-6 regression: BLK-BOTH should report actionable=false: %+v", byID["BLK-BOTH"])
+	}
+	if byID["DONE-1"].Slack != nil || byID["DONE-1"].Betweenness != 0 || byID["DONE-1"].CriticalPath != 0 || byID["DONE-1"].IsArticulation {
+		t.Fatalf("W28-6/A14-7 regression: closed node DONE-1 must suppress active structural metrics (incl. critical_path): %+v", byID["DONE-1"])
+	}
+}

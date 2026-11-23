@@ -4355,8 +4355,13 @@ func (a *Analyzer) GetBlockerChain(issueID string) *BlockerChainResult {
 
 	result.ChainLength = len(result.Chain) - 1 // Exclude target itself
 
-	// Sort root blockers by priority (lower = higher priority)
+	// Sort root blockers: real issues before synthetic "missing" entries, then priority ascending, then ID
 	sort.Slice(result.RootBlockers, func(i, j int) bool {
+		mi := result.RootBlockers[i].Status == "missing"
+		mj := result.RootBlockers[j].Status == "missing"
+		if mi != mj {
+			return !mi
+		}
 		if result.RootBlockers[i].Priority != result.RootBlockers[j].Priority {
 			return result.RootBlockers[i].Priority < result.RootBlockers[j].Priority
 		}

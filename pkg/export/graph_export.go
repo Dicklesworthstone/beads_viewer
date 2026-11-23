@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
@@ -21,12 +22,13 @@ const (
 
 // GraphExportConfig configures graph export behavior.
 type GraphExportConfig struct {
-	Format    GraphExportFormat     // Output format (json, dot, mermaid)
-	Label     string                // Filter to specific label
-	Root      string                // Subgraph from specific root
-	Depth     int                   // Max depth for subgraph (0 = unlimited)
-	DataHash  string                // Hash of input data for provenance
-	Readiness *model.ReadinessIndex // Optional full-source readiness index (falls back to issues when nil)
+	Format       GraphExportFormat     // Output format (json, dot, mermaid)
+	Label        string                // Filter to specific label
+	Root         string                // Subgraph from specific root
+	Depth        int                   // Max depth for subgraph (0 = unlimited)
+	DataHash     string                // Hash of input data for provenance
+	Readiness    *model.ReadinessIndex // Optional full-source readiness index (falls back to issues when nil)
+	ReferenceNow time.Time             // Optional reference instant for deterministic readiness/actionable flags
 }
 
 // GraphExportResult contains the exported graph and metadata.
@@ -56,12 +58,19 @@ type AdjacencyGraph struct {
 
 // AdjacencyNode represents a node in the adjacency graph.
 type AdjacencyNode struct {
-	ID       string   `json:"id"`
-	Title    string   `json:"title"`
-	Status   string   `json:"status"`
-	Priority int      `json:"priority"`
-	Labels   []string `json:"labels,omitempty"`
-	PageRank float64  `json:"pagerank,omitempty"`
+	ID             string   `json:"id"`
+	Title          string   `json:"title"`
+	Status         string   `json:"status"`
+	Priority       int      `json:"priority"`
+	Labels         []string `json:"labels,omitempty"`
+	SourceRepo     string   `json:"source_repo,omitempty"`
+	PageRank       float64  `json:"pagerank,omitempty"`
+	Betweenness    float64  `json:"betweenness,omitempty"`
+	CriticalPath   float64  `json:"critical_path,omitempty"`
+	Slack          *float64 `json:"slack,omitempty"`
+	CoreNumber     int      `json:"kcore,omitempty"`
+	IsArticulation bool     `json:"is_articulation,omitempty"`
+	Actionable     *bool    `json:"actionable,omitempty"`
 }
 
 // AdjacencyEdge represents an edge in the adjacency graph.
@@ -155,7 +164,11 @@ func ExportGraph(issues []model.Issue, stats *analysis.GraphStats, config GraphE
 		fallthrough
 	default:
 		result.Format = "json"
-		adjacency := generateAdjacency(filteredIssues, issueIDs, stats)
+		refNow := config.ReferenceNow
+		if refNow.IsZero() {
+			refNow = time.Now()
+		}
+		adjacency := generateAdjacency(filteredIssues, issueIDs, stats, readiness, refNow)
 		result.Adjacency = adjacency
 		result.Explanation = GraphExplanation{
 			What:      "Dependency graph as JSON adjacency list",
@@ -428,12 +441,28 @@ func generateMermaid(issues []model.Issue, issueIDs map[string]bool) string {
 	})
 }
 
-// generateAdjacency creates a JSON adjacency list representation.
-func generateAdjacency(issues []model.Issue, issueIDs map[string]bool, stats *analysis.GraphStats) *AdjacencyGraph {
-	// Get PageRank
-	var pageRank map[string]float64
+// generateAdjacency creates a JSON adjacency list representation enriched with
+// active-subgraph structural metrics and readiness state.
+func generateAdjacency(issues []model.Issue, issueIDs map[string]bool, stats *analysis.GraphStats, readiness *model.ReadinessIndex, refNow time.Time) *AdjacencyGraph {
+	var pageRank, betweenness, criticalPath, slack map[string]float64
+	var coreNumber map[string]int
+	var artSet map[string]bool
+	hasCycles := false
 	if stats != nil {
 		pageRank = stats.PageRank()
+		betweenness = stats.ActiveBetweenness()
+		criticalPath = stats.ActiveCriticalPathScore()
+		hasCycles = len(stats.Cycles()) > 0
+		if !hasCycles {
+			slack = stats.ActiveSlack()
+		}
+		coreNumber = stats.ActiveCoreNumber()
+		if aps := stats.ActiveArticulationPoints(); len(aps) > 0 {
+			artSet = make(map[string]bool, len(aps))
+			for _, id := range aps {
+				artSet[id] = true
+			}
+		}
 	}
 
 	// Sort issues for deterministic output
@@ -446,17 +475,49 @@ func generateAdjacency(issues []model.Issue, issueIDs map[string]bool, stats *an
 	// Build nodes
 	nodes := make([]AdjacencyNode, 0, len(sortedIssues))
 	for _, i := range sortedIssues {
+		active := i.Status != model.StatusClosed && i.Status != model.StatusTombstone
 		node := AdjacencyNode{
-			ID:       i.ID,
-			Title:    i.Title,
-			Status:   string(i.Status),
-			Priority: i.Priority,
-			Labels:   i.Labels,
+			ID:         i.ID,
+			Title:      i.Title,
+			Status:     string(i.Status),
+			Priority:   i.Priority,
+			Labels:     i.Labels,
+			SourceRepo: strings.TrimSpace(i.SourceRepo),
 		}
 		if pageRank != nil {
 			if pr, ok := pageRank[i.ID]; ok {
 				node.PageRank = pr
 			}
+		}
+		if active {
+			if criticalPath != nil {
+				if cp, ok := criticalPath[i.ID]; ok {
+					node.CriticalPath = cp
+				}
+			}
+			if betweenness != nil {
+				if bw, ok := betweenness[i.ID]; ok {
+					node.Betweenness = bw
+				}
+			}
+			if slack != nil {
+				if sl, ok := slack[i.ID]; ok {
+					slVal := sl
+					node.Slack = &slVal
+				}
+			}
+			if coreNumber != nil {
+				if kc, ok := coreNumber[i.ID]; ok {
+					node.CoreNumber = kc
+				}
+			}
+			if artSet != nil && artSet[i.ID] {
+				node.IsArticulation = true
+			}
+		}
+		if readiness != nil {
+			act := readiness.Ready(i.ID, refNow)
+			node.Actionable = &act
 		}
 		nodes = append(nodes, node)
 	}

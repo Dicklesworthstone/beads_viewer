@@ -363,18 +363,23 @@ function resolveChartsReferenceNowMs() {
     return Date.now();
 }
 
+function parseValidChartDate(raw) {
+    if (!raw) return null;
+    const parsed = raw instanceof Date ? raw : new Date(raw);
+    if (Number.isNaN(parsed.getTime()) || parsed.getUTCFullYear() < 100) {
+        return null;
+    }
+    return parsed;
+}
+
 function resolveClosedDate(issue) {
     const rawClosed = issue.closed_at || issue.closedAt;
-    if (rawClosed) {
-        const parsed = new Date(rawClosed);
-        if (!isNaN(parsed)) return parsed;
-    }
+    const parsedClosed = parseValidChartDate(rawClosed);
+    if (parsedClosed) return parsedClosed;
     if (String(issue.status || '').toLowerCase() === 'closed') {
         const rawUpdated = issue.updated_at || issue.updatedAt;
-        if (rawUpdated) {
-            const parsed = new Date(rawUpdated);
-            if (!isNaN(parsed)) return parsed;
-        }
+        const parsedUpdated = parseValidChartDate(rawUpdated);
+        if (parsedUpdated) return parsedUpdated;
     }
     return null;
 }
@@ -395,12 +400,11 @@ function computeBurndownData() {
     // Precompute lifecycle timestamps for all issues (including tombstones so upstream refs resolve)
     const lifecycleById = new Map();
     chartsState.issues.forEach(issue => {
-        const created = new Date(issue.created_at || issue.createdAt);
-        const rawUpdated = issue.updated_at || issue.updatedAt;
-        const updated = rawUpdated ? new Date(rawUpdated) : null;
+        const created = parseValidChartDate(issue.created_at || issue.createdAt);
+        const updated = parseValidChartDate(issue.updated_at || issue.updatedAt);
         lifecycleById.set(issue.id, {
-            created: Number.isNaN(created.getTime()) ? null : created,
-            updatedAt: updated && !Number.isNaN(updated.getTime()) ? updated : null,
+            created,
+            updatedAt: updated,
             closedAt: resolveClosedDate(issue),
             status: String(issue.status || 'open').toLowerCase()
         });

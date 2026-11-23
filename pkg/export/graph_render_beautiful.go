@@ -1774,24 +1774,34 @@ function populatePanelContent(prefix, node) {
     addMetric('Out-Degree', node.out_degree ?? '-');
 }
 
+// Focus a visible node or inform the user when hidden by active filters
+function focusVisibleGraphNode(targetId) {
+    if (!targetId) return;
+    const graphNodes = Graph.graphData().nodes || [];
+    const target = graphNodes.find(n => n.id === targetId);
+    if (!target) return;
+    if (!currentVisibilityFilter(target)) {
+        showToast(target.id + ' is hidden by active filters');
+        return;
+    }
+    selectNode(target);
+    if (Number.isFinite(target.x) && Number.isFinite(target.y)) {
+        Graph.centerAt(target.x, target.y, 500);
+        Graph.zoom(2.5, 500);
+    }
+}
+
 // Wire up dep chip clicks for a container
 function wireDepChips(container) {
     container.querySelectorAll('.hover-dep-chip').forEach(chip => {
-        chip.onclick = () => {
-            const targetId = chip.dataset.id;
-            const graphNodes = Graph.graphData().nodes;
-            const target = graphNodes.find(n => n.id === targetId);
-            if (target) {
-                Graph.centerAt(target.x, target.y, 500);
-                Graph.zoom(2.5, 500);
-                setTimeout(() => showHoverPanel(target), 600);
-            }
-        };
+        chip.onclick = () => focusVisibleGraphNode(chip.dataset.id);
     });
 }
 
 // Show full details panel (docked or floating based on mode)
+let activePanelNode = null;
 function showHoverPanel(node) {
+    activePanelNode = node || null;
     if (panelMode === 'docked') {
         // Update docked panel
         populatePanelContent('docked-', node);
@@ -1807,6 +1817,7 @@ function showHoverPanel(node) {
 }
 
 function hideHoverPanel() {
+    activePanelNode = null;
     if (panelMode === 'docked') {
         document.getElementById('docked-panel').classList.remove('visible');
         document.getElementById('docked-no-selection').style.display = 'flex';
@@ -1958,17 +1969,11 @@ function performSearch(query) {
     resultsEl.querySelectorAll('.search-result-item[data-id]').forEach(item => {
         item.onclick = () => {
             const id = item.dataset.id;
-            const graphNodes = Graph.graphData().nodes;
-            const node = graphNodes.find(n => n.id === id);
-            if (node) {
-                selectNode(node);
-                Graph.centerAt(node.x, node.y, 500);
-                Graph.zoom(2.5, 500);
-            }
             resultsEl.classList.remove('visible');
             searchQuery = '';
             document.getElementById('search-input').value = '';
             applyFilters();
+            focusVisibleGraphNode(id);
         };
     });
 }
@@ -2410,17 +2415,36 @@ function closeCycleInspector() {
     const btn = document.getElementById('btn-cycles');
     if (btn) btn.classList.remove('active');
 }
-function showCycleInspector(idx) {
+function showCycleInspector(idx, step = 1) {
     const cycles = Array.isArray(DATA.cycles) ? DATA.cycles : [];
     if (cycles.length === 0) return;
+    const graphNodeById = new Map((Graph.graphData().nodes || []).map(n => [n.id, n]));
+    const dir = step < 0 ? -1 : 1;
+    const startIdx = ((idx %% cycles.length) + cycles.length) %% cycles.length;
+    let chosenIdx = -1;
+    let openCycle = [];
+    for (let offset = 0; offset < cycles.length; offset++) {
+        const candIdx = (((startIdx + offset * dir) %% cycles.length) + cycles.length) %% cycles.length;
+        const rawCycle = cycles[candIdx] || [];
+        const candOpen = (rawCycle.length > 1 && rawCycle[0] === rawCycle[rawCycle.length - 1])
+            ? rawCycle.slice(0, -1)
+            : rawCycle;
+        if (candOpen.length > 0 && candOpen.some(id => {
+            const n = graphNodeById.get(id);
+            return n && currentVisibilityFilter(n);
+        })) {
+            chosenIdx = candIdx;
+            openCycle = candOpen;
+            break;
+        }
+    }
+    if (chosenIdx < 0 || openCycle.length === 0) {
+        showToast('Cycle nodes are hidden by active filters');
+        return;
+    }
     cancelPathFinder();
     clearWhatIfSimulation();
-    activeCycleIndex = ((idx %% cycles.length) + cycles.length) %% cycles.length;
-    const rawCycle = cycles[activeCycleIndex] || [];
-    const openCycle = (rawCycle.length > 1 && rawCycle[0] === rawCycle[rawCycle.length - 1])
-        ? rawCycle.slice(0, -1)
-        : rawCycle;
-    if (openCycle.length === 0) return;
+    activeCycleIndex = chosenIdx;
     const nodeSet = new Set(openCycle);
     activePathNodes = nodeSet;
     highlightedNodes = nodeSet;
@@ -2461,8 +2485,8 @@ if (cyclesBtn && Array.isArray(DATA.cycles) && DATA.cycles.length > 0) {
         }
     };
 }
-document.getElementById('btn-cycle-prev').onclick = () => { if (activeCycleIndex >= 0) showCycleInspector(activeCycleIndex - 1); };
-document.getElementById('btn-cycle-next').onclick = () => { if (activeCycleIndex >= 0) showCycleInspector(activeCycleIndex + 1); };
+document.getElementById('btn-cycle-prev').onclick = () => { if (activeCycleIndex >= 0) showCycleInspector(activeCycleIndex - 1, -1); };
+document.getElementById('btn-cycle-next').onclick = () => { if (activeCycleIndex >= 0) showCycleInspector(activeCycleIndex + 1, 1); };
 document.getElementById('btn-cycle-close').onclick = () => {
     closeCycleInspector();
     clearWhatIfSimulation();
@@ -2633,6 +2657,7 @@ function applyFilters() {
     Graph.nodeVisibility(currentVisibilityFilter);
     const visibleIds = new Set(DATA.nodes.filter(currentVisibilityFilter).map(n => n.id));
     let hidActivePanel = false;
+    let needsHighlightRefresh = false;
     if (selectedNode && !visibleIds.has(selectedNode.id)) {
         selectedNode = null;
         document.getElementById('node-detail').classList.remove('visible');
@@ -2642,9 +2667,20 @@ function applyFilters() {
     if (hoveredNode && !visibleIds.has(hoveredNode.id)) {
         hoveredNode = null;
         hidActivePanel = true;
+        if (!activePathNodes && highlightedNodes.size > 0) {
+            highlightedNodes = new Set();
+            needsHighlightRefresh = true;
+        }
     }
-    if (hidActivePanel) {
-        hideHoverPanel();
+    if (contextNode && !visibleIds.has(contextNode.id)) {
+        hideContextMenu();
+    }
+    if (hidActivePanel || (activePanelNode && !visibleIds.has(activePanelNode.id))) {
+        if (selectedNode) {
+            showHoverPanel(selectedNode);
+        } else {
+            hideHoverPanel();
+        }
     }
     if (pathStart && !visibleIds.has(pathStart)) {
         cancelPathFinder();
@@ -2655,6 +2691,9 @@ function applyFilters() {
         clearWhatIfSimulation();
         activePathNodes = null;
         highlightedNodes = new Set();
+        needsHighlightRefresh = true;
+    }
+    if (needsHighlightRefresh) {
         Graph.nodeColor(computeNodeColor).linkColor(Graph.linkColor()).linkWidth(Graph.linkWidth());
     }
     updateVisibleCount();
@@ -2716,6 +2755,7 @@ document.getElementById('btn-reset').onclick = () => {
     Graph.linkWidth(Graph.linkWidth());
     applyFilters();
     clearSelection();
+    hideContextMenu();
     hideHoverPanel();
     Graph.zoomToFit(400, 50);
     document.getElementById('heatmap-legend').classList.remove('heatmap-active');
@@ -2788,12 +2828,7 @@ function renderTriageTab(tab) {
     }
     list.innerHTML = html;
     list.querySelectorAll('.triage-item').forEach(item => {
-        item.onclick = () => {
-            if (!item.dataset.id) return;
-            const graphNodes = Graph.graphData().nodes;
-            const node = graphNodes.find(n => n.id === item.dataset.id);
-            if (node) { selectNode(node); Graph.centerAt(node.x, node.y, 500); Graph.zoom(2.5, 500); }
-        };
+        item.onclick = () => focusVisibleGraphNode(item.dataset.id);
     });
 }
 document.querySelectorAll('.triage-tab-btn').forEach(btn => {
@@ -2836,11 +2871,7 @@ document.getElementById('btn-top').onclick = () => {
             return '<div class="top-node-item" data-id="' + escapeHTML(n.id) + '"><span class="rank">#' + escapeHTML(rankNum) + '</span><span>' + escapeHTML(n.id) + '</span></div>';
         }).join('');
         panel.querySelectorAll('.top-node-item').forEach(el => {
-            el.onclick = () => {
-                const graphNodes = Graph.graphData().nodes;
-                const node = graphNodes.find(n => n.id === el.dataset.id);
-                if (node) { selectNode(node); Graph.centerAt(node.x, node.y, 500); Graph.zoom(2.5, 500); }
-            };
+            el.onclick = () => focusVisibleGraphNode(el.dataset.id);
         });
     }
 };
@@ -2887,11 +2918,7 @@ function updateRecentPanel() {
         '<div class="recent-item" data-id="' + escapeHTML(n.id) + '"><span class="recent-id">' + escapeHTML(n.id) + '</span></div>'
     ).join('');
     list.querySelectorAll('.recent-item').forEach(el => {
-        el.onclick = () => {
-            const graphNodes = Graph.graphData().nodes;
-            const node = graphNodes.find(n => n.id === el.dataset.id);
-            if (node) { selectNode(node); Graph.centerAt(node.x, node.y, 500); Graph.zoom(2.5, 500); }
-        };
+        el.onclick = () => focusVisibleGraphNode(el.dataset.id);
     });
 }
 document.getElementById('btn-recent').onclick = () => {
@@ -3027,6 +3054,7 @@ document.onkeydown = e => {
         case 'f': Graph.zoomToFit(400, 50); break;
         case 'r': document.getElementById('btn-reset').click(); break;
         case 'escape':
+            hideContextMenu();
             if (pathFinderMode) { pathFinderMode = false; pathStart = null; activePathNodes = null; highlightedNodes = new Set(); document.getElementById('pathfinder-banner').classList.remove('visible'); document.getElementById('btn-path').classList.remove('active'); Graph.nodeColor(computeNodeColor).linkColor(Graph.linkColor()).linkWidth(Graph.linkWidth()); }
             else { closeCycleInspector(); clearWhatIfSimulation(); clearSelection(); hideHoverPanel(); activePathNodes = null; highlightedNodes = new Set(); Graph.nodeColor(computeNodeColor).linkColor(Graph.linkColor()).linkWidth(Graph.linkWidth()); }
             break;
