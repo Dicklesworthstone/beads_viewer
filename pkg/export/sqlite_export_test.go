@@ -1858,6 +1858,7 @@ func TestWave29_A15_4_And_W29_4_SQLiteRiskAndETASuppression(t *testing.T) {
 	outDir := t.TempDir()
 	exp := NewSQLiteExporter(ptrs, deps, &stats, nil)
 	exp.Config.Readiness = an.Readiness()
+	exp.Config.ReadinessAt = now
 	if err := exp.Export(outDir); err != nil {
 		t.Fatalf("SQLite Export failed: %v", err)
 	}
@@ -1908,6 +1909,7 @@ func TestWave29_A15_4_And_W29_4_SQLiteRiskAndETASuppression(t *testing.T) {
 	}
 	depOnlyExp := NewSQLiteExporter(depOnlyPtrs, deps, &stats, nil)
 	depOnlyExp.Config.Readiness = an.Readiness()
+	depOnlyExp.Config.ReadinessAt = now
 	depOnlyDir := t.TempDir()
 	if err := depOnlyExp.Export(depOnlyDir); err != nil {
 		t.Fatalf("dep-only Export failed: %v", err)
