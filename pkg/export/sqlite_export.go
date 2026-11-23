@@ -581,11 +581,12 @@ func (e *SQLiteExporter) insertMetrics(db *sql.DB) error {
 		}
 	}
 	etaColsFor := func(issue *model.Issue) (any, any, any) {
-		if etaCtx == nil || issue == nil || issue.Status.IsClosed() || issue.Status.IsTombstone() {
+		if etaCtx == nil || issue == nil || issue.Status.IsClosed() || issue.Status.IsTombstone() ||
+			issue.IsTemplate || issue.Pinned || issue.Status == model.StatusPinned {
 			return nil, nil, nil
 		}
 		est := etaCtx.EstimateForIssue(*issue, 1)
-		if est.ETADate.IsZero() {
+		if est.ETADate.IsZero() || est.EstimatedDays <= 0 {
 			return nil, nil, nil
 		}
 		return est.EstimatedDays, est.ETADate.UTC().Format(time.RFC3339), est.Confidence
