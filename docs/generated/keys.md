@@ -128,6 +128,7 @@
 |  | `+` | Confirm commit correlation |
 |  | `-` | Reject commit correlation |
 |  | `x` | Ignore commit correlation |
+|  | `O` | Toggle orphan commits audit |
 |  | `o` | Open in browser |
 |  | `h` | Close history view |
 | **flow** | `g` | Go to top |

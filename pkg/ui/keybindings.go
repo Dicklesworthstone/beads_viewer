@@ -368,6 +368,7 @@ func GetKeyBindingDocs() []KeyBindingDoc {
 		{"+", "Confirm commit correlation", "History", "history"},
 		{"-", "Reject commit correlation", "History", "history"},
 		{"x", "Ignore commit correlation", "History", "history"},
+		{"O", "Toggle orphan commits audit", "History", "history"},
 		{"o", "Open in browser", "History", "history"},
 		{"h", "Close history view", "History", "history"},
 

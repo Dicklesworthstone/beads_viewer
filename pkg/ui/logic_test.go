@@ -10218,3 +10218,361 @@ func TestWave28_Pass13Fixes_And_W28_TUIParity(t *testing.T) {
 		}
 	})
 }
+
+func TestWave29_Pass15Fixes_And_W29_TUI(t *testing.T) {
+	refNow := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+
+	t.Run("A15-1_A15-2_A15-7_A15-11_PriorityHintsAndRepoScoping", func(t *testing.T) {
+		t.Chdir(t.TempDir())
+		// Build a 2-repo workspace where "api" has a high-impact P4 hub blocking 3 P0 bugs
+		// (triggering a priority increase hint) while "web" has an isolated P2 leaf.
+		issues := []model.Issue{
+			{ID: "api-hub", Title: "Core API bottleneck", Status: model.StatusOpen, Priority: 4, IssueType: model.TypeTask, SourceRepo: "api", Labels: []string{"backend"}, CreatedAt: refNow.Add(-72 * time.Hour), UpdatedAt: refNow.Add(-24 * time.Hour)},
+			{ID: "api-b1", Title: "Critical auth outage", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeBug, SourceRepo: "api", Labels: []string{"backend"}, CreatedAt: refNow.Add(-48 * time.Hour), UpdatedAt: refNow.Add(-12 * time.Hour), Dependencies: []*model.Dependency{{IssueID: "api-b1", DependsOnID: "api-hub", Type: model.DepBlocks}}},
+			{ID: "api-b2", Title: "Critical billing outage", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeBug, SourceRepo: "api", Labels: []string{"backend"}, CreatedAt: refNow.Add(-48 * time.Hour), UpdatedAt: refNow.Add(-12 * time.Hour), Dependencies: []*model.Dependency{{IssueID: "api-b2", DependsOnID: "api-hub", Type: model.DepBlocks}}},
+			{ID: "api-b3", Title: "Critical webhook outage", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeBug, SourceRepo: "api", Labels: []string{"backend"}, CreatedAt: refNow.Add(-48 * time.Hour), UpdatedAt: refNow.Add(-12 * time.Hour), Dependencies: []*model.Dependency{{IssueID: "api-b3", DependsOnID: "api-hub", Type: model.DepBlocks}}},
+			{ID: "web-leaf", Title: "Isolated web tweak", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, SourceRepo: "web", Labels: []string{"frontend"}, CreatedAt: refNow.Add(-24 * time.Hour), UpdatedAt: refNow.Add(-6 * time.Hour)},
+		}
+		m := NewModel(copyIssues(issues), nil, "", ReadinessScope{Authority: model.NewReadinessIndex(issues)})
+		defer m.Stop()
+		m.referenceNow = refNow
+		m.workspaceMode = true
+		m.availableRepos = []string{"api", "web"}
+		m.Update(tea.WindowSizeMsg{Width: 140, Height: 42})
+
+		// A15-1: Phase2ReadyMsg must populate priorityHints BEFORE pushing to insightsPanel and update list delegate.
+		stats := m.analyzer.AnalyzeWithConfig(analysis.FullAnalysisConfig())
+		m.analysis = &stats
+		m.priorityHints = nil
+		updated, _ := m.Update(Phase2ReadyMsg{Stats: &stats, Insights: stats.GenerateInsights(10)})
+		m = updated.(*Model)
+		if len(m.priorityHints) == 0 {
+			t.Fatalf("A15-1 regression: Phase2ReadyMsg did not populate priorityHints for high-impact P4 hub")
+		}
+		// RenderDebugView("insights") should also populate hints cleanly when starting fresh.
+		m.priorityHints = nil
+		_ = m.RenderDebugView("insights", 140, 42)
+		if len(m.priorityHints) == 0 {
+			t.Fatalf("A15-1 regression: RenderDebugView(insights) did not populate priorityHints")
+		}
+
+		// A15-2: When filtering to "web" repo, activeScopePriorityHints() must exclude "api-hub"
+		// and toggling 'p' must report 0 suggestions for "web" (not unscoped global hints).
+		m.activeRepos = map[string]bool{"web": true}
+		m.applyFilter()
+		m.updateListDelegate()
+		if scopedHints := m.activeScopePriorityHints(); len(scopedHints) != 0 {
+			t.Fatalf("A15-2 regression: web-scoped priorityHints leaked api hints: %+v", scopedHints)
+		}
+		m.showPriorityHints = false
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
+		m = updated.(*Model)
+		if strings.Contains(m.statusMsg, "1 suggestion") || strings.Contains(m.statusMsg, "suggestions") && !strings.Contains(m.statusMsg, "No priority") && !strings.Contains(m.statusMsg, "0 ") {
+			t.Fatalf("A15-2 regression: 'p' toggle in web-only scope reported unscoped api hints: %q", m.statusMsg)
+		}
+
+		// A15-7: Label Dashboard must use repo-scoped analysis (only frontend label in web scope).
+		m.refreshLabelViews(focusLabelDashboard)
+		for _, lh := range m.labelDashboard.labels {
+			if lh.Label == "backend" {
+				t.Fatalf("A15-7 regression: web-scoped Label Dashboard leaked backend label: %+v", m.labelDashboard.labels)
+			}
+		}
+
+		// A15-11: Detail Pane Graph Analysis must use repo-scoped stats (web-leaf has PageRank 1.0 in single-node web subgraph).
+		m.selectListIssueByID("web-leaf")
+		m.updateViewportContent()
+		detailPlain := ansi.Strip(m.viewportContent)
+		if !strings.Contains(detailPlain, "Graph Analysis") || !strings.Contains(detailPlain, "1.000") {
+			t.Fatalf("A15-11 regression: Detail Pane Graph Analysis not scoped to single-node web repo:\n%s", detailPlain)
+		}
+	})
+
+	t.Run("A15-5_CorrelationFeedbackTargetHardening", func(t *testing.T) {
+		tmp := t.TempDir()
+		realRepo := filepath.Join(tmp, "real_repo")
+		beadsDir := filepath.Join(realRepo, ".beads")
+		if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		// metadata.json points jsonl_export to a custom JSONL file inside .beads
+		if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(`{"jsonl_export":"custom_export.jsonl"}`), 0o644); err != nil {
+			t.Fatalf("write metadata.json: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(beadsDir, "custom_export.jsonl"), []byte(`{"id":"A-1","title":"Test","status":"open"}`+"\n"), 0o644); err != nil {
+			t.Fatalf("write jsonl: %v", err)
+		}
+		linkRepo := filepath.Join(tmp, "link_repo")
+		if err := os.Symlink(realRepo, linkRepo); err != nil {
+			t.Skipf("symlink unavailable: %v", err)
+		}
+
+		wsIssues := []model.Issue{{
+			ID:         "api-A-1",
+			Title:      "Test",
+			Status:     model.StatusOpen,
+			SourceRepo: "api",
+			Origin: &model.IssueOrigin{
+				LocalID:          "A-1",
+				WorkingDirectory: realRepo,
+				TrackerDirectory: beadsDir,
+			},
+		}}
+		m := NewModel(wsIssues, nil, filepath.Join(beadsDir, "custom_export.jsonl"), ReadinessScope{})
+		defer m.Stop()
+		m.workspaceMode = true
+		// Pinned historical revision MUST be refused BEFORE falling back to origin path!
+		m.workspaceInfo = WorkspaceInfo{
+			Repos: []WorkspaceRepoTarget{
+				{Name: "api", Prefix: "api-", Path: realRepo, BeadsDir: beadsDir, Revision: "HEAD~1"},
+			},
+		}
+		m.beadsPath = filepath.Join(beadsDir, "custom_export.jsonl")
+		if dir, _ := m.resolveCorrelationFeedbackTarget("api-A-1"); dir != "" {
+			t.Fatalf("A15-5 regression: pinned revision workspace repo must refuse feedback write, got dir=%q", dir)
+		}
+
+		// Live workspace repo via symlinked path resolves cleanly to beadsDir honoring metadata.json!
+		m.workspaceInfo = WorkspaceInfo{
+			Repos: []WorkspaceRepoTarget{
+				{Name: "api", Prefix: "api-", Path: linkRepo, BeadsDir: filepath.Join(linkRepo, ".beads"), Revision: ""},
+			},
+		}
+		dir, localID := m.resolveCorrelationFeedbackTarget("api-A-1")
+		if dir == "" || localID != "A-1" {
+			t.Fatalf("A15-5 regression: symlinked live repo failed to resolve feedback target: dir=%q localID=%q", dir, localID)
+		}
+	})
+
+	t.Run("W29-1_TimeTravelDetailDiffsAndCycleDeltas", func(t *testing.T) {
+		t.Chdir(t.TempDir())
+		issues := []model.Issue{
+			{ID: "TT-1", Title: "Modified Task", Status: model.StatusInProgress, Priority: 0, IssueType: model.TypeTask, CreatedAt: refNow.Add(-48 * time.Hour), UpdatedAt: refNow},
+			{ID: "TT-2", Title: "Cycle Partner", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: refNow.Add(-48 * time.Hour), UpdatedAt: refNow},
+		}
+		m := NewModel(copyIssues(issues), nil, "", ReadinessScope{Authority: model.NewReadinessIndex(issues)})
+		defer m.Stop()
+		m.Update(tea.WindowSizeMsg{Width: 140, Height: 42})
+		m.timeTravelMode = true
+		m.timeTravelDiff = &analysis.SnapshotDiff{
+			FromRevision: "HEAD~3",
+			ToRevision:   "HEAD",
+			ModifiedIssues: []analysis.ModifiedIssue{
+				{
+					IssueID: "TT-1",
+					Title:   "Modified Task",
+					Changes: []analysis.FieldChange{
+						{Field: "priority", OldValue: "P2", NewValue: "P0"},
+						{Field: "status", OldValue: "open", NewValue: "in_progress"},
+					},
+				},
+			},
+			RemovedIssues: []model.Issue{
+				{ID: "TT-OLD", Title: "Deleted Legacy Task", Status: model.StatusOpen, Priority: 2},
+			},
+			NewCycles: [][]string{{"TT-1", "TT-2"}},
+		}
+		m.timeTravelModMap = map[string]*analysis.ModifiedIssue{
+			"TT-1": &m.timeTravelDiff.ModifiedIssues[0],
+		}
+		m.selectListIssueByID("TT-1")
+		m.updateViewportContent()
+		plain := ansi.Strip(m.viewportContent)
+		for _, want := range []string{"priority", "P2", "P0", "Introduced Cycle", "TT-OLD"} {
+			if !strings.Contains(plain, want) {
+				t.Fatalf("W29-1 regression: Time-Travel detail view missing %q:\n%s", want, plain)
+			}
+		}
+	})
+
+	t.Run("A15-6_And_W29-3_HistorySignalsStatsClusterAndOrphansMode", func(t *testing.T) {
+		t.Chdir(t.TempDir())
+		theme := DefaultTheme(lipgloss.NewRenderer(os.Stdout))
+		hv := NewHistoryModel(&correlation.HistoryReport{
+			GeneratedAt: refNow,
+			DataHash:    "h1",
+			Stats: correlation.HistoryStats{
+				TotalBeads:        2,
+				BeadsWithCommits:  1,
+				TotalCommits:      2,
+				UniqueAuthors:     2,
+				AvgCommitsPerBead: 1.0,
+				FeedbackApplied:   &correlation.FeedbackApplied{Confirmed: 2, Rejected: 1, Ignored: 1},
+			},
+			Histories: map[string]correlation.BeadHistory{
+				"H-1": {
+					BeadID: "H-1",
+					Title:  "Auth refactor",
+					Status: "open",
+					Commits: []correlation.CorrelatedCommit{
+						{
+							SHA:        "1111111111111111111111111111111111111111",
+							ShortSHA:   "1111111",
+							BeadID:     "H-1",
+							Message:    "fix(H-1): harden auth token validation",
+							Author:     "alice",
+							Timestamp:  refNow.Add(-2 * time.Hour),
+							Method:     correlation.MethodExplicitID,
+							Confidence: 0.92,
+							Files:      []correlation.FileChange{{Path: "token.go", Action: "M", Insertions: 12, Deletions: 3}},
+						},
+					},
+				},
+				"H-CLOSED": {
+					BeadID: "H-CLOSED",
+					Title:  "Old closed cleanup",
+					Status: "closed",
+					Commits: []correlation.CorrelatedCommit{
+						{
+							SHA:        "2222222222222222222222222222222222222222",
+							ShortSHA:   "2222222",
+							BeadID:     "H-CLOSED",
+							Message:    "cleanup token.go",
+							Author:     "bob",
+							Timestamp:  refNow.Add(-4 * time.Hour),
+							Method:     correlation.MethodCoCommitted,
+							Confidence: 0.70,
+							Files:      []correlation.FileChange{{Path: "token.go", Action: "M", Insertions: 2, Deletions: 1}},
+						},
+					},
+				},
+			},
+			CommitIndex: map[string][]string{
+				"1111111111111111111111111111111111111111": {"H-1"},
+				"2222222222222222222222222222222222222222": {"H-CLOSED"},
+			},
+		}, theme)
+		hv.SetSize(220, 40)
+		hv.SetOrphans([]correlation.OrphanCandidate{
+			{
+				SHA:            "3333333333333333333333333333333333333333",
+				ShortSHA:       "3333333",
+				Message:        "hotfix token leak without bead tag",
+				Author:         "carol",
+				Timestamp:      refNow.Add(-1 * time.Hour),
+				Files:          []string{"token.go"},
+				SuspicionScore: 84,
+				ProbableBeads: []correlation.ProbableBead{
+					{BeadID: "H-1", BeadTitle: "Auth refactor", Confidence: 78},
+				},
+			},
+		}, 0.33)
+
+		// W29-3: Stats line shows feedback + orphans; detail shows Signals explanation.
+		beadView := ansi.Strip(hv.View())
+		for _, want := range []string{"✓2", "1 orphan", "Signals:"} {
+			if !strings.Contains(beadView, want) {
+				t.Fatalf("W29-3 regression: History bead view missing %q:\n%s", want, beadView)
+			}
+		}
+
+		// A15-6: File tree blast-radius footer must label H-CLOSED as "recent", not "open".
+		hv.ToggleFileTree()
+		treeView := ansi.Strip(hv.View())
+		if strings.Contains(treeView, "2 open") {
+			t.Fatalf("A15-6 regression: File tree blast-radius mislabeled closed bead as open:\n%s", treeView)
+		}
+		if !strings.Contains(treeView, "recent") {
+			t.Fatalf("A15-6 regression: File tree blast-radius missing 'recent' closed count:\n%s", treeView)
+		}
+		hv.ToggleFileTree()
+
+		// W29-3: ToggleOrphansMode ('O') switches to Orphans view while 'v' stays Bead<->Git.
+		hv.ToggleOrphansMode()
+		if !hv.IsOrphansMode() {
+			t.Fatalf("W29-3 regression: ToggleOrphansMode failed to activate historyModeOrphans")
+		}
+		orphView := ansi.Strip(hv.View())
+		for _, want := range []string{"ORPHAN COMMIT", "3333333", "84", "H-1"} {
+			if !strings.Contains(orphView, want) {
+				t.Fatalf("W29-3 regression: Orphans view missing %q:\n%s", want, orphView)
+			}
+		}
+		if pb := hv.SelectedOrphanProbableBead(); pb == nil || pb.BeadID != "H-1" {
+			t.Fatalf("W29-3 regression: SelectedOrphanProbableBead expected H-1, got %+v", pb)
+		}
+	})
+
+	t.Run("W29-6_AlertsPanelBaselineSaveAndGuards", func(t *testing.T) {
+		tmp := t.TempDir()
+		beadsDir := filepath.Join(tmp, ".beads")
+		if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+			t.Fatalf("mkdir .beads: %v", err)
+		}
+		jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
+		if err := os.WriteFile(jsonlPath, []byte(`{"id":"B-1","title":"Task","status":"open","priority":1,"issue_type":"task"}`+"\n"), 0o644); err != nil {
+			t.Fatalf("write issues.jsonl: %v", err)
+		}
+		t.Chdir(tmp)
+
+		issues := []model.Issue{{ID: "B-1", Title: "Task", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask}}
+		m := NewModel(copyIssues(issues), nil, jsonlPath, ReadinessScope{Authority: model.NewReadinessIndex(issues)})
+		defer m.Stop()
+		m.Update(tea.WindowSizeMsg{Width: 140, Height: 42})
+
+		// Guard: BV_NO_SAVED_CONFIG blocks baseline save (default in pkg/ui TestMain).
+		t.Setenv("BV_NO_SAVED_CONFIG", "1")
+		if reason := m.baselineSaveBlockedReason(); !strings.Contains(reason, "BV_NO_SAVED_CONFIG") {
+			t.Fatalf("W29-6 regression: expected BV_NO_SAVED_CONFIG guard, got %q", reason)
+		}
+		t.Setenv("BV_NO_SAVED_CONFIG", "")
+
+		// Guard: time-travel mode blocks baseline save.
+		m.timeTravelMode = true
+		if reason := m.baselineSaveBlockedReason(); reason == "" {
+			t.Fatalf("W29-6 regression: expected timeTravelMode to block baseline save")
+		}
+		m.timeTravelMode = false
+
+		// Open Alerts panel (Alerts tab = 0) and press 'S' -> writes .bv/baseline.json.
+		m.showAlertsPanel = true
+		m.alertsTab = 0
+		panelBefore := ansi.Strip(m.renderAlertsPanel())
+		if !strings.Contains(panelBefore, "Baseline:") || !strings.Contains(panelBefore, "S: save baseline") {
+			t.Fatalf("W29-6 regression: Alerts panel missing baseline status or S footer hint:\n%s", panelBefore)
+		}
+		updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'S'}})
+		m = updated.(*Model)
+		baselinePath := filepath.Join(tmp, ".bv", "baseline.json")
+		if _, err := os.Stat(baselinePath); err != nil {
+			t.Fatalf("W29-6 regression: pressing 'S' on Alerts tab did not create %s (status=%q): %v", baselinePath, m.statusMsg, err)
+		}
+		// Suggestions tab (alertsTab == 1) must NOT overwrite baseline on 'S'.
+		m.alertsTab = 1
+		m.statusMsg = ""
+		updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'S'}})
+		m = updated.(*Model)
+		if strings.Contains(m.statusMsg, "Baseline saved") {
+			t.Fatalf("W29-6 regression: pressing 'S' on Suggestions tab must not trigger baseline save: %q", m.statusMsg)
+		}
+	})
+
+	t.Run("MicroWinA_SplitDetailCassSessionHint", func(t *testing.T) {
+		t.Chdir(t.TempDir())
+		issues := []model.Issue{{ID: "CASS-1", Title: "Cache invalidation bug", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeBug}}
+		m := NewModel(copyIssues(issues), nil, "", ReadinessScope{Authority: model.NewReadinessIndex(issues)})
+		defer m.Stop()
+		m.Update(tea.WindowSizeMsg{Width: 140, Height: 42})
+
+		cache := cass.NewCache()
+		cache.Set("CASS-1", &cass.CorrelationHint{
+			BeadID:      "CASS-1",
+			ResultCount: 3,
+			Results:     []cass.ScoredResult{{SearchResult: cass.SearchResult{Title: "Debug cache"}}},
+		})
+		m.cassCorrelator = cass.NewCorrelator(nil, cache, t.TempDir())
+		m.selectListIssueByID("CASS-1")
+		updated, _ := m.Update(cassPrefetchDoneMsg{
+			gen:    m.cassPrefetchGen,
+			beadID: "CASS-1",
+			result: cass.CorrelationResult{
+				TopSessions: []cass.ScoredResult{{SearchResult: cass.SearchResult{Title: "Debug cache"}}},
+			},
+		})
+		m = updated.(*Model)
+		plain := ansi.Strip(m.viewportContent)
+		if !strings.Contains(plain, "Agent Sessions:") || !strings.Contains(plain, "3 correlated cass session") {
+			t.Fatalf("Micro-Win A regression: Detail Pane missing cached CASS session hint:\n%s", plain)
+		}
+	})
+}

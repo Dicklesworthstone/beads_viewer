@@ -45,8 +45,9 @@ const (
 type historyViewMode int
 
 const (
-	historyModeBead historyViewMode = iota // Default: beads on left, commits for selected bead
-	historyModeGit                         // Git mode: commits on left, related beads for selected commit
+	historyModeBead    historyViewMode = iota // Default: beads on left, commits for selected bead
+	historyModeGit                            // Git mode: commits on left, related beads for selected commit
+	historyModeOrphans                        // Orphans mode: suspicious unlinked commits with probable beads (W29-3)
 )
 
 // CommitListEntry represents a commit in git-centric mode (bv-tl3n)
@@ -166,6 +167,15 @@ type HistoryModel struct {
 	hotspotOpenCounts  map[string]int                           // Normalized file path -> active bead count
 	hotspotTotalCounts map[string]int                           // Normalized file path -> total bead count
 	relatedCache       map[string][]correlation.RelatedWorkBead // Memoized related beads per bead ID
+	clusterPeersByBead map[string][]string                      // ImpactNetwork cluster peers per bead ID (W29-3)
+
+	// Orphan commits audit mode state (W29-3)
+	orphans               []correlation.OrphanCandidate
+	orphanRatio           float64
+	selectedOrphan        int
+	orphanScrollOffset    int
+	selectedOrphanProbIdx int
+	prevNonOrphanMode     historyViewMode
 
 	// Cass session integration state (bv-pr1l)
 	sessionCache map[string][]cass.ScoredResult // Cached sessions per bead ID
@@ -193,6 +203,7 @@ func (h *HistoryModel) SetReferenceTime(now time.Time) {
 
 func (h *HistoryModel) refreshFileIntelligence() {
 	h.relatedCache = nil
+	h.clusterPeersByBead = nil
 	if h.report == nil || len(h.report.Histories) == 0 {
 		h.fileLookup = nil
 		h.hotspotOpenCounts = nil
@@ -207,6 +218,120 @@ func (h *HistoryModel) refreshFileIntelligence() {
 		cleanPath := strings.TrimSuffix(strings.TrimPrefix(strings.ReplaceAll(hs.FilePath, "\\", "/"), "./"), "/")
 		h.hotspotOpenCounts[cleanPath] = hs.OpenBeads
 		h.hotspotTotalCounts[cleanPath] = hs.TotalBeads
+	}
+	if net := correlation.NewNetworkBuilder(h.report).BuildAt(h.effectiveNow()); net != nil && len(net.Clusters) > 0 {
+		peersByBead := make(map[string][]string)
+		for _, cl := range net.Clusters {
+			if len(cl.BeadIDs) < 2 {
+				continue
+			}
+			for _, id := range cl.BeadIDs {
+				var peers []string
+				for _, other := range cl.BeadIDs {
+					if other != id {
+						peers = append(peers, other)
+					}
+				}
+				if len(peers) > 0 {
+					peersByBead[id] = peers
+				}
+			}
+		}
+		if len(peersByBead) > 0 {
+			h.clusterPeersByBead = peersByBead
+		}
+	}
+}
+
+// SetOrphans stores detected suspicious unlinked commits for Orphans Audit mode (W29-3).
+func (h *HistoryModel) SetOrphans(orphans []correlation.OrphanCandidate, ratio float64) {
+	h.orphans = append([]correlation.OrphanCandidate(nil), orphans...)
+	h.orphanRatio = ratio
+	if h.selectedOrphan >= len(h.orphans) {
+		h.selectedOrphan = max(0, len(h.orphans)-1)
+	}
+	if h.orphanScrollOffset > h.selectedOrphan {
+		h.orphanScrollOffset = h.selectedOrphan
+	}
+	h.clampSelectedOrphanProb()
+}
+
+// IsOrphansMode returns true when History View is in Orphans Audit mode.
+func (h *HistoryModel) IsOrphansMode() bool {
+	return h.viewMode == historyModeOrphans
+}
+
+// ToggleOrphansMode switches between Orphans Audit mode and the previous Bead/Git mode.
+func (h *HistoryModel) ToggleOrphansMode() {
+	if h.viewMode == historyModeOrphans {
+		if h.prevNonOrphanMode == historyModeGit {
+			h.viewMode = historyModeGit
+		} else {
+			h.viewMode = historyModeBead
+		}
+	} else {
+		h.prevNonOrphanMode = h.viewMode
+		h.viewMode = historyModeOrphans
+		h.clampSelectedOrphanProb()
+	}
+	h.modeChangedAt = time.Now()
+}
+
+// OrphanCount returns the number of suspicious unlinked orphan commits loaded.
+func (h *HistoryModel) OrphanCount() int {
+	return len(h.orphans)
+}
+
+// SelectedOrphan returns the currently highlighted orphan commit, or nil.
+func (h *HistoryModel) SelectedOrphan() *correlation.OrphanCandidate {
+	if len(h.orphans) == 0 || h.selectedOrphan < 0 || h.selectedOrphan >= len(h.orphans) {
+		return nil
+	}
+	return &h.orphans[h.selectedOrphan]
+}
+
+// SelectedOrphanProbableBead returns the currently highlighted probable bead for the selected orphan.
+func (h *HistoryModel) SelectedOrphanProbableBead() *correlation.ProbableBead {
+	orph := h.SelectedOrphan()
+	if orph == nil || len(orph.ProbableBeads) == 0 {
+		return nil
+	}
+	idx := h.selectedOrphanProbIdx
+	if idx < 0 || idx >= len(orph.ProbableBeads) {
+		idx = 0
+	}
+	return &orph.ProbableBeads[idx]
+}
+
+// NextOrphanProbableBead advances the probable bead cursor for the selected orphan.
+func (h *HistoryModel) NextOrphanProbableBead() {
+	orph := h.SelectedOrphan()
+	if orph == nil || len(orph.ProbableBeads) <= 1 {
+		return
+	}
+	if h.selectedOrphanProbIdx < len(orph.ProbableBeads)-1 {
+		h.selectedOrphanProbIdx++
+	}
+}
+
+// PrevOrphanProbableBead moves the probable bead cursor up for the selected orphan.
+func (h *HistoryModel) PrevOrphanProbableBead() {
+	if h.selectedOrphanProbIdx > 0 {
+		h.selectedOrphanProbIdx--
+	}
+}
+
+func (h *HistoryModel) clampSelectedOrphanProb() {
+	orph := h.SelectedOrphan()
+	if orph == nil || len(orph.ProbableBeads) == 0 {
+		h.selectedOrphanProbIdx = 0
+		return
+	}
+	if h.selectedOrphanProbIdx < 0 {
+		h.selectedOrphanProbIdx = 0
+	}
+	if h.selectedOrphanProbIdx >= len(orph.ProbableBeads) {
+		h.selectedOrphanProbIdx = len(orph.ProbableBeads) - 1
 	}
 }
 
@@ -972,6 +1097,16 @@ func (h *HistoryModel) CollapseFileNode() {
 
 // MoveUp moves selection up in the current focus pane
 func (h *HistoryModel) MoveUp() {
+	if h.viewMode == historyModeOrphans {
+		if h.selectedOrphan > 0 {
+			h.selectedOrphan--
+			h.selectedOrphanProbIdx = 0
+			if h.selectedOrphan < h.orphanScrollOffset {
+				h.orphanScrollOffset = h.selectedOrphan
+			}
+		}
+		return
+	}
 	if h.focused == historyFocusList {
 		if h.selectedBead > 0 {
 			h.selectedBead--
@@ -997,6 +1132,17 @@ func (h *HistoryModel) MoveUp() {
 
 // MoveDown moves selection down in the current focus pane
 func (h *HistoryModel) MoveDown() {
+	if h.viewMode == historyModeOrphans {
+		if h.selectedOrphan < len(h.orphans)-1 {
+			h.selectedOrphan++
+			h.selectedOrphanProbIdx = 0
+			vis := max(1, h.currentPanelHeight()-4)
+			if h.selectedOrphan >= h.orphanScrollOffset+vis {
+				h.orphanScrollOffset = h.selectedOrphan - vis + 1
+			}
+		}
+		return
+	}
 	if h.focused == historyFocusList {
 		if h.selectedBead < len(h.histories)-1 {
 			h.selectedBead++
@@ -2005,6 +2151,9 @@ func (h *HistoryModel) hasActiveFilters() bool {
 
 // View renders the history view
 func (h *HistoryModel) View() string {
+	if h.viewMode == historyModeOrphans {
+		return h.renderOrphansView()
+	}
 	if h.report == nil {
 		return h.renderEmpty("No history data loaded")
 	}
@@ -2731,10 +2880,14 @@ func (h *HistoryModel) renderHeader() string {
 	// Show view mode indicator with icons (bv-tl3n, bv-kvlx)
 	// Icons: ◉ for git-centric (commits), ◈ for bead-centric (beads)
 	var modeIcon, modeLabel string
-	if h.viewMode == historyModeGit {
+	switch h.viewMode {
+	case historyModeGit:
 		modeIcon = "◉"
 		modeLabel = "Git"
-	} else {
+	case historyModeOrphans:
+		modeIcon = "◎"
+		modeLabel = "Orphans"
+	default:
 		modeIcon = "◈"
 		modeLabel = "Beads"
 	}
@@ -2873,6 +3026,28 @@ func (h *HistoryModel) renderStatsLine() string {
 	if stats.AvgCommitsPerBead > 0 {
 		cpdBadge := badgeStyle.Render(valueStyle.Render(fmt.Sprintf("%.1f", stats.AvgCommitsPerBead)) + " commits/bead")
 		badges = append(badges, cpdBadge)
+	}
+
+	// Feedback applied stats (W29-3)
+	if fb := stats.FeedbackApplied; fb != nil && (fb.Confirmed > 0 || fb.Rejected > 0 || fb.Ignored > 0) {
+		var fbParts []string
+		if fb.Confirmed > 0 {
+			fbParts = append(fbParts, fmt.Sprintf("✓%d", fb.Confirmed))
+		}
+		if fb.Rejected > 0 {
+			fbParts = append(fbParts, fmt.Sprintf("✕%d", fb.Rejected))
+		}
+		if fb.Ignored > 0 {
+			fbParts = append(fbParts, fmt.Sprintf("⊘%d", fb.Ignored))
+		}
+		fbBadge := badgeStyle.Render(valueStyle.Render(strings.Join(fbParts, "/")) + " feedback")
+		badges = append(badges, fbBadge)
+	}
+
+	// Orphan commits count (W29-3)
+	if len(h.orphans) > 0 {
+		orphBadge := badgeStyle.Render(valueStyle.Render(fmt.Sprintf("%d", len(h.orphans))) + fmt.Sprintf(" orphans (%.0f%%)", h.orphanRatio*100))
+		badges = append(badges, orphBadge)
 	}
 
 	// Join with bullet separator
@@ -3183,18 +3358,33 @@ func (h *HistoryModel) renderFileTreePanel(width, height int) string {
 					riskColor = t.Feature
 				}
 				riskBadge := t.Renderer.NewStyle().Foreground(riskColor).Bold(true).Render(strings.ToUpper(impact.RiskLevel))
+				openCnt, recentClosedCnt := 0, 0
 				ids := make([]string, 0, min(3, len(impact.AffectedBeads)))
 				for i, ab := range impact.AffectedBeads {
-					if i >= 3 {
-						break
+					st := strings.ToLower(strings.TrimSpace(ab.Status))
+					if st == "closed" || st == "tombstone" {
+						recentClosedCnt++
+					} else {
+						openCnt++
 					}
-					ids = append(ids, ab.BeadID)
+					if i < 3 {
+						ids = append(ids, ab.BeadID)
+					}
 				}
 				more := ""
 				if len(impact.AffectedBeads) > len(ids) {
 					more = fmt.Sprintf(" +%d", len(impact.AffectedBeads)-len(ids))
 				}
-				riskLine := fmt.Sprintf("Blast: %s (%d open: %s%s)", riskBadge, len(impact.AffectedBeads), strings.Join(ids, ", "), more)
+				countSummary := fmt.Sprintf("%d affected", len(impact.AffectedBeads))
+				switch {
+				case openCnt > 0 && recentClosedCnt > 0:
+					countSummary = fmt.Sprintf("%d open, %d recent", openCnt, recentClosedCnt)
+				case openCnt > 0:
+					countSummary = fmt.Sprintf("%d open", openCnt)
+				case recentClosedCnt > 0:
+					countSummary = fmt.Sprintf("%d recent", recentClosedCnt)
+				}
+				riskLine := fmt.Sprintf("Blast: %s (%s: %s%s)", riskBadge, countSummary, strings.Join(ids, ", "), more)
 				intelLines = append(intelLines, ansi.Truncate(riskLine, innerW, "…"))
 			}
 			if co := h.fileLookup.GetRelatedFiles(sel.Path, 0.3, 3); co != nil && len(co.RelatedFiles) > 0 {
@@ -3387,6 +3577,19 @@ func (h *HistoryModel) renderDetailPanel(width, height int) string {
 			relInfo = truncateRunesHelper(relInfo, width-6, "…")
 		}
 		lines = append(lines, t.Renderer.NewStyle().Foreground(t.Feature).Render(relInfo))
+	}
+	if peers := h.clusterPeersByBead[hist.BeadID]; len(peers) > 0 {
+		shown := peers
+		extra := ""
+		if len(shown) > 3 {
+			extra = fmt.Sprintf(" +%d", len(shown)-3)
+			shown = shown[:3]
+		}
+		clusterInfo := "🕸 Cluster: " + strings.Join(shown, ", ") + extra
+		if width > 10 {
+			clusterInfo = truncateRunesHelper(clusterInfo, width-6, "…")
+		}
+		lines = append(lines, t.Renderer.NewStyle().Foreground(t.Feature).Render(clusterInfo))
 	}
 	detailSepWidth := width - 4
 	if detailSepWidth < 1 {
@@ -3671,6 +3874,26 @@ func (h *HistoryModel) renderCommitDetail(commit correlation.CorrelatedCommit, w
 		confirmedBadge,
 	)
 	lines = append(lines, confLine)
+
+	// === CORRELATION SIGNAL EXPLANATION (W29-3) ===
+	if exp := correlation.NewScorer().BuildExplanation(commit, commit.BeadID); len(exp.Signals) > 0 {
+		sigParts := make([]string, 0, min(4, len(exp.Signals)))
+		for i, sig := range exp.Signals {
+			if i >= 4 {
+				break
+			}
+			sign := "+"
+			if sig.Weight < 0 {
+				sign = ""
+			}
+			sigParts = append(sigParts, fmt.Sprintf("%s%d %s", sign, sig.Weight, sig.Type))
+		}
+		sigText := "    Signals: " + strings.Join(sigParts, " • ")
+		if width > 10 {
+			sigText = truncateRunesHelper(sigText, width-4, "…")
+		}
+		lines = append(lines, t.Renderer.NewStyle().Foreground(t.Muted).Render(sigText))
+	}
 
 	// === FILE CHANGES ===
 	if len(commit.Files) > 0 {
@@ -4440,10 +4663,132 @@ func (h *HistoryModel) renderGitDetailPanel(width, height int) string {
 	// Add footer hint (bv-xf4p, W28-1)
 	lines = append(lines, strings.Repeat("─", detailSepWidth))
 	hintStyle := t.Renderer.NewStyle().Foreground(ColorFooterHint).Italic(true)
-	lines = append(lines, hintStyle.Render("J/K:bead  +/-:confirm/reject  x:ignore  y:copy  o:open  g:graph"))
+	lines = append(lines, hintStyle.Render("J/K:bead  +/-:confirm/reject  x:ignore  O:orphans  y:copy  o:open  g:graph"))
 
 	content := clampHistoryPanelContent(lines, width-2, height-2)
 	return panelStyle.Render(content)
+}
+
+// renderOrphansView renders the two-pane Orphan Commits Audit view (W29-3).
+func (h *HistoryModel) renderOrphansView() string {
+	t := h.theme
+	totalW := h.width
+	if totalW <= 0 {
+		totalW = 120
+	}
+	header := h.renderHeader()
+	panelHeight := h.panelHeightForHeader(header)
+
+	if len(h.orphans) == 0 {
+		emptyBox := t.Renderer.NewStyle().
+			Width(totalW).
+			Height(panelHeight).
+			Align(lipgloss.Center, lipgloss.Center).
+			Foreground(t.Open).
+			Render("✓ No suspicious unlinked orphan commits detected\n\nPress O to return to History view")
+		return lipgloss.JoinVertical(lipgloss.Left, header, emptyBox)
+	}
+
+	leftWidth := max(26, int(float64(totalW)*0.44))
+	rightWidth := max(26, totalW-leftWidth)
+	if leftWidth+rightWidth > totalW {
+		leftWidth = totalW / 2
+		rightWidth = totalW - leftWidth
+	}
+
+	// Left pane: suspicious unlinked commits
+	leftStyle := t.Renderer.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(t.Primary).
+		Width(leftWidth - 2).
+		Height(panelHeight - 2)
+	var leftLines []string
+	leftLines = append(leftLines, t.Renderer.NewStyle().Bold(true).Foreground(t.Primary).Render(fmt.Sprintf("ORPHAN COMMITS (%d)", len(h.orphans))))
+	leftLines = append(leftLines, t.Renderer.NewStyle().Foreground(t.Muted).Render(strings.Repeat("─", max(4, leftWidth-4))))
+	visRows := max(1, panelHeight-5)
+	start := h.orphanScrollOffset
+	if start < 0 {
+		start = 0
+	}
+	if start >= len(h.orphans) {
+		start = max(0, len(h.orphans)-1)
+	}
+	end := min(len(h.orphans), start+visRows)
+	for i := start; i < end; i++ {
+		o := h.orphans[i]
+		cursor := "  "
+		rowStyle := t.Renderer.NewStyle().Foreground(t.Secondary)
+		if i == h.selectedOrphan {
+			cursor = "▸ "
+			rowStyle = t.Renderer.NewStyle().Foreground(t.Primary).Bold(true)
+		}
+		shortSHA := o.ShortSHA
+		if shortSHA == "" && len(o.SHA) >= 7 {
+			shortSHA = o.SHA[:7]
+		}
+		probTag := ""
+		if len(o.ProbableBeads) > 0 {
+			probTag = " → " + o.ProbableBeads[0].BeadID
+		}
+		row := fmt.Sprintf("%s[%2d] %s %s%s", cursor, o.SuspicionScore, shortSHA, strings.TrimSpace(o.Message), probTag)
+		leftLines = append(leftLines, rowStyle.Render(ansi.Truncate(row, max(8, leftWidth-4), "…")))
+	}
+	leftPanel := leftStyle.Render(clampHistoryPanelContent(leftLines, leftWidth-2, panelHeight-2))
+
+	// Right pane: selected orphan detail + probable bead candidates (+ to confirm)
+	rightStyle := t.Renderer.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(t.Muted).
+		Width(rightWidth - 2).
+		Height(panelHeight - 2)
+	var rightLines []string
+	if orph := h.SelectedOrphan(); orph != nil {
+		shortSHA := orph.ShortSHA
+		if shortSHA == "" && len(orph.SHA) >= 7 {
+			shortSHA = orph.SHA[:7]
+		}
+		rightLines = append(rightLines, t.Renderer.NewStyle().Bold(true).Foreground(t.Primary).Render("ORPHAN COMMIT DETAIL"))
+		rightLines = append(rightLines, t.Renderer.NewStyle().Foreground(t.Secondary).Render(
+			ansi.Truncate(fmt.Sprintf("%s  •  Suspicion %d/100  •  @%s", shortSHA, orph.SuspicionScore, orph.Author), max(10, rightWidth-4), "…")))
+		rightLines = append(rightLines, ansi.Truncate(strings.TrimSpace(orph.Message), max(10, rightWidth-4), "…"))
+		rightLines = append(rightLines, "")
+		if len(orph.Files) > 0 {
+			rightLines = append(rightLines, t.Renderer.NewStyle().Foreground(t.Muted).Render(fmt.Sprintf("Files (%d):", len(orph.Files))))
+			for i, f := range orph.Files {
+				if i >= 4 {
+					rightLines = append(rightLines, t.Renderer.NewStyle().Foreground(t.Muted).Italic(true).Render(fmt.Sprintf("  +%d more", len(orph.Files)-4)))
+					break
+				}
+				rightLines = append(rightLines, t.Renderer.NewStyle().Foreground(t.Secondary).Render(ansi.Truncate("  "+f, max(10, rightWidth-4), "…")))
+			}
+			rightLines = append(rightLines, "")
+		}
+		if len(orph.ProbableBeads) > 0 {
+			rightLines = append(rightLines, t.Renderer.NewStyle().Bold(true).Foreground(t.Open).Render("Probable Bead Matches (J/K select • + confirm):"))
+			for i, pb := range orph.ProbableBeads {
+				if i >= 5 {
+					break
+				}
+				mark := "  "
+				st := t.Renderer.NewStyle().Foreground(t.Secondary)
+				if i == h.selectedOrphanProbIdx {
+					mark = "▸ "
+					st = t.Renderer.NewStyle().Foreground(t.Open).Bold(true)
+				}
+				line := fmt.Sprintf("%s%s (%d%%) — %s", mark, pb.BeadID, pb.Confidence, pb.BeadTitle)
+				rightLines = append(rightLines, st.Render(ansi.Truncate(line, max(10, rightWidth-4), "…")))
+			}
+		} else {
+			rightLines = append(rightLines, t.Renderer.NewStyle().Foreground(t.Muted).Italic(true).Render("No probable bead matches found for this commit"))
+		}
+	}
+	rightLines = append(rightLines, strings.Repeat("─", max(4, rightWidth-4)))
+	rightLines = append(rightLines, t.Renderer.NewStyle().Foreground(ColorFooterHint).Italic(true).Render(
+		ansi.Truncate("j/k:orphan  J/K:match  +:confirm link  Enter:open bead  y:copy  O:back", max(10, rightWidth-4), "…")))
+	rightPanel := rightStyle.Render(clampHistoryPanelContent(rightLines, rightWidth-2, panelHeight-2))
+
+	body := lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, rightPanel)
+	return lipgloss.JoinVertical(lipgloss.Left, header, body)
 }
 
 // renderCommitMiddlePanel renders commits for selected bead in middle pane (bv-xrfh)
