@@ -470,7 +470,6 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 	var etaCtx *analysis.ETAContext
 	var priorityHints map[string]analysis.PriorityRecommendation
 
-	var advAn *analysis.Analyzer
 	var riskSignals map[string]analysis.RiskSignals
 	if opts.Stats != nil {
 		etaSource := opts.VelocityIssues
@@ -524,7 +523,6 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 		if opts.Weights != nil {
 			prioAn.SetWeights(*opts.Weights)
 		}
-		advAn = prioAn
 		issueValMap := make(map[string]model.Issue, len(opts.Issues))
 		for _, iss := range opts.Issues {
 			issueValMap[iss.ID] = iss
@@ -778,6 +776,7 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 		if len(rawCycles) > 0 {
 			limit := min(len(rawCycles), 50)
 			exportedCycles = make([][]string, 0, limit)
+			edgeFreq := make(map[[2]string]int)
 			for _, cyc := range rawCycles[:limit] {
 				if len(cyc) == 0 {
 					continue
@@ -790,22 +789,94 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 				}
 				cloned := append([]string(nil), open...)
 				exportedCycles = append(exportedCycles, cloned)
-			}
-			// Use collateral-aware cycle-break scoring from analysis.GenerateAdvancedInsightsFromStats
-			// instead of raw edge frequency so recommendations minimize collateral disruption.
-			if advAn != nil {
-				advCfg := analysis.DefaultAdvancedInsightsConfig()
-				advCfg.CycleBreakLimit = 10
-				if adv := advAn.GenerateAdvancedInsightsFromStats(opts.Stats, advCfg); adv != nil && adv.CycleBreak != nil {
-					for _, s := range adv.CycleBreak.Suggestions {
-						cycleBreaks = append(cycleBreaks, map[string]interface{}{
-							"from":          s.EdgeFrom,
-							"to":            s.EdgeTo,
-							"cycles_broken": s.Impact,
-							"collateral":    s.Collateral,
-							"rationale":     s.Rationale,
-						})
+				seenEdge := make(map[[2]string]struct{}, len(open))
+				for i := 0; i < len(open); i++ {
+					edge := [2]string{open[i], open[(i+1)%len(open)]}
+					if _, dup := seenEdge[edge]; dup {
+						continue
 					}
+					seenEdge[edge] = struct{}{}
+					edgeFreq[edge]++
+				}
+			}
+			// Deduplicate active blocking dependents per target node so collateral scoring
+			// accurately counts distinct active dependents affected by removing from -> to.
+			activeDepCount := make(map[string]int, len(blocksMap))
+			for targetID, dependents := range blocksMap {
+				uniq := make(map[string]struct{}, len(dependents))
+				for _, depID := range dependents {
+					uniq[depID] = struct{}{}
+				}
+				activeDepCount[targetID] = len(uniq)
+			}
+			type breakCand struct {
+				from, to     string
+				cyclesBroken int
+				collateral   int
+			}
+			cands := make([]breakCand, 0, len(edgeFreq))
+			candByEdge := make(map[[2]string]breakCand, len(edgeFreq))
+			for pair, count := range edgeFreq {
+				bc := breakCand{
+					from:         pair[0],
+					to:           pair[1],
+					cyclesBroken: count,
+					collateral:   activeDepCount[pair[1]],
+				}
+				cands = append(cands, bc)
+				candByEdge[pair] = bc
+			}
+			// Rank by maximum cycles broken, then MINIMUM collateral, then deterministic lexicographical order (P16B-1).
+			betterCand := func(a, b breakCand) bool {
+				if a.cyclesBroken != b.cyclesBroken {
+					return a.cyclesBroken > b.cyclesBroken
+				}
+				if a.collateral != b.collateral {
+					return a.collateral < b.collateral
+				}
+				if a.from != b.from {
+					return a.from < b.from
+				}
+				return a.to < b.to
+			}
+			sort.Slice(cands, func(i, j int) bool {
+				return betterCand(cands[i], cands[j])
+			})
+			emitted := make(map[[2]string]bool, min(len(cands), 10))
+			emitCand := func(c breakCand) {
+				key := [2]string{c.from, c.to}
+				if emitted[key] {
+					return
+				}
+				emitted[key] = true
+				cycleBreaks = append(cycleBreaks, map[string]interface{}{
+					"from":          c.from,
+					"to":            c.to,
+					"cycles_broken": c.cyclesBroken,
+					"collateral":    c.collateral,
+					"rationale":     fmt.Sprintf("Breaks %d cycle(s) with %d active dependent(s) on %s.", c.cyclesBroken, c.collateral, c.to),
+				})
+			}
+			for i, c := range cands {
+				if i >= 10 {
+					break
+				}
+				emitCand(c)
+			}
+			// Guarantee every exported cycle has at least its lowest-collateral cut edge present.
+			for _, open := range exportedCycles {
+				var best *breakCand
+				for i := 0; i < len(open); i++ {
+					edge := [2]string{open[i], open[(i+1)%len(open)]}
+					if c, ok := candByEdge[edge]; ok {
+						if best == nil || betterCand(c, *best) {
+							cc := c
+							best = &cc
+						}
+					}
+				}
+				if best != nil {
+					emitCand(*best)
 				}
 			}
 		}

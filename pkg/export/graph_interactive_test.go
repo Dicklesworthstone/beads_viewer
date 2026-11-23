@@ -1007,14 +1007,18 @@ func TestWave29_W29_4_InteractiveGraphRiskAndCollateralCycleBreaks(t *testing.T)
 	if len(payload.CycleBreaks) < 2 {
 		t.Fatalf("W29-4 regression: expected collateral-aware cycle_breaks for both cycle edges, got %+v", payload.CycleBreaks)
 	}
+	// P16B-1: Top break MUST minimize collateral (B->A impacts 1 active dependent vs A->B impacting 3: A, D1, D2).
+	top := payload.CycleBreaks[0]
+	if top.From != "B" || top.To != "A" || top.Collateral == nil || *top.Collateral != 1 || top.Rationale == "" {
+		t.Fatalf("P16B-1 regression: expected lowest-collateral top break B->A (collateral=1), got %+v (all=%+v)", top, payload.CycleBreaks)
+	}
 	colByEdge := make(map[string]int, len(payload.CycleBreaks))
 	for _, cb := range payload.CycleBreaks {
 		if cb.Collateral == nil || cb.Rationale == "" {
-			t.Fatalf("W29-4 regression: cycle_breaks missing collateral/rationale from GenerateAdvancedInsightsFromStats: %+v", cb)
+			t.Fatalf("W29-4 regression: cycle_breaks missing collateral/rationale: %+v", cb)
 		}
 		colByEdge[cb.From+"->"+cb.To] = *cb.Collateral
 	}
-	// A->B impacts B (3 active dependents: A, D1, D2) while B->A impacts only A (1 active dependent: B).
 	if colByEdge["A->B"] <= colByEdge["B->A"] {
 		t.Fatalf("W29-4 regression: expected collateral(A->B) > collateral(B->A), got %+v", colByEdge)
 	}

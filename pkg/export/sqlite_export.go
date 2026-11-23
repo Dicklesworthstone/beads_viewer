@@ -568,18 +568,7 @@ func (e *SQLiteExporter) insertMetrics(db *sql.DB) error {
 
 	// Resolve velocity-calibrated ETA context for active issues (preferring caller-supplied
 	// full-graph ETAContext so scoped/open-only exports retain historical velocity calibration).
-	etaCtx := e.Config.ETAContext
-	if etaCtx == nil && e.Stats != nil && len(e.Issues) > 0 {
-		valIssues := make([]model.Issue, 0, len(e.Issues))
-		for _, iss := range e.Issues {
-			if iss != nil {
-				valIssues = append(valIssues, *iss)
-			}
-		}
-		if len(valIssues) > 0 {
-			etaCtx = analysis.NewETAContext(valIssues, e.Stats, e.exportTimestamp())
-		}
-	}
+	etaCtx := e.resolveETAContext()
 	etaColsFor := func(issue *model.Issue) (any, any, any) {
 		if etaCtx == nil || issue == nil || issue.Status.IsClosed() || issue.Status.IsTombstone() ||
 			issue.IsTemplate || issue.Pinned || issue.Status == model.StatusPinned {
@@ -639,14 +628,9 @@ func (e *SQLiteExporter) insertMetrics(db *sql.DB) error {
 	}
 
 	if e.Stats != nil {
-		// Compute operational risk signals for active non-template/non-pinned issues.
-		issueValMap := make(map[string]model.Issue, len(e.Issues))
-		for _, issue := range e.Issues {
-			if issue != nil {
-				issueValMap[issue.ID] = *issue
-			}
-		}
-		riskMap := analysis.ComputeAllRiskSignalsWithReadiness(issueValMap, e.Stats, e.readiness, e.exportTimestamp())
+		// Compute operational risk signals for active non-template/non-pinned issues,
+		// merging deduplicated edges from e.Deps so programmatic callers pass full graph edges (P16B-6).
+		riskMap := e.buildRiskSignalsMap()
 
 		// Get metrics maps from stats (using active-subgraph betweenness when closed/tombstone issues exist)
 		pageRankMap := e.Stats.PageRank()
@@ -1321,6 +1305,87 @@ func writeJSON(bundle *Bundle, path string, data interface{}) error {
 	})
 }
 
+// resolveETAContext returns caller-supplied ETAContext or constructs one from e.Issues and e.Stats.
+func (e *SQLiteExporter) resolveETAContext() *analysis.ETAContext {
+	if e.Config.ETAContext != nil {
+		return e.Config.ETAContext
+	}
+	if e.Stats == nil || len(e.Issues) == 0 {
+		return nil
+	}
+	valIssues := make([]model.Issue, 0, len(e.Issues))
+	for _, iss := range e.Issues {
+		if iss != nil {
+			valIssues = append(valIssues, *iss)
+		}
+	}
+	if len(valIssues) == 0 {
+		return nil
+	}
+	return analysis.NewETAContext(valIssues, e.Stats, e.exportTimestamp())
+}
+
+// buildRiskSignalsMap computes operational risk signals for e.Issues with deduplicated e.Deps merged
+// onto cloned issue copies (without mutating caller-owned pointers).
+func (e *SQLiteExporter) buildRiskSignalsMap() map[string]analysis.RiskSignals {
+	if e.Stats == nil || len(e.Issues) == 0 {
+		return nil
+	}
+	type depKey struct {
+		from, to string
+		depType  model.DependencyType
+	}
+	issueValMap := make(map[string]model.Issue, len(e.Issues))
+	seenDeps := make(map[depKey]struct{}, len(e.Deps))
+	for _, issue := range e.Issues {
+		if issue == nil {
+			continue
+		}
+		cloned := *issue
+		if len(issue.Dependencies) > 0 {
+			cloned.Dependencies = make([]*model.Dependency, 0, len(issue.Dependencies))
+			for _, dep := range issue.Dependencies {
+				if dep == nil {
+					continue
+				}
+				depCopy := *dep
+				if depCopy.IssueID == "" {
+					depCopy.IssueID = issue.ID
+				}
+				k := depKey{from: depCopy.IssueID, to: depCopy.DependsOnID, depType: depCopy.Type}
+				if _, dup := seenDeps[k]; dup {
+					continue
+				}
+				seenDeps[k] = struct{}{}
+				cloned.Dependencies = append(cloned.Dependencies, &depCopy)
+			}
+		}
+		issueValMap[issue.ID] = cloned
+	}
+	for _, dep := range e.Deps {
+		if dep == nil || dep.IssueID == "" {
+			continue
+		}
+		iss, ok := issueValMap[dep.IssueID]
+		if !ok {
+			continue
+		}
+		k := depKey{from: dep.IssueID, to: dep.DependsOnID, depType: dep.Type}
+		if _, dup := seenDeps[k]; dup {
+			continue
+		}
+		seenDeps[k] = struct{}{}
+		depCopy := *dep
+		iss.Dependencies = append(iss.Dependencies, &depCopy)
+		issueValMap[dep.IssueID] = iss
+	}
+	readiness := e.readiness
+	if readiness == nil {
+		readiness = e.Config.Readiness
+	}
+	return analysis.ComputeAllRiskSignalsWithReadiness(issueValMap, e.Stats, readiness, e.exportTimestamp())
+}
+
 // GetExportedIssues converts issues to ExportIssue format.
 func (e *SQLiteExporter) GetExportedIssues() []ExportIssue {
 	statusByID := make(map[string]model.Status, len(e.Issues))
@@ -1365,10 +1430,13 @@ func (e *SQLiteExporter) GetExportedIssues() []ExportIssue {
 	triageScores := e.buildTriageScoresMap()
 
 	var eigenvectorMap, betweennessMap map[string]float64
+	var riskMap map[string]analysis.RiskSignals
 	if e.Stats != nil {
 		eigenvectorMap = e.Stats.Eigenvector()
 		betweennessMap = e.activeBetweennessMap()
+		riskMap = e.buildRiskSignalsMap()
 	}
+	etaCtx := e.resolveETAContext()
 
 	result := make([]ExportIssue, len(e.Issues))
 	for i, issue := range e.Issues {
@@ -1445,6 +1513,23 @@ func (e *SQLiteExporter) GetExportedIssues() []ExportIssue {
 		}
 		if exp.BlockedByIDs == nil {
 			exp.BlockedByIDs = blockedByIDs[issue.ID]
+		}
+		// Active non-template/non-pinned ETA & operational risk parity with issue_overview_mv (P16B-7).
+		if isActiveCounterpart(issue.ID) && !issue.IsTemplate && !issue.Pinned && issue.Status != model.StatusPinned {
+			if etaCtx != nil {
+				est := etaCtx.EstimateForIssue(*issue, 1)
+				if !est.ETADate.IsZero() && est.EstimatedDays > 0 {
+					days := est.EstimatedDays
+					conf := est.Confidence
+					exp.ETADays = &days
+					exp.ETADate = est.ETADate.UTC().Format(time.RFC3339)
+					exp.ETAConfidence = &conf
+				}
+			}
+			if sig, ok := riskMap[issue.ID]; ok {
+				exp.RiskScore = sig.CompositeRisk
+				exp.RiskExplanation = sig.Explanation
+			}
 		}
 
 		result[i] = exp

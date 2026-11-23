@@ -2659,7 +2659,7 @@ function queryIssues(filters = {}, sort = 'priority', limit = 50, offset = 0) {
       ? "CASE WHEN LOWER(status) IN ('closed', 'tombstone') OR eta_days IS NULL OR typeof(eta_days) NOT IN ('integer', 'real') OR eta_days < 0 THEN 1 ELSE 0 END ASC, CASE WHEN LOWER(status) IN ('closed', 'tombstone') OR eta_days IS NULL OR typeof(eta_days) NOT IN ('integer', 'real') OR eta_days < 0 THEN NULL ELSE eta_days END ASC, priority ASC"
       : 'priority ASC',
     'risk': mvCols.has('risk_score')
-      ? "CASE WHEN LOWER(status) IN ('closed', 'tombstone') OR risk_score IS NULL OR typeof(risk_score) NOT IN ('integer', 'real') THEN 1 ELSE 0 END ASC, COALESCE(risk_score, 0) DESC, priority ASC"
+      ? "CASE WHEN LOWER(status) IN ('closed', 'tombstone') OR risk_score IS NULL OR typeof(risk_score) NOT IN ('integer', 'real') OR risk_score < 0 THEN 1 ELSE 0 END ASC, CASE WHEN LOWER(status) IN ('closed', 'tombstone') OR risk_score IS NULL OR typeof(risk_score) NOT IN ('integer', 'real') OR risk_score < 0 THEN NULL ELSE risk_score END DESC, priority ASC"
       : 'priority ASC',
     'created': 'created_at DESC',
     'title': 'title ASC',
@@ -5698,8 +5698,12 @@ function beadsApp() {
       document.addEventListener('bv-graph:timeTravelStart', () => {
         this.timeTravelActive = true;
       });
+      document.addEventListener('bv-graph:timeTravelCommit', () => {
+        this.reconcileVisibleGraphOverlays();
+      });
       document.addEventListener('bv-graph:timeTravelStop', () => {
         this.timeTravelActive = false;
+        this.reconcileVisibleGraphOverlays();
       });
       document.addEventListener('bv-graph:viewModeChange', (e) => {
         if (e.detail?.preset) {
@@ -6250,19 +6254,7 @@ function beadsApp() {
                 showClosed: detail.filters.showClosed !== false,
               };
             }
-            if (this.graphSearchResult?.id || this.graphDetailNode?.id || (this.graphContextMenu?.open && this.graphContextMenu?.node?.id)) {
-              const visibleNodes = this.forceGraphModule?.getGraph?.()?.graphData?.()?.nodes || [];
-              if (this.graphSearchResult?.id && !visibleNodes.some(n => n.id === this.graphSearchResult.id)) {
-                this.graphSearchResult = null;
-              }
-              if (this.graphDetailNode?.id && !visibleNodes.some(n => n.id === this.graphDetailNode.id)) {
-                this.graphDetailNode = null;
-                setTimeout(() => this.resizeForceGraph(), 250);
-              }
-              if (this.graphContextMenu?.open && this.graphContextMenu?.node?.id && !visibleNodes.some(n => n.id === this.graphContextMenu.node.id)) {
-                this.graphContextMenu = { open: false, x: 0, y: 0, node: null };
-              }
-            }
+            this.reconcileVisibleGraphOverlays({ skipCounts: Number.isFinite(detail.visibleCount) });
           });
           document.addEventListener('bv-graph:selectionChange', (e) => {
             if (e.detail?.node) {
@@ -6877,6 +6869,25 @@ function beadsApp() {
     isActiveNodeStatus(status) {
       const st = String(status || '').trim().toLowerCase();
       return st !== 'closed' && st !== 'tombstone';
+    },
+
+    reconcileVisibleGraphOverlays(opts = {}) {
+      if (!opts.skipCounts) {
+        this.syncGraphVisibleCounts();
+      }
+      if (this.graphSearchResult?.id || this.graphDetailNode?.id || (this.graphContextMenu?.open && this.graphContextMenu?.node?.id)) {
+        const visibleNodes = this.forceGraphModule?.getGraph?.()?.graphData?.()?.nodes || [];
+        if (this.graphSearchResult?.id && !visibleNodes.some(n => n.id === this.graphSearchResult.id)) {
+          this.graphSearchResult = null;
+        }
+        if (this.graphDetailNode?.id && !visibleNodes.some(n => n.id === this.graphDetailNode.id)) {
+          this.graphDetailNode = null;
+          setTimeout(() => this.resizeForceGraph(), 250);
+        }
+        if (this.graphContextMenu?.open && this.graphContextMenu?.node?.id && !visibleNodes.some(n => n.id === this.graphContextMenu.node.id)) {
+          this.graphContextMenu = { open: false, x: 0, y: 0, node: null };
+        }
+      }
     },
 
     formatETAPillCompact(issue) {

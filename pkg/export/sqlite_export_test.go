@@ -1897,4 +1897,42 @@ func TestWave29_A15_4_And_W29_4_SQLiteRiskAndETASuppression(t *testing.T) {
 			t.Fatalf("W29-4 regression: %s must suppress risk_score/risk_explanation, got score=%v expl=%+v", id, rScore, rExpl)
 		}
 	}
+
+	// P16B-6 & P16B-7: Programmatic callers passing edges ONLY in e.Deps (not issue.Dependencies)
+	// still compute cross-repo risk, and GetExportedIssues() exposes risk & ETA parity.
+	depOnlyPtrs := make([]*model.Issue, len(rawIssues))
+	for i := range rawIssues {
+		issCopy := rawIssues[i]
+		issCopy.Dependencies = nil
+		depOnlyPtrs[i] = &issCopy
+	}
+	depOnlyExp := NewSQLiteExporter(depOnlyPtrs, deps, &stats, nil)
+	depOnlyExp.Config.Readiness = an.Readiness()
+	depOnlyDir := t.TempDir()
+	if err := depOnlyExp.Export(depOnlyDir); err != nil {
+		t.Fatalf("dep-only Export failed: %v", err)
+	}
+	depOnlyDB, err := sql.Open("sqlite", filepath.Join(depOnlyDir, "beads.sqlite3"))
+	if err != nil {
+		t.Fatalf("sql.Open depOnlyDB: %v", err)
+	}
+	defer depOnlyDB.Close()
+	var depOnlyRisk float64
+	if err := depOnlyDB.QueryRow(`SELECT risk_score FROM issue_overview_mv WHERE id = 'web-risky'`).Scan(&depOnlyRisk); err != nil {
+		t.Fatalf("query depOnlyDB web-risky: %v", err)
+	}
+	if math.Abs(depOnlyRisk-riskyScore) > 1e-9 {
+		t.Fatalf("P16B-6 regression: e.Deps-only risk_score=%v differed from inline Dependencies risk_score=%v", depOnlyRisk, riskyScore)
+	}
+	exportedIssues := depOnlyExp.GetExportedIssues()
+	expByID := make(map[string]ExportIssue, len(exportedIssues))
+	for _, ei := range exportedIssues {
+		expByID[ei.ID] = ei
+	}
+	if math.Abs(expByID["web-risky"].RiskScore-riskyScore) > 1e-9 || expByID["web-risky"].RiskExplanation == "" || expByID["web-risky"].ETADays == nil {
+		t.Fatalf("P16B-7 regression: GetExportedIssues() missing risk/ETA parity on web-risky: %+v", expByID["web-risky"])
+	}
+	if expByID["tmpl-1"].RiskScore != 0 || expByID["tmpl-1"].ETADays != nil || expByID["closed-1"].RiskScore != 0 || expByID["closed-1"].ETADays != nil {
+		t.Fatalf("P16B-7 regression: GetExportedIssues() leaked risk/ETA on template/closed: tmpl=%+v closed=%+v", expByID["tmpl-1"], expByID["closed-1"])
+	}
 }

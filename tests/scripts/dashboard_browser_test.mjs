@@ -3916,22 +3916,9 @@ async function capabilitiesJourney(page) {
   await waitFor(page, `!${app}.graphContextMenu.open`, 'Escape closes context menu');
   assert.equal(await evaluate(page, `${app}.cycleNavigatorActive`), true, 'Escape on context menu does not leak to tear down Cycle Navigator');
 
-  // A15-10: Filtering out the node backing an open graphContextMenu must dismiss it via bv-graph:filterChange!
-  await evaluate(page, `(() => {
-    const node = ${app}.forceGraphModule.getGraph().graphData().nodes.find(n => n.id === 'cap-auth-root');
-    document.dispatchEvent(new CustomEvent('bv-graph:nodeContextMenu', { detail: { node, x: 180, y: 180 } }));
-  })()`);
-  await waitFor(page, `${app}.graphContextMenu.open`, 'context menu opened for A15-10 filter-dismiss check');
-  await evaluate(page, `(() => {
-    ${app}.forceGraphModule.setFilter('status', 'closed');
-  })()`);
-  await waitFor(page, `!${app}.graphContextMenu.open`, 'A15-10: bv-graph:filterChange closes context menu when its node is filtered out');
-  await evaluate(page, `(() => {
-    ${app}.forceGraphModule.setFilter('status', null);
-  })()`);
-  await waitFor(page, `(${app}.forceGraphModule.getGraph().graphData().nodes || []).some(n => n.id === 'cap-auth-root')`, 'restored graph status filter after A15-10 check');
-
   // Re-open context menu -> click What-If Close -> clears Cycle Navigator & activates #graph-whatif-hud with synced graphWhatIfBatchIds!
+  // (P16B-3: verify cycleNavigatorActive is still true right before What-If Close so the competing-overlay clearance is never tautological.)
+  assert.equal(await evaluate(page, `${app}.cycleNavigatorActive`), true, 'Cycle Navigator remains active immediately before What-If Close');
   await evaluate(page, `(() => {
     const node = ${app}.forceGraphModule.getGraph().graphData().nodes.find(n => n.id === 'cap-auth-root');
     document.dispatchEvent(new CustomEvent('bv-graph:nodeContextMenu', { detail: { node, x: 200, y: 200 } }));
@@ -3945,6 +3932,21 @@ async function capabilitiesJourney(page) {
   assert.equal(await evaluate(page, `${app}.graphWhatIfActive`), true, 'no-op animateCriticalPath on cyclic graph preserves active What-If overlay');
   await click(page, '#graph-whatif-hud button', 'Reset');
   await waitFor(page, `!${app}.graphWhatIfActive && ${app}.graphWhatIfBatchIds.length === 0`, 'What-If HUD Reset clears active simulation and batch queue');
+
+  // A15-10 (placed after What-If Reset per P16B-3): Filtering out the node backing an open graphContextMenu must dismiss it via bv-graph:filterChange!
+  await evaluate(page, `(() => {
+    const node = ${app}.forceGraphModule.getGraph().graphData().nodes.find(n => n.id === 'cap-auth-root');
+    document.dispatchEvent(new CustomEvent('bv-graph:nodeContextMenu', { detail: { node, x: 180, y: 180 } }));
+  })()`);
+  await waitFor(page, `${app}.graphContextMenu.open`, 'context menu opened for A15-10 filter-dismiss check');
+  await evaluate(page, `(() => {
+    ${app}.forceGraphModule.setFilter('status', 'closed');
+  })()`);
+  await waitFor(page, `!${app}.graphContextMenu.open`, 'A15-10: bv-graph:filterChange closes context menu when its node is filtered out');
+  await evaluate(page, `(() => {
+    ${app}.forceGraphModule.setFilter('status', null);
+  })()`);
+  await waitFor(page, `(${app}.forceGraphModule.getGraph().graphData().nodes || []).some(n => n.id === 'cap-auth-root')`, 'restored graph status filter after A15-10 check');
 
   // 5. Error Modal runErrorAction(action) recovery handler ({ action }, { handler }, { url }).
   await evaluate(page, `(() => {
@@ -4497,14 +4499,16 @@ async function standaloneGraphJourney(page) {
       DATA.links = origLinks2;
     }
 
-    // Wave 29 W29-4: Size: Risk option works cleanly & DATA.cycle_breaks carries collateral + rationale
+    // Wave 29 W29-4 + P16B-2: Size: Risk updates #heatmap-metric to 'Risk', produces finite node sizes,
+    // Reset restores #heatmap-metric to 'PageRank', and DATA.cycle_breaks carries collateral + rationale.
     const sizeSelect = document.getElementById('size-by');
     const hasRiskSizeOption = [...sizeSelect.options].some(o => o.value === 'risk');
     sizeSelect.value = 'risk';
     sizeSelect.dispatchEvent(new Event('change', { bubbles: true }));
+    const heatmapLabelOnRisk = document.getElementById('heatmap-metric')?.textContent?.trim();
     const riskSizedFinite = (Graph.graphData().nodes || []).every(n => Number.isFinite(getNodeSize(n)));
-    sizeSelect.value = 'pagerank';
-    sizeSelect.dispatchEvent(new Event('change', { bubbles: true }));
+    document.getElementById('btn-reset').click();
+    const heatmapLabelAfterReset = document.getElementById('heatmap-metric')?.textContent?.trim();
     const cycleBreaksHaveCollateral = cycleBreaks.every(b => typeof b.collateral === 'number' && typeof b.rationale === 'string' && b.rationale.length > 0);
 
     return {
@@ -4533,6 +4537,8 @@ async function standaloneGraphJourney(page) {
       b133HiddenCycleBlocked,
       b134SelfLoopCycleOk,
       hasRiskSizeOption,
+      heatmapLabelOnRisk,
+      heatmapLabelAfterReset,
       riskSizedFinite,
       cycleBreaksHaveCollateral,
     };
@@ -4564,6 +4570,8 @@ async function standaloneGraphJourney(page) {
   assert.equal(wave25StandaloneAudit.b133HiddenCycleBlocked, true, 'Wave 28 B13-3 standalone showCycleInspector skips hidden-by-filter cycles without dimming visible nodes');
   assert.equal(wave25StandaloneAudit.b134SelfLoopCycleOk, true, 'Wave 28 B13-4 standalone computeStandaloneRootBlockers detects self-loop cycles');
   assert.equal(wave25StandaloneAudit.hasRiskSizeOption, true, 'Wave 29 W29-4 standalone #size-by includes Size: Risk');
+  assert.equal(wave25StandaloneAudit.heatmapLabelOnRisk, 'Risk', 'Pass 16 P16B-2 standalone #heatmap-metric updates to Risk when Size: Risk is selected');
+  assert.equal(wave25StandaloneAudit.heatmapLabelAfterReset, 'PageRank', 'Pass 16 P16B-2 standalone #btn-reset restores #heatmap-metric to PageRank');
   assert.equal(wave25StandaloneAudit.riskSizedFinite, true, 'Wave 29 W29-4 Size: Risk produces finite node radii');
   assert.equal(wave25StandaloneAudit.cycleBreaksHaveCollateral, true, 'Wave 29 W29-4 standalone DATA.cycle_breaks carries collateral + rationale');
 

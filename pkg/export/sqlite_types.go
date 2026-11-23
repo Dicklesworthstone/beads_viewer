@@ -39,15 +39,20 @@ type ExportIssue struct {
 	SourceRepo         string          `json:"source_repo,omitempty"`
 
 	// Computed graph metrics
-	PageRank       float64  `json:"pagerank"`
-	Betweenness    float64  `json:"betweenness,omitempty"`
-	Eigenvector    float64  `json:"eigenvector,omitempty"`
-	CriticalPath   int      `json:"critical_path_depth"`
-	TriageScore    float64  `json:"triage_score,omitempty"`
-	BlocksCount    int      `json:"blocks_count"`
-	BlockedByCount int      `json:"blocked_by_count"`
-	BlocksIDs      []string `json:"blocks_ids,omitempty"`
-	BlockedByIDs   []string `json:"blocked_by_ids,omitempty"`
+	PageRank        float64  `json:"pagerank"`
+	Betweenness     float64  `json:"betweenness,omitempty"`
+	Eigenvector     float64  `json:"eigenvector,omitempty"`
+	CriticalPath    int      `json:"critical_path_depth"`
+	TriageScore     float64  `json:"triage_score,omitempty"`
+	BlocksCount     int      `json:"blocks_count"`
+	BlockedByCount  int      `json:"blocked_by_count"`
+	BlocksIDs       []string `json:"blocks_ids,omitempty"`
+	BlockedByIDs    []string `json:"blocked_by_ids,omitempty"`
+	ETADays         *float64 `json:"eta_days,omitempty"`
+	ETADate         string   `json:"eta_date,omitempty"`
+	ETAConfidence   *float64 `json:"eta_confidence,omitempty"`
+	RiskScore       float64  `json:"risk_score,omitempty"`
+	RiskExplanation string   `json:"risk_explanation,omitempty"`
 }
 
 // ExportDependency represents a dependency relationship for export.

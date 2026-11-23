@@ -2463,7 +2463,16 @@ function showCycleInspector(idx, step = 1) {
     for (let i = 0; i < openCycle.length; i++) {
         cycleEdges.add(openCycle[i] + '\0' + openCycle[(i + 1) %% openCycle.length]);
     }
-    const breakSug = (DATA.cycle_breaks || []).find(b => cycleEdges.has(b.from + '\0' + b.to));
+    const matchingBreaks = (DATA.cycle_breaks || []).filter(b => b && cycleEdges.has(b.from + '\0' + b.to));
+    matchingBreaks.sort((a, b) => {
+        const cbDiff = (Number(b.cycles_broken) || 0) - (Number(a.cycles_broken) || 0);
+        if (cbDiff !== 0) return cbDiff;
+        const aCol = typeof a.collateral === 'number' ? a.collateral : Number.MAX_SAFE_INTEGER;
+        const bCol = typeof b.collateral === 'number' ? b.collateral : Number.MAX_SAFE_INTEGER;
+        if (aCol !== bCol) return aCol - bCol;
+        return String(a.from || '').localeCompare(String(b.from || '')) || String(a.to || '').localeCompare(String(b.to || ''));
+    });
+    const breakSug = matchingBreaks[0] || null;
     const banner = document.getElementById('cycle-banner');
     const textEl = document.getElementById('cycle-banner-text');
     if (banner && textEl) {
@@ -2732,9 +2741,10 @@ document.getElementById('view-mode').onchange = e => {
 };
 
 // Size metric
+const SIZE_METRIC_LABELS = { pagerank: 'PageRank', betweenness: 'Betweenness', critical: 'Critical Path', indegree: 'In-Degree', risk: 'Risk' };
 document.getElementById('size-by').onchange = e => {
     sizeMetric = e.target.value;
-    document.getElementById('heatmap-metric').textContent = { pagerank: 'PageRank', betweenness: 'Betweenness', critical: 'Critical Path', indegree: 'In-Degree' }[sizeMetric];
+    document.getElementById('heatmap-metric').textContent = SIZE_METRIC_LABELS[sizeMetric] || 'PageRank';
     Graph.nodeVal(n => getNodeSize(n));
     if (heatmapMode) Graph.nodeColor(computeNodeColor);
 };
@@ -2758,6 +2768,7 @@ document.getElementById('btn-reset').onclick = () => {
     labelFilter = 'all';
     repoFilter = 'all';
     sizeMetric = 'pagerank';
+    document.getElementById('heatmap-metric').textContent = 'PageRank';
     heatmapMode = false;
     pathFinderMode = false;
     pathStart = null;
