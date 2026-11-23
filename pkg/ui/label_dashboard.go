@@ -229,7 +229,11 @@ func (m LabelDashboardModel) View() string {
 
 	headers := []string{"Label", "Health", "Blocked", "Velocity 7d/30d", "Stale"}
 	if m.showExtendedColumns() {
-		headers = []string{"Label", "Health", "Blocked", "Vel 7d/30d", "Trend 4w", "Attn", "Stale"}
+		velHeader := "Vel 7d/30d"
+		if m.width == 0 || m.width >= 90 {
+			velHeader = "Velocity 7d/30d"
+		}
+		headers = []string{"Label", "Health", "Blocked", velHeader, "Trend 4w", "Attn", "Stale"}
 	}
 	widths := m.computeColumnWidths(headers)
 

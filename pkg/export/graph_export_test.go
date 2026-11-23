@@ -632,3 +632,56 @@ func TestExportGraph_MermaidAndDOT_DependencyBlockedAndCustomStatuses(t *testing
 		}
 	}
 }
+
+func TestExportGraph_SuppressActionableOmitsUnprovenReadiness(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "A", Title: "Ready root", Status: model.StatusOpen, Priority: 1},
+		{
+			ID:       "B",
+			Title:    "Blocked child",
+			Status:   model.StatusOpen,
+			Priority: 2,
+			Dependencies: []*model.Dependency{
+				{IssueID: "B", DependsOnID: "A", Type: model.DepBlocks},
+			},
+		},
+	}
+	stats := analysis.NewAnalyzer(issues).Analyze()
+
+	proven, err := ExportGraph(issues, &stats, GraphExportConfig{
+		Format:             GraphFormatJSON,
+		SuppressActionable: false,
+	})
+	if err != nil {
+		t.Fatalf("ExportGraph proven failed: %v", err)
+	}
+	if proven.Adjacency == nil || len(proven.Adjacency.Nodes) != 2 {
+		t.Fatalf("unexpected proven adjacency: %+v", proven.Adjacency)
+	}
+	gotAct := map[string]bool{}
+	for _, n := range proven.Adjacency.Nodes {
+		if n.Actionable == nil {
+			t.Fatalf("expected proven node %s to carry Actionable", n.ID)
+		}
+		gotAct[n.ID] = *n.Actionable
+	}
+	if !gotAct["A"] || gotAct["B"] {
+		t.Fatalf("expected A actionable=true and B actionable=false, got %+v", gotAct)
+	}
+
+	provisional, err := ExportGraph(issues, &stats, GraphExportConfig{
+		Format:             GraphFormatJSON,
+		SuppressActionable: true,
+	})
+	if err != nil {
+		t.Fatalf("ExportGraph provisional failed: %v", err)
+	}
+	if provisional.Adjacency == nil || len(provisional.Adjacency.Nodes) != 2 {
+		t.Fatalf("unexpected provisional adjacency: %+v", provisional.Adjacency)
+	}
+	for _, n := range provisional.Adjacency.Nodes {
+		if n.Actionable != nil {
+			t.Fatalf("expected provisional node %s to omit Actionable, got %v", n.ID, *n.Actionable)
+		}
+	}
+}

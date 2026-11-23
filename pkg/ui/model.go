@@ -19173,7 +19173,7 @@ func (m *Model) renderAlertsPanel() string {
 	boxWidth := max(24, min(80, m.width-4))
 	maxBoxHeight := max(10, m.height-4)
 	innerWidth := max(16, boxWidth-4)
-	footerText := "Tab: suggest • j/k: nav • Enter: jump • d: dismiss • S: save baseline • Esc: close"
+	footerText := "Tab: suggest • j/k • Enter • d: dismiss • S: save baseline • Esc: close"
 	if m.alertsTab == 1 {
 		footerText = "Tab: alerts • j/k: nav • Enter: jump • c: copy cmd • Esc: close"
 	}
@@ -19219,6 +19219,23 @@ func (m *Model) renderAlertsPanel() string {
 		compactFooter = "Esc: close"
 	}
 	compactFooter = ansi.Truncate(compactFooter, innerWidth, "…")
+	if lipgloss.Width(footerText) > innerWidth {
+		if m.alertsTab == 0 {
+			mid := "Tab • j/k • d: dismiss • S: save baseline • Esc: close"
+			if lipgloss.Width(mid) <= innerWidth {
+				footerText = mid
+			} else {
+				footerText = compactFooter
+			}
+		} else {
+			mid := "Tab • j/k • c: copy • Esc: close"
+			if lipgloss.Width(mid) <= innerWidth {
+				footerText = mid
+			} else {
+				footerText = compactFooter
+			}
+		}
+	}
 	writeChrome := func(summaryPlain string, summaryStyle lipgloss.Style) (lineBudget int, footerSep string) {
 		hdr := headerRendered
 		hdrPlain := headerPlain

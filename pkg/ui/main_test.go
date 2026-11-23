@@ -1392,6 +1392,7 @@ func TestWave22_TUIRegressions(t *testing.T) {
 		}
 		m := NewModel(issues, nil, "")
 		t.Cleanup(m.Stop)
+		m.referenceNow = now
 		m.SetSprints(sprints)
 		m.Update(tea.WindowSizeMsg{Width: 100, Height: 40})
 		m.openSprintView()

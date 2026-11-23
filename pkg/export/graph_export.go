@@ -22,13 +22,14 @@ const (
 
 // GraphExportConfig configures graph export behavior.
 type GraphExportConfig struct {
-	Format       GraphExportFormat     // Output format (json, dot, mermaid)
-	Label        string                // Filter to specific label
-	Root         string                // Subgraph from specific root
-	Depth        int                   // Max depth for subgraph (0 = unlimited)
-	DataHash     string                // Hash of input data for provenance
-	Readiness    *model.ReadinessIndex // Optional full-source readiness index (falls back to issues when nil)
-	ReferenceNow time.Time             // Optional reference instant for deterministic readiness/actionable flags
+	Format             GraphExportFormat     // Output format (json, dot, mermaid)
+	Label              string                // Filter to specific label
+	Root               string                // Subgraph from specific root
+	Depth              int                   // Max depth for subgraph (0 = unlimited)
+	DataHash           string                // Hash of input data for provenance
+	Readiness          *model.ReadinessIndex // Optional full-source readiness index (falls back to issues when nil)
+	ReferenceNow       time.Time             // Optional reference instant for deterministic readiness/actionable flags
+	SuppressActionable bool                  // Omit per-node actionable readiness flags when source authority is provisional
 }
 
 // GraphExportResult contains the exported graph and metadata.
@@ -168,7 +169,7 @@ func ExportGraph(issues []model.Issue, stats *analysis.GraphStats, config GraphE
 		if refNow.IsZero() {
 			refNow = time.Now()
 		}
-		adjacency := generateAdjacency(filteredIssues, issueIDs, stats, readiness, refNow)
+		adjacency := generateAdjacency(filteredIssues, issueIDs, stats, readiness, refNow, config.SuppressActionable)
 		result.Adjacency = adjacency
 		result.Explanation = GraphExplanation{
 			What:      "Dependency graph as JSON adjacency list",
@@ -443,7 +444,7 @@ func generateMermaid(issues []model.Issue, issueIDs map[string]bool) string {
 
 // generateAdjacency creates a JSON adjacency list representation enriched with
 // active-subgraph structural metrics and readiness state.
-func generateAdjacency(issues []model.Issue, issueIDs map[string]bool, stats *analysis.GraphStats, readiness *model.ReadinessIndex, refNow time.Time) *AdjacencyGraph {
+func generateAdjacency(issues []model.Issue, issueIDs map[string]bool, stats *analysis.GraphStats, readiness *model.ReadinessIndex, refNow time.Time, suppressActionable bool) *AdjacencyGraph {
 	var pageRank, betweenness, criticalPath, slack map[string]float64
 	var coreNumber map[string]int
 	var artSet map[string]bool
@@ -515,7 +516,7 @@ func generateAdjacency(issues []model.Issue, issueIDs map[string]bool, stats *an
 				node.IsArticulation = true
 			}
 		}
-		if readiness != nil {
+		if readiness != nil && !suppressActionable {
 			act := readiness.Ready(i.ID, refNow)
 			node.Actionable = &act
 		}
