@@ -2520,13 +2520,18 @@ type Model struct {
 	sprintAtRiskThresholds analysis.AtRiskThresholds
 
 	// Cached dataset-level ETA context (O(1+L) per-issue forecasts on cursor move)
-	etaCtx            *analysis.ETAContext
-	etaCtxStats       *analysis.GraphStats
-	etaCtxPhase2Ready bool
-	etaCtxDataGen     uint64
-	etaCtxScopeKey    string
-	etaCtxCount       int
-	etaCtxMinute      int64
+	etaCtx              *analysis.ETAContext
+	etaCtxStats         *analysis.GraphStats
+	etaCtxPhase2Ready   bool
+	etaCtxDataGen       uint64
+	etaCtxScopeKey      string
+	etaCtxCount         int
+	etaCtxMinute        int64
+	boardScopedAnalyzer *analysis.Analyzer
+	boardScopedAnalysis *analysis.GraphStats
+	boardScopedStatsRef *analysis.GraphStats
+	boardScopedDataGen  uint64
+	boardScopedScopeKey string
 
 	// Concurrently readable active internal watcher/worker path for external sibling watcher Sync.
 	internalWatchedPath *atomic.Pointer[string]
@@ -4350,11 +4355,57 @@ func (m *Model) syncBoardReadinessAndFullIssues() {
 	if m.analyzer != nil {
 		m.board.SetReadiness(m.analyzer.Readiness())
 	}
+	if m.workspaceMode && m.activeRepos != nil {
+		m.board.SetFullIssues(m.repoScopedIssues())
+		return
+	}
 	if m.snapshot != nil && len(m.snapshot.Issues) == len(m.issues) && m.snapshot.IssueMap != nil {
 		m.board.SetFullIssuesFromSnapshot(m.snapshot)
 		return
 	}
 	m.board.SetFullIssues(m.issues)
+}
+
+func (m *Model) boardScopeAnalysis() (*analysis.Analyzer, *analysis.GraphStats) {
+	if !m.workspaceMode || m.activeRepos == nil {
+		return m.analyzer, m.analysis
+	}
+	scopeKey := m.etaScopeKey()
+	if m.boardScopedAnalyzer != nil &&
+		m.boardScopedStatsRef == m.analysis &&
+		m.boardScopedDataGen == m.semanticDataGeneration &&
+		m.boardScopedScopeKey == scopeKey {
+		return m.boardScopedAnalyzer, m.boardScopedAnalysis
+	}
+	scoped := m.repoScopedIssues()
+	an := analysis.NewAnalyzer(scoped)
+	an.SetNow(m.analysisReferenceTime())
+	scopedSet := make(map[string]bool, len(scoped))
+	for i := range scoped {
+		scopedSet[scoped[i].ID] = true
+	}
+	candidates := scopedSet
+	if m.candidateIDs != nil {
+		filtered := make(map[string]bool, len(m.candidateIDs))
+		for id, ok := range m.candidateIDs {
+			if ok && scopedSet[id] {
+				filtered[id] = true
+			}
+		}
+		candidates = filtered
+	}
+	if m.analyzer != nil {
+		an.SetReadinessScope(m.analyzer.Readiness(), candidates)
+	} else {
+		an.SetReadinessScope(model.NewReadinessIndex(m.issues), candidates)
+	}
+	stats := an.Analyze()
+	m.boardScopedAnalyzer = an
+	m.boardScopedAnalysis = &stats
+	m.boardScopedStatsRef = m.analysis
+	m.boardScopedDataGen = m.semanticDataGeneration
+	m.boardScopedScopeKey = scopeKey
+	return m.boardScopedAnalyzer, m.boardScopedAnalysis
 }
 
 func (m *Model) currentAdvancedInsightsKey() advancedInsightsCacheKey {
@@ -4508,12 +4559,14 @@ func (m *Model) rebuildInsightsPanel() {
 	if panelHeight < 3 {
 		panelHeight = 3
 	}
+	wasHeatmapDrill := prev.heatmapDrill
 	panel.ClampSelections()
 	if prevSelectedID != "" && panel.focusedPanel == PanelPriority {
-		if panel.showHeatmap && panel.heatmapDrill {
+		if panel.showHeatmap && wasHeatmapDrill {
 			relocated := false
 			for idx, id := range panel.heatmapIssues {
 				if id == prevSelectedID {
+					panel.heatmapDrill = true
 					panel.heatmapDrillIdx = idx
 					relocated = true
 					break
@@ -4527,6 +4580,7 @@ func (m *Model) rebuildInsightsPanel() {
 								panel.heatmapRow = r
 								panel.heatmapCol = c
 								panel.heatmapIssues = panel.heatmapIssueMap[r][c]
+								panel.heatmapDrill = true
 								panel.heatmapDrillIdx = idx
 								relocated = true
 								break
@@ -5789,18 +5843,29 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.analysis = msg.Snapshot.Analysis
 		reloadedWeights, reloadedFeedbackSummary := loadFeedbackForBeadsPath(m.beadsPath)
 		m.feedbackSummary = reloadedFeedbackSummary
-		weightsDiverged := reloadedWeights != nil && m.analyzer != nil && triageWeightsDiffer(m.analyzer.Weights(), *reloadedWeights)
+		feedbackGoverns := strings.TrimSpace(m.beadsPath) != "" && !isHistoricalGitBeadsPath(m.beadsPath) && !msg.Snapshot.explicitWeights
+		desiredWeights := analysis.DefaultWeights()
+		if reloadedWeights != nil {
+			desiredWeights = *reloadedWeights
+		}
+		weightsDiverged := feedbackGoverns && m.analyzer != nil && triageWeightsDiffer(m.analyzer.Weights(), desiredWeights)
 		if m.candidateIDs != nil || !m.referenceNow.IsZero() || weightsDiverged {
 			// The worker owns its analyzer. Bind a UI-owned analyzer to the
 			// fresh authority without mutating analysis still used off-thread.
 			m.analyzer = analysis.NewAnalyzer(m.issues)
-			m.analyzer.RestoreScoring(msg.Snapshot.Analyzer.CaptureScoring())
+			if msg.Snapshot.Analyzer != nil {
+				m.analyzer.RestoreScoring(msg.Snapshot.Analyzer.CaptureScoring())
+			}
 			if !m.referenceNow.IsZero() {
 				m.analyzer.SetNow(m.referenceNow)
 			}
-			m.analyzer.SetReadinessScope(msg.Snapshot.Analyzer.Readiness(), m.candidateIDs)
-			if reloadedWeights != nil {
-				m.analyzer.SetWeights(*reloadedWeights)
+			if msg.Snapshot.Analyzer != nil {
+				m.analyzer.SetReadinessScope(msg.Snapshot.Analyzer.Readiness(), m.candidateIDs)
+			} else {
+				m.analyzer.SetReadinessScope(model.NewReadinessIndex(m.issues), m.candidateIDs)
+			}
+			if feedbackGoverns {
+				m.analyzer.SetWeights(desiredWeights)
 			}
 		}
 		m.graphView.SetAnalyzer(m.analyzer, m.analysisReferenceTime)
@@ -5928,8 +5993,8 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		if m.activeRecipe != nil {
 			// If the snapshot already includes recipe filtering/sorting AND no workspace
-			// repo filter, candidate scope, or custom reference clock is active, use it directly (bv-cwwd).
-			if (!m.workspaceMode || m.activeRepos == nil) && m.candidateIDs == nil && m.referenceNow.IsZero() && snapshotMatchesActiveRecipe {
+			// repo filter, candidate scope, feedback weight divergence, or custom reference clock is active, use it directly (bv-cwwd).
+			if (!m.workspaceMode || m.activeRepos == nil) && m.candidateIDs == nil && m.referenceNow.IsZero() && !weightsDiverged && snapshotMatchesActiveRecipe {
 				filteredItems := make([]list.Item, 0, len(msg.Snapshot.ListItems))
 				filteredIssues := make([]model.Issue, 0, len(msg.Snapshot.ListItems))
 				recipeIDs := make(map[string]bool, len(msg.Snapshot.ListItems))
@@ -6002,6 +6067,7 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.sortMode == SortDefault &&
 				m.candidateIDs == nil &&
 				m.referenceNow.IsZero() &&
+				!weightsDiverged &&
 				(!m.workspaceMode || m.activeRepos == nil) &&
 				len(msg.Snapshot.listModelItems) == len(msg.Snapshot.ListItems) &&
 				msg.Snapshot.BoardState != nil && msg.Snapshot.GetGraphLayout() != nil
@@ -6026,7 +6092,7 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 				for _, item := range msg.Snapshot.ListItems {
 					issue := item.Issue
-					if m.candidateIDs != nil || !m.referenceNow.IsZero() {
+					if m.candidateIDs != nil || !m.referenceNow.IsZero() || weightsDiverged {
 						item = m.itemWithTriage(item)
 					}
 
@@ -11069,8 +11135,9 @@ func (m *Model) renderMainView() (body string, overlay bool) {
 			m.graphView.SetETAContext(m.etaContext())
 			body = m.graphView.View(bodyWidth, bodyHeight)
 		case m.isBoardView:
-			m.board.SetAnalyzer(m.analyzer)
-			m.board.SetAnalysis(m.analysis)
+			boardAn, boardStats := m.boardScopeAnalysis()
+			m.board.SetAnalyzer(boardAn)
+			m.board.SetAnalysis(boardStats)
 			m.board.SetETAContext(m.etaContext())
 			m.board.SetSize(bodyWidth, bodyHeight)
 			body = m.board.View(bodyWidth, bodyHeight)
@@ -17307,16 +17374,23 @@ func (m *Model) refreshActionableView() {
 	}
 	plan := analyzer.GetExecutionPlan()
 	m.actionableView = NewActionableModel(plan, m.theme)
-	if capSum := m.computeGlobalCapacitySummary(scopedIssues, nil); capSum != nil && capSum.TotalMinutes > 0 {
-		m.actionableView.SetCapacitySummary(fmt.Sprintf("1a %.1fd · 2a %.1fd · 4a %.1fd · %.0f%% par",
-			capSum.Days1Agent, capSum.Days2Min, capSum.Days4Min, capSum.ParallelizablePct))
-	}
+	var scopedStats *analysis.GraphStats
 	etaStats := m.analysis
 	if m.workspaceMode && m.activeRepos != nil {
 		s := analyzer.Analyze()
-		etaStats = &s
+		scopedStats = &s
+		etaStats = scopedStats
 	}
-	etaCtx := analysis.NewETAContext(scopedIssues, etaStats, analyzer.Now())
+	if capSum := m.computeGlobalCapacitySummary(scopedIssues, scopedStats); capSum != nil && capSum.TotalMinutes > 0 {
+		m.actionableView.SetCapacitySummary(fmt.Sprintf("1a %.1fd · 2a %.1fd · 4a %.1fd · %.0f%% par",
+			capSum.Days1Agent, capSum.Days2Min, capSum.Days4Min, capSum.ParallelizablePct))
+	}
+	var etaCtx *analysis.ETAContext
+	if scopedStats != nil {
+		etaCtx = analysis.NewETAContext(m.candidateScopedIssues(), scopedStats, analyzer.Now())
+	} else {
+		etaCtx = m.etaContext()
+	}
 	issueByID := make(map[string]model.Issue, len(scopedIssues))
 	for _, iss := range scopedIssues {
 		issueByID[iss.ID] = iss
@@ -17325,10 +17399,12 @@ func (m *Model) refreshActionableView() {
 	whatIfMap := make(map[string]actionableWhatIf)
 	for _, track := range plan.Tracks {
 		for _, item := range track.Items {
-			if iss, ok := issueByID[item.ID]; ok {
-				eta := etaCtx.EstimateForIssue(iss, 1)
-				if eta.EstimatedDays > 0 && !eta.ETADate.IsZero() {
-					etaMap[item.ID] = fmt.Sprintf("~%.1fd", eta.EstimatedDays)
+			if etaCtx != nil {
+				if iss, ok := issueByID[item.ID]; ok {
+					eta := etaCtx.EstimateForIssue(iss, 1)
+					if eta.EstimatedDays > 0 && !eta.ETADate.IsZero() {
+						etaMap[item.ID] = fmt.Sprintf("~%.1fd", eta.EstimatedDays)
+					}
 				}
 			}
 			if len(item.UnblocksIDs) > 0 {
@@ -18446,8 +18522,9 @@ func (m *Model) RenderDebugView(viewName string, width, height int) string {
 		m.isBoardView = true
 		m.focused = focusBoard
 		m.refreshBoardAndGraphForCurrentFilter()
-		m.board.SetAnalyzer(m.analyzer)
-		m.board.SetAnalysis(m.analysis)
+		boardAn, boardStats := m.boardScopeAnalysis()
+		m.board.SetAnalyzer(boardAn)
+		m.board.SetAnalysis(boardStats)
 		m.board.SetETAContext(m.etaContext())
 		m.board.SetSize(width, bodyHeight)
 		return m.board.View(width, bodyHeight)

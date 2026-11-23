@@ -2776,8 +2776,8 @@ async function capabilitiesJourney(page) {
       fcCardVisible: Boolean(fcCard && (${visible})(fcCard)),
       capOpenCount: ${app}.forecastData?.global_capacity?.open_count || 0,
       capDays1a: Number(${app}.forecastData?.global_capacity?.days_1_agent || 0),
-      // B9-2 & B10-P2-7 & B11-5: non-UTC fixed offset ISO date preserves literal calendar day; zero/impossible/malformed times return ''
-      offsetDatePreserved: formatCalendarDateUTC('2026-03-08T00:00:00+02:00') === 'Mar 8, 2026',
+      // B9-2 & B10-P2-7 & B11-5 & B12-3: non-UTC offset + RFC3339 lowercase t/z preserve calendar day; zero/impossible/malformed times return ''
+      offsetDatePreserved: formatCalendarDateUTC('2026-03-08T00:00:00+02:00') === 'Mar 8, 2026' && formatCalendarDateUTC('2026-03-08t12:34:56z') === 'Mar 8, 2026',
       zeroDateBlank: formatCalendarDateUTC('0001-01-01T00:00:00Z') === '',
       impossibleDateBlank: formatCalendarDateUTC('2026-02-30') === '' && formatCalendarDateUTC('2026-13-01') === '' && formatCalendarDateUTC('2026-03-08foo') === '' && formatCalendarDateUTC('2026-03-08T99:99:99Z') === '' && formatCalendarDateUTC('2026-03-08 garbage') === '',
       labelSortAriaPressedOk: document.querySelectorAll('#insights-label-intelligence [role="group"] button[aria-pressed="true"]').length === 1,
@@ -4105,13 +4105,25 @@ async function standaloneGraphJourney(page) {
     const openNodeHasETA = DATA.nodes.some(n => isActiveNodeStatus(n.status) && n.eta_days != null && Boolean(n.eta_date));
     const closedNodeNoETA = DATA.nodes.filter(n => !isActiveNodeStatus(n.status)).every(n => n.eta_days == null);
 
-    // B11-4: Filtering out all What-If highlighted nodes clears stale banner, hidden selection, and dimming.
+    // B11-4 + B12-1 + B12-2: Filtering out selected/What-If/PathFinder nodes clears hidden selection, docked panel, Path Finder, and dimming.
     selectNode(DATA.nodes.find(n => n.id === 'cap-auth-root'));
     runWhatIfSimulation('cap-auth-root');
     const stSel = document.getElementById('filter-status');
     stSel.value = 'closed';
     stSel.onchange({ target: stSel });
-    const b114ClearedOverlay = selectedNode === null && highlightedNodes.size === 0 && !document.getElementById('whatif-banner')?.classList.contains('visible');
+    const b114ClearedOverlay = selectedNode === null && hoveredNode === null && highlightedNodes.size === 0 &&
+      !document.getElementById('whatif-banner')?.classList.contains('visible') &&
+      !document.getElementById('docked-panel')?.classList.contains('visible');
+    stSel.value = 'all';
+    stSel.onchange({ target: stSel });
+    // Also verify Path Finder mode cancels cleanly when pathStart is filtered out (B12-1).
+    document.getElementById('btn-path').click();
+    pathStart = 'cap-auth-root';
+    activePathNodes = new Set(['cap-auth-root']);
+    highlightedNodes = new Set(['cap-auth-root']);
+    stSel.value = 'closed';
+    stSel.onchange({ target: stSel });
+    const b121PathFinderCancelled = !pathFinderMode && pathStart === null && !document.getElementById('pathfinder-banner')?.classList.contains('visible');
     stSel.value = 'all';
     stSel.onchange({ target: stSel });
 
@@ -4136,6 +4148,7 @@ async function standaloneGraphJourney(page) {
       openNodeHasETA,
       closedNodeNoETA,
       b114ClearedOverlay,
+      b121PathFinderCancelled,
     };
   })()`);
   assert.equal(wave25StandaloneAudit.cyclesCount, 2, 'standalone HTML DATA.cycles exports both active cycles');
@@ -4159,7 +4172,8 @@ async function standaloneGraphJourney(page) {
   assert.equal(wave25StandaloneAudit.b91ParentChildOk, true, 'Wave 26 B9-1/W26-3 standalone parent-child What-If & root blocker accuracy verified');
   assert.equal(wave25StandaloneAudit.openNodeHasETA, true, 'Wave 26 W26-4 standalone open nodes carry ETA forecasts');
   assert.equal(wave25StandaloneAudit.closedNodeNoETA, true, 'Wave 26 W26-4 standalone closed nodes suppress ETA forecasts');
-  assert.equal(wave25StandaloneAudit.b114ClearedOverlay, true, 'Wave 27 B11-4 standalone applyFilters clears hidden selection and zero-visible What-If overlay');
+  assert.equal(wave25StandaloneAudit.b114ClearedOverlay, true, 'Wave 27 B11-4/B12-2 standalone applyFilters clears hidden selection, docked panel, and zero-visible What-If overlay');
+  assert.equal(wave25StandaloneAudit.b121PathFinderCancelled, true, 'Wave 27 B12-1 standalone applyFilters cancels Path Finder when pathStart is filtered out');
 
   await capture(page, 'standalone-graph');
   clean(page);

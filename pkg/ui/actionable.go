@@ -390,15 +390,28 @@ func (m *ActionableModel) Render() string {
 			itemLine.WriteString(idStyle.Render(item.ID))
 			itemLine.WriteString(" ")
 
-			// Title with selection highlighting
-			etaLabel := m.etaByID[item.ID]
-			suffixReserve := 20
-			if etaLabel != "" {
-				suffixReserve += len(etaLabel) + 2
+			// Title with selection highlighting (strictly fit single terminal line so ensureVisible() math stays exact)
+			lineBudget := max(1, m.width-2)
+			prefixWidth := lipgloss.Width(itemLine.String())
+			unblockStr := ""
+			if len(item.UnblocksIDs) > 0 {
+				unblockStr = fmt.Sprintf(" →%d", len(item.UnblocksIDs))
 			}
-			maxTitleLen := m.width - lipgloss.Width(itemLine.String()) - suffixReserve
-			if maxTitleLen < 10 {
-				maxTitleLen = 10
+			unblockWidth := lipgloss.Width(unblockStr)
+			etaLabel := m.etaByID[item.ID]
+			etaWidth := 0
+			if etaLabel != "" {
+				etaWidth = lipgloss.Width(etaLabel) + 1
+			}
+			maxTitleLen := lineBudget - prefixWidth - unblockWidth - etaWidth
+			if etaLabel != "" && maxTitleLen < 8 {
+				// Drop optional ETA badge on narrow terminals rather than wrapping onto 2 lines.
+				etaLabel = ""
+				etaWidth = 0
+				maxTitleLen = lineBudget - prefixWidth - unblockWidth
+			}
+			if maxTitleLen < 1 {
+				maxTitleLen = 1
 			}
 			title := truncateRunesHelper(item.Title, maxTitleLen, "…")
 
@@ -418,16 +431,16 @@ func (m *ActionableModel) Render() string {
 			}
 
 			// Unblocks count badge
-			if len(item.UnblocksIDs) > 0 {
+			if unblockStr != "" {
 				unblockBadge := t.Renderer.NewStyle().
 					Foreground(t.Open).
 					Bold(true).
-					Render(fmt.Sprintf(" →%d", len(item.UnblocksIDs)))
+					Render(unblockStr)
 				itemLine.WriteString(unblockBadge)
 			}
 
 			// Style the line with background if selected
-			lineStyle := t.Renderer.NewStyle().Width(m.width - 2)
+			lineStyle := t.Renderer.NewStyle().Width(lineBudget)
 			if isSelected {
 				lineStyle = lineStyle.Background(t.Highlight)
 			}
@@ -453,7 +466,7 @@ func (m *ActionableModel) Render() string {
 						unblocksText += " (" + strings.Join(extra, ", ") + ")"
 					}
 				}
-				unblocksText = truncateRunesHelper(unblocksText, m.width-12, "...")
+				unblocksText = truncateRunesHelper(unblocksText, max(4, m.width-12), "...")
 				lines = append(lines, unblocksStyle.Render(unblocksText))
 			}
 		}

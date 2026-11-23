@@ -203,7 +203,7 @@ func (h *HistoryModel) refreshFileIntelligence() {
 	h.hotspotOpenCounts = make(map[string]int, len(hotspots))
 	h.hotspotTotalCounts = make(map[string]int, len(hotspots))
 	for _, hs := range hotspots {
-		cleanPath := strings.TrimPrefix(hs.FilePath, "./")
+		cleanPath := strings.TrimSuffix(strings.TrimPrefix(strings.ReplaceAll(hs.FilePath, "\\", "/"), "./"), "/")
 		h.hotspotOpenCounts[cleanPath] = hs.OpenBeads
 		h.hotspotTotalCounts[cleanPath] = hs.TotalBeads
 	}
@@ -3225,7 +3225,7 @@ func (h *HistoryModel) renderFileTreeLine(idx int, node *FileTreeNode, width int
 	hotspotTag := ""
 	hotspotStyled := ""
 	if !node.IsDir {
-		cleanPath := strings.TrimPrefix(node.Path, "./")
+		cleanPath := strings.TrimSuffix(strings.TrimPrefix(strings.ReplaceAll(node.Path, "\\", "/"), "./"), "/")
 		openCnt := h.hotspotOpenCounts[cleanPath]
 		totalCnt := h.hotspotTotalCounts[cleanPath]
 		if openCnt >= 2 {

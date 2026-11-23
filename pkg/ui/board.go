@@ -56,15 +56,17 @@ type BoardModel struct {
 	referenceNow time.Time
 
 	// Detail panel (bv-r6kh)
-	showDetail      bool
-	detailVP        viewport.Model
-	mdRenderer      *MarkdownRenderer
-	cardMdRenderer  *MarkdownRenderer
-	detailCache     *boardDetailCache // Shared across value-receiver View() frames
-	lastDetailID    string            // Track which issue detail is currently rendered
-	lastDetailWidth int
-	lastViewWidth   int
-	lastViewHeight  int
+	showDetail       bool
+	detailVP         viewport.Model
+	mdRenderer       *MarkdownRenderer
+	cardMdRenderer   *MarkdownRenderer
+	detailCache      *boardDetailCache // Shared across value-receiver View() frames
+	lastDetailID     string            // Track which issue detail is currently rendered
+	lastDetailWidth  int
+	lastDetailDark   bool
+	lastDetailPhase2 bool
+	lastViewWidth    int
+	lastViewHeight   int
 
 	// Search state (bv-yg39)
 	searchMode    bool
@@ -2316,11 +2318,13 @@ func (b *BoardModel) syncDetailContent() {
 	}
 
 	if prevID == issue.ID && b.lastDetailWidth == curWidth &&
-		(b.detailCache == nil || (b.detailCache.darkMode == wantDark && b.detailCache.phase2Ready == phase2Ready)) {
+		b.lastDetailDark == wantDark && b.lastDetailPhase2 == phase2Ready {
 		return
 	}
 	b.lastDetailID = issue.ID
 	b.lastDetailWidth = curWidth
+	b.lastDetailDark = wantDark
+	b.lastDetailPhase2 = phase2Ready
 
 	if b.detailCache != nil && b.detailCache.issueID == issue.ID && b.detailCache.width == curWidth &&
 		b.detailCache.darkMode == wantDark && b.detailCache.phase2Ready == phase2Ready {

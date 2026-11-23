@@ -9557,5 +9557,36 @@ func TestWave27_Pass11Fixes_And_BoardActionableHistoryParity(t *testing.T) {
 				t.Fatalf("W27-3 regression: Actionable view missing %q:\n%s", want, actView)
 			}
 		}
+		// A12-11: narrow 40-col Actionable view must never wrap an item onto 2 physical lines.
+		m.actionableView.SetSize(40, 20)
+		narrowAct := ansi.Strip(m.actionableView.Render())
+		for _, ln := range strings.Split(narrowAct, "\n") {
+			if w := ansi.StringWidth(ln); w > 40 {
+				t.Fatalf("A12-11 regression: narrow Actionable line exceeded 40 cols (%d): %q", w, ln)
+			}
+		}
+
+		// A12-5: Workspace repo-filtered Board What-If must NOT leak hidden-repo unblock counts.
+		wsIssues := []model.Issue{
+			{ID: "api-1", Title: "API Root", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask, SourceRepo: "api", CreatedAt: refNow, UpdatedAt: refNow},
+			{ID: "web-1", Title: "Web Dependent", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, SourceRepo: "web", CreatedAt: refNow, UpdatedAt: refNow,
+				Dependencies: []*model.Dependency{{IssueID: "web-1", DependsOnID: "api-1", Type: model.DepBlocks}}},
+		}
+		mWS := NewModel(copyIssues(wsIssues), nil, "", ReadinessScope{ReferenceNow: refNow})
+		t.Cleanup(mWS.Stop)
+		mWS.analysis.WaitForPhase2()
+		mWS.EnableWorkspaceMode(WorkspaceInfo{Enabled: true, RepoCount: 2, TotalIssues: 2, RepoPrefixes: []string{"api-", "web-"}})
+		mWS.activeRepos = map[string]bool{"api": true}
+		mWS.syncBoardReadinessAndFullIssues()
+		mWS.board.SetIssues(mWS.repoScopedIssues())
+		mWS.board.ToggleDetail()
+		boardAn, boardStats := mWS.boardScopeAnalysis()
+		mWS.board.SetAnalyzer(boardAn)
+		mWS.board.SetAnalysis(boardStats)
+		mWS.board.SetSize(140, 30)
+		wsBoardOut := ansi.Strip(mWS.board.View(140, 30))
+		if strings.Contains(wsBoardOut, "What-If Close:") || strings.Contains(wsBoardOut, "web-1") {
+			t.Fatalf("A12-5 regression: repo-filtered Board detail leaked hidden-repo web-1 unblock:\n%s", wsBoardOut)
+		}
 	})
 }
