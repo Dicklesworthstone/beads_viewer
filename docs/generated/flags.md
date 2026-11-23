@@ -94,6 +94,7 @@
 | `--robot-capacity` | bool | `false` | Output capacity simulation and completion projection as JSON | Robot & Planning Flags |
 | `--robot-cass` | string | (empty) | Output correlated coding-agent sessions (cass) for bead ID as JSON | Robot & Planning Flags |
 | `--robot-causality` | string | (empty) | Output causal chain analysis for bead ID as JSON | Robot & Planning Flags |
+| `--robot-check-dep` | string | (empty) | Validate proposed blocking dependency edge(s) for cycles and readiness impact before adding (format: fromID:toID[,from2:to2]) | Robot & Planning Flags |
 | `--robot-commit` | string | (empty) | Output beads correlated with a git commit SHA or revision as JSON | Robot & Planning Flags |
 | `--robot-confirm-correlation` | string | (empty) | Confirm a correlation is correct (format: SHA:beadID) | Robot & Planning Flags |
 | `--robot-correlation-stats` | bool | `false` | Output correlation feedback statistics as JSON | Robot & Planning Flags |

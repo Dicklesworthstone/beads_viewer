@@ -341,6 +341,7 @@ var primaryStringCommandFlags = map[string]bool{
 	"robot-related":             true,
 	"robot-blocker-chain":       true,
 	"robot-whatif":              true,
+	"robot-check-dep":           true,
 	"robot-cass":                true,
 	"robot-impact-network":      true,
 	"robot-causality":           true,
@@ -818,6 +819,8 @@ func rewriteCanonicalRobotCommandIntent(command string, rest []string) ([]string
 		return rewriteRobotValueIntent(rest, "blocker-chain", "", "--robot-blocker-chain", ""), true
 	case "robot-whatif":
 		return rewriteRobotValueIntent(rest, "whatif", "", "--robot-whatif", ""), true
+	case "robot-check-dep", "check-dep":
+		return rewriteRobotValueIntent(rest, "check-dep", "", "--robot-check-dep", ""), true
 	case "robot-cass":
 		return rewriteRobotValueIntent(rest, "cass", "", "--robot-cass", ""), true
 	case "robot-impact-network":
@@ -1173,6 +1176,7 @@ var knownValueTakingCLIFlags = map[string]bool{
 	"related-max-results":       true,
 	"robot-blocker-chain":       true,
 	"robot-whatif":              true,
+	"robot-check-dep":           true,
 	"robot-cass":                true,
 	"robot-impact-network":      true,
 	"network-depth":             true,
@@ -1432,6 +1436,7 @@ func agentIntentCommandNames() []string {
 		"blocker-chain",
 		"whatif",
 		"what-if",
+		"check-dep",
 		"cass",
 		"sessions",
 		"impact-network",
@@ -1930,6 +1935,8 @@ func main() {
 	robotBlockerChain := flag.String("robot-blocker-chain", "", "Output full blocker chain analysis for issue ID as JSON")
 	// What-if impact simulation flag (bv-apal.36)
 	robotWhatIf := flag.String("robot-whatif", "", "Simulate completing issue ID and output downstream unblock impact as JSON")
+	// Pre-flight dependency cycle & readiness impact validator (W29-5)
+	robotCheckDep := flag.String("robot-check-dep", "", "Validate proposed blocking dependency edge(s) for cycles and readiness impact before adding (format: fromID:toID[,from2:to2])")
 	// Coding agent session search correlation flag (bv-apal.88)
 	robotCass := flag.String("robot-cass", "", "Output correlated coding-agent sessions (cass) for bead ID as JSON")
 	// Impact network graph flag (bv-48kr)
@@ -2081,6 +2088,7 @@ func main() {
 		RobotRelatedFlag:        robotRelatedWork,
 		RobotBlockerChainFlag:   robotBlockerChain,
 		RobotWhatIfFlag:         robotWhatIf,
+		RobotCheckDepFlag:       robotCheckDep,
 		RobotCassFlag:           robotCass,
 		RobotImpactNetworkFlag:  robotImpactNetwork,
 		RobotCausalityFlag:      robotCausality,
@@ -5199,7 +5207,22 @@ func main() {
 			if !robotDispatchContext.claimsProven() {
 				suppressUnprovenTriageClaims(&triage)
 			}
-			attachDriftAlertsToTriage(&triage, robotDispatchContext, nil, nil, robotDispatchContext.GraphIssues(), *forceFullAnalysis)
+			agentExportCtx := robotDispatchContext
+			agentExportCtx.ForceFullAnalysis = *forceFullAnalysis
+			agentAn := agentExportCtx.GraphAnalyzer()
+			var agentFullStats *analysis.GraphStats
+			if agentAn != nil {
+				if agentFeedbackWeights != nil {
+					agentAn.SetWeights(*agentFeedbackWeights)
+				}
+				if *forceFullAnalysis {
+					fullCfg := analysis.FullAnalysisConfig()
+					agentAn.SetConfig(&fullCfg)
+				}
+				s := agentAn.Analyze()
+				agentFullStats = &s
+			}
+			agentDriftResult := attachDriftAlertsToTriage(&triage, agentExportCtx, agentAn, agentFullStats, agentExportCtx.GraphIssues(), *forceFullAnalysis)
 			triagePayload, err := withEnvelope(robotDispatchContext.Envelope(), triage)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error encoding triage authority: %v\n", err)
@@ -5268,8 +5291,8 @@ func main() {
 			}
 			fmt.Println("  → helpers.md")
 
-			// Generate optional analytical companions (suggestions, labels, forecast, sprints)
-			// reusing one full-graph analysis pass (W28-6).
+			// Generate optional analytical companions (plan, drift, suggestions, labels, forecast, sprints, history)
+			// reusing the weighted full-graph analysis pass computed above (W28-6 + W29-2 + P16A-11).
 			bundleFiles := []string{"triage.json", "insights.json", "brief.md", "helpers.md"}
 			agentScopedIssues := issues
 			if candidateIDs != nil {
@@ -5280,16 +5303,35 @@ func main() {
 					}
 				}
 			}
-			agentExportCtx := robotDispatchContext
-			agentExportCtx.ForceFullAnalysis = *forceFullAnalysis
-			var agentFullStats *analysis.GraphStats
-			if agentAn := agentExportCtx.GraphAnalyzer(); agentAn != nil {
-				if *forceFullAnalysis {
-					fullCfg := analysis.FullAnalysisConfig()
-					agentAn.SetConfig(&fullCfg)
+			if agentAn != nil {
+				plan := agentAn.GetExecutionPlan()
+				planCtx := agentExportCtx
+				planCtx.Command = "robot-plan"
+				planEnvelope := struct {
+					RobotEnvelope
+					Plan analysis.ExecutionPlan `json:"plan"`
+				}{
+					RobotEnvelope: planCtx.EnvelopeWithHash(dataHash),
+					Plan:          plan,
 				}
-				s := agentAn.Analyze()
-				agentFullStats = &s
+				if planJSON, pErr := json.MarshalIndent(planEnvelope, "", "  "); pErr == nil && len(planJSON) > 0 {
+					if wErr := export.SafeWriteOutput(filepath.Join(*agentBrief, "plan.json"), planJSON, 0644); wErr == nil {
+						bundleFiles = append(bundleFiles, "plan.json")
+						fmt.Printf("  → plan.json (%d tracks)\n", len(plan.Tracks))
+					}
+				}
+			}
+			if agentDriftResult != nil {
+				driftCtx := agentExportCtx
+				driftCtx.Command = "robot-drift"
+				if wrappedDrift, dErr := withEnvelope(driftCtx.EnvelopeWithHash(dataHash), agentDriftResult); dErr == nil {
+					if driftJSON, mErr := json.MarshalIndent(wrappedDrift, "", "  "); mErr == nil && len(driftJSON) > 0 {
+						if wErr := export.SafeWriteOutput(filepath.Join(*agentBrief, "drift.json"), driftJSON, 0644); wErr == nil {
+							bundleFiles = append(bundleFiles, "drift.json")
+							fmt.Printf("  → drift.json (%d alerts)\n", len(agentDriftResult.Alerts))
+						}
+					}
+				}
 			}
 			if suggJSON, suggCnt, sErr := buildExportSuggestionsPayload(agentExportCtx, agentScopedIssues, dataHash, agentBriefNow); sErr == nil && suggCnt > 0 && len(suggJSON) > 0 {
 				if wErr := export.SafeWriteOutput(filepath.Join(*agentBrief, "suggestions.json"), suggJSON, 0644); wErr == nil {
@@ -5313,6 +5355,21 @@ func main() {
 				if wErr := export.SafeWriteOutput(filepath.Join(*agentBrief, "sprints.json"), spJSON, 0644); wErr == nil {
 					bundleFiles = append(bundleFiles, "sprints.json")
 					fmt.Printf("  → sprints.json (%d sprints)\n", spCnt)
+				}
+			}
+			if *pagesIncludeHistory {
+				agentHistCtx := agentExportCtx
+				if len(agentHistCtx.FullIssues) == 0 {
+					agentHistCtx.FullIssues = agentExportCtx.GraphIssues()
+				}
+				agentHistCtx.Issues = agentScopedIssues
+				if histRep, hErr := generateHistoryForExportContext(agentHistCtx); hErr == nil && histRep != nil {
+					if histJSON, mErr := json.MarshalIndent(histRep, "", "  "); mErr == nil && len(histJSON) > 0 {
+						if wErr := export.SafeWriteOutput(filepath.Join(*agentBrief, "history.json"), histJSON, 0644); wErr == nil {
+							bundleFiles = append(bundleFiles, "history.json")
+							fmt.Printf("  → history.json (%d commits)\n", len(histRep.Commits))
+						}
+					}
 				}
 			}
 			bundleFiles = append(bundleFiles, "meta.json")
@@ -5383,6 +5440,9 @@ func main() {
 
 		// Handle --robot-whatif flag (bv-apal.36)
 		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-whatif", robotDispatchContext)
+
+		// Handle --robot-check-dep flag (W29-5)
+		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-check-dep", robotDispatchContext)
 		// Handle --robot-cass flag (bv-apal.88)
 		dispatchRobotFlagOrExit(&phaseThreeRobotRegistry, "robot-cass", robotDispatchContext)
 
@@ -5681,7 +5741,7 @@ func main() {
 			if len(graphIssuesForReport) == 0 {
 				graphIssuesForReport = issuesForSearch
 			}
-			if (needsReportStats || options.Format == "markdown") && len(graphIssuesForReport) > 0 {
+			if (needsReportStats || options.Format == "markdown" || options.Format == "html") && len(graphIssuesForReport) > 0 {
 				reportAnalyzer := analysis.NewAnalyzer(graphIssuesForReport)
 				reportAnalyzer.SetNow(options.GeneratedAt)
 				reportAnalyzer.SetReadinessScope(readiness, candidateIDs)
@@ -5701,7 +5761,7 @@ func main() {
 						options.GraphStats = stats
 					}
 				}
-				if options.Format == "markdown" {
+				if options.Format == "markdown" || options.Format == "html" {
 					options.Analyzer = reportAnalyzer
 					visIDs := make(map[string]bool, len(reportIssues))
 					for _, iss := range reportIssues {
@@ -9459,19 +9519,29 @@ jq '.Keystones[:5]' insights.json
 
 ## Additional Analytical Files (emitted when applicable)
 ` + "```bash" + `
+# Parallel execution tracks for multi-agent dispatch
+jq '(.plan.tracks // [])[] | {track: .track_id, items: [.items[].id]}' plan.json
+
+# Full drift & baseline alerts with suggested actions
+jq '(.alerts // [])[] | {severity, type, issue_id, message, suggested_action}' drift.json
+
 # Hygiene suggestions (duplicates, missing deps, cycle breaks)
-jq '.suggestions[] | {type, confidence, target_bead, action_command}' suggestions.json
+jq '(.suggestions // [])[] | {type, confidence, target_bead, action_command}' suggestions.json
 
 # Label health, 4-week velocity & blockage cascades
-jq '.labels[] | {label, health, health_level, blocked_count, trend: .trend_direction}' labels.json
-jq '.cascades[] | {source: .source_label, blocked_count, total_impact, affected: .affected_labels}' labels.json
+jq '(.labels // [])[] | {label, health, health_level, blocked_count, trend: .trend_direction}' labels.json
+jq '(.cascades // [])[] | {source: .source_label, blocked_count, total_impact, affected: .affected_labels}' labels.json
 
 # Global Graham capacity bounds & priority misalignment alerts
 jq '.global_capacity' forecast.json
-jq '.priority_recommendations[] | {id: .issue_id, from: .current_priority, to: .suggested_priority, conf: .confidence}' forecast.json
+jq '(.priority_recommendations // [])[] | {id: .issue_id, from: .current_priority, to: .suggested_priority, conf: .confidence}' forecast.json
 
 # Active sprints & burndown
-jq '.sprints[] | {id, name, on_track: .burndown.on_track, remaining: .burndown.remaining_issues}' sprints.json
+jq '(.sprints // [])[] | {id, name, on_track: .burndown.on_track, remaining: .burndown.remaining_issues}' sprints.json
+
+# Code hotspots & suspicious orphan commits (with --pages-include-history)
+jq '(.file_hotspots // [])[:5] | .[] | {path, open_beads, co_changed}' history.json
+jq '(.orphans // [])[] | {short_sha, suspicion_score, probable_bead_id, confirm_command}' history.json
 ` + "```" + `
 
 ## Combining Files
@@ -9939,6 +10009,20 @@ func generateHistoryForExportContext(ctx RobotContext) (*TimeTravelHistory, erro
 		if gitRoot, grErr := correlation.FindGitRoot(orphanGitRoot); grErr == nil && gitRoot != "" {
 			orphanGitRoot = gitRoot
 		}
+		canonOrphanPath := func(p string) string {
+			p = strings.TrimSpace(p)
+			if p == "" {
+				return ""
+			}
+			if abs, aErr := filepath.Abs(p); aErr == nil {
+				p = abs
+			}
+			if eval, eErr := filepath.EvalSymlinks(p); eErr == nil && eval != "" {
+				p = eval
+			}
+			return filepath.Clean(p)
+		}
+		canonGitRoot := canonOrphanPath(orphanGitRoot)
 		var orphanStoreDirs []string
 		workDir := ctx.ProjectDir
 		if workDir == "" {
@@ -9949,12 +10033,17 @@ func generateHistoryForExportContext(ctx RobotContext) (*TimeTravelHistory, erro
 			if !filepath.IsAbs(storeDir) {
 				storeDir = filepath.Clean(filepath.Join(workDir, storeDir))
 			}
-			if rel, relErr := filepath.Rel(filepath.Clean(orphanGitRoot), storeDir); relErr == nil && rel != "." && rel != "" && !strings.HasPrefix(rel, "..") {
+			canonStoreDir := canonOrphanPath(storeDir)
+			if rel, relErr := filepath.Rel(canonGitRoot, canonStoreDir); relErr == nil && rel != "." && rel != "" && !strings.HasPrefix(rel, "..") {
 				orphanStoreDirs = append(orphanStoreDirs, filepath.ToSlash(rel))
 			}
 		}
 		orphanBaseReport := report
-		if fullIssues := ctx.GraphIssues(); singleRepoCorrelator != nil && len(fullIssues) > len(issues) {
+		fullIssues := ctx.FullIssues
+		if len(fullIssues) == 0 {
+			fullIssues = ctx.GraphIssues()
+		}
+		if singleRepoCorrelator != nil && len(fullIssues) > len(issues) {
 			fullBeadInfos := make([]correlation.BeadInfo, len(fullIssues))
 			for i, issue := range fullIssues {
 				fullBeadInfos[i] = correlation.BeadInfo{
@@ -10852,6 +10941,12 @@ func robotCommandDocs() map[string]robotCommandDoc {
 			KeyFields:   []string{"result.issue_id", "result.delta.direct_unblocks", "result.delta.transitive_unblocks", "result.delta.blocked_reduction", "result.delta.parallelization_gain", "result.delta.unblocked_issue_ids"},
 			NeedsIssues: true,
 		},
+		"robot-check-dep": {
+			Flag:        "--robot-check-dep FROM_ID:TO_ID[,...]",
+			Description: "Pre-flight validator for proposed blocking dependency edge(s): checks cycles, readiness impact, and cross-repo links.",
+			KeyFields:   []string{"all_safe", "checked_count", "cycle_count", "results", "results[].from_id", "results[].to_id", "results[].can_add", "results[].would_cycle", "results[].would_block_actionable"},
+			NeedsIssues: true,
+		},
 		"robot-cass": {
 			Flag:        "--robot-cass <id>",
 			Description: "Correlated coding-agent sessions (cass) for a specific bead ID.",
@@ -11030,6 +11125,8 @@ func preferredRobotInvocationOverride(commandName string) string {
 		return "bv robot-blocker-chain ISSUE_ID --json"
 	case "robot-whatif":
 		return "bv robot-whatif ISSUE_ID --json"
+	case "robot-check-dep":
+		return "bv robot-check-dep FROM_ID:TO_ID --json"
 	case "robot-cass":
 		return "bv robot-cass ISSUE_ID --json"
 	case "robot-causality":
@@ -11878,6 +11975,7 @@ func generateRobotSchemas() RobotSchemas {
 		"robot-related":             robotRelatedOutputSchema(),
 		"robot-blocker-chain":       robotBlockerChainOutputSchema(),
 		"robot-whatif":              robotWhatIfOutputSchema(),
+		"robot-check-dep":           robotCheckDepOutputSchema(),
 		"robot-cass":                robotCassOutputSchema(),
 		"robot-impact-network":      robotImpactNetworkOutputSchema(),
 		"robot-causality":           robotCausalityOutputSchema(),
@@ -12960,6 +13058,34 @@ func robotWhatIfOutputSchema() map[string]interface{} {
 	}, []string{"generated_at", "data_hash", "output_format", "version", "result"})
 }
 
+func robotCheckDepOutputSchema() map[string]interface{} {
+	return robotFileCommandOutputSchema("Robot Check Dep Output", "Pre-flight cycle, readiness, and cross-repo validation for proposed blocking dependencies", map[string]interface{}{
+		"all_safe":      map[string]interface{}{"type": "boolean"},
+		"checked_count": map[string]interface{}{"type": "integer"},
+		"cycle_count":   map[string]interface{}{"type": "integer"},
+		"results": map[string]interface{}{
+			"type": "array",
+			"items": map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"from_id":                map[string]interface{}{"type": "string"},
+					"to_id":                  map[string]interface{}{"type": "string"},
+					"can_add":                map[string]interface{}{"type": "boolean"},
+					"already_exists":         map[string]interface{}{"type": "boolean"},
+					"would_cycle":            map[string]interface{}{"type": "boolean"},
+					"cycle_path":             map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+					"would_block_actionable": map[string]interface{}{"type": "boolean"},
+					"cross_repo":             map[string]interface{}{"type": "boolean"},
+					"missing_ids":            map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+					"warning":                map[string]interface{}{"type": "string"},
+					"command":                map[string]interface{}{"type": "string"},
+				},
+				"required": []string{"from_id", "to_id", "can_add", "already_exists", "would_cycle", "would_block_actionable", "cross_repo"},
+			},
+		},
+	}, []string{"generated_at", "data_hash", "output_format", "version", "all_safe", "checked_count", "cycle_count", "results"})
+}
+
 func robotCassOutputSchema() map[string]interface{} {
 	return robotFileCommandOutputSchema("Robot Cass Output", "Correlated coding-agent sessions (cass) for a bead", map[string]interface{}{
 		"bead_id":     map[string]interface{}{"type": "string"},
@@ -13523,7 +13649,7 @@ func cliModifierFlagRules(isNonTUICLIInvocation bool) []modifierFlagRule {
 		{modifier: "pages-title", requires: []string{"export-pages"}},
 		{modifier: "pages-subtitle", requires: []string{"export-pages"}},
 		{modifier: "pages-include-closed", requires: []string{"export-pages"}},
-		{modifier: "pages-include-history", requires: []string{"export-pages"}},
+		{modifier: "pages-include-history", requires: []string{"export-pages", "agent-brief"}},
 		{modifier: "no-live-reload", requires: []string{"preview-pages"}},
 		{modifier: "watch-export", requires: []string{"export-pages"}},
 		{modifier: "debug-width", requires: []string{"debug-render"}},
@@ -13578,6 +13704,7 @@ func cliPrimaryRobotCommandGroups() []primaryCommandGroup {
 		{flags: []string{"robot-related"}},
 		{flags: []string{"robot-blocker-chain"}},
 		{flags: []string{"robot-whatif"}},
+		{flags: []string{"robot-check-dep"}},
 		{flags: []string{"robot-cass"}},
 		{flags: []string{"robot-impact-network"}},
 		{flags: []string{"robot-causality"}},
@@ -13889,7 +14016,19 @@ func buildExportSuggestionsPayload(ctx RobotContext, exportIssues []model.Issue,
 	if len(set.Suggestions) == 0 {
 		return nil, 0, nil
 	}
-	wrapped, err := withEnvelope(ctx.EnvelopeWithHash(dataHash), set)
+	if !ctx.claimsProven() || ctx.AsOf != "" || ctx.AsOfCommit != "" {
+		reason := "source authority is incomplete or unknown"
+		if ctx.AsOf != "" || ctx.AsOfCommit != "" {
+			reason = "historical snapshots cannot authorize tracker mutations"
+		}
+		for i, suggestion := range set.Suggestions {
+			set.Suggestions[i] = suggestion.WithAction(nil).WithMetadata("action_unavailable_reason", reason)
+		}
+		set = analysis.NewSuggestionSetAt(set.Suggestions, set.DataHash, set.GeneratedAt)
+	}
+	envCtx := ctx
+	envCtx.Command = "robot-suggest"
+	wrapped, err := withEnvelope(envCtx.EnvelopeWithHash(dataHash), set)
 	if err != nil {
 		return nil, 0, err
 	}

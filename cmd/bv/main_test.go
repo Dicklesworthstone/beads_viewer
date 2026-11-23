@@ -2132,6 +2132,7 @@ func TestRobotRelationshipWorkflowDocsExposeLiveJSONPaths(t *testing.T) {
 		"robot-related":        {"target_bead_id", "total_related", "file_overlap"},
 		"robot-blocker-chain":  {"result.target_id", "result.root_blockers", "result.chain"},
 		"robot-whatif":         {"result.issue_id", "result.delta.direct_unblocks", "result.delta.transitive_unblocks", "result.delta.unblocked_issue_ids"},
+		"robot-check-dep":      {"all_safe", "checked_count", "cycle_count", "results"},
 		"robot-impact-network": {"network.nodes", "stats.total_nodes", "top_connected"},
 		"robot-causality":      {"chain.events", "insights.summary", "insights.recommendations"},
 	}
@@ -3537,6 +3538,7 @@ func TestRobotRegistry_TotalContract(t *testing.T) {
 		"robot-related":             {"--robot-related", "bv-1"},
 		"robot-blocker-chain":       {"--robot-blocker-chain", "bv-2"},
 		"robot-whatif":              {"--robot-whatif", "bv-1"},
+		"robot-check-dep":           {"--robot-check-dep", "bv-2:bv-1"},
 		"robot-cass":                {"--robot-cass", "bv-1"},
 		"robot-impact-network":      {"--robot-impact-network", "bv-1"},
 		"robot-causality":           {"--robot-causality", "bv-1"},
@@ -11069,4 +11071,278 @@ func TestWave27_Pass11ExportFixes_Hotspots_Cascades_And_ExecutiveBriefs(t *testi
 	if !actMap["HS-1"] || actMap["HS-2"] {
 		t.Fatalf("W28-6 regression: expected HS-1 actionable=true, HS-2 actionable=false, got %+v", actMap)
 	}
+}
+
+func TestWave29_Pass15AndGapClosures_CLI(t *testing.T) {
+	exe := buildTestBinary(t)
+	proj := t.TempDir()
+	beadsDir := filepath.Join(proj, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatalf("mkdir .beads: %v", err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	closedAt := now.Add(-24 * time.Hour)
+	est := 120
+	issues := []model.Issue{
+		{ID: "W29-A", Title: "Core Auth Service", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask, SourceRepo: "api", EstimatedMinutes: &est, Labels: []string{"auth"}, CreatedAt: now.Add(-72 * time.Hour), UpdatedAt: now.Add(-2 * time.Hour)},
+		{ID: "W29-B", Title: "Web Login Handler", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeFeature, SourceRepo: "web", EstimatedMinutes: &est, Labels: []string{"web"}, CreatedAt: now.Add(-48 * time.Hour), UpdatedAt: now.Add(-2 * time.Hour), Dependencies: []*model.Dependency{{IssueID: "W29-B", DependsOnID: "W29-A", Type: model.DepBlocks}}},
+		{ID: "W29-C", Title: "Audit Log Sink", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, SourceRepo: "api", EstimatedMinutes: &est, Labels: []string{"auth"}, CreatedAt: now.Add(-24 * time.Hour), UpdatedAt: now.Add(-1 * time.Hour)},
+		{ID: "W29-DUP", Title: "Core Auth Service", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, SourceRepo: "api", CreatedAt: now.Add(-20 * time.Hour), UpdatedAt: now.Add(-1 * time.Hour)},
+		{ID: "W29-DONE", Title: "Bootstrap Repo", Status: model.StatusClosed, Priority: 1, IssueType: model.TypeChore, SourceRepo: "api", CreatedAt: now.Add(-96 * time.Hour), UpdatedAt: closedAt, ClosedAt: &closedAt},
+	}
+	var buf strings.Builder
+	for _, iss := range issues {
+		raw, err := json.Marshal(iss)
+		if err != nil {
+			t.Fatalf("marshal %s: %v", iss.ID, err)
+		}
+		buf.Write(raw)
+		buf.WriteByte('\n')
+	}
+	if err := os.WriteFile(filepath.Join(beadsDir, "issues.jsonl"), []byte(buf.String()), 0o644); err != nil {
+		t.Fatalf("write issues.jsonl: %v", err)
+	}
+
+	// Initialize a real git repo with 1 commit so --as-of and --pages-include-history work.
+	runGit := func(args ...string) string {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = proj
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=Tester", "GIT_AUTHOR_EMAIL=test@example.com",
+			"GIT_COMMITTER_NAME=Tester", "GIT_COMMITTER_EMAIL=test@example.com",
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v failed: %v\n%s", args, err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	runGit("init", "-b", "main")
+	if err := os.WriteFile(filepath.Join(proj, "auth.go"), []byte("package main\n"), 0o644); err != nil {
+		t.Fatalf("write auth.go: %v", err)
+	}
+	runGit("add", ".")
+	runGit("commit", "-m", "feat(W29-A): initialize auth service")
+
+	// 1. W29-5: --robot-check-dep safe edge, direct cycle, sequential compound cycle, self-loop, missing ID, already_exists, cross_repo, and --as-of command suppression.
+	t.Run("W29-5_RobotCheckDep", func(t *testing.T) {
+		// Safe edge: W29-C -> W29-B (blocks actionable W29-C, cross-repo api->web, safe no cycle)
+		out, stderr, err := runCommandWithTimeout(t, proj, exe, "--robot-check-dep", "W29-C:W29-B")
+		if err != nil {
+			t.Fatalf("--robot-check-dep safe edge failed: %v\nstderr=%s", err, stderr)
+		}
+		var safeResp struct {
+			AllSafe      bool `json:"all_safe"`
+			CheckedCount int  `json:"checked_count"`
+			CycleCount   int  `json:"cycle_count"`
+			Results      []struct {
+				From                 string   `json:"from_id"`
+				To                   string   `json:"to_id"`
+				CanAdd               bool     `json:"can_add"`
+				WouldCycle           bool     `json:"would_cycle"`
+				WouldBlockActionable bool     `json:"would_block_actionable"`
+				CrossRepo            bool     `json:"cross_repo"`
+				Command              string   `json:"command"`
+				CyclePath            []string `json:"cycle_path"`
+			} `json:"results"`
+		}
+		if err := json.Unmarshal([]byte(out), &safeResp); err != nil {
+			t.Fatalf("unmarshal safeResp: %v\n%s", err, out)
+		}
+		if !safeResp.AllSafe || safeResp.CheckedCount != 1 || safeResp.CycleCount != 0 || len(safeResp.Results) != 1 {
+			t.Fatalf("unexpected safeResp summary: %+v", safeResp)
+		}
+		r0 := safeResp.Results[0]
+		if r0.From != "W29-C" || r0.To != "W29-B" || !r0.CanAdd || r0.WouldCycle || !r0.WouldBlockActionable || !r0.CrossRepo || !strings.Contains(r0.Command, "br dep add") {
+			t.Fatalf("unexpected safeResp[0]: %+v", r0)
+		}
+
+		// Direct cycle + sequential compound cycle + already_exists + self-loop + missing ID in one batch!
+		// Existing edge: W29-B -> W29-A. Adding W29-A:W29-C is safe; then W29-C:W29-B creates compound cycle W29-A->W29-C->W29-B->W29-A!
+		batchOut, stderr, err := runCommandWithTimeout(t, proj, exe, "--robot-check-dep", "W29-A:W29-C,W29-C:W29-B,W29-B:W29-A,W29-A:W29-A,W29-A:NO-SUCH-ID")
+		if err != nil {
+			t.Fatalf("--robot-check-dep batch failed: %v\nstderr=%s", err, stderr)
+		}
+		var batchResp struct {
+			AllSafe      bool `json:"all_safe"`
+			CheckedCount int  `json:"checked_count"`
+			CycleCount   int  `json:"cycle_count"`
+			Results      []struct {
+				From          string   `json:"from_id"`
+				To            string   `json:"to_id"`
+				CanAdd        bool     `json:"can_add"`
+				WouldCycle    bool     `json:"would_cycle"`
+				AlreadyExists bool     `json:"already_exists"`
+				MissingIDs    []string `json:"missing_ids"`
+				CyclePath     []string `json:"cycle_path"`
+				Command       string   `json:"command"`
+			} `json:"results"`
+		}
+		if err := json.Unmarshal([]byte(batchOut), &batchResp); err != nil {
+			t.Fatalf("unmarshal batchResp: %v\n%s", err, batchOut)
+		}
+		if batchResp.AllSafe || batchResp.CheckedCount != 5 || batchResp.CycleCount < 2 || len(batchResp.Results) != 5 {
+			t.Fatalf("unexpected batchResp summary: %+v", batchResp)
+		}
+		if !batchResp.Results[0].CanAdd || batchResp.Results[0].WouldCycle {
+			t.Fatalf("step 0 W29-A:W29-C should be safe: %+v", batchResp.Results[0])
+		}
+		if batchResp.Results[1].CanAdd || !batchResp.Results[1].WouldCycle || len(batchResp.Results[1].CyclePath) < 3 {
+			t.Fatalf("step 1 W29-C:W29-B should catch compound cycle after step 0: %+v", batchResp.Results[1])
+		}
+		if !batchResp.Results[2].AlreadyExists || batchResp.Results[2].Command != "" {
+			t.Fatalf("step 2 W29-B:W29-A should detect already_exists and omit command: %+v", batchResp.Results[2])
+		}
+		if batchResp.Results[3].CanAdd || !batchResp.Results[3].WouldCycle {
+			t.Fatalf("step 3 W29-A:W29-A self-loop must fail cycle check: %+v", batchResp.Results[3])
+		}
+		if batchResp.Results[4].CanAdd || len(batchResp.Results[4].MissingIDs) != 1 || batchResp.Results[4].MissingIDs[0] != "NO-SUCH-ID" {
+			t.Fatalf("step 4 missing ID check failed: %+v", batchResp.Results[4])
+		}
+
+		// Historical --as-of mode must suppress live mutation command.
+		histOut, stderr, err := runCommandWithTimeout(t, proj, exe, "--robot-check-dep", "W29-C:W29-B", "--as-of", "HEAD")
+		if err != nil {
+			t.Fatalf("--robot-check-dep --as-of failed: %v\nstderr=%s", err, stderr)
+		}
+		if strings.Contains(histOut, `"command"`) {
+			t.Fatalf("W29-5 regression: --as-of must suppress command field:\n%s", histOut)
+		}
+
+		// P16A-3: Sequential readiness updates across batch edges (W29-C:W29-B blocks W29-C, so second edge
+		// W29-C:W29-DUP and duplicate W29-C:W29-B must NOT report would_block_actionable: true).
+		seqOut, stderr, err := runCommandWithTimeout(t, proj, exe, "--robot-check-dep", "W29-C:W29-B,W29-C:W29-DUP,W29-C:W29-B")
+		if err != nil {
+			t.Fatalf("P16A-3 sequential check-dep failed: %v\nstderr=%s", err, stderr)
+		}
+		var seqResp struct {
+			Results []struct {
+				AlreadyExists        bool `json:"already_exists"`
+				WouldBlockActionable bool `json:"would_block_actionable"`
+			} `json:"results"`
+		}
+		if err := json.Unmarshal([]byte(seqOut), &seqResp); err != nil || len(seqResp.Results) != 3 {
+			t.Fatalf("P16A-3 unmarshal failed: err=%v out=%s", err, seqOut)
+		}
+		if !seqResp.Results[0].WouldBlockActionable || seqResp.Results[1].WouldBlockActionable ||
+			!seqResp.Results[2].AlreadyExists || seqResp.Results[2].WouldBlockActionable {
+			t.Fatalf("P16A-3 regression: stale sequential readiness or already_exists contradiction: %+v", seqResp.Results)
+		}
+
+		// P16A-2: Scoped --label auth --robot-check-dep must STILL validate cycles against full graph
+		// even when intermediate node W29-B lacks label "auth"!
+		// Existing: W29-B(web) -> W29-A(auth). Check W29-A:W29-B under --label auth -> MUST detect cycle!
+		lblOut, stderr, err := runCommandWithTimeout(t, proj, exe, "--label", "auth", "--robot-check-dep", "W29-A:W29-B")
+		if err != nil {
+			t.Fatalf("P16A-2 --label check-dep failed: %v\nstderr=%s", err, stderr)
+		}
+		var lblResp struct {
+			AllSafe    bool `json:"all_safe"`
+			CycleCount int  `json:"cycle_count"`
+			Results    []struct {
+				CanAdd     bool `json:"can_add"`
+				WouldCycle bool `json:"would_cycle"`
+			} `json:"results"`
+		}
+		if err := json.Unmarshal([]byte(lblOut), &lblResp); err != nil || len(lblResp.Results) != 1 {
+			t.Fatalf("P16A-2 unmarshal failed: err=%v out=%s", err, lblOut)
+		}
+		if lblResp.AllSafe || lblResp.CycleCount != 1 || lblResp.Results[0].CanAdd || !lblResp.Results[0].WouldCycle {
+			t.Fatalf("P16A-2 regression: --label auth missed cycle through non-auth intermediate W29-B: %+v", lblResp)
+		}
+
+		// P16A-9: Ergonomic subcommand alias `bv check-dep` is registered in agentIntentCommandNames and rewrites to --robot-check-dep.
+		requireContainsString(t, agentIntentCommandNames(), "check-dep")
+		rewritten := rewriteAgentIntentArgs([]string{"check-dep", "W29-C:W29-B"})
+		if len(rewritten) < 2 || rewritten[0] != "--robot-check-dep" || rewritten[1] != "W29-C:W29-B" {
+			t.Fatalf("P16A-9 regression: `bv check-dep` intent rewrite unexpected: args=%v", rewritten)
+		}
+	})
+
+	// 2. W29-2 + A15-3 + A15-9: --agent-brief emits plan.json, drift.json, history.json (with --pages-include-history),
+	// accurate meta.json files list, null-safe helpers.md jq recipes, and strips suggestions actions on --as-of!
+	t.Run("W29-2_A15-3_A15-9_AgentBriefCompanions", func(t *testing.T) {
+		briefDir := filepath.Join(t.TempDir(), "brief")
+		out, stderr, err := runCommandWithTimeout(t, proj, exe, "--agent-brief", briefDir, "--pages-include-history")
+		if err != nil {
+			t.Fatalf("--agent-brief failed: %v\nstdout=%s\nstderr=%s", err, out, stderr)
+		}
+		for _, reqFile := range []string{"triage.json", "insights.json", "brief.md", "helpers.md", "plan.json", "drift.json", "history.json", "meta.json"} {
+			if _, statErr := os.Stat(filepath.Join(briefDir, reqFile)); statErr != nil {
+				t.Fatalf("W29-2 regression: --agent-brief missing %s: %v", reqFile, statErr)
+			}
+		}
+		metaBytes, err := os.ReadFile(filepath.Join(briefDir, "meta.json"))
+		if err != nil {
+			t.Fatalf("read meta.json: %v", err)
+		}
+		var metaObj struct {
+			Files []string `json:"files"`
+		}
+		if err := json.Unmarshal(metaBytes, &metaObj); err != nil {
+			t.Fatalf("unmarshal meta.json: %v", err)
+		}
+		for _, want := range []string{"plan.json", "drift.json", "history.json", "meta.json"} {
+			requireContainsString(t, metaObj.Files, want)
+		}
+		helpersBytes, err := os.ReadFile(filepath.Join(briefDir, "helpers.md"))
+		if err != nil {
+			t.Fatalf("read helpers.md: %v", err)
+		}
+		helpersStr := string(helpersBytes)
+		for _, want := range []string{"(.plan.tracks // [])[]", "(.alerts // [])[]", "(.suggestions // [])[]", "(.file_hotspots // [])[:5]"} {
+			if !strings.Contains(helpersStr, want) {
+				t.Fatalf("A15-9/W29-2 regression: helpers.md missing null-safe jq recipe %q", want)
+			}
+		}
+
+		// A15-3: Historical --as-of buildExportSuggestionsPayload strips ActionCommand and sets command=robot-suggest.
+		histBriefDir := filepath.Join(t.TempDir(), "brief-asof")
+		if _, stderr, err := runCommandWithTimeout(t, proj, exe, "--agent-brief", histBriefDir, "--as-of", "HEAD"); err != nil {
+			t.Fatalf("--agent-brief --as-of failed: %v\nstderr=%s", err, stderr)
+		}
+		if suggBytes, readErr := os.ReadFile(filepath.Join(histBriefDir, "suggestions.json")); readErr == nil {
+			suggStr := string(suggBytes)
+			if strings.Contains(suggStr, `"action_command"`) {
+				t.Fatalf("A15-3 regression: --as-of suggestions.json leaked live action_command:\n%s", suggStr)
+			}
+			if !strings.Contains(suggStr, `"action_unavailable_reason"`) || !strings.Contains(suggStr, `"actionable_count": 0`) {
+				t.Fatalf("A15-3 regression: --as-of suggestions.json missing action_unavailable_reason or actionable_count=0:\n%s", suggStr)
+			}
+		} else {
+			t.Fatalf("A15-3 regression: expected --agent-brief --as-of to write suggestions.json: %v", readErr)
+		}
+	})
+
+	// 3. W29-4 CLI HTML Report Parity: --export report.html --export-format html receives ETAContext & Analyzer.
+	t.Run("W29-4_CLI_HTMLReportParity", func(t *testing.T) {
+		htmlPath := filepath.Join(t.TempDir(), "report.html")
+		_, stderr, err := runCommandWithTimeout(t, proj, exe, "--export", htmlPath, "--export-format", "html")
+		if err != nil {
+			t.Fatalf("--export report.html failed: %v\nstderr=%s", err, stderr)
+		}
+		raw, err := os.ReadFile(htmlPath)
+		if err != nil {
+			t.Fatalf("read report.html: %v", err)
+		}
+		htmlStr := string(raw)
+		if !strings.Contains(htmlStr, "<th>ETA Forecast</th>") {
+			t.Fatalf("W29-4 CLI regression: exported HTML report missing ETA Forecast row")
+		}
+		if !strings.Contains(htmlStr, "<th>Start Here (Root Blockers)</th>") {
+			t.Fatalf("W29-4 CLI regression: exported HTML report missing Start Here (Root Blockers) row")
+		}
+	})
+
+	// 4. A15-8: Symlinked project directory still resolves orphanStoreDirs cleanly (relative path match).
+	t.Run("A15-8_SymlinkedOrphanStoreDirs", func(t *testing.T) {
+		linkProj := filepath.Join(t.TempDir(), "proj_link")
+		if err := os.Symlink(proj, linkProj); err != nil {
+			t.Skipf("symlink unavailable: %v", err)
+		}
+		_, stderr, err := runCommandWithTimeout(t, linkProj, exe, "--robot-orphans")
+		if err != nil {
+			t.Fatalf("A15-8 regression: --robot-orphans in symlinked git root failed: %v\nstderr=%s", err, stderr)
+		}
+	})
 }

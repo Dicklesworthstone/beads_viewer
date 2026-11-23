@@ -75,6 +75,7 @@ bv --robot-label-health        # Per-label health: healthy|warning|critical
 bv --robot-label-flow          # Cross-label dependency flow matrix + blockage_cascade + critical_paths
 bv --robot-label-attention     # Attention-ranked labels
 bv --robot-whatif <id>         # Counterfactual unblock & impact delta if <id> completes
+bv --robot-check-dep <from:to> # Pre-flight cycle, readiness & cross-repo check for proposed dep edge(s)
 bv --robot-blocker-chain <id>  # Full upstream blocker chain for one issue
 bv --robot-impact-network [id] # Dependency & co-change impact network (omit id for full graph)
 bv --robot-related <id>        # Related beads via commit overlap, file overlap, and sibling blockers

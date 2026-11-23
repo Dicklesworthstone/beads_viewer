@@ -92,6 +92,7 @@ func TestShouldSuppressTTYQueries_PositionalAndStructuredFormatForms(t *testing.
 		{"bv", "insights"},
 		{"bv", "commit", "HEAD", "--json"},
 		{"bv", "drift"},
+		{"bv", "check-dep", "bv-2:bv-1"},
 		{"bv", "bead-history", "bv-1"},
 		{"bv", "upgrade", "--check"},
 		{"bv", "-w", "--robot-triage"},

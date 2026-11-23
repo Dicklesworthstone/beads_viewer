@@ -1799,8 +1799,8 @@ func TestDocsParity_RC40CrossDocumentTruthAndNegativeControls(t *testing.T) {
 
 	bv := buildBvBinary(t)
 
-	// 1. SKILL.md covers 46/46 primary commands from live --robot-capabilities.
-	t.Run("skill_md_46_command_parity", func(t *testing.T) {
+	// 1. SKILL.md covers 47/47 primary commands from live --robot-capabilities.
+	t.Run("skill_md_47_command_parity", func(t *testing.T) {
 		cmd := exec.Command(bv, "--robot-capabilities")
 		cmd.Dir = t.TempDir()
 		var stderr bytes.Buffer
@@ -1811,7 +1811,7 @@ func TestDocsParity_RC40CrossDocumentTruthAndNegativeControls(t *testing.T) {
 				FixtureID: "empty_temp_dir",
 				DocPath:   "SKILL.md",
 				Argv:      cmd.Args,
-				Expected:  "exit 0 with 46 registered commands",
+				Expected:  "exit 0 with 47 registered commands",
 				Observed:  err.Error(),
 				Stdout:    string(out),
 				Stderr:    stderr.String(),
@@ -1827,12 +1827,12 @@ func TestDocsParity_RC40CrossDocumentTruthAndNegativeControls(t *testing.T) {
 		if err := json.Unmarshal(out, &caps); err != nil {
 			t.Fatalf("decode --robot-capabilities: %v", err)
 		}
-		if len(caps.Commands) != 46 {
+		if len(caps.Commands) != 47 {
 			t.Fatalf("%s", formatLog(rc40AuditLog{
 				FixtureID: "robot_capabilities_count",
 				DocPath:   "SKILL.md",
 				Argv:      cmd.Args,
-				Expected:  "46 commands",
+				Expected:  "47 commands",
 				Observed:  fmt.Sprintf("%d commands", len(caps.Commands)),
 				Stderr:    stderr.String(),
 				ExitCode:  0,
@@ -1861,7 +1861,7 @@ func TestDocsParity_RC40CrossDocumentTruthAndNegativeControls(t *testing.T) {
 				FixtureID: "live_skill_md",
 				DocPath:   "SKILL.md",
 				Argv:      cmd.Args,
-				Expected:  "all 46 registered commands present",
+				Expected:  "all 47 registered commands present",
 				Observed:  err.Error(),
 				Stderr:    stderr.String(),
 				ExitCode:  0,
@@ -2235,7 +2235,7 @@ func TestDocsParity_RC40CrossDocumentTruthAndNegativeControls(t *testing.T) {
 		checkReleasingDoc := func(relText string) error {
 			for _, must := range []string{
 				"scripts/verify_vendor.sh --source",
-				"all 46 registered robot commands",
+				"all 47 registered robot commands",
 				"tests/scripts/graph_wasm_test.sh",
 				"Go 1.26.11",
 			} {
@@ -2250,7 +2250,7 @@ func TestDocsParity_RC40CrossDocumentTruthAndNegativeControls(t *testing.T) {
 			t.Fatalf("%s", formatLog(rc40AuditLog{
 				FixtureID: "docs_releasing_stage7_and_stage10",
 				DocPath:   "docs/RELEASING.md",
-				Expected:  "verify_vendor.sh --source, 46 robot commands, graph_wasm_test.sh, Go 1.26.11",
+				Expected:  "verify_vendor.sh --source, 47 robot commands, graph_wasm_test.sh, Go 1.26.11",
 				Observed:  err.Error(),
 			}))
 		}

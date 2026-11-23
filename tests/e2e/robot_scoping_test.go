@@ -671,6 +671,8 @@ func argvFor(flag, inScopeID string) []string {
 		switch p {
 		case "ISSUE_ID":
 			parts[i] = inScopeID
+		case "FROM_ID:TO_ID", "FROM_ID:TO_ID[,...]":
+			parts[i] = inScopeID + ":" + inScopeID
 		case "README.md":
 			parts[i] = "README.md"
 		}

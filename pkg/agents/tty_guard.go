@@ -21,6 +21,7 @@ var canonicalRobotFlags = []string{
 	"robot-capacity",
 	"robot-cass",
 	"robot-causality",
+	"robot-check-dep",
 	"robot-commit",
 	"robot-confirm-correlation",
 	"robot-correlation-stats",
@@ -115,7 +116,7 @@ var nonInteractiveFlagSet = func() map[string]struct{} {
 var nonInteractiveSubcommandSet = map[string]struct{}{
 	"alerts": {}, "analysis": {}, "analyze": {}, "bead-history": {},
 	"blocker-chain": {}, "blockers": {}, "burndown": {}, "capabilities": {},
-	"capability": {}, "capacity": {}, "cass": {}, "causality": {}, "changes": {},
+	"capability": {}, "capacity": {}, "cass": {}, "causality": {}, "changes": {}, "check-dep": {},
 	"commit": {}, "diff": {}, "doc": {}, "docs": {}, "drift": {},
 	"file-beads": {}, "file-hotspots": {}, "file-relations": {}, "find": {},
 	"forecast": {}, "graph": {}, "help": {}, "history": {},

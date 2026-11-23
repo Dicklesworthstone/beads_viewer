@@ -68,7 +68,7 @@ tree), GitHub Actions pin check (`scripts/check_action_pins.sh`), vendored
 asset hashes and pinned graph-WASM source rebuild (`scripts/verify_vendor.sh --source` against `MANIFEST.json`), benchmark
 comparison (`scripts/benchmark.sh compare` against `benchmarks/baseline.txt`,
 fails above 20% best-of-N sec/op regression on any tracked benchmark), and the
-robot smoke (`scripts/robot_smoke.sh`: all 46 registered robot commands on this repository
+robot smoke (`scripts/robot_smoke.sh`: all 47 registered robot commands on this repository
 and on a synthetic fixture), and the gate's own script self-tests
 (`tests/scripts/benchmark_compare_test.sh`, `release_gate_test.sh`,
 `install_ps1_test.sh`, and `tests/scripts/graph_wasm_test.sh`), followed by required source-mode vulnerability analysis

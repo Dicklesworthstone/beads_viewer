@@ -285,6 +285,7 @@ type phaseThreeRobotHandlerConfig struct {
 	RobotRelatedFlag        *string
 	RobotBlockerChainFlag   *string
 	RobotWhatIfFlag         *string
+	RobotCheckDepFlag       *string
 	RobotCassFlag           *string
 	RobotImpactNetworkFlag  *string
 	RobotCausalityFlag      *string
@@ -824,6 +825,7 @@ func configuredPrimaryRobotFlagNames() []string {
 		RobotRelatedFlag:        &dummyStr,
 		RobotBlockerChainFlag:   &dummyStr,
 		RobotWhatIfFlag:         &dummyStr,
+		RobotCheckDepFlag:       &dummyStr,
 		RobotCassFlag:           &dummyStr,
 		RobotImpactNetworkFlag:  &dummyStr,
 		RobotCausalityFlag:      &dummyStr,
@@ -2437,6 +2439,9 @@ func registerPhaseThreeRobotHandlers(registry *RobotRegistry, cfg phaseThreeRobo
 	})
 	register("robot-whatif", cfg.RobotWhatIfFlag, "Simulate completing an issue and output downstream unblock impact as JSON", func(ctx RobotContext) error {
 		return handleRobotWhatIf(ctx, cfg)
+	})
+	register("robot-check-dep", cfg.RobotCheckDepFlag, "Validate proposed blocking dependency edge(s) for cycles and readiness impact before adding", func(ctx RobotContext) error {
+		return handleRobotCheckDep(ctx, cfg)
 	})
 	register("robot-cass", cfg.RobotCassFlag, "Output correlated coding-agent sessions (cass) for a bead as JSON", func(ctx RobotContext) error {
 		return handleRobotCass(ctx, cfg)
@@ -6785,6 +6790,195 @@ func handleRobotWhatIf(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error
 	return nil
 }
 
+type robotCheckDepEdgeResult struct {
+	FromID               string   `json:"from_id"`
+	ToID                 string   `json:"to_id"`
+	CanAdd               bool     `json:"can_add"`
+	AlreadyExists        bool     `json:"already_exists"`
+	WouldCycle           bool     `json:"would_cycle"`
+	CyclePath            []string `json:"cycle_path,omitempty"`
+	WouldBlockActionable bool     `json:"would_block_actionable"`
+	CrossRepo            bool     `json:"cross_repo"`
+	MissingIDs           []string `json:"missing_ids,omitempty"`
+	Warning              string   `json:"warning,omitempty"`
+	Command              string   `json:"command,omitempty"`
+}
+
+func handleRobotCheckDep(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
+	rawSpec := ""
+	if cfg.RobotCheckDepFlag != nil {
+		rawSpec = strings.TrimSpace(*cfg.RobotCheckDepFlag)
+	}
+	if rawSpec == "" {
+		return fmt.Errorf("--robot-check-dep requires one or more fromID:toID pairs")
+	}
+
+	rawPairs := strings.Split(rawSpec, ",")
+	type depPair struct{ from, to string }
+	pairs := make([]depPair, 0, len(rawPairs))
+	for _, token := range rawPairs {
+		trimmed := strings.TrimSpace(token)
+		if trimmed == "" {
+			continue
+		}
+		fromID, toID, ok := strings.Cut(trimmed, ":")
+		fromID = strings.TrimSpace(fromID)
+		toID = strings.TrimSpace(toID)
+		if !ok || fromID == "" || toID == "" {
+			return fmt.Errorf("invalid --robot-check-dep edge %q: expected fromID:toID", trimmed)
+		}
+		pairs = append(pairs, depPair{from: fromID, to: toID})
+	}
+	if len(pairs) == 0 {
+		return fmt.Errorf("--robot-check-dep requires one or more fromID:toID pairs")
+	}
+
+	// P16A-2: Always validate cycles and readiness against the full issue graph so
+	// --repo / --label / --recipe filters never hide multi-hop intermediate paths.
+	baseIssues := ctx.FullIssues
+	if len(baseIssues) == 0 {
+		baseIssues = ctx.GraphIssues()
+	}
+	workingIssues := make([]model.Issue, len(baseIssues))
+	idxByID := make(map[string]int, len(baseIssues))
+	for i, iss := range baseIssues {
+		cloned := iss
+		if len(iss.Dependencies) > 0 {
+			cloned.Dependencies = make([]*model.Dependency, len(iss.Dependencies))
+			for j, d := range iss.Dependencies {
+				if d != nil {
+					dc := *d
+					cloned.Dependencies[j] = &dc
+				}
+			}
+		}
+		workingIssues[i] = cloned
+		idxByID[iss.ID] = i
+	}
+	readiness := ctx.Readiness
+	if readiness == nil {
+		readiness = model.NewReadinessIndex(workingIssues)
+	}
+	var resolvedStubs []model.Issue
+	if ctx.Readiness != nil {
+		for _, rid := range ctx.Readiness.ResolvedIDs() {
+			if _, ok := idxByID[rid]; !ok {
+				resolvedStubs = append(resolvedStubs, model.Issue{ID: rid, Status: model.StatusTombstone})
+			}
+		}
+	}
+	rebuildReadiness := func() {
+		if len(resolvedStubs) == 0 {
+			readiness = model.NewReadinessIndex(workingIssues)
+			return
+		}
+		combined := make([]model.Issue, 0, len(workingIssues)+len(resolvedStubs))
+		combined = append(combined, workingIssues...)
+		combined = append(combined, resolvedStubs...)
+		readiness = model.NewReadinessIndex(combined)
+	}
+	refNow := ctx.ReferenceNow()
+	canEmitCommand := ctx.AsOf == "" && ctx.AsOfCommit == "" && ctx.claimsProven()
+
+	results := make([]robotCheckDepEdgeResult, 0, len(pairs))
+	allSafe := true
+	cycleCount := 0
+	for _, p := range pairs {
+		res := robotCheckDepEdgeResult{
+			FromID: p.from,
+			ToID:   p.to,
+		}
+		fromIdx, fromOK := idxByID[p.from]
+		toIdx, toOK := idxByID[p.to]
+		if !fromOK {
+			res.MissingIDs = append(res.MissingIDs, p.from)
+		}
+		if !toOK && p.to != p.from {
+			res.MissingIDs = append(res.MissingIDs, p.to)
+		}
+		if len(res.MissingIDs) > 0 {
+			res.CanAdd = false
+			res.Warning = fmt.Sprintf("Unknown issue ID(s): %s", strings.Join(res.MissingIDs, ", "))
+			allSafe = false
+			results = append(results, res)
+			continue
+		}
+		fromIss := &workingIssues[fromIdx]
+		toIss := &workingIssues[toIdx]
+		fromRepo := strings.TrimSpace(fromIss.SourceRepo)
+		toRepo := strings.TrimSpace(toIss.SourceRepo)
+		res.CrossRepo = fromRepo != "" && toRepo != "" && !strings.EqualFold(fromRepo, toRepo)
+
+		if p.from == p.to {
+			res.CanAdd = false
+			res.WouldCycle = true
+			res.CyclePath = []string{p.from, p.to}
+			res.Warning = fmt.Sprintf("Self-dependency %s → %s would create a 1-node cycle", p.from, p.to)
+			allSafe = false
+			cycleCount++
+			results = append(results, res)
+			continue
+		}
+		for _, dep := range fromIss.Dependencies {
+			if dep != nil && dep.Type.IsBlocking() && dep.DependsOnID == p.to {
+				res.AlreadyExists = true
+				break
+			}
+		}
+		if res.AlreadyExists {
+			// P16A-3: An existing edge is a no-op and never newly blocks an actionable issue.
+			res.CanAdd = true
+			res.Warning = fmt.Sprintf("Blocking dependency %s → %s already exists", p.from, p.to)
+			results = append(results, res)
+			continue
+		}
+		res.WouldBlockActionable = readiness.Ready(p.from, refNow) && !toIss.Status.IsClosed() && !toIss.Status.IsTombstone()
+
+		canAdd, cyclePath, warning := analysis.CheckDependencyAddition(workingIssues, p.from, p.to)
+		res.CanAdd = canAdd
+		res.WouldCycle = !canAdd
+		res.CyclePath = cyclePath
+		res.Warning = warning
+		if canAdd {
+			if canEmitCommand {
+				res.Command = fmt.Sprintf("br dep add %s %s", shellQuoteWord(p.from), shellQuoteWord(p.to))
+			}
+			// Accumulate safe edges so multi-edge batch requests detect compound cycles (e.g. A:B,B:C,C:A)
+			// and keep sequential readiness accurate (P16A-3).
+			fromIss.Dependencies = append(fromIss.Dependencies, &model.Dependency{
+				IssueID:     p.from,
+				DependsOnID: p.to,
+				Type:        model.DepBlocks,
+			})
+			if !toIss.Status.IsClosed() && !toIss.Status.IsTombstone() {
+				rebuildReadiness()
+			}
+		} else {
+			allSafe = false
+			cycleCount++
+		}
+		results = append(results, res)
+	}
+
+	output := struct {
+		RobotEnvelope
+		AllSafe      bool                      `json:"all_safe"`
+		CheckedCount int                       `json:"checked_count"`
+		CycleCount   int                       `json:"cycle_count"`
+		Results      []robotCheckDepEdgeResult `json:"results"`
+	}{
+		RobotEnvelope: ctx.Envelope(),
+		AllSafe:       allSafe,
+		CheckedCount:  len(results),
+		CycleCount:    cycleCount,
+		Results:       results,
+	}
+	if err := ctx.EncoderOrDefault().Encode(output); err != nil {
+		return fmt.Errorf("encoding check-dep result: %w", err)
+	}
+	return nil
+}
+
 type robotCassSession struct {
 	SourcePath    string   `json:"source_path"`
 	LineNumber    int      `json:"line_number"`
@@ -8088,9 +8282,9 @@ func computeDriftResultForContext(ctx RobotContext, analyzer *analysis.Analyzer,
 // scope_creep, baseline regressions, source_inconsistency, etc.) into
 // triage.Alerts for static-site exports so the exported dashboard matches
 // --robot-alerts and the TUI Alerts panel.
-func attachDriftAlertsToTriage(triage *analysis.TriageResult, ctx RobotContext, analyzer *analysis.Analyzer, stats *analysis.GraphStats, graphIssues []model.Issue, forceFullAnalysis bool) {
+func attachDriftAlertsToTriage(triage *analysis.TriageResult, ctx RobotContext, analyzer *analysis.Analyzer, stats *analysis.GraphStats, graphIssues []model.Issue, forceFullAnalysis bool) *drift.Result {
 	if triage == nil {
-		return
+		return nil
 	}
 	if analyzer == nil {
 		analyzer = ctx.GraphAnalyzer()
@@ -8100,9 +8294,18 @@ func attachDriftAlertsToTriage(triage *analysis.TriageResult, ctx RobotContext, 
 		}
 		stats = nil
 	}
-	driftResult, _, err := computeDriftResultForContext(ctx, analyzer, stats, graphIssues)
-	if err != nil || driftResult == nil || len(driftResult.Alerts) == 0 {
-		return
+	driftResult, scopeMismatchSkipped, err := computeDriftResultForContext(ctx, analyzer, stats, graphIssues)
+	if err != nil || driftResult == nil {
+		return nil
+	}
+	if scopeMismatchSkipped {
+		driftResult.SkippedChecks = append(driftResult.SkippedChecks, drift.SkippedCheck{
+			Type:   drift.AlertType("baseline_scope_mismatch"),
+			Reason: "saved baseline scope does not match active CLI scope; aggregate baseline deltas skipped",
+		})
+	}
+	if len(driftResult.Alerts) == 0 {
+		return driftResult
 	}
 
 	seenExact := make(map[string]bool, len(triage.Alerts))
@@ -8160,4 +8363,5 @@ func attachDriftAlertsToTriage(triage *analysis.TriageResult, ctx RobotContext, 
 		hasType[alertType] = true
 		triage.Alerts = append(triage.Alerts, mapped)
 	}
+	return driftResult
 }
