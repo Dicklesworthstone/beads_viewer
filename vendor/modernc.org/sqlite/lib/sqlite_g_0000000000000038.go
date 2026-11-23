@@ -30,8 +30,6 @@ const F_DUPFD_CLOFORK = 23
 
 const MINCORE_PSIND_SHIFT = 5
 
-const O_CLOFORK = 134217728
-
 const O_NAMEDATTR = 67108864
 
 const O_XATTR = 67108864
@@ -67,9 +65,83 @@ const __SSP_FORTIFY_LEVEL = 0
 // C documentation
 //
 //	/*
+//	** This function is called to handle the SQLITE_FCNTL_SIZE_HINT
+//	** file-control operation.  Enlarge the database to nBytes in size
+//	** (rounded up to the next chunk-size).  If the database is already
+//	** nBytes or larger, this routine is a no-op.
+//	*/
+func _fcntlSizeHint(tls *libc.TLS, pFile uintptr, nByte Ti64) (r int32) {
+	bp := tls.Alloc(224)
+	defer tls.Free(224)
+	var iWrite, nSize Ti64
+	var nBlk, nWrite, rc int32
+	var _ /* buf at bp+0 */ Tstat
+	_, _, _, _, _ = iWrite, nBlk, nSize, nWrite, rc
+	if (*TunixFile)(unsafe.Pointer(pFile)).FszChunk > 0 { /* Used to hold return values of fstat() */
+		if (*(*func(*libc.TLS, int32, uintptr) int32)(unsafe.Pointer(&struct{ uintptr }{_aSyscall[int32(5)].FpCurrent})))(tls, (*TunixFile)(unsafe.Pointer(pFile)).Fh, bp) != 0 {
+			return libc.Int32FromInt32(SQLITE_IOERR) | libc.Int32FromInt32(7)<<libc.Int32FromInt32(8)
+		}
+		nSize = (nByte + int64((*TunixFile)(unsafe.Pointer(pFile)).FszChunk) - int64(1)) / int64((*TunixFile)(unsafe.Pointer(pFile)).FszChunk) * int64((*TunixFile)(unsafe.Pointer(pFile)).FszChunk)
+		if nSize > (*(*Tstat)(__ccgo_ptr(bp))).Fst_size {
+			/* If the OS does not have posix_fallocate(), fake it. Write a
+			 ** single byte to the last byte in each block that falls entirely
+			 ** within the extended region. Then, if required, a single byte
+			 ** at offset (nSize-1), to set the size of the file correctly.
+			 ** This is a similar technique to that used by glibc on systems
+			 ** that do not have a real fallocate() call.
+			 */
+			nBlk = (*(*Tstat)(__ccgo_ptr(bp))).Fst_blksize /* File-system block size */
+			nWrite = 0                                     /* Next offset to write to */
+			iWrite = (*(*Tstat)(__ccgo_ptr(bp))).Fst_size/int64(nBlk)*int64(nBlk) + int64(nBlk) - int64(1)
+			for {
+				if !(iWrite < nSize+int64(nBlk)-int64(1)) {
+					break
+				}
+				if iWrite >= nSize {
+					iWrite = nSize - int64(1)
+				}
+				nWrite = _seekAndWrite(tls, pFile, iWrite, __ccgo_ts+1730, int32(1))
+				if nWrite != int32(1) {
+					return libc.Int32FromInt32(SQLITE_IOERR) | libc.Int32FromInt32(3)<<libc.Int32FromInt32(8)
+				}
+				goto _1
+			_1:
+				;
+				iWrite = iWrite + int64(nBlk)
+			}
+		}
+	}
+	if (*TunixFile)(unsafe.Pointer(pFile)).FmmapSizeMax > 0 && nByte > (*TunixFile)(unsafe.Pointer(pFile)).FmmapSize {
+		if (*TunixFile)(unsafe.Pointer(pFile)).FszChunk <= 0 {
+			if _robust_ftruncate(tls, (*TunixFile)(unsafe.Pointer(pFile)).Fh, nByte) != 0 {
+				_storeLastErrno(tls, pFile, *(*int32)(__ccgo_ptr(libc.X__error(tls))))
+				return _unixLogErrorAtLine(tls, libc.Int32FromInt32(SQLITE_IOERR)|libc.Int32FromInt32(6)<<libc.Int32FromInt32(8), __ccgo_ts+3590, (*TunixFile)(unsafe.Pointer(pFile)).FzPath, int32(44903))
+			}
+		}
+		rc = _unixMapfile(tls, pFile, nByte)
+		return rc
+	}
+	return SQLITE_OK
+}
+
+// C documentation
+//
+//	/*
+//	** Return TRUE if pFile has been renamed or unlinked since it was first opened.
+//	*/
+func _fileHasMoved(tls *libc.TLS, pFile uintptr) (r int32) {
+	bp := tls.Alloc(224)
+	defer tls.Free(224)
+	var _ /* buf at bp+0 */ Tstat
+	return libc.BoolInt32((*TunixFile)(unsafe.Pointer(pFile)).FpInode != uintptr(0) && ((*(*func(*libc.TLS, uintptr, uintptr) int32)(unsafe.Pointer(&struct{ uintptr }{_aSyscall[int32(4)].FpCurrent})))(tls, (*TunixFile)(unsafe.Pointer(pFile)).FzPath, bp) != 0 || (*(*Tstat)(__ccgo_ptr(bp))).Fst_ino != (*TunixInodeInfo)(unsafe.Pointer((*TunixFile)(unsafe.Pointer(pFile)).FpInode)).FfileId.Fino))
+}
+
+// C documentation
+//
+//	/*
 //	** Find the mode, uid and gid of file zFile.
 //	*/
-func _getFileMode(tls *libc.TLS, zFile uintptr, pMode uintptr, pUid uintptr, pGid uintptr) (r int32) {
+func _getFileMode(tls *libc.TLS, zFile uintptr, pMode unsafe.Pointer, pUid unsafe.Pointer, pGid unsafe.Pointer) (r int32) {
 	bp := tls.Alloc(224)
 	defer tls.Free(224)
 	var rc int32
@@ -77,9 +149,9 @@ func _getFileMode(tls *libc.TLS, zFile uintptr, pMode uintptr, pUid uintptr, pGi
 	_ = rc /* Output of stat() on database file */
 	rc = SQLITE_OK
 	if 0 == (*(*func(*libc.TLS, uintptr, uintptr) int32)(unsafe.Pointer(&struct{ uintptr }{_aSyscall[int32(4)].FpCurrent})))(tls, zFile, bp) {
-		**(**Tmode_t)(__ccgo_up(pMode)) = libc.Uint16FromInt32(libc.Int32FromUint16((**(**Tstat)(__ccgo_up(bp))).Fst_mode) & int32(0777))
-		**(**Tuid_t)(__ccgo_up(pUid)) = (**(**Tstat)(__ccgo_up(bp))).Fst_uid
-		**(**Tgid_t)(__ccgo_up(pGid)) = (**(**Tstat)(__ccgo_up(bp))).Fst_gid
+		*(*Tmode_t)(pMode) = libc.Uint16FromInt32(libc.Int32FromUint16((*(*Tstat)(__ccgo_ptr(bp))).Fst_mode) & int32(0777))
+		*(*Tuid_t)(pUid) = (*(*Tstat)(__ccgo_ptr(bp))).Fst_uid
+		*(*Tgid_t)(pGid) = (*(*Tstat)(__ccgo_ptr(bp))).Fst_gid
 	} else {
 		rc = libc.Int32FromInt32(SQLITE_IOERR) | libc.Int32FromInt32(7)<<libc.Int32FromInt32(8)
 	}
@@ -121,7 +193,7 @@ func _robust_open(tls *libc.TLS, z uintptr, f int32, m Tmode_t) (r int32) {
 	for int32(1) != 0 {
 		fd = (*(*func(*libc.TLS, uintptr, int32, int32) int32)(unsafe.Pointer(&struct{ uintptr }{_aSyscall[0].FpCurrent})))(tls, z, f|int32(O_CLOEXEC), libc.Int32FromUint16(m2))
 		if fd < 0 {
-			if **(**int32)(__ccgo_up(libc.X__error(tls))) == int32(EINTR) {
+			if *(*int32)(__ccgo_ptr(libc.X__error(tls))) == int32(EINTR) {
 				continue
 			}
 			break
@@ -133,15 +205,15 @@ func _robust_open(tls *libc.TLS, z uintptr, f int32, m Tmode_t) (r int32) {
 			(*(*func(*libc.TLS, uintptr) int32)(unsafe.Pointer(&struct{ uintptr }{_aSyscall[int32(16)].FpCurrent})))(tls, z)
 		}
 		(*(*func(*libc.TLS, int32) int32)(unsafe.Pointer(&struct{ uintptr }{_aSyscall[int32(1)].FpCurrent})))(tls, fd)
-		Xsqlite3_log(tls, int32(SQLITE_WARNING), __ccgo_ts+3750, libc.VaList(bp+232, z, fd))
+		Xsqlite3_log(tls, int32(SQLITE_WARNING), __ccgo_ts+3764, libc.VaList(bp+232, z, fd))
 		fd = -int32(1)
-		if (*(*func(*libc.TLS, uintptr, int32, int32) int32)(unsafe.Pointer(&struct{ uintptr }{_aSyscall[0].FpCurrent})))(tls, __ccgo_ts+3793, O_RDONLY, libc.Int32FromUint16(m)) < 0 {
+		if (*(*func(*libc.TLS, uintptr, int32, int32) int32)(unsafe.Pointer(&struct{ uintptr }{_aSyscall[0].FpCurrent})))(tls, __ccgo_ts+3807, O_RDONLY, libc.Int32FromUint16(m)) < 0 {
 			break
 		}
 	}
 	if fd >= 0 {
 		if libc.Int32FromUint16(m) != 0 {
-			if (*(*func(*libc.TLS, int32, uintptr) int32)(unsafe.Pointer(&struct{ uintptr }{_aSyscall[int32(5)].FpCurrent})))(tls, fd, bp) == 0 && (**(**Tstat)(__ccgo_up(bp))).Fst_size == 0 && libc.Int32FromUint16((**(**Tstat)(__ccgo_up(bp))).Fst_mode)&int32(0777) != libc.Int32FromUint16(m) {
+			if (*(*func(*libc.TLS, int32, uintptr) int32)(unsafe.Pointer(&struct{ uintptr }{_aSyscall[int32(5)].FpCurrent})))(tls, fd, bp) == 0 && (*(*Tstat)(__ccgo_ptr(bp))).Fst_size == 0 && libc.Int32FromUint16((*(*Tstat)(__ccgo_ptr(bp))).Fst_mode)&int32(0777) != libc.Int32FromUint16(m) {
 				(*(*func(*libc.TLS, int32, Tmode_t) int32)(unsafe.Pointer(&struct{ uintptr }{_aSyscall[int32(14)].FpCurrent})))(tls, fd, m)
 			}
 		}
@@ -208,11 +280,130 @@ func _unixAccess(tls *libc.TLS, NotUsed uintptr, zPath uintptr, flags int32, pRe
 	/* The spec says there are three possible values for flags.  But only
 	 ** two of them are actually used */
 	if flags == SQLITE_ACCESS_EXISTS {
-		**(**int32)(__ccgo_up(pResOut)) = libc.BoolInt32(0 == (*(*func(*libc.TLS, uintptr, uintptr) int32)(unsafe.Pointer(&struct{ uintptr }{_aSyscall[int32(4)].FpCurrent})))(tls, zPath, bp) && (!(libc.Int32FromUint16((**(**Tstat)(__ccgo_up(bp))).Fst_mode)&libc.Int32FromInt32(0170000) == libc.Int32FromInt32(0100000)) || (**(**Tstat)(__ccgo_up(bp))).Fst_size > 0))
+		*(*int32)(__ccgo_ptr(pResOut)) = libc.BoolInt32(0 == (*(*func(*libc.TLS, uintptr, uintptr) int32)(unsafe.Pointer(&struct{ uintptr }{_aSyscall[int32(4)].FpCurrent})))(tls, zPath, bp) && (!(libc.Int32FromUint16((*(*Tstat)(__ccgo_ptr(bp))).Fst_mode)&libc.Int32FromInt32(0170000) == libc.Int32FromInt32(0100000)) || (*(*Tstat)(__ccgo_ptr(bp))).Fst_size > 0))
 	} else {
-		**(**int32)(__ccgo_up(pResOut)) = libc.BoolInt32((*(*func(*libc.TLS, uintptr, int32) int32)(unsafe.Pointer(&struct{ uintptr }{_aSyscall[int32(2)].FpCurrent})))(tls, zPath, libc.Int32FromInt32(W_OK)|libc.Int32FromInt32(R_OK)) == 0)
+		*(*int32)(__ccgo_ptr(pResOut)) = libc.BoolInt32((*(*func(*libc.TLS, uintptr, int32) int32)(unsafe.Pointer(&struct{ uintptr }{_aSyscall[int32(2)].FpCurrent})))(tls, zPath, libc.Int32FromInt32(W_OK)|libc.Int32FromInt32(R_OK)) == 0)
 	}
 	return SQLITE_OK
+}
+
+// C documentation
+//
+//	/*
+//	** Determine the current size of a file in bytes
+//	*/
+func _unixFileSize(tls *libc.TLS, id uintptr, pSize uintptr) (r int32) {
+	bp := tls.Alloc(224)
+	defer tls.Free(224)
+	var rc int32
+	var _ /* buf at bp+0 */ Tstat
+	_ = rc
+	rc = (*(*func(*libc.TLS, int32, uintptr) int32)(unsafe.Pointer(&struct{ uintptr }{_aSyscall[int32(5)].FpCurrent})))(tls, (*TunixFile)(unsafe.Pointer(id)).Fh, bp)
+	if rc != 0 {
+		_storeLastErrno(tls, id, *(*int32)(__ccgo_ptr(libc.X__error(tls))))
+		return libc.Int32FromInt32(SQLITE_IOERR) | libc.Int32FromInt32(7)<<libc.Int32FromInt32(8)
+	}
+	*(*Ti64)(__ccgo_ptr(pSize)) = (*(*Tstat)(__ccgo_ptr(bp))).Fst_size
+	/* When opening a zero-size database, the findInodeInfo() procedure
+	 ** writes a single byte into that file in order to work around a bug
+	 ** in the OS-X msdos filesystem.  In order to avoid problems with upper
+	 ** layers, we need to report this file size as zero even though it is
+	 ** really 1.   Ticket #3260.
+	 */
+	if *(*Ti64)(__ccgo_ptr(pSize)) == int64(1) {
+		*(*Ti64)(__ccgo_ptr(pSize)) = 0
+	}
+	return SQLITE_OK
+}
+
+// C documentation
+//
+//	/*
+//	** Memory map or remap the file opened by file-descriptor pFd (if the file
+//	** is already mapped, the existing mapping is replaced by the new). Or, if
+//	** there already exists a mapping for this file, and there are still
+//	** outstanding xFetch() references to it, this function is a no-op.
+//	**
+//	** If parameter nByte is non-negative, then it is the requested size of
+//	** the mapping to create. Otherwise, if nByte is less than zero, then the
+//	** requested size is the size of the file on disk. The actual size of the
+//	** created mapping is either the requested size or the value configured
+//	** using SQLITE_FCNTL_MMAP_LIMIT, whichever is smaller.
+//	**
+//	** SQLITE_OK is returned if no error occurs (even if the mapping is not
+//	** recreated as a result of outstanding references) or an SQLite error
+//	** code otherwise.
+//	*/
+func _unixMapfile(tls *libc.TLS, pFd uintptr, nMap Ti64) (r int32) {
+	bp := tls.Alloc(224)
+	defer tls.Free(224)
+	var _ /* statbuf at bp+0 */ Tstat
+	if (*TunixFile)(unsafe.Pointer(pFd)).FnFetchOut > 0 {
+		return SQLITE_OK
+	}
+	if nMap < 0 { /* Low-level file information */
+		if (*(*func(*libc.TLS, int32, uintptr) int32)(unsafe.Pointer(&struct{ uintptr }{_aSyscall[int32(5)].FpCurrent})))(tls, (*TunixFile)(unsafe.Pointer(pFd)).Fh, bp) != 0 {
+			return libc.Int32FromInt32(SQLITE_IOERR) | libc.Int32FromInt32(7)<<libc.Int32FromInt32(8)
+		}
+		nMap = (*(*Tstat)(__ccgo_ptr(bp))).Fst_size
+	}
+	if nMap > (*TunixFile)(unsafe.Pointer(pFd)).FmmapSizeMax {
+		nMap = (*TunixFile)(unsafe.Pointer(pFd)).FmmapSizeMax
+	}
+	if nMap != (*TunixFile)(unsafe.Pointer(pFd)).FmmapSize {
+		_unixRemapfile(tls, pFd, nMap)
+	}
+	return SQLITE_OK
+}
+
+// C documentation
+//
+//	/*
+//	** Return the name of a directory in which to put temporary files.
+//	** If no suitable temporary file directory can be found, return NULL.
+//	**
+//	** The return value might be a string obtained from getenv() and so
+//	** the return value should not be used after any call to setenv() or
+//	** putenv() as that value might have been freed.
+//	*/
+func _unixTempFileDir(tls *libc.TLS) (r uintptr) {
+	bp := tls.Alloc(224)
+	defer tls.Free(224)
+	var i uint32
+	var zDir uintptr
+	var _ /* buf at bp+0 */ Tstat
+	_, _ = i, zDir
+	i = uint32(0)
+	for {
+		if !(i < uint32(7)) {
+			break
+		}
+		switch i {
+		case uint32(0):
+			zDir = Xsqlite3_temp_directory
+		case uint32(1):
+			zDir = libc.Xgetenv(tls, __ccgo_ts+4013)
+		case uint32(2):
+			zDir = libc.Xgetenv(tls, __ccgo_ts+4027)
+		case uint32(3):
+			zDir = __ccgo_ts + 4034
+		case uint32(4):
+			zDir = __ccgo_ts + 4043
+		case uint32(5):
+			zDir = __ccgo_ts + 4052
+		default:
+			zDir = __ccgo_ts + 1765
+			break
+		}
+		if zDir != uintptr(0) && (*(*func(*libc.TLS, uintptr, uintptr) int32)(unsafe.Pointer(&struct{ uintptr }{_aSyscall[int32(4)].FpCurrent})))(tls, zDir, bp) == 0 && libc.Int32FromUint16((*(*Tstat)(__ccgo_ptr(bp))).Fst_mode)&int32(0170000) == int32(0040000) && (*(*func(*libc.TLS, uintptr, int32) int32)(unsafe.Pointer(&struct{ uintptr }{_aSyscall[int32(2)].FpCurrent})))(tls, zDir, int32(03)) == 0 {
+			return zDir
+		}
+		goto _1
+	_1:
+		;
+		i = i + 1
+	}
+	return uintptr(0)
 }
 
 // C documentation
@@ -238,19 +429,19 @@ func _verifyDbFile(tls *libc.TLS, pFile uintptr) {
 	}
 	rc = (*(*func(*libc.TLS, int32, uintptr) int32)(unsafe.Pointer(&struct{ uintptr }{_aSyscall[int32(5)].FpCurrent})))(tls, (*TunixFile)(unsafe.Pointer(pFile)).Fh, bp)
 	if rc != 0 {
-		Xsqlite3_log(tls, int32(SQLITE_WARNING), __ccgo_ts+3834, libc.VaList(bp+232, (*TunixFile)(unsafe.Pointer(pFile)).FzPath))
+		Xsqlite3_log(tls, int32(SQLITE_WARNING), __ccgo_ts+3848, libc.VaList(bp+232, (*TunixFile)(unsafe.Pointer(pFile)).FzPath))
 		return
 	}
-	if (**(**Tstat)(__ccgo_up(bp))).Fst_nlink == uint64(0) {
-		Xsqlite3_log(tls, int32(SQLITE_WARNING), __ccgo_ts+3858, libc.VaList(bp+232, (*TunixFile)(unsafe.Pointer(pFile)).FzPath))
+	if (*(*Tstat)(__ccgo_ptr(bp))).Fst_nlink == uint64(0) {
+		Xsqlite3_log(tls, int32(SQLITE_WARNING), __ccgo_ts+3872, libc.VaList(bp+232, (*TunixFile)(unsafe.Pointer(pFile)).FzPath))
 		return
 	}
-	if (**(**Tstat)(__ccgo_up(bp))).Fst_nlink > uint64(1) {
-		Xsqlite3_log(tls, int32(SQLITE_WARNING), __ccgo_ts+3887, libc.VaList(bp+232, (*TunixFile)(unsafe.Pointer(pFile)).FzPath))
+	if (*(*Tstat)(__ccgo_ptr(bp))).Fst_nlink > uint64(1) {
+		Xsqlite3_log(tls, int32(SQLITE_WARNING), __ccgo_ts+3901, libc.VaList(bp+232, (*TunixFile)(unsafe.Pointer(pFile)).FzPath))
 		return
 	}
 	if _fileHasMoved(tls, pFile) != 0 {
-		Xsqlite3_log(tls, int32(SQLITE_WARNING), __ccgo_ts+3914, libc.VaList(bp+232, (*TunixFile)(unsafe.Pointer(pFile)).FzPath))
+		Xsqlite3_log(tls, int32(SQLITE_WARNING), __ccgo_ts+3928, libc.VaList(bp+232, (*TunixFile)(unsafe.Pointer(pFile)).FzPath))
 		return
 	}
 }

@@ -7,17 +7,21 @@ package sqlite // import "modernc.org/sqlite"
 import (
 	"context"
 	"database/sql/driver"
+	"sync/atomic"
 
-	"modernc.org/libc"
 	sqlite3 "modernc.org/sqlite/lib"
 )
 
 type tx struct {
 	c *conn
+	// ctx is the context given to BeginTx. database/sql documents it as in
+	// use until the transaction is committed or rolled back, so Commit's
+	// wait for a lock ends once it is done.
+	ctx context.Context
 }
 
 func newTx(ctx context.Context, c *conn, opts driver.TxOptions) (*tx, error) {
-	r := &tx{c: c}
+	r := &tx{c: c, ctx: ctx}
 
 	sql := "begin"
 	if !opts.ReadOnly && c.beginMode != "" {
@@ -32,8 +36,14 @@ func newTx(ctx context.Context, c *conn, opts driver.TxOptions) (*tx, error) {
 }
 
 // Commit implements driver.Tx.
+//
+// A COMMIT can wait, under busy_timeout, for a lock another connection holds,
+// such as a reader's SHARED lock in rollback-journal mode. The wait ends once
+// the context given to BeginTx is done, with the context's error, and the
+// transaction is rolled back, as database/sql rolls it back when that context
+// ends before Commit. See https://gitlab.com/cznic/sqlite/-/issues/263.
 func (t *tx) Commit() (err error) {
-	err = t.exec(context.Background(), "commit")
+	err = t.exec(t.ctx, "commit")
 	if err == nil {
 		return nil
 	}
@@ -54,26 +64,48 @@ func (t *tx) Commit() (err error) {
 }
 
 // Rollback implements driver.Tx.
+//
+// Unlike Commit it does not watch the context given to BeginTx: database/sql
+// calls Rollback to clean up once that context is done, and the ROLLBACK must
+// run then. It takes no lock another connection could hold.
 func (t *tx) Rollback() (err error) {
 	return t.exec(context.Background(), "rollback")
 }
 
+// exec runs sql, a BEGIN, COMMIT or ROLLBACK, through the statement path, so
+// that with a shared cache it waits for the lock held by another connection,
+// as an executed BEGIN does, rather than failing at once with
+// SQLITE_LOCKED_SHAREDCACHE, and ends that wait once ctx is done. Unlike
+// conn.exec, it reports a statement that has run as a success even if ctx
+// is done by then: a BEGIN that took effect must reach database/sql as a
+// transaction, which it then rolls back for the done context.
 func (t *tx) exec(ctx context.Context, sql string) (err error) {
-	psql, err := libc.CString(sql)
+	s, err := t.c.newStmtContext(ctx, sql)
 	if err != nil {
 		return err
 	}
 
-	defer t.c.free(psql)
-	//TODO use t.conn.ExecContext() instead
+	defer func() {
+		if err2 := s.Close(); err2 != nil && err == nil {
+			err = err2
+		}
+	}()
+
+	if s.pstmt == 0 { // Not a single statement, which BEGIN, COMMIT and ROLLBACK are
+		_, err = s.exec(ctx, nil)
+		return err
+	}
 
 	if ctx != nil && ctx.Done() != nil {
-		defer interruptOnDone(ctx, t.c, nil)()
+		var done int32
+		defer interruptOnDone(ctx, t.c, &done)()
+		defer func() {
+			if err != nil && (atomic.LoadInt32(&done) != 0 || t.c.canceled.Load() != 0) {
+				err = ctx.Err()
+			}
+		}()
 	}
 
-	if rc := sqlite3.Xsqlite3_exec(t.c.tls, t.c.db, psql, 0, 0, 0); rc != sqlite3.SQLITE_OK {
-		return t.c.errstr(rc)
-	}
-
-	return nil
+	_, err = t.c.step(s.pstmt)
+	return err
 }

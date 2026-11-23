@@ -107,7 +107,9 @@ func (s *stmt) exec(ctx context.Context, args []driver.NamedValue) (r driver.Res
 	}
 
 	defer func() {
-		if ctx != nil && atomic.LoadInt32(&done) != 0 {
+		// done: the watcher goroutine saw the context end; canceled: so did
+		// busyHandler, ending a wait for a lock, perhaps before the watcher ran
+		if ctx != nil && ctx.Done() != nil && (atomic.LoadInt32(&done) != 0 || s.c.canceled.Load() != 0) {
 			r, err = nil, ctx.Err()
 		}
 		if pstmt != 0 {
@@ -124,6 +126,7 @@ func (s *stmt) exec(ctx context.Context, args []driver.NamedValue) (r driver.Res
 
 	// OPTIMIZED PATH: Single Cached Statement
 	if s.pstmt != 0 {
+		var allocs []cBinding
 		err = func() error {
 			// Bind
 			n, err := s.c.bindParameterCount(s.pstmt)
@@ -131,7 +134,7 @@ func (s *stmt) exec(ctx context.Context, args []driver.NamedValue) (r driver.Res
 				return err
 			}
 			if n != 0 {
-				allocs, err := s.c.bind(s.pstmt, n, args)
+				allocs, err = s.c.bind(s.pstmt, n, args)
 				if err != nil {
 					return err
 				}
@@ -180,7 +183,7 @@ func (s *stmt) exec(ctx context.Context, args []driver.NamedValue) (r driver.Res
 		if resetErr := s.c.reset(s.pstmt); resetErr != nil && err == nil {
 			err = resetErr
 		}
-		if clearErr := s.c.clearBindings(s.pstmt); clearErr != nil && err == nil {
+		if clearErr := s.c.clearBindings(s.pstmt, allocs); clearErr != nil && err == nil {
 			err = clearErr
 		}
 		return r, err
@@ -297,13 +300,15 @@ func (s *stmt) query(ctx context.Context, args []driver.NamedValue) (r driver.Ro
 	}
 
 	defer func() {
-		if ctx != nil && atomic.LoadInt32(&done) != 0 {
+		// done: the watcher goroutine saw the context end; canceled: so did
+		// busyHandler, ending a wait for a lock, perhaps before the watcher ran
+		if ctx != nil && ctx.Done() != nil && (atomic.LoadInt32(&done) != 0 || s.c.canceled.Load() != 0) {
 			if r != nil {
 				r.Close()
 			}
 			r, err = nil, ctx.Err()
 		} else if r == nil && err == nil {
-			r, err = newRows(s.c, pstmt, nil, true)
+			r, err = newRows(ctx, s.c, pstmt, nil, true)
 		}
 
 		if pstmt != 0 {
@@ -321,7 +326,7 @@ func (s *stmt) query(ctx context.Context, args []driver.NamedValue) (r driver.Ro
 
 	// OPTIMIZED PATH: Single Cached Statement
 	if s.pstmt != 0 {
-		var allocs []uintptr
+		var allocs []cBinding
 		// Bind
 		n, err := s.c.bindParameterCount(s.pstmt)
 		if err != nil {
@@ -339,7 +344,7 @@ func (s *stmt) query(ctx context.Context, args []driver.NamedValue) (r driver.Ro
 			// On error, we must free allocs manually because 'newRows' won't take ownership
 			s.c.freeAllocs(allocs)
 			s.c.reset(s.pstmt)
-			s.c.clearBindings(s.pstmt)
+			s.c.clearBindings(s.pstmt, allocs)
 			return nil, err
 		}
 
@@ -347,9 +352,9 @@ func (s *stmt) query(ctx context.Context, args []driver.NamedValue) (r driver.Ro
 		switch rc & 0xff {
 		case sqlite3.SQLITE_ROW:
 			// Pass reuseStmt=true
-			if r, err = newRows(s.c, s.pstmt, &allocs, false); err != nil {
+			if r, err = newRows(ctx, s.c, s.pstmt, &allocs, false); err != nil {
 				s.c.reset(s.pstmt)
-				s.c.clearBindings(s.pstmt)
+				s.c.clearBindings(s.pstmt, allocs)
 				return nil, err
 			}
 			r.(*rows).reuseStmt = true
@@ -364,9 +369,9 @@ func (s *stmt) query(ctx context.Context, args []driver.NamedValue) (r driver.Ro
 
 			// Actually, if we pass reuseStmt=true to an empty set,
 			// rows.Close() will eventually reset it.
-			if r, err = newRows(s.c, s.pstmt, &allocs, true); err != nil {
+			if r, err = newRows(ctx, s.c, s.pstmt, &allocs, true); err != nil {
 				s.c.reset(s.pstmt)
-				s.c.clearBindings(s.pstmt)
+				s.c.clearBindings(s.pstmt, allocs)
 				return nil, err
 			}
 			r.(*rows).reuseStmt = true
@@ -376,7 +381,7 @@ func (s *stmt) query(ctx context.Context, args []driver.NamedValue) (r driver.Ro
 			// Error case
 			s.c.freeAllocs(allocs)
 			s.c.reset(s.pstmt)
-			s.c.clearBindings(s.pstmt)
+			s.c.clearBindings(s.pstmt, allocs)
 			return nil, s.c.errstr(int32(rc))
 		}
 	}
@@ -395,7 +400,7 @@ func (s *stmt) query(ctx context.Context, args []driver.NamedValue) (r driver.Ro
 		}
 
 		err = func() (err error) {
-			var allocs []uintptr
+			var allocs []cBinding
 			defer func() { s.c.freeAllocs(allocs) }()
 
 			n, err := s.c.bindParameterCount(pstmt)
@@ -419,14 +424,14 @@ func (s *stmt) query(ctx context.Context, args []driver.NamedValue) (r driver.Ro
 				if r != nil {
 					r.Close()
 				}
-				if r, err = newRows(s.c, pstmt, &allocs, false); err != nil {
+				if r, err = newRows(ctx, s.c, pstmt, &allocs, false); err != nil {
 					return err
 				}
 				pstmt = 0
 				return nil
 			case sqlite3.SQLITE_DONE:
 				if r == nil {
-					if r, err = newRows(s.c, pstmt, &allocs, true); err != nil {
+					if r, err = newRows(ctx, s.c, pstmt, &allocs, true); err != nil {
 						return err
 					}
 					pstmt = 0
@@ -442,7 +447,7 @@ func (s *stmt) query(ctx context.Context, args []driver.NamedValue) (r driver.Ro
 				if r != nil {
 					r.Close()
 				}
-				if r, err = newRows(s.c, pstmt, &allocs, true); err != nil {
+				if r, err = newRows(ctx, s.c, pstmt, &allocs, true); err != nil {
 					return err
 				}
 				pstmt = 0
@@ -489,12 +494,30 @@ func (s *stmt) QueryContext(ctx context.Context, args []driver.NamedValue) (dr d
 	return s.query(ctx, args)
 }
 
-// C documentation
+// clearBindings unbinds the parameters of pstmt bound to the buffers in
+// allocs, which bind allocated for its text and blob arguments and which the
+// caller frees; pstmt must be reset, as sqlite3_bind_null requires. The other
+// parameters stay bound: an integer, float or NULL holds no memory the driver
+// owns, and the next bind replaces it anyway, since bind refuses to run with
+// an argument missing.
 //
-//	int sqlite3_clear_bindings(sqlite3_stmt*);
-func (c *conn) clearBindings(pstmt uintptr) error {
-	if rc := sqlite3.Xsqlite3_clear_bindings(c.tls, pstmt); rc != sqlite3.SQLITE_OK {
-		return c.errstr(rc)
+// Not sqlite3_clear_bindings, and not sqlite3_bind_null on every parameter:
+// since SQLite 3.54 a "col = ?" term of a join or of an ORDER BY query makes
+// the plan depend on whether the value is 0 or 1, so sqlite3_clear_bindings
+// expires such a statement outright, and unbinding the parameter to NULL
+// makes the next binding of 0 or 1 expire it. Either way the next step
+// parses and plans the statement again. Leaving the value in place expires
+// the statement only when the value changes to or from 0 or 1, as SQLite
+// means it to. Unbinding every parameter also costs a call per parameter and
+// execution, which a multi-row INSERT with thousands of parameters would pay
+// for every one of them.
+//
+// https://gitlab.com/cznic/sqlite/-/issues/264
+func (c *conn) clearBindings(pstmt uintptr, allocs []cBinding) error {
+	for _, a := range allocs {
+		if rc := sqlite3.Xsqlite3_bind_null(c.tls, pstmt, a.idx); rc != sqlite3.SQLITE_OK {
+			return c.errstr(rc)
+		}
 	}
 	return nil
 }

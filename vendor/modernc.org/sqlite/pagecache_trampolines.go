@@ -5,6 +5,7 @@
 package sqlite
 
 import (
+	"fmt"
 	"math/bits"
 	"sync"
 	"unsafe"
@@ -39,15 +40,15 @@ import (
 //     when the impl retains the entry.
 //
 // Threading invariant: all Cache callbacks for a single pcacheBinding
-// are serialised by the SQLite engine. This driver opens every
-// connection SQLITE_OPEN_FULLMUTEX without shared-cache mode, and
-// database/sql never invokes one driver.Conn from two goroutines, so
-// the Cache instance returned by xCreate is only ever touched from
-// one goroutine at a time. The mutex on pcacheBinding protects the
-// maps against any future shared-cache mode and against the
-// cross-cache traffic that the package-global pcacheBindings
-// registry would otherwise impose; under the current invariant it is
-// uncontended.
+// are serialised by the SQLite engine, but not always on one goroutine.
+// Without shared cache, a binding belongs to one connection, which
+// database/sql never uses from two goroutines at once. With cache=shared in a "file:" DSN, every
+// connection sharing the cache reaches the same binding, each from its
+// own goroutine, and SQLite serialises them through the BtShared mutex.
+// The mutex on pcacheBinding gives the race detector the happens-before
+// edge that SQLite's own mutex provides invisibly, and guards the maps
+// against the cross-cache traffic of the package-global pcacheBindings
+// registry.
 type pcacheBinding struct {
 	mu     sync.Mutex
 	cache  Cache
@@ -58,6 +59,21 @@ type pcacheBinding struct {
 type pcacheEntry struct {
 	page Page
 	key  uint32
+	// pinned is set by Fetch and cleared by Unpin; Truncate and Destroy
+	// drop the entry outright. While it is set SQLite holds the stub,
+	// so the binding must not free it: see pcacheContractViolation.
+	pinned bool
+}
+
+// pcacheContractViolation panics. It is called when Cache.Fetch returns nil,
+// or a different Page, for a key whose stub SQLite still holds pinned. The
+// Page contract forbids that: Buf and Extra must stay valid from the Fetch
+// until the matching Unpin. Freeing the stub, which is what the binding does
+// for an unpinned key, would leave SQLite reading and writing freed memory
+// and corrupt the database without any error. Crashing is the better
+// failure.
+func pcacheContractViolation(key uint32, got string) {
+	panic(fmt.Sprintf("sqlite: page cache contract violation: Cache.Fetch returned %s for page %d while SQLite holds it pinned", got, key))
 }
 
 // pcacheBindings is the package-global registry mapping the opaque
@@ -237,30 +253,43 @@ func pcacheTrampolineFetch(tls *libc.TLS, pCache uintptr, key uint32, createFlag
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	old, had := b.byKey[key]
+	var held pcacheEntry
+	if had {
+		held = b.byStub[old]
+	}
 
 	if page == nil {
 		// Lookup miss, eviction, or OOM: retire any stale stub the
 		// binding still held for this key. The next Fetch with
 		// createFlag > 0 will re-allocate.
 		if had {
+			if held.pinned {
+				pcacheContractViolation(key, "nil")
+			}
 			delete(b.byKey, key)
 			delete(b.byStub, old)
 			libc.Xfree(tls, old)
 		}
 		return pcacheNullStub
 	}
-	if had && b.byStub[old].page == page {
+	if had && held.page == page {
 		// Same Page value retained across the unpin/refetch cycle;
 		// reuse the existing stub. Buf and Extra addresses are stable
 		// while the page is pinned, which is exactly the window during
 		// which SQLite holds the stub pointer.
+		held.pinned = true
+		b.byStub[old] = held
 		return old
 	}
 	if had {
 		// Page was replaced for this key (impl evicted and re-allocated
 		// fresh memory). Retire the stale stub before minting a new one;
 		// SQLite has already finished using the old stub by the time
-		// xUnpin returned.
+		// xUnpin returned -- unless it has not, which is a contract
+		// violation by the Cache.
+		if held.pinned {
+			pcacheContractViolation(key, "a different Page")
+		}
 		delete(b.byStub, old)
 		libc.Xfree(tls, old)
 	}
@@ -272,7 +301,7 @@ func pcacheTrampolineFetch(tls *libc.TLS, pCache uintptr, key uint32, createFlag
 	f := (*[2]uintptr)(unsafe.Pointer(stub))
 	f[0], f[1] = uintptr(page.Buf()), uintptr(page.Extra())
 	b.byKey[key] = stub
-	b.byStub[stub] = pcacheEntry{page: page, key: key}
+	b.byStub[stub] = pcacheEntry{page: page, key: key, pinned: true}
 	return stub
 }
 
@@ -296,6 +325,12 @@ func pcacheTrampolineUnpin(tls *libc.TLS, pCache, pPage uintptr, discard int32) 
 	}
 	b.cache.Unpin(entry.page, discard != 0)
 	if discard == 0 {
+		b.mu.Lock()
+		if e, ok := b.byStub[pPage]; ok {
+			e.pinned = false
+			b.byStub[pPage] = e
+		}
+		b.mu.Unlock()
 		return
 	}
 	b.mu.Lock()

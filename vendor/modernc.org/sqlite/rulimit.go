@@ -2,8 +2,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//go:build linux || darwin || netbsd || openbsd
-// +build linux darwin netbsd openbsd
+//go:build linux || darwin || illumos || netbsd || openbsd
+// +build linux darwin illumos netbsd openbsd
 
 package sqlite // import "modernc.org/sqlite"
 

@@ -35,6 +35,48 @@ The repository you are currently viewing might be a mirror. Please review the gu
 
 ---
 
+Changelog
+---------
+
+Release notes are kept in [CHANGELOG.md](CHANGELOG.md).
+
+Contributing
+------------
+
+[CONTRIBUTING.md](CONTRIBUTING.md) covers where to send a merge request or pull
+request, how to build and test, and the one thing that is not obvious from the
+tree: most of the Go here is generated from C and edits to it are lost at the
+next re-vendoring.
+
+Security
+--------
+
+Please report a vulnerability privately rather than in a public issue.
+[SECURITY.md](SECURITY.md) names three private channels, says what is in scope
+-- including transpilation faults, the bug class unique to a project that ships
+SQLite's C as generated Go -- and describes the disclosure path, which includes
+filing the advisory with the Go vulnerability database so that `govulncheck`
+reports it.
+
+Licensing
+---------
+
+This package is BSD-3-Clause ([LICENSE](LICENSE)). It also carries a large body of
+third-party code: SQLite itself, which is public domain ([LICENSE-SQLITE](LICENSE-SQLITE)),
+the `sqlite-vec` extension, MIT ([LICENSE-SQLITE_VEC](LICENSE-SQLITE_VEC)), and the Go
+module dependency graph.
+
+[LICENSE-3RD-PARTY.md](LICENSE-3RD-PARTY.md) accounts for all of it, transitively and
+in full text, and separates what is linked into your binary from what merely appears in
+the module graph.
+
+A machine-readable SBOM ships beside it: [`sbom.cdx.json`](sbom.cdx.json) (CycloneDX 1.6)
+and [`sbom.spdx.json`](sbom.spdx.json) (SPDX 2.3), with [SBOM.md](SBOM.md) explaining
+what they cover. They name the transpiled SQLite and `sqlite-vec` C that no Go module
+graph reports, which is the part a stock SBOM tool gets wrong about this project.
+
+All four are generated from the tree by `make sbom`; do not edit them by hand.
+
 Virtual Tables (vtab)
 ---------------------
 

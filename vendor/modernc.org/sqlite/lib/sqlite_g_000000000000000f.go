@@ -13,46 +13,6 @@ import (
 // C documentation
 //
 //	/*
-//	** Compare the 19-character string zNum against the text representation
-//	** value 2^63:  9223372036854775808.  Return negative, zero, or positive
-//	** if zNum is less than, equal to, or greater than the string.
-//	** Note that zNum must contain exactly 19 characters.
-//	**
-//	** Unlike memcmp() this routine is guaranteed to return the difference
-//	** in the values of the last digit if the only difference is in the
-//	** last digit.  So, for example,
-//	**
-//	**      compare2pow63("9223372036854775800", 1)
-//	**
-//	** will return -8.
-//	*/
-func _compare2pow63(tls *libc.TLS, zNum uintptr, incr int32) (r int32) {
-	var c, i int32
-	var pow63 uintptr
-	_, _, _ = c, i, pow63
-	c = 0
-	/* 012345678901234567 */
-	pow63 = __ccgo_ts + 1813
-	i = 0
-	for {
-		if !(c == 0 && i < int32(18)) {
-			break
-		}
-		c = (int32(**(**int8)(__ccgo_up(zNum + uintptr(i*incr)))) - int32(**(**int8)(__ccgo_up(pow63 + uintptr(i))))) * int32(10)
-		goto _1
-	_1:
-		;
-		i = i + 1
-	}
-	if c == 0 {
-		c = int32(**(**int8)(__ccgo_up(zNum + uintptr(int32(18)*incr)))) - int32('8')
-	}
-	return c
-}
-
-// C documentation
-//
-//	/*
 //	** Parse times of the form HH:MM or HH:MM:SS or HH:MM:SS.FFFF.
 //	** The HH, MM, and SS must each be exactly 2 digits.  The
 //	** fractional seconds FFFF can be one or more digits.
@@ -68,22 +28,22 @@ func _parseHhMmSs(tls *libc.TLS, zDate uintptr, p uintptr) (r int32) {
 	var _ /* s at bp+8 */ int32
 	_, _ = ms, rScale
 	ms = float64(0)
-	if _getDigits(tls, zDate, __ccgo_ts+1202, libc.VaList(bp+24, bp, bp+4)) != int32(2) {
+	if _getDigits(tls, zDate, __ccgo_ts+1222, libc.VaList(bp+24, bp, bp+4)) != int32(2) {
 		return int32(1)
 	}
 	zDate = zDate + uintptr(5)
-	if int32(**(**int8)(__ccgo_up(zDate))) == int32(':') {
+	if int32(*(*int8)(__ccgo_ptr(zDate))) == int32(':') {
 		zDate = zDate + 1
-		if _getDigits(tls, zDate, __ccgo_ts+1210, libc.VaList(bp+24, bp+8)) != int32(1) {
+		if _getDigits(tls, zDate, __ccgo_ts+1230, libc.VaList(bp+24, bp+8)) != int32(1) {
 			return int32(1)
 		}
 		zDate = zDate + uintptr(2)
-		if int32(**(**int8)(__ccgo_up(zDate))) == int32('.') && libc.Int32FromUint8(_sqlite3CtypeMap[libc.Uint8FromInt8(**(**int8)(__ccgo_up(zDate + 1)))])&int32(0x04) != 0 {
+		if int32(*(*int8)(__ccgo_ptr(zDate))) == int32('.') && libc.Int32FromUint8(_sqlite3CtypeMap[libc.Uint8FromInt8(*(*int8)(__ccgo_ptr(zDate + 1)))])&int32(0x04) != 0 {
 			rScale = float64(1)
 			zDate = zDate + 1
-			for libc.Int32FromUint8(_sqlite3CtypeMap[libc.Uint8FromInt8(**(**int8)(__ccgo_up(zDate)))])&int32(0x04) != 0 {
-				ms = float64(ms*float64(10)) + float64(**(**int8)(__ccgo_up(zDate))) - libc.Float64FromUint8('0')
-				rScale = rScale * float64(10)
+			for libc.Int32FromUint8(_sqlite3CtypeMap[libc.Uint8FromInt8(*(*int8)(__ccgo_ptr(zDate)))])&int32(0x04) != 0 {
+				ms = float64(ms*float64(10)) + float64(*(*int8)(__ccgo_ptr(zDate))) - libc.Float64FromUint8('0')
+				rScale = float64(rScale * float64(10))
 				zDate = zDate + 1
 			}
 			ms = ms / rScale
@@ -94,14 +54,17 @@ func _parseHhMmSs(tls *libc.TLS, zDate uintptr, p uintptr) (r int32) {
 			}
 		}
 	} else {
-		**(**int32)(__ccgo_up(bp + 8)) = 0
+		*(*int32)(__ccgo_ptr(bp + 8)) = 0
+	}
+	if *(*int32)(__ccgo_ptr(bp)) == int32(24) && (*(*int32)(__ccgo_ptr(bp + 4)) != 0 || *(*int32)(__ccgo_ptr(bp + 8)) != 0 || ms != float64(0)) {
+		return int32(1)
 	}
 	(*TDateTime)(unsafe.Pointer(p)).FvalidJD = 0
 	libc.SetBitFieldPtr8Uint32(p+44, libc.Uint32FromInt32(0), 0, 0x1)
 	(*TDateTime)(unsafe.Pointer(p)).FvalidHMS = int8(1)
-	(*TDateTime)(unsafe.Pointer(p)).Fh = **(**int32)(__ccgo_up(bp))
-	(*TDateTime)(unsafe.Pointer(p)).Fm = **(**int32)(__ccgo_up(bp + 4))
-	(*TDateTime)(unsafe.Pointer(p)).Fs = float64(**(**int32)(__ccgo_up(bp + 8))) + ms
+	(*TDateTime)(unsafe.Pointer(p)).Fh = *(*int32)(__ccgo_ptr(bp))
+	(*TDateTime)(unsafe.Pointer(p)).Fm = *(*int32)(__ccgo_ptr(bp + 4))
+	(*TDateTime)(unsafe.Pointer(p)).Fs = float64(*(*int32)(__ccgo_ptr(bp + 8))) + ms
 	if _parseTimezone(tls, zDate, p) != 0 {
 		return int32(1)
 	}
@@ -134,11 +97,11 @@ func _parseTimezone(tls *libc.TLS, zDate uintptr, p uintptr) (r int32) {
 	var _ /* nMn at bp+4 */ int32
 	_, _ = c, sgn
 	sgn = 0
-	for libc.Int32FromUint8(_sqlite3CtypeMap[libc.Uint8FromInt8(**(**int8)(__ccgo_up(zDate)))])&int32(0x01) != 0 {
+	for libc.Int32FromUint8(_sqlite3CtypeMap[libc.Uint8FromInt8(*(*int8)(__ccgo_ptr(zDate)))])&int32(0x01) != 0 {
 		zDate = zDate + 1
 	}
 	(*TDateTime)(unsafe.Pointer(p)).Ftz = 0
-	c = int32(**(**int8)(__ccgo_up(zDate)))
+	c = int32(*(*int8)(__ccgo_ptr(zDate)))
 	if c == int32('-') {
 		sgn = -int32(1)
 	} else {
@@ -156,11 +119,11 @@ func _parseTimezone(tls *libc.TLS, zDate uintptr, p uintptr) (r int32) {
 		}
 	}
 	zDate = zDate + 1
-	if _getDigits(tls, zDate, __ccgo_ts+1194, libc.VaList(bp+16, bp, bp+4)) != int32(2) {
+	if _getDigits(tls, zDate, __ccgo_ts+1214, libc.VaList(bp+16, bp, bp+4)) != int32(2) {
 		return int32(1)
 	}
 	zDate = zDate + uintptr(5)
-	(*TDateTime)(unsafe.Pointer(p)).Ftz = sgn * (**(**int32)(__ccgo_up(bp + 4)) + **(**int32)(__ccgo_up(bp))*int32(60))
+	(*TDateTime)(unsafe.Pointer(p)).Ftz = sgn * (*(*int32)(__ccgo_ptr(bp + 4)) + *(*int32)(__ccgo_ptr(bp))*int32(60))
 	if (*TDateTime)(unsafe.Pointer(p)).Ftz == 0 { /* Forum post 2025-09-17T10:12:14z */
 		libc.SetBitFieldPtr8Uint32(p+44, libc.Uint32FromInt32(0), 4, 0x10)
 		libc.SetBitFieldPtr8Uint32(p+44, libc.Uint32FromInt32(1), 3, 0x8)
@@ -168,10 +131,10 @@ func _parseTimezone(tls *libc.TLS, zDate uintptr, p uintptr) (r int32) {
 	goto zulu_time
 zulu_time:
 	;
-	for libc.Int32FromUint8(_sqlite3CtypeMap[libc.Uint8FromInt8(**(**int8)(__ccgo_up(zDate)))])&int32(0x01) != 0 {
+	for libc.Int32FromUint8(_sqlite3CtypeMap[libc.Uint8FromInt8(*(*int8)(__ccgo_ptr(zDate)))])&int32(0x01) != 0 {
 		zDate = zDate + 1
 	}
-	return libc.BoolInt32(int32(**(**int8)(__ccgo_up(zDate))) != 0)
+	return libc.BoolInt32(int32(*(*int8)(__ccgo_ptr(zDate))) != 0)
 }
 
 // C documentation
@@ -191,28 +154,40 @@ zulu_time:
 func _parseYyyyMmDd(tls *libc.TLS, zDate uintptr, p uintptr) (r int32) {
 	bp := tls.Alloc(48)
 	defer tls.Free(48)
-	var neg, v1 int32
+	var mxD, neg, v1 int32
 	var _ /* D at bp+8 */ int32
 	var _ /* M at bp+4 */ int32
 	var _ /* Y at bp+0 */ int32
-	_, _ = neg, v1
-	if int32(**(**int8)(__ccgo_up(zDate))) == int32('-') {
+	_, _, _ = mxD, neg, v1
+	if int32(*(*int8)(__ccgo_ptr(zDate))) == int32('-') {
 		zDate = zDate + 1
 		neg = int32(1)
 	} else {
 		neg = 0
 	}
-	if _getDigits(tls, zDate, __ccgo_ts+1214, libc.VaList(bp+24, bp, bp+4, bp+8)) != int32(3) {
+	if _getDigits(tls, zDate, __ccgo_ts+1234, libc.VaList(bp+24, bp, bp+4, bp+8)) != int32(3) {
 		return int32(1)
 	}
 	zDate = zDate + uintptr(10)
-	for libc.Int32FromUint8(_sqlite3CtypeMap[libc.Uint8FromInt8(**(**int8)(__ccgo_up(zDate)))])&int32(0x01) != 0 || int32('T') == libc.Int32FromUint8(**(**Tu8)(__ccgo_up(zDate))) {
+	for libc.Int32FromUint8(_sqlite3CtypeMap[libc.Uint8FromInt8(*(*int8)(__ccgo_ptr(zDate)))])&int32(0x01) != 0 || int32('T') == libc.Int32FromUint8(*(*Tu8)(__ccgo_ptr(zDate))) {
 		zDate = zDate + 1
 	}
 	if _parseHhMmSs(tls, zDate, p) == 0 {
-		/* We got the time */
+		if (*TDateTime)(unsafe.Pointer(p)).Fh == int32(24) {
+			mxD = _daysOfMonth(tls, *(*int32)(__ccgo_ptr(bp)), *(*int32)(__ccgo_ptr(bp + 4)))
+			(*TDateTime)(unsafe.Pointer(p)).Fh = 0
+			*(*int32)(__ccgo_ptr(bp + 8)) = *(*int32)(__ccgo_ptr(bp + 8)) + 1
+			if *(*int32)(__ccgo_ptr(bp + 8)) > mxD {
+				*(*int32)(__ccgo_ptr(bp + 8)) = *(*int32)(__ccgo_ptr(bp + 8)) - mxD
+				*(*int32)(__ccgo_ptr(bp + 4)) = *(*int32)(__ccgo_ptr(bp + 4)) + 1
+				if *(*int32)(__ccgo_ptr(bp + 4)) > int32(12) {
+					*(*int32)(__ccgo_ptr(bp + 4)) = int32(1)
+					*(*int32)(__ccgo_ptr(bp)) = *(*int32)(__ccgo_ptr(bp)) + 1
+				}
+			}
+		}
 	} else {
-		if int32(**(**int8)(__ccgo_up(zDate))) == 0 {
+		if int32(*(*int8)(__ccgo_ptr(zDate))) == 0 {
 			(*TDateTime)(unsafe.Pointer(p)).FvalidHMS = 0
 		} else {
 			return int32(1)
@@ -221,13 +196,13 @@ func _parseYyyyMmDd(tls *libc.TLS, zDate uintptr, p uintptr) (r int32) {
 	(*TDateTime)(unsafe.Pointer(p)).FvalidJD = 0
 	(*TDateTime)(unsafe.Pointer(p)).FvalidYMD = int8(1)
 	if neg != 0 {
-		v1 = -**(**int32)(__ccgo_up(bp))
+		v1 = -*(*int32)(__ccgo_ptr(bp))
 	} else {
-		v1 = **(**int32)(__ccgo_up(bp))
+		v1 = *(*int32)(__ccgo_ptr(bp))
 	}
 	(*TDateTime)(unsafe.Pointer(p)).FY = v1
-	(*TDateTime)(unsafe.Pointer(p)).FM = **(**int32)(__ccgo_up(bp + 4))
-	(*TDateTime)(unsafe.Pointer(p)).FD = **(**int32)(__ccgo_up(bp + 8))
+	(*TDateTime)(unsafe.Pointer(p)).FM = *(*int32)(__ccgo_ptr(bp + 4))
+	(*TDateTime)(unsafe.Pointer(p)).FD = *(*int32)(__ccgo_ptr(bp + 8))
 	_computeFloor(tls, p)
 	if (*TDateTime)(unsafe.Pointer(p)).Ftz != 0 {
 		_computeJD(tls, p)

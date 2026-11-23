@@ -14,9 +14,8 @@ import (
 	"sync"
 	"time"
 	"unsafe"
-	// "golang.org/x/sys/unix"
-	// "modernc.org/libc/errno"
-	// "modernc.org/libc/fcntl"
+
+	"golang.org/x/sys/unix"
 )
 
 // Random number state.
@@ -42,29 +41,25 @@ func nextRandom(x uintptr) {
 	copy((*RawMem)(unsafe.Pointer(x))[:6:6], fmt.Sprintf("%06d", int(1e9+r%1e9)%1e6))
 }
 
-func tempFile(s, x uintptr, flags int32) (fd int, err error) {
-	panic(todo(""))
-	// const maxTry = 10000
-	// nconflict := 0
-	// flags |= int32(os.O_RDWR | os.O_CREATE | os.O_EXCL | unix.O_LARGEFILE)
-	// for i := 0; i < maxTry; i++ {
-	// 	nextRandom(x)
-	// 	fdcwd := fcntl.AT_FDCWD
-	// 	n, _, err := unix.Syscall6(unix.SYS_OPENAT, uintptr(fdcwd), s, uintptr(flags), 0600, 0, 0)
-	// 	if err == 0 {
-	// 		return int(n), nil
-	// 	}
+func tempFile(s, x uintptr, _ int32) (fd int, err error) {
+	const maxTry = 10000
+	nconflict := 0
+	for i := 0; i < maxTry; i++ {
+		nextRandom(x)
+		if fd, err = unix.Open(GoString(s), os.O_RDWR|os.O_CREATE|os.O_EXCL, 0600); err == nil {
+			return fd, nil
+		}
 
-	// 	if err != errno.EEXIST {
-	// 		return -1, err
-	// 	}
+		if !os.IsExist(err) {
+			return -1, err
+		}
 
-	// 	if nconflict++; nconflict > 10 {
-	// 		randStateMu.Lock()
-	// 		randState = reseed()
-	// 		nconflict = 0
-	// 		randStateMu.Unlock()
-	// 	}
-	// }
-	// return -1, unix.Errno(errno.EEXIST)
+		if nconflict++; nconflict > 10 {
+			randStateMu.Lock()
+			randState = reseed()
+			nconflict = 0
+			randStateMu.Unlock()
+		}
+	}
+	return -1, err
 }

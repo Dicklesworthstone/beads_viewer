@@ -467,6 +467,9 @@ more:
 			default:
 				fmt.Fprintf(buf, "%016X", VaUintptr(args))
 			}
+		case "illumos":
+			// Like the system libc: no 0x prefix, NULL is 0.
+			fmt.Fprintf(buf, "%x", VaUintptr(args))
 		default:
 			fmt.Fprintf(buf, "%#0x", VaUintptr(args))
 		}

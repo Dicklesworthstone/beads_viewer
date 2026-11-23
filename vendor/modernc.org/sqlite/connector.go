@@ -47,6 +47,19 @@ import (
 //	}
 //	db := sql.OpenDB(tracer{base})
 //
+// A wrapper around the connection itself should do two things. Give it an
+// Unwrap method returning the wrapped [driver.Conn]: [Limit] sees through a
+// wrapper that way, and fails on one without it. And forward the optional
+// interfaces every connection this driver opens implements --
+// [driver.ConnBeginTx], [driver.ConnPrepareContext], [driver.ExecerContext],
+// [driver.QueryerContext], [driver.Pinger], [driver.SessionResetter] and
+// [driver.Validator]. A wrapper that merely embeds driver.Conn hides them,
+// and database/sql then falls back to the context-free methods: BeginTx with
+// non-default options fails, a wait for a lock in Begin, Commit or Prepare
+// no longer ends when the context does, a transaction whose context is
+// canceled discards its connection, and the driver's connection validation
+// is skipped.
+//
 // Reaching the same driver through sql.Open requires sql.Register, which is
 // process-global, rejects a name it has already seen with a panic, and offers
 // no way to undo a registration; a library doing the above would have to

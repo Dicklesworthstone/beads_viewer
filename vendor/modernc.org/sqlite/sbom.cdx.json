@@ -1,0 +1,1278 @@
+{
+  "bomFormat": "CycloneDX",
+  "specVersion": "1.6",
+  "version": 1,
+  "metadata": {
+    "component": {
+      "type": "library",
+      "bom-ref": "pkg:golang/modernc.org/sqlite",
+      "name": "modernc.org/sqlite",
+      "description": "Pure-Go SQLite driver, no cgo. Describes the source tree; the release version is applied by the maintainer when a tag is pushed.",
+      "purl": "pkg:golang/modernc.org/sqlite",
+      "externalReferences": [
+        {
+          "type": "vcs",
+          "url": "https://gitlab.com/cznic/sqlite"
+        },
+        {
+          "type": "distribution",
+          "url": "https://pkg.go.dev/modernc.org/sqlite"
+        }
+      ]
+    },
+    "tools": {
+      "components": [
+        {
+          "type": "application",
+          "bom-ref": "licensegen",
+          "name": "licensegen"
+        }
+      ]
+    },
+    "properties": [
+      {
+        "name": "modernc:generator",
+        "value": "licensegen, in this repository; run make sbom"
+      },
+      {
+        "name": "modernc:reproducible",
+        "value": "no timestamp and no serial number, so regeneration of an unchanged tree is byte-identical"
+      },
+      {
+        "name": "modernc:notes",
+        "value": "See SBOM.md. Components whose C was transpiled into Go are marked with a pedigree note; no Go module graph names them."
+      }
+    ]
+  },
+  "components": [
+    {
+      "type": "library",
+      "bom-ref": "inherited:Go",
+      "name": "Go",
+      "scope": "required",
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://github.com/golang/go"
+        }
+      ],
+      "pedigree": {
+        "notes": "Reached through modernc.org/libc, which carries the upstream notice. The upstream revision is not recorded there, hence no version."
+      },
+      "properties": [
+        {
+          "name": "modernc:reachedVia",
+          "value": "modernc.org/libc"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "inherited:NixOS-nixpkgs",
+      "name": "NixOS/nixpkgs",
+      "scope": "required",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://github.com/NixOS/nixpkgs"
+        }
+      ],
+      "pedigree": {
+        "notes": "Reached through modernc.org/libc, which carries the upstream notice. The upstream revision is not recorded there, hence no version."
+      },
+      "properties": [
+        {
+          "name": "modernc:reachedVia",
+          "value": "modernc.org/libc"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "inherited:go-netdb",
+      "name": "go-netdb",
+      "scope": "required",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://github.com/dominikh/go-netdb"
+        }
+      ],
+      "pedigree": {
+        "notes": "Reached through modernc.org/libc, which carries the upstream notice. The upstream revision is not recorded there, hence no version."
+      },
+      "properties": [
+        {
+          "name": "modernc:reachedVia",
+          "value": "modernc.org/libc"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "inherited:musl-libc",
+      "name": "musl libc",
+      "scope": "required",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://musl.libc.org/"
+        }
+      ],
+      "pedigree": {
+        "notes": "Reached through modernc.org/libc, which carries the upstream notice. The upstream revision is not recorded there, hence no version."
+      },
+      "properties": [
+        {
+          "name": "modernc:reachedVia",
+          "value": "modernc.org/libc"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:generic/sqlite@3.54.1",
+      "name": "SQLite",
+      "version": "3.54.1",
+      "description": "The SQLite C amalgamation, translated to Go by modernc.org/ccgo. Local copy of the upstream dedication: LICENSE-SQLITE.",
+      "scope": "required",
+      "purl": "pkg:generic/sqlite@3.54.1",
+      "licenses": [
+        {
+          "license": {
+            "name": "LicenseRef-SQLite-PublicDomain",
+            "text": {
+              "contentType": "text/plain",
+              "content": "SQLite Is Public Domain\n\nAll of the code and documentation in SQLite has been dedicated to the public\ndomain by the authors. All code authors, and representatives of the companies\nthey work for, have signed affidavits dedicating their contributions to the\npublic domain and originals of those signed affidavits are stored in a firesafe\nat the main offices of Hwaci. Anyone is free to copy, modify, publish, use,\ncompile, sell, or distribute the original SQLite code, either in source code\nform or as a compiled binary, for any purpose, commercial or non-commercial,\nand by any means.\n\nThe previous paragraph applies to the deliverable code and documentation in\nSQLite - those parts of the SQLite library that you actually bundle and ship\nwith a larger application. Some scripts used as part of the build process (for\nexample the \"configure\" scripts generated by autoconf) might fall under other\nopen-source licenses. Nothing from these build scripts ever reaches the final\ndeliverable SQLite library, however, and so the licenses associated with those\nscripts should not be a factor in assessing your rights to copy and use the\nSQLite library.\n\nAll of the deliverable code in SQLite has been written from scratch. No code\nhas been taken from other projects or from the open internet. Every line of\ncode can be traced back to its original author, and all of those authors have\npublic domain dedications on file. So the SQLite code base is clean and is\nuncontaminated with licensed code from other projects."
+            }
+          }
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://sqlite.org/"
+        }
+      ],
+      "pedigree": {
+        "notes": "C source transpiled to Go by modernc.org/ccgo and committed to this repository. It is not a Go module dependency and appears in no module graph."
+      },
+      "properties": [
+        {
+          "name": "modernc:reachedVia",
+          "value": "transpiled into lib/"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:github/asg017/sqlite-vec@v0.1.9",
+      "name": "sqlite-vec",
+      "version": "v0.1.9",
+      "description": "Vector-search extension, linked only when modernc.org/sqlite/vec is imported. Local copy: LICENSE-SQLITE_VEC.",
+      "scope": "required",
+      "purl": "pkg:github/asg017/sqlite-vec@v0.1.9",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://github.com/asg017/sqlite-vec"
+        }
+      ],
+      "pedigree": {
+        "notes": "C source transpiled to Go by modernc.org/ccgo and committed to this repository. It is not a Go module dependency and appears in no module graph."
+      },
+      "properties": [
+        {
+          "name": "modernc:reachedVia",
+          "value": "transpiled into vec/"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:golang/github.com/chzyer/readline@v1.5.1",
+      "name": "github.com/chzyer/readline",
+      "version": "v1.5.1",
+      "scope": "excluded",
+      "purl": "pkg:golang/github.com/chzyer/readline@v1.5.1",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://pkg.go.dev/github.com/chzyer/readline"
+        },
+        {
+          "type": "distribution",
+          "url": "https://proxy.golang.org/github.com/chzyer/readline/@v/v1.5.1.zip"
+        }
+      ],
+      "properties": [
+        {
+          "name": "modernc:reachedVia",
+          "value": "github.com/google/pprof"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:golang/github.com/dustin/go-humanize@v1.1.0",
+      "name": "github.com/dustin/go-humanize",
+      "version": "v1.1.0",
+      "scope": "required",
+      "purl": "pkg:golang/github.com/dustin/go-humanize@v1.1.0",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://pkg.go.dev/github.com/dustin/go-humanize"
+        },
+        {
+          "type": "distribution",
+          "url": "https://proxy.golang.org/github.com/dustin/go-humanize/@v/v1.1.0.zip"
+        }
+      ],
+      "properties": [
+        {
+          "name": "modernc:reachedVia",
+          "value": "modernc.org/libc, go.mod"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:golang/github.com/google/pprof@v0.0.0-20261016150608-1facf8f91b50",
+      "name": "github.com/google/pprof",
+      "version": "v0.0.0-20261016150608-1facf8f91b50",
+      "scope": "optional",
+      "purl": "pkg:golang/github.com/google/pprof@v0.0.0-20261016150608-1facf8f91b50",
+      "licenses": [
+        {
+          "license": {
+            "id": "Apache-2.0"
+          }
+        },
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://pkg.go.dev/github.com/google/pprof"
+        },
+        {
+          "type": "distribution",
+          "url": "https://proxy.golang.org/github.com/google/pprof/@v/v0.0.0-20261016150608-1facf8f91b50.zip"
+        }
+      ],
+      "properties": [
+        {
+          "name": "modernc:reachedVia",
+          "value": "go.mod"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:golang/github.com/google/uuid@v1.6.0",
+      "name": "github.com/google/uuid",
+      "version": "v1.6.0",
+      "scope": "required",
+      "purl": "pkg:golang/github.com/google/uuid@v1.6.0",
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://pkg.go.dev/github.com/google/uuid"
+        },
+        {
+          "type": "distribution",
+          "url": "https://proxy.golang.org/github.com/google/uuid/@v/v1.6.0.zip"
+        }
+      ],
+      "properties": [
+        {
+          "name": "modernc:reachedVia",
+          "value": "modernc.org/libc, go.mod"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:golang/github.com/hashicorp/golang-lru/v2@v2.0.7",
+      "name": "github.com/hashicorp/golang-lru/v2",
+      "version": "v2.0.7",
+      "scope": "excluded",
+      "purl": "pkg:golang/github.com/hashicorp/golang-lru/v2@v2.0.7",
+      "licenses": [
+        {
+          "license": {
+            "id": "MPL-2.0"
+          }
+        },
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://pkg.go.dev/github.com/hashicorp/golang-lru/v2"
+        },
+        {
+          "type": "distribution",
+          "url": "https://proxy.golang.org/github.com/hashicorp/golang-lru/v2/@v/v2.0.7.zip"
+        }
+      ],
+      "properties": [
+        {
+          "name": "modernc:reachedVia",
+          "value": "modernc.org/libc"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:golang/github.com/ianlancetaylor/demangle@v0.0.0-20250417193237-f615e6bd150b",
+      "name": "github.com/ianlancetaylor/demangle",
+      "version": "v0.0.0-20250417193237-f615e6bd150b",
+      "scope": "excluded",
+      "purl": "pkg:golang/github.com/ianlancetaylor/demangle@v0.0.0-20250417193237-f615e6bd150b",
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://pkg.go.dev/github.com/ianlancetaylor/demangle"
+        },
+        {
+          "type": "distribution",
+          "url": "https://proxy.golang.org/github.com/ianlancetaylor/demangle/@v/v0.0.0-20250417193237-f615e6bd150b.zip"
+        }
+      ],
+      "properties": [
+        {
+          "name": "modernc:reachedVia",
+          "value": "github.com/google/pprof"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:golang/github.com/mattn/go-isatty@v0.0.24",
+      "name": "github.com/mattn/go-isatty",
+      "version": "v0.0.24",
+      "scope": "excluded",
+      "purl": "pkg:golang/github.com/mattn/go-isatty@v0.0.24",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://pkg.go.dev/github.com/mattn/go-isatty"
+        },
+        {
+          "type": "distribution",
+          "url": "https://proxy.golang.org/github.com/mattn/go-isatty/@v/v0.0.24.zip"
+        }
+      ],
+      "properties": [
+        {
+          "name": "modernc:reachedVia",
+          "value": "modernc.org/libc, go.mod"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:golang/github.com/ncruces/go-strftime@v1.1.0",
+      "name": "github.com/ncruces/go-strftime",
+      "version": "v1.1.0",
+      "scope": "excluded",
+      "purl": "pkg:golang/github.com/ncruces/go-strftime@v1.1.0",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://pkg.go.dev/github.com/ncruces/go-strftime"
+        },
+        {
+          "type": "distribution",
+          "url": "https://proxy.golang.org/github.com/ncruces/go-strftime/@v/v1.1.0.zip"
+        }
+      ],
+      "properties": [
+        {
+          "name": "modernc:reachedVia",
+          "value": "modernc.org/libc, go.mod"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:golang/github.com/remyoudompheng/bigfft@v0.0.0-20230129092748-24d4a6f8daec",
+      "name": "github.com/remyoudompheng/bigfft",
+      "version": "v0.0.0-20230129092748-24d4a6f8daec",
+      "scope": "required",
+      "purl": "pkg:golang/github.com/remyoudompheng/bigfft@v0.0.0-20230129092748-24d4a6f8daec",
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://pkg.go.dev/github.com/remyoudompheng/bigfft"
+        },
+        {
+          "type": "distribution",
+          "url": "https://proxy.golang.org/github.com/remyoudompheng/bigfft/@v/v0.0.0-20230129092748-24d4a6f8daec.zip"
+        }
+      ],
+      "properties": [
+        {
+          "name": "modernc:reachedVia",
+          "value": "modernc.org/fileutil, modernc.org/libc, modernc.org/mathutil, modernc.org/memory, go.mod"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:golang/golang.org/x/mod@v0.42.0",
+      "name": "golang.org/x/mod",
+      "version": "v0.42.0",
+      "scope": "excluded",
+      "purl": "pkg:golang/golang.org/x/mod@v0.42.0",
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://pkg.go.dev/golang.org/x/mod"
+        },
+        {
+          "type": "distribution",
+          "url": "https://proxy.golang.org/golang.org/x/mod/@v/v0.42.0.zip"
+        }
+      ],
+      "properties": [
+        {
+          "name": "modernc:reachedVia",
+          "value": "modernc.org/libc"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:golang/golang.org/x/sync@v0.24.0",
+      "name": "golang.org/x/sync",
+      "version": "v0.24.0",
+      "scope": "excluded",
+      "purl": "pkg:golang/golang.org/x/sync@v0.24.0",
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://pkg.go.dev/golang.org/x/sync"
+        },
+        {
+          "type": "distribution",
+          "url": "https://proxy.golang.org/golang.org/x/sync/@v/v0.24.0.zip"
+        }
+      ],
+      "properties": [
+        {
+          "name": "modernc:reachedVia",
+          "value": "modernc.org/libc"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:golang/golang.org/x/sys@v0.49.0",
+      "name": "golang.org/x/sys",
+      "version": "v0.49.0",
+      "scope": "required",
+      "purl": "pkg:golang/golang.org/x/sys@v0.49.0",
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://pkg.go.dev/golang.org/x/sys"
+        },
+        {
+          "type": "distribution",
+          "url": "https://proxy.golang.org/golang.org/x/sys/@v/v0.49.0.zip"
+        }
+      ],
+      "properties": [
+        {
+          "name": "modernc:reachedVia",
+          "value": "github.com/google/pprof, github.com/mattn/go-isatty, modernc.org/libc, modernc.org/memory, go.mod"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:golang/golang.org/x/tools@v0.52.0",
+      "name": "golang.org/x/tools",
+      "version": "v0.52.0",
+      "scope": "excluded",
+      "purl": "pkg:golang/golang.org/x/tools@v0.52.0",
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://pkg.go.dev/golang.org/x/tools"
+        },
+        {
+          "type": "distribution",
+          "url": "https://proxy.golang.org/golang.org/x/tools/@v/v0.52.0.zip"
+        }
+      ],
+      "properties": [
+        {
+          "name": "modernc:reachedVia",
+          "value": "modernc.org/libc"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:golang/modernc.org/cc/v4@v4.30.6-0.20261101114202-1b9d1a076f6b",
+      "name": "modernc.org/cc/v4",
+      "version": "v4.30.6-0.20261101114202-1b9d1a076f6b",
+      "scope": "excluded",
+      "purl": "pkg:golang/modernc.org/cc/v4@v4.30.6-0.20261101114202-1b9d1a076f6b",
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://pkg.go.dev/modernc.org/cc/v4"
+        },
+        {
+          "type": "distribution",
+          "url": "https://proxy.golang.org/modernc.org/cc/v4/@v/v4.30.6-0.20261101114202-1b9d1a076f6b.zip"
+        }
+      ],
+      "properties": [
+        {
+          "name": "modernc:reachedVia",
+          "value": "modernc.org/libc"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:golang/modernc.org/ccgo/v4@v4.38.1",
+      "name": "modernc.org/ccgo/v4",
+      "version": "v4.38.1",
+      "scope": "excluded",
+      "purl": "pkg:golang/modernc.org/ccgo/v4@v4.38.1",
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://pkg.go.dev/modernc.org/ccgo/v4"
+        },
+        {
+          "type": "distribution",
+          "url": "https://proxy.golang.org/modernc.org/ccgo/v4/@v/v4.38.1.zip"
+        }
+      ],
+      "properties": [
+        {
+          "name": "modernc:reachedVia",
+          "value": "modernc.org/libc"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:golang/modernc.org/fileutil@v1.4.0",
+      "name": "modernc.org/fileutil",
+      "version": "v1.4.0",
+      "scope": "optional",
+      "purl": "pkg:golang/modernc.org/fileutil@v1.4.0",
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        },
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://pkg.go.dev/modernc.org/fileutil"
+        },
+        {
+          "type": "distribution",
+          "url": "https://proxy.golang.org/modernc.org/fileutil/@v/v1.4.0.zip"
+        }
+      ],
+      "properties": [
+        {
+          "name": "modernc:reachedVia",
+          "value": "modernc.org/libc, go.mod"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:golang/modernc.org/gc/v2@v2.6.5",
+      "name": "modernc.org/gc/v2",
+      "version": "v2.6.5",
+      "scope": "excluded",
+      "purl": "pkg:golang/modernc.org/gc/v2@v2.6.5",
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://pkg.go.dev/modernc.org/gc/v2"
+        },
+        {
+          "type": "distribution",
+          "url": "https://proxy.golang.org/modernc.org/gc/v2/@v/v2.6.5.zip"
+        }
+      ],
+      "properties": [
+        {
+          "name": "modernc:reachedVia",
+          "value": "modernc.org/libc"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:golang/modernc.org/gc/v3@v3.2.0",
+      "name": "modernc.org/gc/v3",
+      "version": "v3.2.0",
+      "scope": "excluded",
+      "purl": "pkg:golang/modernc.org/gc/v3@v3.2.0",
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://pkg.go.dev/modernc.org/gc/v3"
+        },
+        {
+          "type": "distribution",
+          "url": "https://proxy.golang.org/modernc.org/gc/v3/@v/v3.2.0.zip"
+        }
+      ],
+      "properties": [
+        {
+          "name": "modernc:reachedVia",
+          "value": "modernc.org/libc"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:golang/modernc.org/goabi0@v0.2.0",
+      "name": "modernc.org/goabi0",
+      "version": "v0.2.0",
+      "scope": "excluded",
+      "purl": "pkg:golang/modernc.org/goabi0@v0.2.0",
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://pkg.go.dev/modernc.org/goabi0"
+        },
+        {
+          "type": "distribution",
+          "url": "https://proxy.golang.org/modernc.org/goabi0/@v/v0.2.0.zip"
+        }
+      ],
+      "properties": [
+        {
+          "name": "modernc:reachedVia",
+          "value": "modernc.org/libc"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:golang/modernc.org/libc@v1.80.1",
+      "name": "modernc.org/libc",
+      "version": "v1.80.1",
+      "scope": "required",
+      "purl": "pkg:golang/modernc.org/libc@v1.80.1",
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://pkg.go.dev/modernc.org/libc"
+        },
+        {
+          "type": "distribution",
+          "url": "https://proxy.golang.org/modernc.org/libc/@v/v1.80.1.zip"
+        }
+      ],
+      "properties": [
+        {
+          "name": "modernc:reachedVia",
+          "value": "go.mod"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:golang/modernc.org/mathutil@v1.7.1",
+      "name": "modernc.org/mathutil",
+      "version": "v1.7.1",
+      "scope": "required",
+      "purl": "pkg:golang/modernc.org/mathutil@v1.7.1",
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://pkg.go.dev/modernc.org/mathutil"
+        },
+        {
+          "type": "distribution",
+          "url": "https://proxy.golang.org/modernc.org/mathutil/@v/v1.7.1.zip"
+        }
+      ],
+      "properties": [
+        {
+          "name": "modernc:reachedVia",
+          "value": "modernc.org/fileutil, modernc.org/libc, modernc.org/memory, go.mod"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:golang/modernc.org/memory@v1.12.1",
+      "name": "modernc.org/memory",
+      "version": "v1.12.1",
+      "scope": "required",
+      "purl": "pkg:golang/modernc.org/memory@v1.12.1",
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        },
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        },
+        {
+          "license": {
+            "name": "LicenseRef-L5",
+            "text": {
+              "contentType": "text/plain",
+              "content": "https://commons.wikimedia.org/wiki/File:Memory_infra_logo.png"
+            }
+          }
+        },
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://pkg.go.dev/modernc.org/memory"
+        },
+        {
+          "type": "distribution",
+          "url": "https://proxy.golang.org/modernc.org/memory/@v/v1.12.1.zip"
+        }
+      ],
+      "properties": [
+        {
+          "name": "modernc:reachedVia",
+          "value": "modernc.org/libc, go.mod"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:golang/modernc.org/opt@v0.2.0",
+      "name": "modernc.org/opt",
+      "version": "v0.2.0",
+      "scope": "excluded",
+      "purl": "pkg:golang/modernc.org/opt@v0.2.0",
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://pkg.go.dev/modernc.org/opt"
+        },
+        {
+          "type": "distribution",
+          "url": "https://proxy.golang.org/modernc.org/opt/@v/v0.2.0.zip"
+        }
+      ],
+      "properties": [
+        {
+          "name": "modernc:reachedVia",
+          "value": "modernc.org/libc"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:golang/modernc.org/sortutil@v1.2.1",
+      "name": "modernc.org/sortutil",
+      "version": "v1.2.1",
+      "scope": "excluded",
+      "purl": "pkg:golang/modernc.org/sortutil@v1.2.1",
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://pkg.go.dev/modernc.org/sortutil"
+        },
+        {
+          "type": "distribution",
+          "url": "https://proxy.golang.org/modernc.org/sortutil/@v/v1.2.1.zip"
+        }
+      ],
+      "properties": [
+        {
+          "name": "modernc:reachedVia",
+          "value": "modernc.org/libc"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:golang/modernc.org/strutil@v1.2.1",
+      "name": "modernc.org/strutil",
+      "version": "v1.2.1",
+      "scope": "excluded",
+      "purl": "pkg:golang/modernc.org/strutil@v1.2.1",
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://pkg.go.dev/modernc.org/strutil"
+        },
+        {
+          "type": "distribution",
+          "url": "https://proxy.golang.org/modernc.org/strutil/@v/v1.2.1.zip"
+        }
+      ],
+      "properties": [
+        {
+          "name": "modernc:reachedVia",
+          "value": "modernc.org/libc"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "pkg:golang/modernc.org/token@v1.1.0",
+      "name": "modernc.org/token",
+      "version": "v1.1.0",
+      "scope": "excluded",
+      "purl": "pkg:golang/modernc.org/token@v1.1.0",
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-3-Clause"
+          }
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://pkg.go.dev/modernc.org/token"
+        },
+        {
+          "type": "distribution",
+          "url": "https://proxy.golang.org/modernc.org/token/@v/v1.1.0.zip"
+        }
+      ],
+      "properties": [
+        {
+          "name": "modernc:reachedVia",
+          "value": "modernc.org/libc"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "repo:SQLite-TCL-test-suite",
+      "name": "SQLite TCL test suite",
+      "description": "SQLite's own TCL and C test suite, vendored under testdata/. Present in a clone and in the module zip; compiled into nothing.",
+      "scope": "excluded",
+      "licenses": [
+        {
+          "license": {
+            "name": "LicenseRef-SQLite-PublicDomain",
+            "text": {
+              "contentType": "text/plain",
+              "content": "SQLite Is Public Domain\n\nAll of the code and documentation in SQLite has been dedicated to the public\ndomain by the authors. All code authors, and representatives of the companies\nthey work for, have signed affidavits dedicating their contributions to the\npublic domain and originals of those signed affidavits are stored in a firesafe\nat the main offices of Hwaci. Anyone is free to copy, modify, publish, use,\ncompile, sell, or distribute the original SQLite code, either in source code\nform or as a compiled binary, for any purpose, commercial or non-commercial,\nand by any means.\n\nThe previous paragraph applies to the deliverable code and documentation in\nSQLite - those parts of the SQLite library that you actually bundle and ship\nwith a larger application. Some scripts used as part of the build process (for\nexample the \"configure\" scripts generated by autoconf) might fall under other\nopen-source licenses. Nothing from these build scripts ever reaches the final\ndeliverable SQLite library, however, and so the licenses associated with those\nscripts should not be a factor in assessing your rights to copy and use the\nSQLite library.\n\nAll of the deliverable code in SQLite has been written from scratch. No code\nhas been taken from other projects or from the open internet. Every line of\ncode can be traced back to its original author, and all of those authors have\npublic domain dedications on file. So the SQLite code base is clean and is\nuncontaminated with licensed code from other projects."
+            }
+          }
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://sqlite.org/"
+        }
+      ],
+      "pedigree": {
+        "notes": "Third-party material committed to this repository. It is compiled into nothing; it ships because it is in the tree."
+      },
+      "properties": [
+        {
+          "name": "modernc:reachedVia",
+          "value": "testdata/"
+        }
+      ]
+    },
+    {
+      "type": "library",
+      "bom-ref": "vendored:SQLite-test-demovfs.c",
+      "name": "SQLite `test_demovfs.c`",
+      "version": "--",
+      "description": "Starting point of the Go-fs VFS bridge, linked only when modernc.org/sqlite/vfs is imported. Carries SQLite's own copyright disclaimer.",
+      "scope": "required",
+      "licenses": [
+        {
+          "license": {
+            "name": "LicenseRef-SQLite-PublicDomain",
+            "text": {
+              "contentType": "text/plain",
+              "content": "SQLite Is Public Domain\n\nAll of the code and documentation in SQLite has been dedicated to the public\ndomain by the authors. All code authors, and representatives of the companies\nthey work for, have signed affidavits dedicating their contributions to the\npublic domain and originals of those signed affidavits are stored in a firesafe\nat the main offices of Hwaci. Anyone is free to copy, modify, publish, use,\ncompile, sell, or distribute the original SQLite code, either in source code\nform or as a compiled binary, for any purpose, commercial or non-commercial,\nand by any means.\n\nThe previous paragraph applies to the deliverable code and documentation in\nSQLite - those parts of the SQLite library that you actually bundle and ship\nwith a larger application. Some scripts used as part of the build process (for\nexample the \"configure\" scripts generated by autoconf) might fall under other\nopen-source licenses. Nothing from these build scripts ever reaches the final\ndeliverable SQLite library, however, and so the licenses associated with those\nscripts should not be a factor in assessing your rights to copy and use the\nSQLite library.\n\nAll of the deliverable code in SQLite has been written from scratch. No code\nhas been taken from other projects or from the open internet. Every line of\ncode can be traced back to its original author, and all of those authors have\npublic domain dedications on file. So the SQLite code base is clean and is\nuncontaminated with licensed code from other projects."
+            }
+          }
+        }
+      ],
+      "externalReferences": [
+        {
+          "type": "website",
+          "url": "https://www.sqlite.org/src/doc/trunk/src/test_demovfs.c"
+        }
+      ],
+      "pedigree": {
+        "notes": "C source transpiled to Go by modernc.org/ccgo and committed to this repository. It is not a Go module dependency and appears in no module graph."
+      },
+      "properties": [
+        {
+          "name": "modernc:reachedVia",
+          "value": "vfs/c/vfs.c, transpiled into vfs/"
+        }
+      ]
+    }
+  ],
+  "dependencies": [
+    {
+      "ref": "pkg:golang/modernc.org/sqlite",
+      "dependsOn": [
+        "pkg:generic/sqlite@3.54.1",
+        "pkg:github/asg017/sqlite-vec@v0.1.9",
+        "pkg:golang/github.com/dustin/go-humanize@v1.1.0",
+        "pkg:golang/github.com/google/pprof@v0.0.0-20261016150608-1facf8f91b50",
+        "pkg:golang/github.com/google/uuid@v1.6.0",
+        "pkg:golang/github.com/mattn/go-isatty@v0.0.24",
+        "pkg:golang/github.com/ncruces/go-strftime@v1.1.0",
+        "pkg:golang/github.com/remyoudompheng/bigfft@v0.0.0-20230129092748-24d4a6f8daec",
+        "pkg:golang/golang.org/x/sys@v0.49.0",
+        "pkg:golang/modernc.org/fileutil@v1.4.0",
+        "pkg:golang/modernc.org/libc@v1.80.1",
+        "pkg:golang/modernc.org/mathutil@v1.7.1",
+        "pkg:golang/modernc.org/memory@v1.12.1",
+        "repo:SQLite-TCL-test-suite",
+        "vendored:SQLite-test-demovfs.c"
+      ]
+    },
+    {
+      "ref": "pkg:golang/github.com/chzyer/readline@v1.5.1"
+    },
+    {
+      "ref": "pkg:golang/github.com/dustin/go-humanize@v1.1.0"
+    },
+    {
+      "ref": "pkg:golang/github.com/google/pprof@v0.0.0-20261016150608-1facf8f91b50",
+      "dependsOn": [
+        "pkg:golang/github.com/chzyer/readline@v1.5.1",
+        "pkg:golang/github.com/ianlancetaylor/demangle@v0.0.0-20250417193237-f615e6bd150b",
+        "pkg:golang/golang.org/x/sys@v0.49.0"
+      ]
+    },
+    {
+      "ref": "pkg:golang/github.com/google/uuid@v1.6.0"
+    },
+    {
+      "ref": "pkg:golang/github.com/hashicorp/golang-lru/v2@v2.0.7"
+    },
+    {
+      "ref": "pkg:golang/github.com/ianlancetaylor/demangle@v0.0.0-20250417193237-f615e6bd150b"
+    },
+    {
+      "ref": "pkg:golang/github.com/mattn/go-isatty@v0.0.24",
+      "dependsOn": [
+        "pkg:golang/golang.org/x/sys@v0.49.0"
+      ]
+    },
+    {
+      "ref": "pkg:golang/github.com/ncruces/go-strftime@v1.1.0"
+    },
+    {
+      "ref": "pkg:golang/github.com/remyoudompheng/bigfft@v0.0.0-20230129092748-24d4a6f8daec"
+    },
+    {
+      "ref": "pkg:golang/golang.org/x/mod@v0.42.0"
+    },
+    {
+      "ref": "pkg:golang/golang.org/x/sync@v0.24.0"
+    },
+    {
+      "ref": "pkg:golang/golang.org/x/sys@v0.49.0"
+    },
+    {
+      "ref": "pkg:golang/golang.org/x/tools@v0.52.0"
+    },
+    {
+      "ref": "pkg:golang/modernc.org/cc/v4@v4.30.6-0.20261101114202-1b9d1a076f6b"
+    },
+    {
+      "ref": "pkg:golang/modernc.org/ccgo/v4@v4.38.1"
+    },
+    {
+      "ref": "pkg:golang/modernc.org/fileutil@v1.4.0",
+      "dependsOn": [
+        "pkg:golang/github.com/remyoudompheng/bigfft@v0.0.0-20230129092748-24d4a6f8daec",
+        "pkg:golang/modernc.org/mathutil@v1.7.1"
+      ]
+    },
+    {
+      "ref": "pkg:golang/modernc.org/gc/v2@v2.6.5"
+    },
+    {
+      "ref": "pkg:golang/modernc.org/gc/v3@v3.2.0"
+    },
+    {
+      "ref": "pkg:golang/modernc.org/goabi0@v0.2.0"
+    },
+    {
+      "ref": "pkg:golang/modernc.org/libc@v1.80.1",
+      "dependsOn": [
+        "pkg:golang/github.com/dustin/go-humanize@v1.1.0",
+        "pkg:golang/github.com/google/uuid@v1.6.0",
+        "pkg:golang/github.com/hashicorp/golang-lru/v2@v2.0.7",
+        "pkg:golang/github.com/mattn/go-isatty@v0.0.24",
+        "pkg:golang/github.com/ncruces/go-strftime@v1.1.0",
+        "pkg:golang/github.com/remyoudompheng/bigfft@v0.0.0-20230129092748-24d4a6f8daec",
+        "pkg:golang/golang.org/x/mod@v0.42.0",
+        "pkg:golang/golang.org/x/sync@v0.24.0",
+        "pkg:golang/golang.org/x/sys@v0.49.0",
+        "pkg:golang/golang.org/x/tools@v0.52.0",
+        "pkg:golang/modernc.org/cc/v4@v4.30.6-0.20261101114202-1b9d1a076f6b",
+        "pkg:golang/modernc.org/ccgo/v4@v4.38.1",
+        "pkg:golang/modernc.org/fileutil@v1.4.0",
+        "pkg:golang/modernc.org/gc/v2@v2.6.5",
+        "pkg:golang/modernc.org/gc/v3@v3.2.0",
+        "pkg:golang/modernc.org/goabi0@v0.2.0",
+        "pkg:golang/modernc.org/mathutil@v1.7.1",
+        "pkg:golang/modernc.org/memory@v1.12.1",
+        "pkg:golang/modernc.org/opt@v0.2.0",
+        "pkg:golang/modernc.org/sortutil@v1.2.1",
+        "pkg:golang/modernc.org/strutil@v1.2.1",
+        "pkg:golang/modernc.org/token@v1.1.0"
+      ]
+    },
+    {
+      "ref": "pkg:golang/modernc.org/mathutil@v1.7.1",
+      "dependsOn": [
+        "pkg:golang/github.com/remyoudompheng/bigfft@v0.0.0-20230129092748-24d4a6f8daec"
+      ]
+    },
+    {
+      "ref": "pkg:golang/modernc.org/memory@v1.12.1",
+      "dependsOn": [
+        "pkg:golang/github.com/remyoudompheng/bigfft@v0.0.0-20230129092748-24d4a6f8daec",
+        "pkg:golang/golang.org/x/sys@v0.49.0",
+        "pkg:golang/modernc.org/mathutil@v1.7.1"
+      ]
+    },
+    {
+      "ref": "pkg:golang/modernc.org/opt@v0.2.0"
+    },
+    {
+      "ref": "pkg:golang/modernc.org/sortutil@v1.2.1"
+    },
+    {
+      "ref": "pkg:golang/modernc.org/strutil@v1.2.1"
+    },
+    {
+      "ref": "pkg:golang/modernc.org/token@v1.1.0"
+    }
+  ]
+}

@@ -10,13 +10,19 @@ import (
 	"modernc.org/libc"
 )
 
+const RSIZE_MAX = 9223372036854775807
+
 type Tvm_offset_t = uint64
 
 type Tvm_size_t = uint64
 
+const __INTMAX_C_SUFFIX__ = "L"
+
 const __INTMAX_FMTd__ = "ld"
 
 const __INTMAX_FMTi__ = "li"
+
+const __UINTMAX_C_SUFFIX__ = "UL"
 
 const __UINTMAX_FMTX__ = "lX"
 
@@ -26,6 +32,8 @@ const __UINTMAX_FMTu__ = "lu"
 
 const __UINTMAX_FMTx__ = "lx"
 
+const __WORDSIZE = 64
+
 // C documentation
 //
 //	/*
@@ -33,7 +41,7 @@ const __UINTMAX_FMTx__ = "lx"
 //	** responsibility of the caller to eventually release the structure
 //	** by passing the pointer returned by this function to freeIndexInfo().
 //	*/
-func _allocateIndexInfo(tls *libc.TLS, pWInfo uintptr, pWC uintptr, mUnusable TBitmask, pSrc uintptr, pmNoOmit uintptr) (r uintptr) {
+func _allocateIndexInfo(tls *libc.TLS, pWInfo uintptr, pWC uintptr, mUnusable TBitmask, pSrc uintptr, pmNoOmit unsafe.Pointer) (r uintptr) {
 	var bSortByGroup, eDistinct, i, iCol, j, n, nLast, nOrderBy, nTerm, v10 int32
 	var mNoOmit, op Tu16
 	var p, pE2, pExpr, pExpr1, pHidden, pIdxCons, pIdxInfo, pIdxOrderBy, pOrderBy, pParse, pPk, pTab, pTerm, pUsage, zColl, v3 uintptr
@@ -163,7 +171,7 @@ func _allocateIndexInfo(tls *libc.TLS, pWInfo uintptr, pWC uintptr, mUnusable TB
 	 */
 	pIdxInfo = _sqlite3DbMallocZero(tls, (*TParse)(unsafe.Pointer(pParse)).Fdb, uint64(uint64(96)+(libc.Uint64FromInt64(12)+libc.Uint64FromInt64(8))*libc.Uint64FromInt32(nTerm)+uint64(8)*libc.Uint64FromInt32(nOrderBy)+(uint64(libc.UintptrFromInt32(0)+32)+libc.Uint64FromInt32(nTerm)*uint64(8))))
 	if pIdxInfo == uintptr(0) {
-		_sqlite3ErrorMsg(tls, pParse, __ccgo_ts+1672, 0)
+		_sqlite3ErrorMsg(tls, unsafe.Pointer(pParse), __ccgo_ts+1700, 0)
 		return uintptr(0)
 	}
 	pHidden = pIdxInfo + 1*96
@@ -183,11 +191,11 @@ func _allocateIndexInfo(tls *libc.TLS, pWInfo uintptr, pWC uintptr, mUnusable TB
 			if !(i < libc.Int32FromUint16((*TIndex)(unsafe.Pointer(pPk)).FnKeyCol)) {
 				break
 			}
-			iCol = int32(**(**Ti16)(__ccgo_up((*TIndex)(unsafe.Pointer(pPk)).FaiColumn + uintptr(i)*2)))
+			iCol = int32(*(*Ti16)(__ccgo_ptr((*TIndex)(unsafe.Pointer(pPk)).FaiColumn + uintptr(i)*2)))
 			if iCol >= libc.Int32FromUint64(libc.Uint64FromInt64(8)*libc.Uint64FromInt32(8))-libc.Int32FromInt32(1) {
 				iCol = libc.Int32FromUint64(libc.Uint64FromInt64(8)*libc.Uint64FromInt32(8)) - libc.Int32FromInt32(1)
 			}
-			**(**Tsqlite3_uint64)(__ccgo_up(pIdxInfo + 88)) |= libc.Uint64FromInt32(1) << iCol
+			*(*Tsqlite3_uint64)(__ccgo_ptr(pIdxInfo + 88)) |= libc.Uint64FromInt32(1) << iCol
 			goto _8
 		_8:
 			;
@@ -215,11 +223,11 @@ func _allocateIndexInfo(tls *libc.TLS, pWInfo uintptr, pWC uintptr, mUnusable TB
 			if libc.Int32FromUint16((*TWhereTerm)(unsafe.Pointer(pTerm)).FwtFlags)&int32(TERM_OK) == 0 {
 				goto _11
 			}
-			(**(**Tsqlite3_index_constraint)(__ccgo_up(pIdxCons + uintptr(j)*12))).FiColumn = (*(*struct {
+			(*(*Tsqlite3_index_constraint)(__ccgo_ptr(pIdxCons + uintptr(j)*12))).FiColumn = (*(*struct {
 				FleftColumn int32
 				FiField     int32
 			})(unsafe.Pointer(pTerm + 32))).FleftColumn
-			(**(**Tsqlite3_index_constraint)(__ccgo_up(pIdxCons + uintptr(j)*12))).FiTermOffset = i
+			(*(*Tsqlite3_index_constraint)(__ccgo_ptr(pIdxCons + uintptr(j)*12))).FiTermOffset = i
 			op = libc.Uint16FromInt32(libc.Int32FromUint16((*TWhereTerm)(unsafe.Pointer(pTerm)).FeOperator) & int32(WO_ALL))
 			if libc.Int32FromUint16(op) == int32(WO_IN) {
 				if libc.Int32FromUint16((*TWhereTerm)(unsafe.Pointer(pTerm)).FwtFlags)&int32(TERM_SLICE) == 0 {
@@ -228,21 +236,21 @@ func _allocateIndexInfo(tls *libc.TLS, pWInfo uintptr, pWC uintptr, mUnusable TB
 					} else {
 						v12 = uint32(0)
 					}
-					**(**Tu32)(__ccgo_up(pHidden + 20)) |= v12
+					*(*Tu32)(__ccgo_ptr(pHidden + 20)) |= v12
 				}
 				op = uint16(WO_EQ)
 			}
 			if libc.Int32FromUint16(op) == int32(WO_AUX) {
-				(**(**Tsqlite3_index_constraint)(__ccgo_up(pIdxCons + uintptr(j)*12))).Fop = (*TWhereTerm)(unsafe.Pointer(pTerm)).FeMatchOp
+				(*(*Tsqlite3_index_constraint)(__ccgo_ptr(pIdxCons + uintptr(j)*12))).Fop = (*TWhereTerm)(unsafe.Pointer(pTerm)).FeMatchOp
 			} else {
 				if libc.Int32FromUint16(op)&(libc.Int32FromInt32(WO_ISNULL)|libc.Int32FromInt32(WO_IS)) != 0 {
 					if libc.Int32FromUint16(op) == int32(WO_ISNULL) {
-						(**(**Tsqlite3_index_constraint)(__ccgo_up(pIdxCons + uintptr(j)*12))).Fop = uint8(SQLITE_INDEX_CONSTRAINT_ISNULL)
+						(*(*Tsqlite3_index_constraint)(__ccgo_ptr(pIdxCons + uintptr(j)*12))).Fop = uint8(SQLITE_INDEX_CONSTRAINT_ISNULL)
 					} else {
-						(**(**Tsqlite3_index_constraint)(__ccgo_up(pIdxCons + uintptr(j)*12))).Fop = uint8(SQLITE_INDEX_CONSTRAINT_IS)
+						(*(*Tsqlite3_index_constraint)(__ccgo_ptr(pIdxCons + uintptr(j)*12))).Fop = uint8(SQLITE_INDEX_CONSTRAINT_IS)
 					}
 				} else {
-					(**(**Tsqlite3_index_constraint)(__ccgo_up(pIdxCons + uintptr(j)*12))).Fop = uint8(op)
+					(*(*Tsqlite3_index_constraint)(__ccgo_ptr(pIdxCons + uintptr(j)*12))).Fop = uint8(op)
 					/* The direct assignment in the previous line is possible only because
 					 ** the WO_ and SQLITE_INDEX_CONSTRAINT_ codes are identical.  The
 					 ** following asserts verify this fact. */
@@ -251,10 +259,10 @@ func _allocateIndexInfo(tls *libc.TLS, pWInfo uintptr, pWC uintptr, mUnusable TB
 							mNoOmit = libc.Uint16FromInt32(int32(mNoOmit) | libc.Int32FromInt32(1)<<j)
 						}
 						if libc.Int32FromUint16(op) == libc.Int32FromInt32(WO_EQ)<<(libc.Int32FromInt32(TK_LT)-libc.Int32FromInt32(TK_EQ)) {
-							(**(**Tsqlite3_index_constraint)(__ccgo_up(pIdxCons + uintptr(j)*12))).Fop = libc.Uint8FromInt32(libc.Int32FromInt32(WO_EQ) << (libc.Int32FromInt32(TK_LE) - libc.Int32FromInt32(TK_EQ)))
+							(*(*Tsqlite3_index_constraint)(__ccgo_ptr(pIdxCons + uintptr(j)*12))).Fop = libc.Uint8FromInt32(libc.Int32FromInt32(WO_EQ) << (libc.Int32FromInt32(TK_LE) - libc.Int32FromInt32(TK_EQ)))
 						}
 						if libc.Int32FromUint16(op) == libc.Int32FromInt32(WO_EQ)<<(libc.Int32FromInt32(TK_GT)-libc.Int32FromInt32(TK_EQ)) {
-							(**(**Tsqlite3_index_constraint)(__ccgo_up(pIdxCons + uintptr(j)*12))).Fop = libc.Uint8FromInt32(libc.Int32FromInt32(WO_EQ) << (libc.Int32FromInt32(TK_GE) - libc.Int32FromInt32(TK_EQ)))
+							(*(*Tsqlite3_index_constraint)(__ccgo_ptr(pIdxCons + uintptr(j)*12))).Fop = libc.Uint8FromInt32(libc.Int32FromInt32(WO_EQ) << (libc.Int32FromInt32(TK_GE) - libc.Int32FromInt32(TK_EQ)))
 						}
 					}
 				}
@@ -283,8 +291,8 @@ func _allocateIndexInfo(tls *libc.TLS, pWInfo uintptr, pWC uintptr, mUnusable TB
 		if _sqlite3ExprIsConstant(tls, uintptr(0), pExpr1) != 0 {
 			goto _13
 		}
-		(**(**Tsqlite3_index_orderby)(__ccgo_up(pIdxOrderBy + uintptr(j)*8))).FiColumn = int32((*TExpr)(unsafe.Pointer(pExpr1)).FiColumn)
-		(**(**Tsqlite3_index_orderby)(__ccgo_up(pIdxOrderBy + uintptr(j)*8))).Fdesc = libc.Uint8FromInt32(libc.Int32FromUint8((*(*TExprList_item)(unsafe.Pointer(pOrderBy + 8 + uintptr(i)*32))).Ffg.FsortFlags) & int32(KEYINFO_ORDER_DESC))
+		(*(*Tsqlite3_index_orderby)(__ccgo_ptr(pIdxOrderBy + uintptr(j)*8))).FiColumn = int32((*TExpr)(unsafe.Pointer(pExpr1)).FiColumn)
+		(*(*Tsqlite3_index_orderby)(__ccgo_ptr(pIdxOrderBy + uintptr(j)*8))).Fdesc = libc.Uint8FromInt32(libc.Int32FromUint8((*(*TExprList_item)(unsafe.Pointer(pOrderBy + 8 + uintptr(i)*32))).Ffg.FsortFlags) & int32(KEYINFO_ORDER_DESC))
 		j = j + 1
 		goto _13
 	_13:
@@ -292,7 +300,7 @@ func _allocateIndexInfo(tls *libc.TLS, pWInfo uintptr, pWC uintptr, mUnusable TB
 		i = i + 1
 	}
 	(*Tsqlite3_index_info)(unsafe.Pointer(pIdxInfo)).FnOrderBy = j
-	**(**Tu16)(__ccgo_up(pmNoOmit)) = mNoOmit
+	*(*Tu16)(pmNoOmit) = mNoOmit
 	return pIdxInfo
 }
 
@@ -313,10 +321,10 @@ func _sqlite3MemMalloc(tls *libc.TLS, nByte int32) (r uintptr) {
 	_ = p
 	p = libc.Xmalloc(tls, libc.Uint64FromInt32(nByte+int32(8)))
 	if p != 0 {
-		**(**Tsqlite3_int64)(__ccgo_up(p)) = int64(nByte)
+		*(*Tsqlite3_int64)(__ccgo_ptr(p)) = int64(nByte)
 		p += 8
 	} else {
-		Xsqlite3_log(tls, int32(SQLITE_NOMEM), __ccgo_ts+1598, libc.VaList(bp+8, nByte))
+		Xsqlite3_log(tls, int32(SQLITE_NOMEM), __ccgo_ts+1626, libc.VaList(bp+8, nByte))
 	}
 	return p
 }
@@ -343,10 +351,10 @@ func _sqlite3MemRealloc(tls *libc.TLS, pPrior uintptr, nByte int32) (r uintptr) 
 	p -= 8
 	p = libc.Xrealloc(tls, p, libc.Uint64FromInt32(nByte+libc.Int32FromInt32(8)))
 	if p != 0 {
-		**(**Tsqlite3_int64)(__ccgo_up(p)) = int64(nByte)
+		*(*Tsqlite3_int64)(__ccgo_ptr(p)) = int64(nByte)
 		p += 8
 	} else {
-		Xsqlite3_log(tls, int32(SQLITE_NOMEM), __ccgo_ts+1636, libc.VaList(bp+8, _sqlite3MemSize(tls, pPrior), nByte))
+		Xsqlite3_log(tls, int32(SQLITE_NOMEM), __ccgo_ts+1664, libc.VaList(bp+8, _sqlite3MemSize(tls, pPrior), nByte))
 	}
 	return p
 }
@@ -372,12 +380,12 @@ func _sqlite3OomFault(tls *libc.TLS, db uintptr) (r uintptr) {
 	if libc.Int32FromUint8((*Tsqlite3)(unsafe.Pointer(db)).FmallocFailed) == 0 && libc.Int32FromUint8((*Tsqlite3)(unsafe.Pointer(db)).FbBenignMalloc) == 0 {
 		(*Tsqlite3)(unsafe.Pointer(db)).FmallocFailed = uint8(1)
 		if (*Tsqlite3)(unsafe.Pointer(db)).FnVdbeExec > 0 {
-			libc.AtomicStoreNInt32(db+432, libc.Int32FromInt32(1), libc.Int32FromInt32(__ATOMIC_RELAXED))
+			libc.AtomicStoreNInt32(db+440, libc.Int32FromInt32(1), libc.Int32FromInt32(__ATOMIC_RELAXED))
 		}
 		(*Tsqlite3)(unsafe.Pointer(db)).Flookaside.FbDisable = (*Tsqlite3)(unsafe.Pointer(db)).Flookaside.FbDisable + 1
 		(*Tsqlite3)(unsafe.Pointer(db)).Flookaside.Fsz = uint16(0)
 		if (*Tsqlite3)(unsafe.Pointer(db)).FpParse != 0 {
-			_sqlite3ErrorMsg(tls, (*Tsqlite3)(unsafe.Pointer(db)).FpParse, __ccgo_ts+1672, 0)
+			_sqlite3ErrorMsg(tls, unsafe.Pointer((*Tsqlite3)(unsafe.Pointer(db)).FpParse), __ccgo_ts+1700, 0)
 			(*TParse)(unsafe.Pointer((*Tsqlite3)(unsafe.Pointer(db)).FpParse)).Frc = int32(SQLITE_NOMEM)
 			pParse = (*TParse)(unsafe.Pointer((*Tsqlite3)(unsafe.Pointer(db)).FpParse)).FpOuterParse
 			for {
@@ -409,7 +417,7 @@ func _sqlite3VdbeMemSetPointer(tls *libc.TLS, pMem uintptr, pPtr uintptr, zPType
 	if zPType != 0 {
 		v1 = zPType
 	} else {
-		v1 = __ccgo_ts + 1702
+		v1 = __ccgo_ts + 1730
 	}
 	*(*uintptr)(unsafe.Pointer(pMem)) = v1
 	(*TMem)(unsafe.Pointer(pMem)).Fz = pPtr
@@ -448,26 +456,23 @@ func _sqlite3VdbeMemSetPointer(tls *libc.TLS, pMem uintptr, pPtr uintptr, zPType
 //	**     unhex('A BCD', ' ') IS NULL
 //	*/
 func _unhexFunc(tls *libc.TLS, pCtx uintptr, argc int32, argv uintptr) {
-	bp := tls.Alloc(16)
-	defer tls.Free(16)
 	var c, d, v2 Tu8
 	var ch Tu32
 	var nHex, nPass int32
-	var p, pBlob, zPass, v1 uintptr
+	var p, pBlob, zHex, zPass, v1 uintptr
 	var v3 uint32
-	var _ /* zHex at bp+0 */ uintptr
-	_, _, _, _, _, _, _, _, _, _, _ = c, ch, d, nHex, nPass, p, pBlob, zPass, v1, v2, v3
-	zPass = __ccgo_ts + 1702
+	_, _, _, _, _, _, _, _, _, _, _, _ = c, ch, d, nHex, nPass, p, pBlob, zHex, zPass, v1, v2, v3
+	zPass = __ccgo_ts + 1730
 	nPass = 0
-	**(**uintptr)(__ccgo_up(bp)) = Xsqlite3_value_text(tls, **(**uintptr)(__ccgo_up(argv)))
-	nHex = Xsqlite3_value_bytes(tls, **(**uintptr)(__ccgo_up(argv)))
+	zHex = Xsqlite3_value_text(tls, *(*uintptr)(__ccgo_ptr(argv)))
+	nHex = Xsqlite3_value_bytes(tls, *(*uintptr)(__ccgo_ptr(argv)))
 	pBlob = uintptr(0)
 	p = uintptr(0)
 	if argc == int32(2) {
-		zPass = Xsqlite3_value_text(tls, **(**uintptr)(__ccgo_up(argv + 1*8)))
-		nPass = Xsqlite3_value_bytes(tls, **(**uintptr)(__ccgo_up(argv + 1*8)))
+		zPass = Xsqlite3_value_text(tls, *(*uintptr)(__ccgo_ptr(argv + 1*8)))
+		nPass = Xsqlite3_value_bytes(tls, *(*uintptr)(__ccgo_ptr(argv + 1*8)))
 	}
-	if !(**(**uintptr)(__ccgo_up(bp)) != 0) || !(zPass != 0) {
+	if !(zHex != 0) || !(zPass != 0) {
 		return
 	}
 	v1 = _contextMalloc(tls, pCtx, int64(nHex/int32(2)+int32(1)))
@@ -475,38 +480,38 @@ func _unhexFunc(tls *libc.TLS, pCtx uintptr, argc int32, argv uintptr) {
 	p = v1
 	if pBlob != 0 { /* Least significant digit of next byte */
 		for {
-			v2 = **(**Tu8)(__ccgo_up(**(**uintptr)(__ccgo_up(bp))))
+			v2 = *(*Tu8)(__ccgo_ptr(zHex))
 			c = v2
 			if !(libc.Int32FromUint8(v2) != 0x00) {
 				break
 			}
 			for !(libc.Int32FromUint8(_sqlite3CtypeMap[c])&libc.Int32FromInt32(0x08) != 0) {
-				if libc.Int32FromUint8(**(**Tu8)(__ccgo_up(**(**uintptr)(__ccgo_up(bp))))) < int32(0x80) {
-					v1 = **(**uintptr)(__ccgo_up(bp))
-					**(**uintptr)(__ccgo_up(bp)) = **(**uintptr)(__ccgo_up(bp)) + 1
-					v3 = uint32(**(**Tu8)(__ccgo_up(v1)))
+				if libc.Int32FromUint8(*(*Tu8)(__ccgo_ptr(zHex))) < int32(0x80) {
+					v1 = zHex
+					zHex = zHex + 1
+					v3 = uint32(*(*Tu8)(__ccgo_ptr(v1)))
 				} else {
-					v3 = _sqlite3Utf8Read(tls, bp)
+					v3 = _sqlite3Utf8Read(tls, unsafe.Pointer(&zHex))
 				}
 				ch = v3
 				if !(_strContainsChar(tls, zPass, nPass, ch) != 0) {
 					goto unhex_null
 				}
-				c = **(**Tu8)(__ccgo_up(**(**uintptr)(__ccgo_up(bp))))
+				c = *(*Tu8)(__ccgo_ptr(zHex))
 				if libc.Int32FromUint8(c) == 0x00 {
 					goto unhex_done
 				}
 			}
-			**(**uintptr)(__ccgo_up(bp)) = **(**uintptr)(__ccgo_up(bp)) + 1
-			v1 = **(**uintptr)(__ccgo_up(bp))
-			**(**uintptr)(__ccgo_up(bp)) = **(**uintptr)(__ccgo_up(bp)) + 1
-			d = **(**Tu8)(__ccgo_up(v1))
+			zHex = zHex + 1
+			v1 = zHex
+			zHex = zHex + 1
+			d = *(*Tu8)(__ccgo_ptr(v1))
 			if !(libc.Int32FromUint8(_sqlite3CtypeMap[d])&libc.Int32FromInt32(0x08) != 0) {
 				goto unhex_null
 			}
 			v1 = p
 			p = p + 1
-			**(**Tu8)(__ccgo_up(v1)) = libc.Uint8FromInt32(libc.Int32FromUint8(_sqlite3HexToInt(tls, libc.Int32FromUint8(c)))<<int32(4) | libc.Int32FromUint8(_sqlite3HexToInt(tls, libc.Int32FromUint8(d))))
+			*(*Tu8)(__ccgo_ptr(v1)) = libc.Uint8FromInt32(libc.Int32FromUint8(_sqlite3HexToInt(tls, libc.Int32FromUint8(c)))<<int32(4) | libc.Int32FromUint8(_sqlite3HexToInt(tls, libc.Int32FromUint8(d))))
 		}
 	}
 	goto unhex_done
@@ -539,37 +544,38 @@ unhex_null:
 //	** methods.
 //	*/
 func _unixRemapfile(tls *libc.TLS, pFd uintptr, nNew Ti64) {
-	var flags, h, szSyspage int32
-	var nOrig, nReuse Ti64
-	var pNew, pOrig, pReq, zErr uintptr
+	var flags, h int32
+	var nReuse Ti64
+	var pNew, pOrig, zErr uintptr
 	var v1 Tsqlite3_int64
-	_, _, _, _, _, _, _, _, _, _ = flags, h, nOrig, nReuse, pNew, pOrig, pReq, szSyspage, zErr, v1
-	zErr = __ccgo_ts + 3698
-	h = (*TunixFile)(unsafe.Pointer(pFd)).Fh                  /* File descriptor open on db file */
-	pOrig = (*TunixFile)(unsafe.Pointer(pFd)).FpMapRegion     /* Pointer to current file mapping */
-	nOrig = (*TunixFile)(unsafe.Pointer(pFd)).FmmapSizeActual /* Size of pOrig region in bytes */
-	pNew = uintptr(0)                                         /* Location of new mapping */
-	flags = int32(PROT_READ)                                  /* Flags to pass to mmap() */
+	_, _, _, _, _, _, _ = flags, h, nReuse, pNew, pOrig, zErr, v1
+	zErr = __ccgo_ts + 3712
+	h = (*TunixFile)(unsafe.Pointer(pFd)).Fh              /* File descriptor open on db file */
+	pOrig = (*TunixFile)(unsafe.Pointer(pFd)).FpMapRegion /* Pointer to current file mapping */
+	pNew = uintptr(0)                                     /* Location of new mapping */
+	flags = int32(PROT_READ)                              /* Flags to pass to mmap() */
 	if pOrig != 0 {
-		szSyspage = (*(*func(*libc.TLS) int32)(unsafe.Pointer(&struct{ uintptr }{_aSyscall[int32(25)].FpCurrent})))(tls)
-		nReuse = (*TunixFile)(unsafe.Pointer(pFd)).FmmapSize & int64(^(szSyspage - libc.Int32FromInt32(1)))
-		pReq = pOrig + uintptr(nReuse)
-		/* Unmap any pages of the existing mapping that cannot be reused. */
-		if nReuse != nOrig {
-			(*(*func(*libc.TLS, uintptr, Tsize_t) int32)(unsafe.Pointer(&struct{ uintptr }{_aSyscall[int32(23)].FpCurrent})))(tls, pReq, libc.Uint64FromInt64(nOrig-nReuse))
+		nReuse = (*TunixFile)(unsafe.Pointer(pFd)).FmmapSize & int64(^((*(*func(*libc.TLS) int32)(unsafe.Pointer(&struct{ uintptr }{_aSyscall[int32(25)].FpCurrent})))(tls) - libc.Int32FromInt32(1)))
+		/* Unmap any part of the current mapping that will not be reused */
+		if nReuse < (*TunixFile)(unsafe.Pointer(pFd)).FmmapSizeActual {
+			(*(*func(*libc.TLS, uintptr, Tsize_t) int32)(unsafe.Pointer(&struct{ uintptr }{_aSyscall[int32(23)].FpCurrent})))(tls, pOrig+uintptr(nReuse), libc.Uint64FromInt64((*TunixFile)(unsafe.Pointer(pFd)).FmmapSizeActual-nReuse))
 		}
-		pNew = (*(*func(*libc.TLS, uintptr, Tsize_t, int32, int32, int32, Toff_t) uintptr)(unsafe.Pointer(&struct{ uintptr }{_aSyscall[int32(22)].FpCurrent})))(tls, pReq, libc.Uint64FromInt64(nNew-nReuse), flags, int32(MAP_SHARED), h, nReuse)
-		if pNew != uintptr(-libc.Int32FromInt32(1)) {
-			if pNew != pReq {
-				(*(*func(*libc.TLS, uintptr, Tsize_t) int32)(unsafe.Pointer(&struct{ uintptr }{_aSyscall[int32(23)].FpCurrent})))(tls, pNew, libc.Uint64FromInt64(nNew-nReuse))
-				pNew = uintptr(0)
-			} else {
-				pNew = pOrig
+		/* If nReuse is now zero, then the entire mapping was unmapped by the
+		 ** call above. In this case do not attempt to extend pOrig. */
+		if nReuse > 0 {
+			pNew = (*(*func(*libc.TLS, uintptr, Tsize_t, int32, int32, int32, Toff_t) uintptr)(unsafe.Pointer(&struct{ uintptr }{_aSyscall[int32(22)].FpCurrent})))(tls, pOrig+uintptr(nReuse), libc.Uint64FromInt64(nNew-nReuse), flags, int32(MAP_SHARED), h, nReuse)
+			if pNew != uintptr(-libc.Int32FromInt32(1)) {
+				if pNew != pOrig+uintptr(nReuse) {
+					(*(*func(*libc.TLS, uintptr, Tsize_t) int32)(unsafe.Pointer(&struct{ uintptr }{_aSyscall[int32(23)].FpCurrent})))(tls, pNew, libc.Uint64FromInt64(nNew-nReuse))
+					pNew = uintptr(0)
+				} else {
+					pNew = pOrig
+				}
 			}
-		}
-		/* The attempt to extend the existing mapping failed. Free it. */
-		if pNew == uintptr(-libc.Int32FromInt32(1)) || pNew == uintptr(0) {
-			(*(*func(*libc.TLS, uintptr, Tsize_t) int32)(unsafe.Pointer(&struct{ uintptr }{_aSyscall[int32(23)].FpCurrent})))(tls, pOrig, libc.Uint64FromInt64(nReuse))
+			/* The attempt to extend the existing mapping failed. Free it. */
+			if pNew == uintptr(-libc.Int32FromInt32(1)) || pNew == uintptr(0) {
+				(*(*func(*libc.TLS, uintptr, Tsize_t) int32)(unsafe.Pointer(&struct{ uintptr }{_aSyscall[int32(23)].FpCurrent})))(tls, pOrig, libc.Uint64FromInt64(nReuse))
+			}
 		}
 	}
 	/* If pNew is still NULL, try to create an entirely new mapping. */
@@ -579,7 +585,7 @@ func _unixRemapfile(tls *libc.TLS, pFd uintptr, nNew Ti64) {
 	if pNew == uintptr(-libc.Int32FromInt32(1)) {
 		pNew = uintptr(0)
 		nNew = 0
-		_unixLogErrorAtLine(tls, SQLITE_OK, zErr, (*TunixFile)(unsafe.Pointer(pFd)).FzPath, int32(45992))
+		_unixLogErrorAtLine(tls, SQLITE_OK, zErr, (*TunixFile)(unsafe.Pointer(pFd)).FzPath, int32(46450))
 		/* If the mmap() above failed, assume that all subsequent mmap() calls
 		 ** will probably fail too. Fall back to using xRead/xWrite exclusively
 		 ** in this case.  */
@@ -616,21 +622,21 @@ func _unixRemapfile(tls *libc.TLS, pFd uintptr, nNew Ti64) {
 //	** a numeric type (real or integer), then the result of the addition
 //	** or subtraction is a a copy of csr1.peerVal.
 //	*/
-func _windowCodeRangeTest(tls *libc.TLS, p uintptr, op int32, csr1 int32, regVal int32, csr2 int32, lbl int32) {
+func _windowCodeRangeTest(tls *libc.TLS, p unsafe.Pointer, op int32, csr1 int32, regVal int32, csr2 int32, lbl int32) {
 	var addr, addrDone, addrGe, arith, reg1, reg2, regString, v1 int32
 	var pColl, pOrderBy, pParse, v, v2 uintptr
 	_, _, _, _, _, _, _, _, _, _, _, _, _ = addr, addrDone, addrGe, arith, pColl, pOrderBy, pParse, reg1, reg2, regString, v, v1, v2
-	pParse = (*TWindowCodeArg)(unsafe.Pointer(p)).FpParse
+	pParse = *(*uintptr)(p)
 	v = _sqlite3GetVdbe(tls, pParse)
-	pOrderBy = (*TWindow)(unsafe.Pointer((*TWindowCodeArg)(unsafe.Pointer(p)).FpMWin)).FpOrderBy /* ORDER BY clause for window */
-	reg1 = _sqlite3GetTempReg(tls, pParse)                                                       /* Reg. for csr1.peerVal+regVal */
+	pOrderBy = (*TWindow)(unsafe.Pointer(*(*uintptr)(unsafe.Add(p, 8)))).FpOrderBy /* ORDER BY clause for window */
+	reg1 = _sqlite3GetTempReg(tls, pParse)                                         /* Reg. for csr1.peerVal+regVal */
 	reg2 = _sqlite3GetTempReg(tls, pParse)
 	v2 = pParse + 60
 	*(*int32)(unsafe.Pointer(v2)) = *(*int32)(unsafe.Pointer(v2)) + 1
 	v1 = *(*int32)(unsafe.Pointer(v2)) /* Reg. for csr2.peerVal */
 	regString = v1                     /* Reg. for constant value '' */
 	arith = int32(OP_Add)              /* Jump destination */
-	addrDone = _sqlite3VdbeMakeLabel(tls, pParse)
+	addrDone = _sqlite3VdbeMakeLabel(tls, unsafe.Pointer(pParse))
 	/* Read the peer-value from each cursor into a register */
 	_windowReadPeerValues(tls, p, csr1, reg1)
 	_windowReadPeerValues(tls, p, csr2, reg2)
@@ -701,7 +707,7 @@ func _windowCodeRangeTest(tls *libc.TLS, p uintptr, op int32, csr1 int32, regVal
 	 ** the add/subtract is skipped for these, as required. If reg1 is a NULL,
 	 ** then the arithmetic is performed, but since adding or subtracting from
 	 ** NULL is always NULL anyway, this case is handled as required too.  */
-	_sqlite3VdbeAddOp4(tls, v, int32(OP_String8), 0, regString, 0, __ccgo_ts+1702, -int32(1))
+	_sqlite3VdbeAddOp4(tls, v, int32(OP_String8), 0, regString, 0, __ccgo_ts+1730, -int32(1))
 	addrGe = _sqlite3VdbeAddOp3(tls, v, int32(OP_Ge), regString, 0, reg1)
 	if op == int32(OP_Ge) && arith == int32(OP_Add) || op == int32(OP_Le) && arith == int32(OP_Subtract) {
 		_sqlite3VdbeAddOp3(tls, v, op, reg2, lbl, reg1)

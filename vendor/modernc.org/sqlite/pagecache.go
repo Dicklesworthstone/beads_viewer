@@ -61,16 +61,30 @@ const (
 // only call Unpin with discard=true and the cache is permitted to free
 // every page on Unpin. When true, the cache may retain unpinned pages
 // for re-use.
+//
+// Create may be called concurrently: connections are opened from
+// whichever goroutines open them, and each open database calls Create
+// from its own. Any state a PageCache shares between the Caches it
+// creates must be safe for concurrent use.
 type PageCache interface {
 	Create(pageSize, extraSize int, purgeable bool) (Cache, error)
 }
 
 // Cache is one database's worth of cached pages. All callbacks for a
-// single Cache are serialised by the SQLite engine: this driver opens
-// every connection SQLITE_OPEN_FULLMUTEX without shared-cache mode,
-// and database/sql never invokes one driver.Conn from two goroutines,
-// so an implementation does not need to synchronise per-Cache state
-// against concurrent calls.
+// single Cache are serialised by the SQLite engine, so an
+// implementation never sees two of them at once. They do not always
+// come from one goroutine, though. With shared cache -- cache=shared in
+// a "file:" DSN -- every connection sharing the cache calls the same
+// Cache from its own goroutine, and SQLite serialises them with a mutex
+// of its own that the Go race detector cannot see. An implementation
+// that should run clean under -race therefore guards its state with a
+// sync.Mutex even though it is never contended; the reference
+// implementation in modernc.org/sqlite/pcache does.
+//
+// A Cache must never return nil, or a different Page, from Fetch for a
+// key SQLite still holds pinned -- from the Fetch that returned the
+// Page until its Unpin. The binding detects that and panics: the
+// alternative would be SQLite reading and writing freed memory.
 //
 // Implementations should NOT call RegisterPageCache directly or
 // transitively. Callbacks run under the openGate read lock that the
@@ -249,6 +263,13 @@ type pcacheMethods2 = sqlite3.Tsqlite3_pcache_methods2
 //     returns the same error. Mutating the module fields after the
 //     first successful Register is silently ignored because SQLite has
 //     already copied the C methods table.
+//
+// A program that imports modernc.org/sqlite/vec cannot register a page
+// cache. That package's init installs sqlite-vec with
+// sqlite3_auto_extension, which initializes SQLite, and SQLite accepts
+// SQLITE_CONFIG_PCACHE2 only before it is initialized. Go runs vec's
+// init before the init of any package importing it, so RegisterPageCache
+// fails with SQLITE_MISUSE (21) however early the program calls it.
 func RegisterPageCache(m PageCache) error {
 	if m == nil {
 		return errors.New("sqlite: RegisterPageCache(nil)")

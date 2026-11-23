@@ -1,1 +1,6 @@
 .claude/
+/.vendor-preflight.json
+/vendor
+/attest
+/provenance.json
+/provenance.json.sigstore.json

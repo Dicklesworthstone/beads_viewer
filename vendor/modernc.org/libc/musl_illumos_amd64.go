@@ -586,15 +586,6 @@ type lldiv_t = struct {
 	rem  int64
 } /* stdlib.h:64:41 */
 
-func Xclosedir(tls *TLS, dir uintptr) int32 { /* closedir.c:6:5: */
-	if __ccgo_strace {
-		trc("tls=%v dir=%v, (%v:)", tls, dir, origin(2))
-	}
-	var ret int32 = Xclose(tls, (*DIR)(unsafe.Pointer(dir)).fd)
-	Xfree(tls, dir)
-	return ret
-}
-
 type mode_t = uint32 /* alltypes.h:152:18 */
 
 type iovec = struct {
@@ -625,55 +616,12 @@ type f_owner_ex = struct {
 
 type syscall_arg_t = int64 /* syscall.h:22:14 */
 
-func Xopendir(tls *TLS, name uintptr) uintptr { /* opendir.c:8:5: */
-	if __ccgo_strace {
-		trc("tls=%v name=%v, (%v:)", tls, name, origin(2))
-	}
-	panic(todo(""))
-	//	var fd int32
-	//	var dir uintptr
-	//
-	//	if AssignInt32(&fd, Xopen(tls, name, 00|0200000|02000000, 0)) < 0 {
-	//		return uintptr(0)
-	//	}
-	//	if !(int32(AssignUintptr(&dir, Xcalloc(tls, uint64(1), uint64(unsafe.Sizeof(DIR{}))))) != 0) {
-	//		X__syscall1(tls, int64(3), int64(fd))
-	//		return uintptr(0)
-	//	}
-	//	(*DIR)(unsafe.Pointer(dir)).fd = fd
-	//	return dir
-}
-
 type max_align_t = struct {
 	__ll int64
 	__ld float64
 } /* alltypes.h:41:54 */
 
 type dirstream_buf_alignment_check = [1]int8 /* readdir.c:7:14 */
-
-func Xreaddir(tls *TLS, dir uintptr) uintptr { /* readdir.c:10:15: */
-	if __ccgo_strace {
-		trc("tls=%v dir=%v, (%v:)", tls, dir, origin(2))
-	}
-	panic(todo(""))
-	//	var de uintptr
-	//
-	//	if (*DIR)(unsafe.Pointer(dir)).buf_pos >= (*DIR)(unsafe.Pointer(dir)).buf_end {
-	//		var len int32 = int32(X__syscall3(tls, int64(217), int64((*DIR)(unsafe.Pointer(dir)).fd), int64(dir+24), int64(unsafe.Sizeof([2048]int8{}))))
-	//		if len <= 0 {
-	//			if len < 0 && len != -2 {
-	//				*(*int32)(unsafe.Pointer(X___errno_location(tls))) = -len
-	//			}
-	//			return uintptr(0)
-	//		}
-	//		(*DIR)(unsafe.Pointer(dir)).buf_end = len
-	//		(*DIR)(unsafe.Pointer(dir)).buf_pos = 0
-	//	}
-	//	de = dir + 24 + uintptr((*DIR)(unsafe.Pointer(dir)).buf_pos)
-	//	*(*int32)(unsafe.Pointer(dir + 12)) += int32((*dirent)(unsafe.Pointer(de)).d_reclen)
-	//	(*DIR)(unsafe.Pointer(dir)).tell = (*dirent)(unsafe.Pointer(de)).d_off
-	//	return de
-}
 
 type uintptr_t = uint64 /* alltypes.h:55:24 */
 
@@ -3929,240 +3877,6 @@ type resolvconf = struct {
 	timeout  uint32
 } /* lookup.h:34:1 */
 
-func Xfreeaddrinfo(tls *TLS, p uintptr) { /* freeaddrinfo.c:7:6: */
-	if __ccgo_strace {
-		trc("tls=%v p=%v, (%v:)", tls, p, origin(2))
-	}
-	var cnt size_t
-	cnt = uint64(1)
-__1:
-	if !((*addrinfo)(unsafe.Pointer(p)).ai_next != 0) {
-		goto __3
-	}
-	goto __2
-__2:
-	cnt++
-	p = (*addrinfo)(unsafe.Pointer(p)).ai_next
-	goto __1
-	goto __3
-__3:
-	;
-	var b uintptr = p - uintptr(uint64(uintptr(0)))
-	b -= 88 * uintptr((*aibuf)(unsafe.Pointer(b)).slot)
-	//TODO LOCK(b->lock);
-	if !(int32(AssignSubPtrInt16(b+82, int16(cnt))) != 0) {
-		Xfree(tls, b)
-	}
-	//TODO else UNLOCK(b->lock);
-}
-
-func Xgetaddrinfo(tls *TLS, host uintptr, serv uintptr, hint uintptr, res uintptr) int32 { /* getaddrinfo.c:12:5: */
-	if __ccgo_strace {
-		trc("tls=%v host=%v serv=%v hint=%v res=%v, (%v:)", tls, host, serv, hint, res, origin(2))
-	}
-	bp := tls.Alloc(1608)
-	defer tls.Free(1608)
-
-	// var ports [2]service at bp, 8
-
-	// var addrs [48]address at bp+8, 1344
-
-	// var canon [256]int8 at bp+1352, 256
-
-	var outcanon uintptr
-	var nservs int32
-	var naddrs int32
-	var nais int32
-	var canon_len int32
-	var i int32
-	var j int32
-	var k int32
-	var family int32 = 0
-	var flags int32 = 0
-	var proto int32 = 0
-	var socktype int32 = 0
-	var out uintptr
-
-	if !(host != 0) && !(serv != 0) {
-		return -2
-	}
-
-	if hint != 0 {
-		family = (*addrinfo)(unsafe.Pointer(hint)).ai_family
-		flags = (*addrinfo)(unsafe.Pointer(hint)).ai_flags
-		proto = (*addrinfo)(unsafe.Pointer(hint)).ai_protocol
-		socktype = (*addrinfo)(unsafe.Pointer(hint)).ai_socktype
-
-		var mask int32 = 0x01 | 0x02 | 0x04 | 0x08 | 0x10 | 0x20 | 0x400
-		if flags&mask != flags {
-			return -1
-		}
-
-		switch family {
-		case 2:
-			fallthrough
-		case 10:
-			fallthrough
-		case 0:
-			break
-			fallthrough
-		default:
-			return -6
-		}
-	}
-
-	if flags&0x20 != 0 {
-		Xabort(tls) //TODO-
-		// 	/* Define the "an address is configured" condition for address
-		// 	 * families via ability to create a socket for the family plus
-		// 	 * routability of the loopback address for the family. */
-		// 	static const struct sockaddr_in lo4 = {
-		// 		.sin_family = AF_INET, .sin_port = 65535,
-		// 		.sin_addr.s_addr = __BYTE_ORDER == __BIG_ENDIAN
-		// 			? 0x7f000001 : 0x0100007f
-		// 	};
-		// 	static const struct sockaddr_in6 lo6 = {
-		// 		.sin6_family = AF_INET6, .sin6_port = 65535,
-		// 		.sin6_addr = IN6ADDR_LOOPBACK_INIT
-		// 	};
-		// 	int tf[2] = { AF_INET, AF_INET6 };
-		// 	const void *ta[2] = { &lo4, &lo6 };
-		// 	socklen_t tl[2] = { sizeof lo4, sizeof lo6 };
-		// 	for (i=0; i<2; i++) {
-		// 		if (family==tf[1-i]) continue;
-		// 		int s = socket(tf[i], SOCK_CLOEXEC|SOCK_DGRAM,
-		// 			IPPROTO_UDP);
-		// 		if (s>=0) {
-		// 			int cs;
-		// 			pthread_setcancelstate(
-		// 				PTHREAD_CANCEL_DISABLE, &cs);
-		// 			int r = connect(s, ta[i], tl[i]);
-		// 			pthread_setcancelstate(cs, 0);
-		// 			close(s);
-		// 			if (!r) continue;
-		// 		}
-		// 		switch (errno) {
-		// 		case EADDRNOTAVAIL:
-		// 		case EAFNOSUPPORT:
-		// 		case EHOSTUNREACH:
-		// 		case ENETDOWN:
-		// 		case ENETUNREACH:
-		// 			break;
-		// 		default:
-		// 			return EAI_SYSTEM;
-		// 		}
-		// 		if (family == tf[i]) return EAI_NONAME;
-		// 		family = tf[1-i];
-		// 	}
-	}
-
-	nservs = X__lookup_serv(tls, bp, serv, proto, socktype, flags)
-	if nservs < 0 {
-		return nservs
-	}
-
-	naddrs = X__lookup_name(tls, bp+8, bp+1352, host, family, flags)
-	if naddrs < 0 {
-		return naddrs
-	}
-
-	nais = nservs * naddrs
-	canon_len = int32(Xstrlen(tls, bp+1352))
-	out = Xcalloc(tls, uint64(1), uint64(nais)*uint64(unsafe.Sizeof(aibuf{}))+uint64(canon_len)+uint64(1))
-	if !(out != 0) {
-		return -10
-	}
-
-	if canon_len != 0 {
-		outcanon = out + uintptr(nais)*88
-		Xmemcpy(tls, outcanon, bp+1352, uint64(canon_len+1))
-	} else {
-		outcanon = uintptr(0)
-	}
-
-	for k = AssignInt32(&i, 0); i < naddrs; i++ {
-		j = 0
-	__1:
-		if !(j < nservs) {
-			goto __3
-		}
-		{
-			(*aibuf)(unsafe.Pointer(out + uintptr(k)*88)).slot = int16(k)
-			//TODO out[k].ai = (struct addrinfo){
-			//TODO 	.ai_family = addrs[i].family,
-			//TODO 	.ai_socktype = ports[j].socktype,
-			//TODO 	.ai_protocol = ports[j].proto,
-			//TODO 	.ai_addrlen = addrs[i].family == AF_INET
-			//TODO 		? sizeof(struct sockaddr_in)
-			//TODO 		: sizeof(struct sockaddr_in6),
-			//TODO 	.ai_addr = (void *)&out[k].sa,
-			//TODO 	.ai_canonname = outcanon };
-			(*aibuf)(unsafe.Pointer(out + uintptr(k)*88)).ai.ai_family = (*address)(unsafe.Pointer(bp + 8 + uintptr(i)*28)).family
-			(*aibuf)(unsafe.Pointer(out + uintptr(k)*88)).ai.ai_socktype = int32((*service)(unsafe.Pointer(bp + uintptr(j)*4)).socktype)
-			(*aibuf)(unsafe.Pointer(out + uintptr(k)*88)).ai.ai_protocol = int32((*service)(unsafe.Pointer(bp + uintptr(j)*4)).proto)
-			(*aibuf)(unsafe.Pointer(out + uintptr(k)*88)).ai.ai_addrlen = func() uint32 {
-				if (*address)(unsafe.Pointer(bp+8+uintptr(i)*28)).family == 2 {
-					return uint32(unsafe.Sizeof(sockaddr_in{}))
-				}
-				return uint32(unsafe.Sizeof(sockaddr_in6{}))
-			}()
-			(*aibuf)(unsafe.Pointer(out + uintptr(k)*88)).ai.ai_addr = out + uintptr(k)*88 + 48
-			(*aibuf)(unsafe.Pointer(out + uintptr(k)*88)).ai.ai_canonname = outcanon
-			if k != 0 {
-				(*aibuf)(unsafe.Pointer(out + uintptr(k-1)*88)).ai.ai_next = out + uintptr(k)*88
-			}
-			switch (*address)(unsafe.Pointer(bp + 8 + uintptr(i)*28)).family {
-			case 2:
-				(*sockaddr_in)(unsafe.Pointer(out + uintptr(k)*88 + 48)).sin_family = sa_family_t(2)
-				(*sockaddr_in)(unsafe.Pointer(out + uintptr(k)*88 + 48)).sin_port = Xhtons(tls, (*service)(unsafe.Pointer(bp+uintptr(j)*4)).port)
-				Xmemcpy(tls, out+uintptr(k)*88+48+4, bp+8+uintptr(i)*28+8, uint64(4))
-				break
-			case 10:
-				(*sockaddr_in6)(unsafe.Pointer(out + uintptr(k)*88 + 48)).sin6_family = sa_family_t(10)
-				(*sockaddr_in6)(unsafe.Pointer(out + uintptr(k)*88 + 48)).sin6_port = Xhtons(tls, (*service)(unsafe.Pointer(bp+uintptr(j)*4)).port)
-				(*sockaddr_in6)(unsafe.Pointer(out + uintptr(k)*88 + 48)).sin6_scope_id = (*address)(unsafe.Pointer(bp + 8 + uintptr(i)*28)).scopeid
-				Xmemcpy(tls, out+uintptr(k)*88+48+8, bp+8+uintptr(i)*28+8, uint64(16))
-				break
-			}
-
-		}
-		goto __2
-	__2:
-		j++
-		k++
-		goto __1
-		goto __3
-	__3:
-	}
-	(*aibuf)(unsafe.Pointer(out)).ref = int16(nais)
-	*(*uintptr)(unsafe.Pointer(res)) = out
-	return 0
-}
-
-type ucred = struct {
-	pid pid_t
-	uid uid_t
-	gid gid_t
-} /* socket.h:57:1 */
-
-type mmsghdr = struct {
-	msg_hdr struct {
-		msg_name       uintptr
-		msg_namelen    socklen_t
-		_              [4]byte
-		msg_iov        uintptr
-		msg_iovlen     int32
-		__pad1         int32
-		msg_control    uintptr
-		msg_controllen socklen_t
-		__pad2         int32
-		msg_flags      int32
-		_              [4]byte
-	}
-	msg_len uint32
-	_       [4]byte
-} /* socket.h:63:1 */
-
 func Xgethostbyaddr(tls *TLS, a uintptr, l socklen_t, af int32) uintptr { /* gethostbyaddr.c:7:16: */
 	if __ccgo_strace {
 		trc("tls=%v a=%v l=%v af=%v, (%v:)", tls, a, l, af, origin(2))
@@ -4254,7 +3968,7 @@ func Xgethostbyaddr_r(tls *TLS, a uintptr, l socklen_t, af int32, h uintptr, buf
 	*(*uintptr)(unsafe.Pointer((*hostent)(unsafe.Pointer(h)).h_aliases)) = buf
 	*(*uintptr)(unsafe.Pointer((*hostent)(unsafe.Pointer(h)).h_aliases + 1*8)) = uintptr(0)
 
-	switch Xgetnameinfo(tls, bp, sl, buf, uint32(buflen), uintptr(0), uint32(0), 0) {
+	switch xgetnameinfo(tls, bp, sl, buf, uint32(buflen), uintptr(0), uint32(0), 0) {
 	case -3:
 		*(*int32)(unsafe.Pointer(err)) = 2
 		return 11
@@ -4712,7 +4426,7 @@ func reverse_services(tls *TLS, buf uintptr, port int32, dgram int32) { /* getna
 	// __fclose_ca(f);
 }
 
-func Xgetnameinfo(tls *TLS, sa1 uintptr, sl socklen_t, node uintptr, nodelen socklen_t, serv uintptr, servlen socklen_t, flags int32) int32 { /* getnameinfo.c:125:5: */
+func xgetnameinfo(tls *TLS, sa1 uintptr, sl socklen_t, node uintptr, nodelen socklen_t, serv uintptr, servlen socklen_t, flags int32) int32 { /* getnameinfo.c:125:5: */
 	if __ccgo_strace {
 		trc("tls=%v sa1=%v sl=%v node=%v nodelen=%v serv=%v servlen=%v flags=%v, (%v:)", tls, sa1, sl, node, nodelen, serv, servlen, flags, origin(2))
 	}
@@ -4774,7 +4488,7 @@ func Xgetnameinfo(tls *TLS, sa1 uintptr, sl socklen_t, node uintptr, nodelen soc
 			if flags&0x08 != 0 {
 				return -2
 			}
-			Xinet_ntop(tls, af, a, bp+78, uint32(unsafe.Sizeof([256]int8{})))
+			xinet_ntop(tls, af, a, bp+78, uint32(unsafe.Sizeof([256]int8{})))
 			if scopeid != 0 {
 				Xabort(tls) //TODO-
 				// char *p = 0, tmp[IF_NAMESIZE+1];
@@ -4876,7 +4590,7 @@ func X__inet_aton(tls *TLS, s0 uintptr, dest uintptr) int32 { /* inet_aton.c:7:5
 	return 1
 }
 
-func Xinet_ntop(tls *TLS, af int32, a0 uintptr, s uintptr, l socklen_t) uintptr { /* inet_ntop.c:7:12: */
+func xinet_ntop(tls *TLS, af int32, a0 uintptr, s uintptr, l socklen_t) uintptr { /* inet_ntop.c:7:12: */
 	if __ccgo_strace {
 		trc("tls=%v af=%v a0=%v s=%v l=%v, (%v:)", tls, af, a0, s, l, origin(2))
 	}
@@ -4953,7 +4667,7 @@ func hexval(tls *TLS, c uint32) int32 { /* inet_pton.c:7:12: */
 	return -1
 }
 
-func Xinet_pton(tls *TLS, af int32, s uintptr, a0 uintptr) int32 { /* inet_pton.c:15:5: */
+func xinet_pton(tls *TLS, af int32, s uintptr, a0 uintptr) int32 { /* inet_pton.c:15:5: */
 	if __ccgo_strace {
 		trc("tls=%v af=%v s=%v a0=%v, (%v:)", tls, af, s, a0, origin(2))
 	}
@@ -5047,7 +4761,7 @@ func Xinet_pton(tls *TLS, af int32, s uintptr, a0 uintptr) int32 { /* inet_pton.
 		*(*uint8)(unsafe.Pointer(PostIncUintptr(&a, 1))) = uint8(int32(*(*uint16_t)(unsafe.Pointer(bp + uintptr(j)*2))) >> 8)
 		*(*uint8)(unsafe.Pointer(PostIncUintptr(&a, 1))) = uint8(*(*uint16_t)(unsafe.Pointer(bp + uintptr(j)*2)))
 	}
-	if need_v4 != 0 && Xinet_pton(tls, 2, s, a-uintptr(4)) <= 0 {
+	if need_v4 != 0 && xinet_pton(tls, 2, s, a-uintptr(4)) <= 0 {
 		return 0
 	}
 	return 1
@@ -5085,7 +4799,7 @@ func X__lookup_ipliteral(tls *TLS, buf uintptr, name uintptr, family int32) int3
 		name = bp + 4 /* &tmp[0] */
 	}
 
-	if Xinet_pton(tls, 10, name, bp+68) <= 0 {
+	if xinet_pton(tls, 10, name, bp+68) <= 0 {
 		return 0
 	}
 	if family == 2 { // wrong family
@@ -7032,21 +6746,6 @@ func Xstrtok(tls *TLS, s uintptr, sep uintptr) uintptr { /* strtok.c:3:6: */
 
 var _sp uintptr /* strtok.c:5:14: */
 
-func X__ccgo_pthreadAttrGetDetachState(tls *TLS, a uintptr) int32 { /* pthread_attr_get.c:3:5: */
-	if __ccgo_strace {
-		trc("tls=%v a=%v, (%v:)", tls, a, origin(2))
-	}
-	return *(*int32)(unsafe.Pointer(a + 6*4))
-}
-
-func Xpthread_attr_getdetachstate(tls *TLS, a uintptr, state uintptr) int32 { /* pthread_attr_get.c:7:5: */
-	if __ccgo_strace {
-		trc("tls=%v a=%v state=%v, (%v:)", tls, a, state, origin(2))
-	}
-	*(*int32)(unsafe.Pointer(state)) = *(*int32)(unsafe.Pointer(a + 6*4))
-	return 0
-}
-
 //
 // int pthread_attr_getguardsize(const pthread_attr_t *restrict a, size_t *restrict size)
 // {
@@ -7128,13 +6827,6 @@ func Xpthread_attr_getdetachstate(tls *TLS, a uintptr, state uintptr) int32 { /*
 // 	return 0;
 // }
 
-func X__ccgo_pthreadMutexattrGettype(tls *TLS, a uintptr) int32 { /* pthread_attr_get.c:93:5: */
-	if __ccgo_strace {
-		trc("tls=%v a=%v, (%v:)", tls, a, origin(2))
-	}
-	return int32((*pthread_mutexattr_t)(unsafe.Pointer(a)).__attr & uint32(3))
-}
-
 // int pthread_mutexattr_gettype(const pthread_mutexattr_t *restrict a, int *restrict type)
 // {
 // 	*type = a->__attr & 3;
@@ -7147,24 +6839,6 @@ func X__ccgo_pthreadMutexattrGettype(tls *TLS, a uintptr) int32 { /* pthread_att
 // 	return 0;
 // }
 
-func Xpthread_attr_setdetachstate(tls *TLS, a uintptr, state int32) int32 { /* pthread_attr_setdetachstate.c:3:5: */
-	if __ccgo_strace {
-		trc("tls=%v a=%v state=%v, (%v:)", tls, a, state, origin(2))
-	}
-	if uint32(state) > 1 {
-		return 22
-	}
-	*(*int32)(unsafe.Pointer(a + 6*4)) = state
-	return 0
-}
-
-func X__ccgo_getMutexType(tls *TLS, m uintptr) int32 { /* pthread_mutex_lock.c:3:5: */
-	if __ccgo_strace {
-		trc("tls=%v m=%v, (%v:)", tls, m, origin(2))
-	}
-	return *(*int32)(unsafe.Pointer(m)) & 15
-}
-
 // int __pthread_mutex_lock(pthread_mutex_t *m)
 // {
 // 	if ((m->_m_type&15) == PTHREAD_MUTEX_NORMAL
@@ -7175,32 +6849,6 @@ func X__ccgo_getMutexType(tls *TLS, m uintptr) int32 { /* pthread_mutex_lock.c:3
 // }
 //
 // weak_alias(__pthread_mutex_lock, pthread_mutex_lock);
-
-func Xpthread_mutexattr_destroy(tls *TLS, a uintptr) int32 { /* pthread_mutexattr_destroy.c:3:5: */
-	if __ccgo_strace {
-		trc("tls=%v a=%v, (%v:)", tls, a, origin(2))
-	}
-	return 0
-}
-
-func Xpthread_mutexattr_init(tls *TLS, a uintptr) int32 { /* pthread_mutexattr_init.c:3:5: */
-	if __ccgo_strace {
-		trc("tls=%v a=%v, (%v:)", tls, a, origin(2))
-	}
-	*(*pthread_mutexattr_t)(unsafe.Pointer(a)) = pthread_mutexattr_t{}
-	return 0
-}
-
-func Xpthread_mutexattr_settype(tls *TLS, a uintptr, type1 int32) int32 { /* pthread_mutexattr_settype.c:3:5: */
-	if __ccgo_strace {
-		trc("tls=%v a=%v type1=%v, (%v:)", tls, a, type1, origin(2))
-	}
-	if uint32(type1) > uint32(2) {
-		return 22
-	}
-	(*pthread_mutexattr_t)(unsafe.Pointer(a)).__attr = (*pthread_mutexattr_t)(unsafe.Pointer(a)).__attr&Uint32FromInt32(CplInt32(3)) | uint32(type1)
-	return 0
-}
 
 func init() {
 	*(*uintptr)(unsafe.Pointer(uintptr(unsafe.Pointer(&ptable)) + 0)) = uintptr(unsafe.Pointer(&table)) + uintptr(128)*2 // __ctype_b_loc.c:36:45:

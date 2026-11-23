@@ -87,13 +87,31 @@ func defaultDriver() *Driver { return d }
 //
 // The returned connection is only used by one goroutine at a time.
 //
-// The name may be a filename, e.g., "/tmp/mydata.sqlite", or a URI, in which
-// case it may include a '?' followed by one or more query parameters.
-// For example, "file:///tmp/mydata.sqlite?_pragma=foreign_keys(1)&_time_format=sqlite".
-// The supported query parameters are:
+// The name is either a plain file name, e.g. "/tmp/mydata.sqlite", or a
+// SQLite URI, e.g. "file:///tmp/mydata.sqlite" (see
+// https://www.sqlite.org/uri.html). Both forms may carry a '?' followed by
+// one or more '&'-separated query parameters, for example
+// "file:///tmp/mydata.sqlite?_pragma=foreign_keys(1)&_time_format=sqlite".
+// The parameters this driver interprets are the underscore-prefixed keys and
+// vfs, all listed below; the driver consumes them in either form. What
+// happens to any other key depends on the form:
 //
-// _pragma: Each value will be run as a "PRAGMA ..." statement (with the PRAGMA
-// keyword added for you). May be specified more than once, '&'-separated. For more
+//   - A plain file name has its query removed before the name reaches
+//     sqlite3_open_v2, matching github.com/mattn/go-sqlite3, so every key the
+//     driver does not interpret is silently ignored, SQLite's own URI
+//     parameters included: "/tmp/mydata.sqlite?mode=ro" opens the database
+//     read-write and creates the file when it is missing.
+//   - A name starting with "file:" is passed to sqlite3_open_v2 whole, with
+//     SQLITE_OPEN_URI set, so SQLite applies its own URI parameters (mode,
+//     cache, immutable, nolock, psow, modeof and vfs; see the mode paragraph
+//     below) and ignores the keys it does not recognize, the underscore keys
+//     among them.
+//
+// The parameters this driver interprets are:
+//
+// _pragma: Each value is run with the PRAGMA keyword prepended, as SQL text; see
+// below for why that is not limited to one PRAGMA statement. May be specified
+// more than once, '&'-separated. For more
 // information on supported PRAGMAs see: https://www.sqlite.org/pragma.html
 //
 // The following shorthand keys set common PRAGMAs for easier DSN compatibility
@@ -123,17 +141,29 @@ func defaultDriver() *Driver { return d }
 // or with auto_vacuum already set.
 //
 // Unlike these validated shorthand keys, each _pragma value is executed verbatim
-// (with PRAGMA prepended) and is not validated, so a DSN that includes _pragma
-// must come from a trusted source. It is also the one case that can still fail
-// partway: a bad _pragma is only rejected by SQLite as it runs, after any
+// (with PRAGMA prepended) and is not validated. It is executed as SQL text, not
+// as a single PRAGMA: anything after a ';' runs too, so
+// "_pragma=foreign_keys(1);ATTACH 'x.db' AS x" also attaches, and creates,
+// x.db. A DSN therefore carries the authority of the SQL it can run and of the
+// file paths it names, and one that includes _pragma must come from a trusted
+// source. An application whose DSN is not a compile-time constant should call
+// [StrictPragmas](true), which rejects a _pragma value holding more than one
+// statement before anything is applied. It is also the one case that can still
+// fail partway: a bad _pragma is only rejected by SQLite as it runs, after any
 // earlier _pragma in the list has taken effect.
 //
 // _time_format: The name of a format to use when writing time values to the database.
 // The currently supported values are (1) "sqlite" for YYYY-MM-DD HH:MM:SS.SSS[+-]HH:MM
 // (format 4 from https://www.sqlite.org/lang_datefunc.html#time_values with sub-second
-// precision and timezone specifier) and (2) "datetime" for YYYY-MM-DD HH:MM:SS
-// (format 3, matching the output of SQLite's datetime() function).
-// If this parameter is not specified, then the default String() format will be used.
+// precision and timezone specifier), (2) "datetime" for YYYY-MM-DD HH:MM:SS
+// (format 3, matching the output of SQLite's datetime() function), and
+// (3) "string_no_monotonic" for t.Round(0).String(), which preserves the default
+// wall-clock layout, timezone and nanosecond precision but omits the process-local
+// monotonic clock reading. This lets a scanned time match its stored text when
+// rebound in SQL. It does not rewrite existing strings containing a monotonic
+// reading; applications must normalize those values separately if needed.
+// If this parameter is not specified, then the default String() format will be
+// used, including any monotonic clock reading.
 //
 // _time_integer_format: The name of a integer format to use when writing time values.
 // By default, the time is stored as string and the format can be set with _time_format
@@ -211,10 +241,14 @@ func defaultDriver() *Driver { return d }
 // Defensive mode is a hardening measure, not a sandbox for hostile database
 // files. It is one of several steps SQLite recommends for that purpose (see
 // https://www.sqlite.org/security.html); this build compiles with neither
-// SQLITE_TRUSTED_SCHEMA=0 nor SQLITE_DQS=0 and the driver exposes no
-// authorizer, so _defensive=1 alone does not make opening an untrusted file
-// safe. It is also a property of the connection, not of the database: another
-// connection to the same file, opened without the parameter, is unrestricted.
+// SQLITE_TRUSTED_SCHEMA=0 nor SQLITE_DQS=0, so _defensive=1 alone does not make
+// opening an untrusted file safe. The driver exposes SQLite's authorizer as an
+// opt-in [AuthorizerRegisterer] capability. For pool-wide enforcement, install
+// the policy on every newly opened physical connection with
+// [RegisterConnectionHook] (or [Driver.RegisterConnectionHook] on a
+// caller-constructed Driver); database/sql's Conn.Raw is the per-connection
+// escape hatch. The policy is a property of the connection, not of the
+// database: another connection to the same file without it is unrestricted.
 // See: https://www.sqlite.org/c3ref/c_dbconfig_defensive.html
 //
 // _error_rc: Opt-in error-string reporting mode for synthesised errors.
@@ -235,11 +269,31 @@ func defaultDriver() *Driver { return d }
 //
 // vfs: The name of the SQLite VFS to open the database with. Note the absent
 // underscore prefix: this is the same parameter SQLite recognizes in a file:
-// URI, and its value is passed on as the sqlite3_open_v2 zVfs argument. It
-// selects any VFS registered with SQLite, in particular one returned by
-// [modernc.org/sqlite/vfs.New], which exposes a Go fs.FS as a read-only VFS.
-// When absent or empty the default VFS is used. Supplying the parameter more
-// than once with values that differ is an error.
+// URI, but the driver reads it too and passes its value on as the
+// sqlite3_open_v2 zVfs argument, so unlike the SQLite URI parameters below it
+// also works in a plain file name. It selects any VFS registered with SQLite,
+// in particular one returned by [modernc.org/sqlite/vfs.New], which exposes a
+// Go fs.FS as a read-only VFS. When absent or empty the default VFS is used.
+// Supplying the parameter more than once with values that differ is an error.
+//
+// mode, cache, immutable, nolock, psow, modeof: SQLite's own URI parameters,
+// documented at https://www.sqlite.org/uri.html#recognized_query_parameters.
+// The driver does not interpret them, SQLite does, which is why they take
+// effect only in a name that starts with "file:" and are silently dropped
+// from a plain file name (see above). The driver opens with
+// SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE and mode may only restrict those
+// flags, so all four of its values are available:
+// "file:/tmp/mydata.sqlite?mode=ro" opens the database read-only, fails with
+// SQLITE_CANTOPEN instead of creating a missing file, and every write on the
+// connection fails with SQLITE_READONLY. This differs from _query_only=1,
+// which still creates a missing file and is a PRAGMA that any later statement
+// can turn off again. A driver key that has to write the database, such as
+// _journal_mode=WAL on a database that is not in WAL mode yet or a _pragma to
+// the same effect, fails the open of a mode=ro connection with
+// SQLITE_READONLY; _auto_vacuum on such a connection is accepted and has no
+// effect. mode=memory selects a pure in-memory database; see
+// https://www.sqlite.org/inmemorydb.html for how cache=shared lets several
+// connections share one.
 func (d *Driver) Open(name string) (conn driver.Conn, err error) {
 	if dmesgs {
 		defer func() {

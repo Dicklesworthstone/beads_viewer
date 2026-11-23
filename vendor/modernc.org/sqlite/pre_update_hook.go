@@ -82,6 +82,21 @@ func (c *conn) RegisterRollbackHook(callback RollbackHookFn) {
 	sqlite3.Xsqlite3_rollback_hook(c.tls, c.db, cFuncPointer(rollbackHookTrampoline), c.db)
 }
 
+// unregisterHooks forgets the pre-update, commit and rollback hooks registered
+// for db. Close calls it before the handle is freed: afterwards the same handle
+// value can belong to a newly opened connection.
+func unregisterHooks(db uintptr) {
+	xPreUpdateHandlers.mu.Lock()
+	delete(xPreUpdateHandlers.m, db)
+	xPreUpdateHandlers.mu.Unlock()
+	xCommitHandlers.mu.Lock()
+	delete(xCommitHandlers.m, db)
+	xCommitHandlers.mu.Unlock()
+	xRollbackHandlers.mu.Lock()
+	delete(xRollbackHandlers.m, db)
+	xRollbackHandlers.mu.Unlock()
+}
+
 type SQLitePreUpdateData struct {
 	tls          *libc.TLS
 	pCsr         uintptr
@@ -152,13 +167,29 @@ func mallocValue(tls *libc.TLS) (uintptr, error) {
 }
 
 func (d *SQLitePreUpdateData) value(ppValue uintptr, i int, new bool) (any, error) {
-	var src any
+	// What SQLite leaves in the slot is a value only when it returns
+	// SQLITE_OK. It reads the old row from the database when it is first
+	// asked for, which fails on a row it cannot read, a damaged one for
+	// example, and then it stores nothing. The slot serves every column of
+	// the row, so it is cleared first: it never holds the pointer of the
+	// column before.
+	*(*uintptr)(unsafe.Pointer(ppValue)) = 0
+	var rc int32
 	if new {
-		sqlite3.Xsqlite3_preupdate_new(d.tls, d.pCsr, int32(i), ppValue)
+		rc = sqlite3.Xsqlite3_preupdate_new(d.tls, d.pCsr, int32(i), ppValue)
 	} else {
-		sqlite3.Xsqlite3_preupdate_old(d.tls, d.pCsr, int32(i), ppValue)
+		rc = sqlite3.Xsqlite3_preupdate_old(d.tls, d.pCsr, int32(i), ppValue)
 	}
+	if rc != sqlite3.SQLITE_OK {
+		return nil, errstrForDB(d.tls, rc, d.pCsr, true)
+	}
+
 	ptrValue := *(*uintptr)(unsafe.Pointer(ppValue))
+	if ptrValue == 0 {
+		return nil, errstrForDB(d.tls, sqlite3.SQLITE_NOMEM, 0, false)
+	}
+
+	var src any
 	switch sqlite3.Xsqlite3_value_type(d.tls, ptrValue) {
 	case sqlite3.SQLITE_INTEGER:
 		src = int64(sqlite3.Xsqlite3_value_int64(d.tls, ptrValue))
@@ -168,14 +199,27 @@ func (d *SQLitePreUpdateData) value(ppValue uintptr, i int, new bool) (any, erro
 		size := sqlite3.Xsqlite3_value_bytes(d.tls, ptrValue)
 		blobPtr := sqlite3.Xsqlite3_value_blob(d.tls, ptrValue)
 
-		var v []byte
+		if size != 0 && blobPtr == 0 {
+			// SQLite could not make the bytes of the value, a zeroblob it
+			// had not expanded for example.
+			return nil, errstrForDB(d.tls, sqlite3.SQLITE_NOMEM, 0, false)
+		}
+
+		v := make([]byte, size)
 		if size != 0 {
-			v = make([]byte, size)
 			copy(v, (*libc.RawMem)(unsafe.Pointer(blobPtr))[:size:size])
 		}
 		src = v
 	case sqlite3.SQLITE_TEXT:
-		src = libc.GoString(sqlite3.Xsqlite3_value_text(d.tls, ptrValue))
+		// The length is SQLite's: a TEXT value can hold a NUL, and the
+		// first one is not its end.
+		p := sqlite3.Xsqlite3_value_text(d.tls, ptrValue)
+		if p == 0 {
+			return nil, errstrForDB(d.tls, sqlite3.SQLITE_NOMEM, 0, false)
+		}
+
+		n := sqlite3.Xsqlite3_value_bytes(d.tls, ptrValue)
+		src = string((*libc.RawMem)(unsafe.Pointer(p))[:n:n])
 	case sqlite3.SQLITE_NULL:
 		src = nil
 	}

@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -26,6 +27,22 @@ type conn struct {
 	// Context handling can cause conn.Close and conn.interrupt to be invoked
 	// concurrently.
 	sync.Mutex
+
+	// waitCtx is the context of the call in progress on this connection, if
+	// it has one, so that a wait for a shared-cache lock in retry ends once
+	// it is done. Calls on a connection do not overlap, but they nest, e.g.
+	// preparing inside an exec, so each restores the outer call's.
+	waitCtx context.Context
+
+	// canceled is set once the context of the call in progress is done, see
+	// interruptOnDone. canceledRegistered records that cancellationFlags
+	// holds it for db.
+	canceled           atomic.Int32
+	canceledRegistered bool
+
+	// waitingForLock is set while retry waits for a shared-cache lock, so
+	// that tests can see the wait.
+	waitingForLock atomic.Bool
 
 	writeTimeFormat   string
 	beginMode         string
@@ -94,13 +111,22 @@ func newConn(dsn string) (*conn, error) {
 	// completes. sqlite3_initialize fires implicitly inside openV2 the
 	// first time; after that point SQLITE_CONFIG_PCACHE2 can no longer be
 	// installed. See pagecache.go for the lifecycle contract.
+	//
+	// SQLITE_OPEN_NOMUTEX: SQLite's connection mutex is recursive and knows
+	// its owner by the libc.TLS, and every call on c runs on c.tls, so the
+	// mutex SQLITE_OPEN_FULLMUTEX adds never kept a second goroutine using
+	// c out; it only cost a lock and an unlock per sqlite3_column_* call.
+	// The one call made on c.db with another TLS, sqlite3_interrupt, does
+	// not take it. Connections sharing a cache are still serialized by the
+	// BtShared mutex, which does not depend on this flag. See
+	// https://github.com/modernc-org/sqlite/issues/13.
 	var db uintptr
 	if gateErr := withOpenGate(func() error {
 		db, err = c.openV2(
 			dsn,
 			vfsName,
 			sqlite3.SQLITE_OPEN_READWRITE|sqlite3.SQLITE_OPEN_CREATE|
-				sqlite3.SQLITE_OPEN_FULLMUTEX|
+				sqlite3.SQLITE_OPEN_NOMUTEX|
 				sqlite3.SQLITE_OPEN_URI,
 		)
 		return err
@@ -229,8 +255,9 @@ func (c *conn) applyTimezone(t time.Time) time.Time {
 // writeTimeFormats are the names and formats supported
 // by the `_time_format` DSN query param.
 var writeTimeFormats = map[string]string{
-	"sqlite":   parseTimeFormats[0],
-	"datetime": "2006-01-02 15:04:05",
+	"sqlite":              parseTimeFormats[0],
+	"datetime":            "2006-01-02 15:04:05",
+	"string_no_monotonic": "2006-01-02 15:04:05.999999999 -0700 MST",
 }
 
 func (c *conn) formatTime(t time.Time) string {
@@ -255,7 +282,9 @@ func (c *conn) columnBlob(pstmt uintptr, iCol int) (v []byte, err error) {
 	}
 
 	if p == 0 || len == 0 {
-		return nil, nil
+		// A zero-length BLOB has no pointer. Return an empty slice, since
+		// database/sql reads nil as NULL.
+		return make([]byte, 0), nil
 	}
 
 	v = make([]byte, len)
@@ -448,9 +477,16 @@ func (c *conn) step(pstmt uintptr) (int, error) {
 	}
 }
 
+// retry waits until the connection holding the shared-cache lock that made
+// pstmt, or the statement being prepared when pstmt is 0, return
+// SQLITE_LOCKED_SHAREDCACHE releases it. busy_timeout does not apply to that
+// code, so the wait is not bounded by it; it ends early, with the context's
+// error, once the context of the call (waitCtx) is done, also if it is done
+// before the wait begins.
 func (c *conn) retry(pstmt uintptr) error {
 	mu := mutexAlloc(c.tls)
-	(*mutex)(unsafe.Pointer(mu)).Lock()
+	m := (*mutex)(unsafe.Pointer(mu))
+	m.Lock()
 	rc := sqlite3.Xsqlite3_unlock_notify(
 		c.tls,
 		c.db,
@@ -460,67 +496,80 @@ func (c *conn) retry(pstmt uintptr) error {
 		mu,
 	)
 	if rc == sqlite3.SQLITE_LOCKED { // Deadlock, see https://www.sqlite.org/c3ref/unlock_notify.html
-		(*mutex)(unsafe.Pointer(mu)).Unlock()
+		m.Unlock()
 		mutexFree(c.tls, mu)
 		return c.errstr(rc)
 	}
 
-	(*mutex)(unsafe.Pointer(mu)).Lock()
-	(*mutex)(unsafe.Pointer(mu)).Unlock()
+	// The callback or, once the context is done, ctxWake unlocks m, which
+	// ends the wait. context.AfterFunc runs ctxWake at once if the context
+	// is done already.
+	ctx := c.waitCtx
+	var ctxWoke bool
+	var ctxWakeDone chan struct{}
+	var stop func() bool
+	if ctx != nil && ctx.Done() != nil {
+		ctxWakeDone = make(chan struct{})
+		stop = context.AfterFunc(ctx, func() {
+			ctxWoke = m.wake()
+			close(ctxWakeDone)
+		})
+	}
+
+	c.waitingForLock.Store(true)
+	m.Lock()
+	c.waitingForLock.Store(false)
+
+	// A ctxWake that has started may still use m, so it is waited for
+	if stop != nil && !stop() {
+		<-ctxWakeDone
+	}
+
+	// Cancels the callback if the context ended the wait, and in any case
+	// returns only once no callback is running: SQLite invokes it, and
+	// handles this call, under the same mutex, so mu can be freed
+	sqlite3.Xsqlite3_unlock_notify(c.tls, c.db, 0, 0)
 	mutexFree(c.tls, mu)
+
+	if ctxWoke {
+		return ctx.Err()
+	}
+
 	if pstmt != 0 {
 		sqlite3.Xsqlite3_reset(c.tls, pstmt)
 	}
 	return nil
 }
 
-func (c *conn) bind(pstmt uintptr, n int, args []driver.NamedValue) (allocs []uintptr, err error) {
+// cBinding is a C buffer bind allocated for a text or blob argument, and the
+// 1-based index of the parameter it is bound to. The caller frees the buffer
+// once the statement has run and, for a cached statement, unbinds the
+// parameter, see clearBindings.
+type cBinding struct {
+	p   uintptr
+	idx int32
+}
+
+func (c *conn) bind(pstmt uintptr, n int, args []driver.NamedValue) (allocs []cBinding, err error) {
 	defer func() {
 		if err == nil {
 			return
 		}
 
+		// Leave no parameter pointing into the freed buffers.
+		c.clearBindings(pstmt, allocs)
 		c.freeAllocs(allocs)
 		allocs = nil
 	}()
 
+	f := newArgFinder(args)
 	for i := 1; i <= n; i++ {
 		name, err := c.bindParameterName(pstmt, i)
 		if err != nil {
 			return allocs, err
 		}
 
-		var found bool
-		var v driver.NamedValue
-		for _, v = range args {
-			if name != "" {
-				// For ?NNN and $NNN params, match if NNN == v.Ordinal.
-				//
-				// Supporting this for $NNN is a special case that makes eg
-				// `select $1, $2, $3 ...` work without needing to use
-				// sql.Named.
-				if (name[0] == '?' || name[0] == '$') && name[1:] == strconv.Itoa(v.Ordinal) {
-					found = true
-					break
-				}
-
-				// sqlite supports '$', '@' and ':' prefixes for string
-				// identifiers and '?' for numeric, so we cannot
-				// combine different prefixes with the same name
-				// because `database/sql` requires variable names
-				// to start with a letter
-				if name[1:] == v.Name[:] {
-					found = true
-					break
-				}
-			} else {
-				if v.Ordinal == i {
-					found = true
-					break
-				}
-			}
-		}
-
+		v, found := f.find(name, i)
 		if !found {
 			if name != "" {
 				return allocs, fmt.Errorf("missing named argument %q", name[1:])
@@ -587,10 +636,120 @@ func (c *conn) bind(pstmt uintptr, n int, args []driver.NamedValue) (allocs []ui
 			return allocs, fmt.Errorf("sqlite: invalid driver.Value type %T", x)
 		}
 		if p != 0 {
-			allocs = append(allocs, p)
+			allocs = append(allocs, cBinding{p, int32(i)})
 		}
 	}
 	return allocs, nil
+}
+
+// argFinder finds the argument bound to a statement parameter.
+type argFinder struct {
+	args    []driver.NamedValue
+	byName  map[string]int // index of the first argument with a name, built on first use
+	ordered bool           // args[j].Ordinal == j+1 for every j
+	named   bool           // some argument has a name
+}
+
+func newArgFinder(args []driver.NamedValue) argFinder {
+	f := argFinder{args: args, ordered: true}
+	for j := range args {
+		f.ordered = f.ordered && args[j].Ordinal == j+1
+		f.named = f.named || args[j].Name != ""
+	}
+	return f
+}
+
+// find returns the argument scanArgs(f.args, name, i) returns. database/sql
+// passes args ordered by Ordinal, starting at 1, so the argument with ordinal
+// k is args[k-1] and find does not have to scan args for every parameter,
+// which made binding quadratic in the number of parameters.
+//
+// https://github.com/modernc-org/sqlite/issues/8
+func (f *argFinder) find(name string, i int) (driver.NamedValue, bool) {
+	if !f.ordered {
+		return scanArgs(f.args, name, i)
+	}
+
+	ord := i
+	if name != "" {
+		// scanArgs matches ?NNN and $NNN if NNN == strconv.Itoa(v.Ordinal),
+		// which for an ordinal >= 1 has no sign and no leading zero.
+		ord = 0
+		if (name[0] == '?' || name[0] == '$') && len(name) > 1 && name[1] >= '1' && name[1] <= '9' {
+			if k, err := strconv.Atoi(name[1:]); err == nil {
+				ord = k
+			}
+		}
+	}
+	j := -1 // index of the first matching argument
+	if ord >= 1 && ord <= len(f.args) {
+		j = ord - 1
+	}
+	if name != "" && f.named {
+		if k, ok := f.nameIndex(name[1:]); ok && (j < 0 || k < j) {
+			j = k
+		}
+	}
+	if j < 0 {
+		return driver.NamedValue{}, false
+	}
+
+	return f.args[j], true
+}
+
+// nameIndex returns the index of the first argument with the given name.
+func (f *argFinder) nameIndex(name string) (int, bool) {
+	// Up to a few dozen arguments, scanning beats building the map.
+	if len(f.args) <= 32 {
+		for j := range f.args {
+			if f.args[j].Name == name {
+				return j, true
+			}
+		}
+		return 0, false
+	}
+
+	if f.byName == nil {
+		f.byName = make(map[string]int, len(f.args))
+		for j := len(f.args) - 1; j >= 0; j-- {
+			if f.args[j].Name != "" {
+				f.byName[f.args[j].Name] = j
+			}
+		}
+	}
+	j, ok := f.byName[name]
+	return j, ok
+}
+
+// scanArgs returns the first argument in args matching the parameter at index
+// i named name, "" for an anonymous parameter. It is linear in len(args).
+func scanArgs(args []driver.NamedValue, name string, i int) (driver.NamedValue, bool) {
+	for _, v := range args {
+		if name != "" {
+			// For ?NNN and $NNN params, match if NNN == v.Ordinal.
+			//
+			// Supporting this for $NNN is a special case that makes eg
+			// `select $1, $2, $3 ...` work without needing to use
+			// sql.Named.
+			if (name[0] == '?' || name[0] == '$') && name[1:] == strconv.Itoa(v.Ordinal) {
+				return v, true
+			}
+
+			// sqlite supports '$', '@' and ':' prefixes for string
+			// identifiers and '?' for numeric, so we cannot
+			// combine different prefixes with the same name
+			// because `database/sql` requires variable names
+			// to start with a letter
+			if name[1:] == v.Name[:] {
+				return v, true
+			}
+		} else {
+			if v.Ordinal == i {
+				return v, true
+			}
+		}
+	}
+	return driver.NamedValue{}, false
 }
 
 // C documentation
@@ -732,7 +891,16 @@ func (c *conn) interrupt(pdb uintptr) (err error) {
 	defer c.Unlock()
 
 	if c.tls != nil {
-		sqlite3.Xsqlite3_interrupt(c.tls, pdb)
+		// Not c.tls. This runs on the goroutine watching the context,
+		// while the query it interrupts may be running on c.tls, and a
+		// libc.TLS is not safe for concurrent use. The transpiled
+		// sqlite3_interrupt is a single atomic store today and never
+		// touches the TLS, but nothing guarantees a future SQLite or ccgo
+		// keeps it so. A fresh TLS costs ~140 ns and is paid only when a
+		// query is actually interrupted.
+		tls := libc.NewTLS()
+		sqlite3.Xsqlite3_interrupt(tls, pdb)
+		tls.Close()
 	}
 	return nil
 }
@@ -818,9 +986,9 @@ func (c *conn) free(p uintptr) {
 	}
 }
 
-func (c *conn) freeAllocs(allocs []uintptr) {
+func (c *conn) freeAllocs(allocs []cBinding) {
 	for _, v := range allocs {
-		c.free(v)
+		c.free(v.p)
 	}
 }
 
@@ -925,6 +1093,11 @@ func (c *conn) Close() (err error) {
 	defer c.Unlock()
 
 	if c.db != 0 {
+		unregisterAuthorizer(c.db)
+		unregisterHooks(c.db)
+		cancellationFlags.Delete(c.db)
+		busyConns.Delete(c.db)
+		c.canceledRegistered = false
 		if err := c.closeV2(c.db); err != nil {
 			return err
 		}
@@ -1088,8 +1261,63 @@ func (c *conn) Prepare(query string) (ds driver.Stmt, err error) {
 }
 
 func (c *conn) prepare(ctx context.Context, query string) (s driver.Stmt, err error) {
-	//TODO use ctx
-	return newStmt(c, query)
+	return c.newStmtContext(ctx, query)
+}
+
+// newStmtContext is newStmt for a call with a context: preparing a statement
+// can wait for a shared-cache lock, or for a lock under busy_timeout, and
+// either wait ends early, with ctx.Err(), once ctx is done. Only the waits
+// watch ctx, see retry and busyHandler.
+func (c *conn) newStmtContext(ctx context.Context, query string) (*stmt, error) {
+	if ctx != nil {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+	}
+
+	prevWaitCtx := c.waitCtx
+	c.waitCtx = ctx
+	defer func() { c.waitCtx = prevWaitCtx }()
+
+	if ctx != nil && ctx.Done() != nil {
+		c.ensureBusyHandler()
+	}
+	s, err := newStmt(c, query)
+	if err != nil && ctx != nil && ctx.Err() != nil {
+		// A wait for a lock that the context ended, see busyHandler, or any
+		// other failure once the context is done: report the context
+		return nil, ctx.Err()
+	}
+	return s, err
+}
+
+// withWaitCtx runs f with ctx as the context of the call in progress, so that
+// a wait for a lock in f, under busy_timeout or with a shared cache, ends once
+// ctx is done, see busyHandler and retry; the outer call's context is restored
+// afterwards. A failure of f once ctx is done is reported as ctx.Err(). Only
+// the waits watch ctx: f is not interrupted, and a ctx without a deadline or
+// cancellation changes nothing.
+func (c *conn) withWaitCtx(ctx context.Context, f func() error) error {
+	if ctx == nil || ctx.Done() == nil {
+		return f()
+	}
+
+	prevWaitCtx := c.waitCtx
+	c.waitCtx = ctx
+	defer func() { c.waitCtx = prevWaitCtx }()
+
+	c.ensureBusyHandler()
+	if err := f(); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		return err
+	}
+
+	return nil
 }
 
 // Queryer is an optional interface that may be implemented by a Conn.
@@ -1110,9 +1338,9 @@ func (c *conn) Query(query string, args []driver.Value) (dr driver.Rows, err err
 }
 
 func (c *conn) query(ctx context.Context, query string, args []driver.NamedValue) (r driver.Rows, err error) {
-	// Use newStmt directly. c.prepare wraps this, but we need the concrete *stmt type
+	// Use newStmtContext directly. c.prepare wraps this, but we need the concrete *stmt type
 	// to manipulate the handle ownership below.
-	s, err := newStmt(c, query)
+	s, err := c.newStmtContext(ctx, query)
 	if err != nil {
 		return nil, err
 	}

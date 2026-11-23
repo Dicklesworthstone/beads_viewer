@@ -1,0 +1,163 @@
+# The only CI this repository has, and deliberately small.
+#
+# Cross-platform building and the test suite run on the modernc.org/builder
+# farm, not here; see HACKING.md. This pipeline exists for three things that
+# need no build of the transpiled code:
+#
+# - LICENSE-3RD-PARTY.md, SBOM.md, sbom.cdx.json and sbom.spdx.json are
+#   generated from the module graph and the vendored C, so a dependency bump or
+#   a re-vendoring silently makes all four wrong. licgen -check regenerates them
+#   in memory and fails if what is committed differs.
+# - vendor.json records where lib/ and vec/ came from and a digest of them; see
+#   internal/vendorstamp. It fails when a re-vendoring was not stamped, a
+#   stamp says a sibling checkout was dirty, or generated files were edited by
+#   hand. The test suite runs the same check, so the builders refuse such a
+#   commit as well, and a release is tagged only when they are green.
+# - On the push of a vX.Y.Z tag, the attest job writes a provenance document
+#   for the release, signs it with the pipeline's own identity (Sigstore,
+#   no key to keep), stores it in the package registry and links it from the
+#   GitLab release. It cannot stop a release, which is public from the moment
+#   the tag is; it can only refuse to sign, and then the job is red. See
+#   VERIFYING.md.
+#
+# Each check job runs only when something that feeds it changes, so ordinary
+# commits cost no CI minutes.
+
+stages:
+  - check
+  - attest
+
+# One pipeline per change: a merge request pipeline, or a branch pipeline when
+# no merge request is open for that branch. And one for each release tag.
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/
+
+.generated-docs-inputs: &generated-docs-inputs
+  - go.mod
+  - go.sum
+  - licensegen/**/*
+  - lib/sqlite.go          # holds SQLITE_VERSION
+  - vec/vec.go             # holds m_SQLITE_VEC_VERSION
+  - LICENSE-SQLITE
+  - LICENSE-SQLITE_VEC
+  - LICENSE-3RD-PARTY.md
+  - SBOM.md
+  - sbom.cdx.json
+  - sbom.spdx.json
+  - .gitlab-ci.yml
+
+generated-docs:
+  stage: check
+  # Any Go at least as new as the go directive in go.mod works; the documents
+  # do not depend on the toolchain version.
+  image: golang:1.27
+  interruptible: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes: *generated-docs-inputs
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes: *generated-docs-inputs
+  script:
+    - cd licensegen && go build -tags none -o ../licgen .
+    - cd "$CI_PROJECT_DIR"
+    - |
+      if ! ./licgen -check; then
+        echo
+        echo "The generated documents are stale. Run 'make sbom' and commit the result."
+        echo "What differs:"
+        ./licgen
+        git --no-pager diff --stat
+        exit 1
+      fi
+  after_script:
+    - rm -f "$CI_PROJECT_DIR/licgen"
+
+.vendor-stamp-inputs: &vendor-stamp-inputs
+  - vendor.json
+  - go.mod
+  - lib/**/*
+  - vec/**/*
+  - LICENSE-SQLITE_VEC
+  - internal/vendorstamp/**/*
+  - vendor_libs/**/*
+  - Makefile
+  - .gitlab-ci.yml
+
+vendor-stamp:
+  stage: check
+  image: golang:1.27
+  interruptible: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes: *vendor-stamp-inputs
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes: *vendor-stamp-inputs
+  script:
+    - go test ./internal/vendorstamp/
+
+.attestgen-inputs: &attestgen-inputs
+  - attestgen/**/*
+  - .gitlab-ci.yml
+
+attestgen:
+  stage: check
+  image: golang:1.27
+  interruptible: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      changes: *attestgen-inputs
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes: *attestgen-inputs
+  script:
+    - cd attestgen && go vet -tags none . && go test -tags none .
+
+# Only for a tag push, and only on a GitLab-hosted runner: a pipeline started
+# by hand or through the API, or a job on a runner of our own, gets a
+# certificate that says so, and verification refuses it. attest -observe
+# reads the same claims from the ID token and stops before anything is signed.
+# Before anything is observed or signed, the job checks the stamp out: it
+# clones the libsqlite3 and libsqlite_vec commits vendor.json names and runs
+# make vendor-check, which vendors again and fails unless lib/ and vec/ come
+# out as committed. No artifacts: the document and bundle are stored in the
+# package registry only, and only once they verify. The image is pinned by
+# digest, since the job holds the identity cosign signs with; it is
+# golang:1.27.1. vendor-check compares everything in vendor.json but its go
+# field, which names the Go of the last make vendor, and the document's
+# builder.go records the Go that vendored again here; the document's vendor
+# is the committed vendor.json, read from the commit, not the copy
+# vendor-check leaves stamped with this image's Go. The v1.61.0 job read that
+# copy and failed its own verification, so that release has no document.
+attest:
+  stage: attest
+  image: golang:1.27.1@sha256:3680233e3204827fbdc66088528ae6d4b3d034f51d03a99d454f6de034888244
+  tags:
+    - saas-linux-small-amd64
+  interruptible: false
+  timeout: 30m          # the ID token below expires with the job
+  resource_group: attest
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/ && $CI_PIPELINE_SOURCE == "push"
+  id_tokens:
+    SIGSTORE_ID_TOKEN:
+      aud: sigstore
+  script:
+    - go install github.com/sigstore/cosign/v3/cmd/cosign@v3.1.3
+    - go test ./internal/vendorstamp/
+    - cd attestgen && go build -tags none -o ../attest . && cd ..
+    - ./attest -siblings > siblings.txt
+    - |
+      while read -r repo commit dir; do
+        git clone -q --filter=blob:none --no-checkout "$repo" "$dir"
+        git -C "$dir" checkout -q "$commit"
+      done < siblings.txt
+    - rm siblings.txt
+    - make vendor-check
+    - ./attest -observe -check-token SIGSTORE_ID_TOKEN
+    - cosign sign-blob --yes --bundle provenance.json.sigstore.json provenance.json
+    - ./attest -verify provenance.json provenance.json.sigstore.json
+    - ./attest -publish provenance.json provenance.json.sigstore.json

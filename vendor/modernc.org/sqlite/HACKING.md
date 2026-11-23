@@ -27,6 +27,38 @@ maintainer set the final version number and date when the release is actually
 tagged. The next version is the one after the latest tag reported by the
 command above, not after whatever header currently sits at the top of the file.
 
+### Entry style
+
+CHANGELOG.md is read by people deciding whether they need to upgrade, not by
+people auditing the implementation. Keep it that way.
+
+  - One bullet per user-visible change. One to three sentences for an ordinary
+    change, five at the very outside for a new public API or for something
+    people must act on; roughly sixty words is the right size to aim at. A
+    release is a list someone can scan, not prose.
+
+  - A bullet answers three questions and stops: what changed, does it affect
+    me, where do I read more. Mechanism, benchmark figures, review history and
+    internal details belong in the linked issue or merge request, or in
+    doc.go - not inlined here. Detail worth keeping is worth keeping where it
+    can be maintained.
+
+  - Never restate what a linked document already says. An entry announcing a
+    new doc.go section must not also paraphrase that section.
+
+  - Say plainly when a change is opt-in, off by default, documentation-only or
+    breaking. That is the sentence people are scanning for. Put it in bold
+    when it changes the behavior of an existing DSN or API call.
+
+  - Keep "See [GitLab merge request #N](...), thanks X!" attached to the change
+    it credits. Stranded on a bullet of its own it carries no context.
+
+Length is not fidelity. Between v1.51.0 and v1.59.0 entries grew from about
+twenty words per bullet to over a hundred and seventy, and nearly all of the
+detail that accumulated was already in the issues, the merge requests and the
+doc.go sections those same entries linked to. Those six releases were rewritten
+against the rules above; see GitLab issue #258.
+
 ## Integrating merge requests
 
 The canonical repository is GitLab cznic/sqlite; the GitHub mirror does not

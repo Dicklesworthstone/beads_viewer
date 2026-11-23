@@ -71,6 +71,12 @@ var parseTimeFormats = []string{
 	"2006-01-02",
 }
 
+// cancellationFlags maps a connection handle to its conn's canceled flag, which
+// canceledProgress reads. A connection stores its entry on its first call with
+// a context and Close removes it, so the map is not written per call and the
+// lookups of concurrent connections do not contend.
+var cancellationFlags sync.Map // uintptr -> *atomic.Int32
+
 // interruptOnDone sets up a goroutine to interrupt the provided db when the
 // context is canceled, and returns a function the caller must defer so it
 // doesn't interrupt after the caller finishes.
@@ -83,11 +89,26 @@ func interruptOnDone(
 		var d int32
 		done = &d
 	}
+	// SQLite clears an interrupt delivered before the first active VM starts.
+	// Check every 1000 VM steps; shorter statements may still finish after a
+	// lost interrupt. The driver owns the connection's only progress-handler slot.
+	if !c.canceledRegistered {
+		cancellationFlags.Store(c.db, &c.canceled)
+		c.canceledRegistered = true
+	}
+	c.canceled.Store(0)
+	sqlite3.Xsqlite3_progress_handler(c.tls, c.db, 1000, cFuncPointer(canceledProgress), c.db)
 	// donemu prevents a TOCTOU logical race between checking the done flag and
 	// calling interrupt in the select statement below.
 	var donemu sync.Mutex
 
 	donech := make(chan struct{})
+
+	// A wait for a shared-cache lock during the call ends once ctx is done,
+	// see retry; the outer call's context is restored afterwards
+	prevWaitCtx := c.waitCtx
+	c.waitCtx = ctx
+	c.ensureBusyHandler()
 
 	go func() {
 		select {
@@ -97,6 +118,7 @@ func interruptOnDone(
 			// nothing, or even possibly an unrelated later call to exec.
 			donemu.Lock()
 			if atomic.CompareAndSwapInt32(done, 0, 1) {
+				c.canceled.Store(1)
 				c.interrupt(c.db)
 			}
 			donemu.Unlock()
@@ -112,7 +134,16 @@ func interruptOnDone(
 		atomic.StoreInt32(done, 1)
 		donemu.Unlock()
 		close(donech)
+		sqlite3.Xsqlite3_progress_handler(c.tls, c.db, 0, 0, 0)
+		c.waitCtx = prevWaitCtx
 	}
+}
+
+func canceledProgress(_ *libc.TLS, db uintptr) int32 {
+	if flag, ok := cancellationFlags.Load(db); ok {
+		return flag.(*atomic.Int32).Load()
+	}
+	return 0
 }
 
 func getVFSName(query string) (r string, err error) {
@@ -304,6 +335,16 @@ func applyQueryParams(c *conn, query string, defensive bool) error {
 	//
 	// _pragma values are the one exception: they are executed verbatim and
 	// cannot be checked here, so a malformed _pragma can still fail partway.
+	// What can be checked, when StrictPragmas is on, is that each is a single
+	// statement; that check compiles nothing.
+	if strictPragmas.Load() {
+		for _, v := range q["_pragma"] {
+			if !singleStatement(v) {
+				return fmt.Errorf("%w: _pragma=%q", ErrMultiStatementPragma, v)
+			}
+		}
+	}
+
 	busyKey, busyTimeout := dsnPick(q, "_busy_timeout", "_timeout")
 	if busyTimeout != "" {
 		if _, err := strconv.ParseInt(busyTimeout, 10, 64); err != nil {
@@ -487,7 +528,7 @@ func applyQueryParams(c *conn, query string, defensive bool) error {
 func unlockNotify(t *libc.TLS, ppArg uintptr, nArg int32) {
 	for i := int32(0); i < nArg; i++ {
 		mu := *(*uintptr)(unsafe.Pointer(ppArg))
-		(*mutex)(unsafe.Pointer(mu)).Unlock()
+		(*mutex)(unsafe.Pointer(mu)).wake()
 		ppArg += ptrSize
 	}
 }
@@ -511,8 +552,8 @@ type FunctionImpl struct {
 	// for more details.
 	Deterministic bool
 
-	// Scalar is called when a scalar function is invoked in SQL. The
-	// argument Values are not valid past the return of the function.
+	// Scalar is called when a scalar function is invoked in SQL. Neither ctx
+	// nor the argument Values are valid past the return of the function.
 	Scalar func(ctx *FunctionContext, args []driver.Value) (driver.Value, error)
 
 	// MakeAggregate is called at the beginning of each evaluation of an
@@ -547,7 +588,7 @@ type FunctionImpl struct {
 	// When in doubt, leave VolatileArgs at its default (false) — the driver
 	// already pools the argument-slice header (issue #226), so the per-row
 	// overhead with VolatileArgs=false is one make([]byte) per BLOB column
-	// and one libc.GoString per TEXT column, not a fresh slice header.
+	// and one copy of the string per TEXT column, not a fresh slice header.
 	//
 	// Similarly, do not re-enter SQLite on the same connection while a
 	// volatile argument is in scope. A nested Query/Exec on the same conn
@@ -567,8 +608,8 @@ type FunctionImpl struct {
 // [application-defined window functions]: https://www.sqlite.org/windowfunctions.html#user_defined_aggregate_window_functions
 type AggregateFunction interface {
 	// Step is called for each row of an aggregate function's SQL
-	// invocation. The argument Values are not valid past the return of the
-	// function. When the aggregate was registered with
+	// invocation. Neither ctx nor the argument Values are valid past the
+	// return of the function. When the aggregate was registered with
 	// [FunctionImpl.VolatileArgs] set to true, string and []byte arguments
 	// in rowArgs are zero-copy views into SQLite-owned memory and retaining
 	// them produces silent data corruption — see [FunctionImpl.VolatileArgs]
@@ -577,20 +618,21 @@ type AggregateFunction interface {
 
 	// WindowInverse is called to remove the oldest presently aggregated
 	// result of Step from the current window. The arguments are those
-	// passed to Step for the row being removed. The argument Values are not
-	// valid past the return of the function. The same
+	// passed to Step for the row being removed. Neither ctx nor the argument
+	// Values are valid past the return of the function. The same
 	// [FunctionImpl.VolatileArgs] caveat applies as for Step.
 	WindowInverse(ctx *FunctionContext, rowArgs []driver.Value) error
 
 	// WindowValue is called to get the current value of an aggregate
 	// function. This is used to return the final value of the function,
-	// whether it is used as a window function or not.
+	// whether it is used as a window function or not. The ctx is not valid
+	// past the return of the function.
 	WindowValue(ctx *FunctionContext) (driver.Value, error)
 
 	// Final is called after all of the aggregate function's input rows have
 	// been stepped through. No other methods will be called on the
 	// AggregateFunction after calling Final. WindowValue returns the value
-	// from the function.
+	// from the function. The ctx is not valid past the return of Final.
 	Final(ctx *FunctionContext)
 }
 
@@ -688,8 +730,19 @@ type ConnectionHookFn func(
 ) error
 
 // FunctionContext represents the context user defined functions execute in.
-// Fields and/or methods of this type may get addedd in the future.
+// Fields and/or methods of this type may get added in the future.
+//
+// The *FunctionContext passed to [FunctionImpl.Scalar] and to the
+// [AggregateFunction] methods is owned by the driver and reused across
+// invocations: it is valid only for the duration of the call it is passed to
+// and must not be retained past its return.
 type FunctionContext struct {
+	// The type has no methods yet, so a retained *FunctionContext is inert.
+	// Any method added must stay safe when called on a retained one: by
+	// then releaseUDFCall has zeroed it, or the pool has handed it to
+	// another invocation, and ctx is that invocation's sqlite3_context.
+	// Documenting "must not be retained" does not stop a caller from
+	// retaining it.
 	tls *libc.TLS
 	ctx uintptr
 }
@@ -877,68 +930,80 @@ func errorResultFunction(tls *libc.TLS, ctx uintptr) func(error) {
 	}
 }
 
-// udfArgsPool reuses []driver.Value slices passed to user-defined functions.
-// The driver's contract (documented on FunctionImpl.Scalar and
-// AggregateFunction.Step/WindowInverse) states that the args values are not
-// valid past the return of the user function, which makes the slice itself
-// safe to reuse. See https://gitlab.com/cznic/sqlite/-/issues/226.
-var udfArgsPool = sync.Pool{
+// udfCall is the per-invocation scratch state handed to a user-defined
+// function, aggregate or virtual table callback: the argument slice and the
+// FunctionContext. Both are reused across invocations through udfCallPool, so
+// a callback costs no heap allocation for either. The driver's contract
+// (documented on FunctionContext, FunctionImpl.Scalar and the
+// AggregateFunction methods) states that neither the args values nor the
+// context are valid past the return of the user callback, which is what makes
+// the reuse safe. See https://gitlab.com/cznic/sqlite/-/issues/226.
+type udfCall struct {
+	args []driver.Value
+	ctx  FunctionContext
+}
+
+var udfCallPool = sync.Pool{
 	New: func() any {
-		s := make([]driver.Value, 0, 8)
-		return &s
+		return &udfCall{args: make([]driver.Value, 0, 8)}
 	},
 }
 
-// acquireUDFArgs returns a pooled *[]driver.Value with len == n. The caller
-// must invoke releaseUDFArgs after the user function has returned.
-func acquireUDFArgs(n int) *[]driver.Value {
-	sp := udfArgsPool.Get().(*[]driver.Value)
-	if cap(*sp) < n {
-		*sp = make([]driver.Value, n)
+// acquireUDFCall returns a pooled udfCall whose args has len == n and whose
+// ctx refers to the sqlite3_context ctx on tls. The caller must invoke
+// releaseUDFCall after the user callback has returned.
+func acquireUDFCall(tls *libc.TLS, ctx uintptr, n int) *udfCall {
+	c := udfCallPool.Get().(*udfCall)
+	if cap(c.args) < n {
+		c.args = make([]driver.Value, n)
 	} else {
-		*sp = (*sp)[:n]
+		c.args = c.args[:n]
 	}
-	return sp
+	c.ctx = FunctionContext{tls: tls, ctx: ctx}
+	return c
 }
 
-// releaseUDFArgs returns the slice to the pool after clearing each entry so
-// any heap references held in the previous invocation can be reclaimed.
-func releaseUDFArgs(sp *[]driver.Value) {
-	s := *sp
-	for i := range s {
-		s[i] = nil
+// releaseUDFCall returns c to the pool after clearing it so any heap
+// references held by the previous invocation can be reclaimed.
+func releaseUDFCall(c *udfCall) {
+	for i := range c.args {
+		c.args[i] = nil
 	}
-	*sp = s[:0]
-	udfArgsPool.Put(sp)
+	c.args = c.args[:0]
+	c.ctx = FunctionContext{}
+	udfCallPool.Put(c)
 }
 
-// functionArgs prepares a []driver.Value for one user-function invocation.
-// The returned slice is owned by the driver and must be released via
-// releaseUDFArgs once the user function returns.
+// functionArgs prepares the pooled udfCall for one user-callback invocation,
+// filling its args from argv. The returned call is owned by the driver and
+// must be released via releaseUDFCall once the user callback returns. ctx is
+// the sqlite3_context of the invocation, or 0 for virtual table callbacks,
+// which have none.
 //
 // When volatile is true, SQLITE_TEXT and SQLITE_BLOB arguments are returned as
 // zero-copy views into SQLite-owned memory (see [FunctionImpl.VolatileArgs]
 // for the user-facing safety contract). When false (the default for all
 // existing call sites), text and blob payloads are copied into Go-owned
 // memory and stay valid for the lifetime of the slice.
-func functionArgs(tls *libc.TLS, argc int32, argv uintptr, volatile bool) *[]driver.Value {
-	sp := acquireUDFArgs(int(argc))
-	args := *sp
+func functionArgs(tls *libc.TLS, ctx uintptr, argc int32, argv uintptr, volatile bool) *udfCall {
+	call := acquireUDFCall(tls, ctx, int(argc))
+	args := call.args
 	for i := int32(0); i < argc; i++ {
 		valPtr := *(*uintptr)(unsafe.Pointer(argv + uintptr(i)*sqliteValPtrSize))
 
 		switch valType := sqlite3.Xsqlite3_value_type(tls, valPtr); valType {
 		case sqlite3.SQLITE_TEXT:
-			if volatile {
-				p := sqlite3.Xsqlite3_value_text(tls, valPtr)
-				n := sqlite3.Xsqlite3_value_bytes(tls, valPtr)
-				if p == 0 || n == 0 {
-					args[i] = ""
-				} else {
-					args[i] = unsafe.String((*byte)(unsafe.Pointer(p)), int(n))
-				}
-			} else {
-				args[i] = libc.GoString(sqlite3.Xsqlite3_value_text(tls, valPtr))
+			// The length is SQLite's: a TEXT value can hold a NUL, and the
+			// first one is not its end.
+			p := sqlite3.Xsqlite3_value_text(tls, valPtr)
+			n := sqlite3.Xsqlite3_value_bytes(tls, valPtr)
+			switch {
+			case p == 0 || n == 0:
+				args[i] = ""
+			case volatile:
+				args[i] = unsafe.String((*byte)(unsafe.Pointer(p)), int(n))
+			default:
+				args[i] = string((*libc.RawMem)(unsafe.Pointer(p))[:n:n])
 			}
 		case sqlite3.SQLITE_INTEGER:
 			args[i] = sqlite3.Xsqlite3_value_int64(tls, valPtr)
@@ -967,7 +1032,7 @@ func functionArgs(tls *libc.TLS, argc int32, argv uintptr, volatile bool) *[]dri
 		}
 	}
 
-	return sp
+	return call
 }
 
 func functionReturnValue(tls *libc.TLS, ctx uintptr, res driver.Value) error {
@@ -1166,9 +1231,9 @@ func funcTrampoline(tls *libc.TLS, ctx uintptr, argc int32, argv uintptr) {
 	xFuncs.mu.RUnlock()
 
 	setErrorResult := errorResultFunction(tls, ctx)
-	sp := functionArgs(tls, argc, argv, entry.volatile)
-	defer releaseUDFArgs(sp)
-	res, err := entry.fn(&FunctionContext{}, *sp)
+	call := functionArgs(tls, ctx, argc, argv, entry.volatile)
+	defer releaseUDFCall(call)
+	res, err := entry.fn(&call.ctx, call.args)
 
 	if err != nil {
 		setErrorResult(err)
@@ -1203,9 +1268,9 @@ func stepTrampoline(tls *libc.TLS, ctx uintptr, argc int32, argv uintptr) {
 	}
 
 	setErrorResult := errorResultFunction(tls, ctx)
-	sp := functionArgs(tls, argc, argv, volatile)
-	defer releaseUDFArgs(sp)
-	err := impl.Step(&FunctionContext{}, *sp)
+	call := functionArgs(tls, ctx, argc, argv, volatile)
+	defer releaseUDFCall(call)
+	err := impl.Step(&call.ctx, call.args)
 	if err != nil {
 		setErrorResult(err)
 	}
@@ -1218,9 +1283,9 @@ func inverseTrampoline(tls *libc.TLS, ctx uintptr, argc int32, argv uintptr) {
 	}
 
 	setErrorResult := errorResultFunction(tls, ctx)
-	sp := functionArgs(tls, argc, argv, volatile)
-	defer releaseUDFArgs(sp)
-	err := impl.WindowInverse(&FunctionContext{}, *sp)
+	call := functionArgs(tls, ctx, argc, argv, volatile)
+	defer releaseUDFCall(call)
+	err := impl.WindowInverse(&call.ctx, call.args)
 	if err != nil {
 		setErrorResult(err)
 	}
@@ -1233,7 +1298,9 @@ func valueTrampoline(tls *libc.TLS, ctx uintptr) {
 	}
 
 	setErrorResult := errorResultFunction(tls, ctx)
-	res, err := impl.WindowValue(&FunctionContext{})
+	call := acquireUDFCall(tls, ctx, 0)
+	defer releaseUDFCall(call)
+	res, err := impl.WindowValue(&call.ctx)
 	if err != nil {
 		setErrorResult(err)
 	} else {
@@ -1251,7 +1318,9 @@ func finalTrampoline(tls *libc.TLS, ctx uintptr) {
 	}
 
 	setErrorResult := errorResultFunction(tls, ctx)
-	res, err := impl.WindowValue(&FunctionContext{})
+	call := acquireUDFCall(tls, ctx, 0)
+	defer releaseUDFCall(call)
+	res, err := impl.WindowValue(&call.ctx)
 	if err != nil {
 		setErrorResult(err)
 	} else {
@@ -1260,7 +1329,7 @@ func finalTrampoline(tls *libc.TLS, ctx uintptr) {
 			setErrorResult(err)
 		}
 	}
-	impl.Final(&FunctionContext{})
+	impl.Final(&call.ctx)
 
 	xAggregateContext.mu.Lock()
 	defer xAggregateContext.mu.Unlock()
@@ -1299,18 +1368,44 @@ func collationTrampoline(tls *libc.TLS, pApp uintptr, nLeft int32, zLeft uintptr
 // the particular instance of 'c', so getting a new connection only to pass it
 // to Limit is possibly not useful above querying what are the various
 // configured default values.
+//
+// The connection may come from a [driver.Connector] that wraps the
+// connections [NewConnector] opens. Limit reaches the driver's own connection
+// through the wrapper's Unwrap method, unwrapping for as long as the value
+// implements
+//
+//	interface{ Unwrap() driver.Conn }
+//
+// A wrapper without that method, or one whose chain does not end at a
+// connection this driver opened, fails with an error naming its type.
 func Limit(c *sql.Conn, id int, newVal int) (r int, err error) {
 	err = c.Raw(func(driverConn any) error {
-		switch dc := driverConn.(type) {
-		case *conn:
-			r = dc.limit(id, newVal)
-			return nil
-		default:
+		dc := unwrapConn(driverConn)
+		if dc == nil {
 			return fmt.Errorf("unexpected driverConn type: %T", driverConn)
 		}
+
+		r = dc.limit(id, newVal)
+		return nil
 	})
 	return r, err
+}
 
+// unwrapConn returns the connection this driver opened behind v, the value
+// sql.Conn.Raw passes to its function, seeing through every wrapper that
+// implements interface{ Unwrap() driver.Conn }. It returns nil when v is not
+// such a connection and does not wrap one.
+func unwrapConn(v any) *conn {
+	for {
+		switch x := v.(type) {
+		case *conn:
+			return x
+		case interface{ Unwrap() driver.Conn }:
+			v = x.Unwrap()
+		default:
+			return nil
+		}
+	}
 }
 
 // ColumnInfo describes one output column of a prepared SQL statement.

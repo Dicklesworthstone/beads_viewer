@@ -199,8 +199,8 @@ type Updater interface {
 // VolatileArgs has no effect on integer, float, time, or NULL arguments.
 // When in doubt, leave it returning false: the engine already pools the
 // argument-slice header, so the per-row overhead in the default mode is one
-// libc.GoString per TEXT column and one make([]byte) per BLOB column, not a
-// fresh slice header.
+// copy of the string per TEXT column and one make([]byte) per BLOB column,
+// not a fresh slice header.
 type VolatileArgsOpter interface {
 	VolatileArgs() bool
 }

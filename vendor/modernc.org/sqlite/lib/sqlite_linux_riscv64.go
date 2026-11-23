@@ -4,8 +4,6 @@
 
 package sqlite3
 
-const __FLT16_IS_IEC_60559__ = 1
-
 const __riscv = 1
 
 const __riscv_a = 2001000
