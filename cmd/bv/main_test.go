@@ -10627,7 +10627,9 @@ func TestWave27_Pass11ExportFixes_Hotspots_Cascades_And_ExecutiveBriefs(t *testi
 	// - WeeklyClosed sparkline & Cascades are populated cleanly.
 	// - Templates & pinned issues are excluded from forecast/sprint Graham capacity bounds.
 	allIssues := []model.Issue{
-		{ID: "L-BE-1", Title: "Backend root", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask, Labels: []string{"backend"}, EstimatedMinutes: &est, CreatedAt: now.Add(-14 * 24 * time.Hour), UpdatedAt: now},
+		{ID: "L-DB-ROOT", Title: "DB root blocked", Status: model.StatusBlocked, Priority: 0, IssueType: model.TypeTask, Labels: []string{"db"}, EstimatedMinutes: &est, CreatedAt: now.Add(-14 * 24 * time.Hour), UpdatedAt: now},
+		{ID: "L-BE-1", Title: "Backend root", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask, Labels: []string{"backend"}, EstimatedMinutes: &est, CreatedAt: now.Add(-14 * 24 * time.Hour), UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "L-BE-1", DependsOnID: "L-DB-ROOT", Type: model.DepBlocks}}},
 		{ID: "L-FE-1", Title: "Frontend blocked by backend", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, Labels: []string{"frontend"}, EstimatedMinutes: &est, CreatedAt: now.Add(-14 * 24 * time.Hour), UpdatedAt: now,
 			Dependencies: []*model.Dependency{{IssueID: "L-FE-1", DependsOnID: "L-BE-1", Type: model.DepBlocks}}},
 		{ID: "L-FE-HIDDEN", Title: "Excluded frontend issue", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, Labels: []string{"frontend"}, EstimatedMinutes: &est, CreatedAt: now.Add(-14 * 24 * time.Hour), UpdatedAt: now,
@@ -10636,8 +10638,8 @@ func TestWave27_Pass11ExportFixes_Hotspots_Cascades_And_ExecutiveBriefs(t *testi
 		{ID: "L-TMPL", Title: "Template issue", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, IsTemplate: true, EstimatedMinutes: &est, CreatedAt: now, UpdatedAt: now},
 		{ID: "L-PIN", Title: "Pinned issue", Status: model.StatusPinned, Priority: 2, IssueType: model.TypeTask, Pinned: true, EstimatedMinutes: &est, CreatedAt: now, UpdatedAt: now},
 	}
-	exportIssues := []model.Issue{allIssues[0], allIssues[1], allIssues[4], allIssues[5]} // omits L-FE-HIDDEN & L-BE-DONE
-	candIDs := map[string]bool{"L-BE-1": true, "L-FE-1": true, "L-TMPL": true, "L-PIN": true}
+	exportIssues := []model.Issue{allIssues[0], allIssues[1], allIssues[2], allIssues[5], allIssues[6]} // omits L-FE-HIDDEN & L-BE-DONE
+	candIDs := map[string]bool{"L-DB-ROOT": true, "L-BE-1": true, "L-FE-1": true, "L-TMPL": true, "L-PIN": true}
 	ctx := RobotContext{
 		Issues:                 exportIssues,
 		FullIssues:             allIssues,
@@ -10650,7 +10652,7 @@ func TestWave27_Pass11ExportFixes_Hotspots_Cascades_And_ExecutiveBriefs(t *testi
 	}
 
 	rawLabels, labelCount, err := buildExportLabelsPayload(ctx, exportIssues, nil, "hash-w27", now)
-	if err != nil || labelCount < 2 {
+	if err != nil || labelCount < 3 {
 		t.Fatalf("buildExportLabelsPayload failed: count=%d err=%v", labelCount, err)
 	}
 	if strings.Contains(string(rawLabels), "L-FE-HIDDEN") {
@@ -10663,11 +10665,13 @@ func TestWave27_Pass11ExportFixes_Hotspots_Cascades_And_ExecutiveBriefs(t *testi
 			Flow         struct {
 				IncomingDeps      int `json:"incoming_deps"`
 				BlockedByExternal int `json:"blocked_by_external"`
+				BlockingExternal  int `json:"blocking_external"`
 				FlowScore         int `json:"flow_score"`
 			} `json:"flow"`
 		} `json:"labels"`
 		Flow struct {
-			TotalCrossLabelDeps int `json:"total_cross_label_deps"`
+			FlowMatrix          [][]int `json:"flow_matrix"`
+			TotalCrossLabelDeps int     `json:"total_cross_label_deps"`
 		} `json:"flow"`
 		Cascades []struct {
 			SourceLabel    string   `json:"source_label"`
@@ -10678,8 +10682,32 @@ func TestWave27_Pass11ExportFixes_Hotspots_Cascades_And_ExecutiveBriefs(t *testi
 	if err := json.Unmarshal(rawLabels, &parsedLabels); err != nil {
 		t.Fatalf("unmarshal labels payload: %v", err)
 	}
-	if parsedLabels.Flow.TotalCrossLabelDeps != 1 {
-		t.Fatalf("A11-3 regression: expected 1 scoped cross-label dep (L-BE-1->L-FE-1), got %d", parsedLabels.Flow.TotalCrossLabelDeps)
+	if parsedLabels.Flow.TotalCrossLabelDeps != 2 {
+		t.Fatalf("A11-3 regression: expected 2 scoped cross-label deps (db->backend, backend->frontend), got %d", parsedLabels.Flow.TotalCrossLabelDeps)
+	}
+	if len(parsedLabels.Flow.FlowMatrix) != 3 {
+		t.Fatalf("A12-1 regression: expected 3x3 FlowMatrix in data/labels.json, got %+v", parsedLabels.Flow.FlowMatrix)
+	}
+	foundDBCascade := false
+	for _, cas := range parsedLabels.Cascades {
+		if cas.SourceLabel == "db" && cas.TotalImpact > 0 {
+			hasBE, hasFE := false, false
+			for _, lbl := range cas.AffectedLabels {
+				if lbl == "backend" {
+					hasBE = true
+				}
+				if lbl == "frontend" {
+					hasFE = true
+				}
+			}
+			if hasBE && hasFE {
+				foundDBCascade = true
+				break
+			}
+		}
+	}
+	if !foundDBCascade {
+		t.Fatalf("A12-1 regression: expected db -> [backend, frontend] blockage cascade in data/labels.json, got %+v", parsedLabels.Cascades)
 	}
 	foundBackendSpark := false
 	for _, lbl := range parsedLabels.Labels {
@@ -10694,7 +10722,7 @@ func TestWave27_Pass11ExportFixes_Hotspots_Cascades_And_ExecutiveBriefs(t *testi
 		t.Fatalf("W27-4 regression: expected backend chronological 4-week sparkline ending with 1 closure (from VelocityIssues), got %+v", parsedLabels.Labels)
 	}
 
-	// Forecast payload excludes L-TMPL and L-PIN from global_capacity.open_count (only L-BE-1 and L-FE-1 count = 2).
+	// Forecast payload excludes L-TMPL and L-PIN from global_capacity.open_count (L-DB-ROOT, L-BE-1, L-FE-1 = 3).
 	rawForecast, _, err := buildExportForecastPayload(ctx, exportIssues, nil, "hash-w27", now)
 	if err != nil {
 		t.Fatalf("buildExportForecastPayload: %v", err)
@@ -10708,8 +10736,8 @@ func TestWave27_Pass11ExportFixes_Hotspots_Cascades_And_ExecutiveBriefs(t *testi
 	if err := json.Unmarshal(rawForecast, &parsedForecast); err != nil {
 		t.Fatalf("unmarshal forecast payload: %v", err)
 	}
-	if parsedForecast.GlobalCapacity.OpenCount != 2 || parsedForecast.GlobalCapacity.TotalMinutes <= 0 || parsedForecast.GlobalCapacity.TotalMinutes >= 200 {
-		t.Fatalf("A11-4 regression: forecast global_capacity included template/pinned issues: %+v (want open_count=2, total_minutes<200)", parsedForecast.GlobalCapacity)
+	if parsedForecast.GlobalCapacity.OpenCount != 3 || parsedForecast.GlobalCapacity.TotalMinutes <= 0 || parsedForecast.GlobalCapacity.TotalMinutes >= 300 {
+		t.Fatalf("A11-4 regression: forecast global_capacity included template/pinned issues: %+v (want open_count=3, total_minutes<300)", parsedForecast.GlobalCapacity)
 	}
 
 	// 2. W27-1 + W27-5 CLI E2E: real temp git repo with shared-file hotspot + cycle ->
@@ -10799,6 +10827,10 @@ func TestWave27_Pass11ExportFixes_Hotspots_Cascades_And_ExecutiveBriefs(t *testi
 		if !strings.Contains(string(briefBytes), want) {
 			t.Fatalf("W27-5 regression: --priority-brief missing %q:\n%s", want, string(briefBytes))
 		}
+	}
+	// Blocked issue HS-2 must never appear as a primary brief row (**HS-2**) without --robot-include-inactive.
+	if strings.Contains(string(briefBytes), "**HS-2**") {
+		t.Fatalf("W27-5 regression: default --priority-brief leaked blocked HS-2 as primary row:\n%s", string(briefBytes))
 	}
 
 	mdOutPath := filepath.Join(t.TempDir(), "exec_report.md")

@@ -5100,7 +5100,6 @@ func main() {
 			// Generate the brief
 			config := export.DefaultPriorityBriefConfig()
 			config.DataHash = dataHash
-			populatePriorityBriefExecutiveData(&config, robotDispatchContext, *forceFullAnalysis, briefNow)
 			if *robotMaxResults > 0 {
 				config.MaxRecommendations = *robotMaxResults
 				if *robotMaxResults < config.MaxQuickWins {
@@ -5110,6 +5109,7 @@ func main() {
 					config.MaxBlockers = *robotMaxResults
 				}
 			}
+			populatePriorityBriefExecutiveData(&config, robotDispatchContext, briefFeedbackWeights, *robotIncludeInactive, *forceFullAnalysis, *robotMaxResults, briefNow)
 			brief, err := export.GeneratePriorityBriefFromTriageJSON(triageJSON, config)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error generating priority brief: %v\n", err)
@@ -5232,7 +5232,6 @@ func main() {
 			// Generate priority brief
 			config := export.DefaultPriorityBriefConfig()
 			config.DataHash = dataHash
-			populatePriorityBriefExecutiveData(&config, robotDispatchContext, *forceFullAnalysis, agentBriefNow)
 			if *robotMaxResults > 0 {
 				config.MaxRecommendations = *robotMaxResults
 				if config.MaxQuickWins > *robotMaxResults {
@@ -5242,6 +5241,7 @@ func main() {
 					config.MaxBlockers = *robotMaxResults
 				}
 			}
+			populatePriorityBriefExecutiveData(&config, robotDispatchContext, agentFeedbackWeights, *robotIncludeInactive, *forceFullAnalysis, *robotMaxResults, agentBriefNow)
 			brief, err := export.GeneratePriorityBriefFromTriageJSON(triageJSON, config)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error generating brief: %v\n", err)
@@ -9704,7 +9704,7 @@ func generateHistoryForExportContext(ctx RobotContext) (*TimeTravelHistory, erro
 		CommitIndex: report.CommitIndex,
 	}
 	fileLookup := correlation.NewFileLookup(scopedReport)
-	rawHotspots := fileLookup.GetHotspots(50)
+	rawHotspots := fileLookup.GetHotspots(0)
 	sort.Slice(rawHotspots, func(i, j int) bool {
 		if rawHotspots[i].OpenBeads != rawHotspots[j].OpenBeads {
 			return rawHotspots[i].OpenBeads > rawHotspots[j].OpenBeads
@@ -9716,7 +9716,7 @@ func generateHistoryForExportContext(ctx RobotContext) (*TimeTravelHistory, erro
 	})
 	var fileHotspots []TimeTravelFileHotspot
 	for _, hs := range rawHotspots {
-		if hs.TotalBeads < 2 && hs.OpenBeads < 1 {
+		if hs.TotalBeads < 2 {
 			continue
 		}
 		var openIDs []string
@@ -13650,7 +13650,7 @@ func countUniqueIssueIDs(issues []model.Issue) int {
 
 // populatePriorityBriefExecutiveData attaches scoped Global Backlog Capacity (Graham bounds),
 // Priority Misalignment Alerts, and Cycle Break Suggestions to priority/agent brief configs.
-func populatePriorityBriefExecutiveData(config *export.PriorityBriefConfig, ctx RobotContext, forceFullAnalysis bool, now time.Time) {
+func populatePriorityBriefExecutiveData(config *export.PriorityBriefConfig, ctx RobotContext, feedbackWeights *analysis.Weights, includeInactive, forceFullAnalysis bool, maxResults int, now time.Time) {
 	if config == nil {
 		return
 	}
@@ -13667,6 +13667,9 @@ func populatePriorityBriefExecutiveData(config *export.PriorityBriefConfig, ctx 
 		return
 	}
 	analyzer.SetNow(now)
+	if feedbackWeights != nil {
+		analyzer.SetWeights(*feedbackWeights)
+	}
 	if forceFullAnalysis {
 		fullCfg := analysis.FullAnalysisConfig()
 		analyzer.SetConfig(&fullCfg)
@@ -13712,24 +13715,39 @@ func populatePriorityBriefExecutiveData(config *export.PriorityBriefConfig, ctx 
 		}
 	}
 
+	limit := 5
+	if maxResults > 0 {
+		limit = maxResults
+	}
+	config.MaxPriorityAlerts = limit
+	config.MaxCycleBreaks = limit
+
+	selectionMode := analysis.SelectionReadyLeaf
+	if includeInactive {
+		selectionMode = analysis.SelectionAllScopedCandidates
+	}
+	eligiblePriorityIDs := analyzer.CandidateIssueSet(selectionMode)
 	recs := analyzer.GenerateRecommendationsFromStats(&stats, analysis.DefaultThresholds())
 	for _, rec := range recs {
-		if visibleIDs[rec.IssueID] {
+		if visibleIDs[rec.IssueID] && eligiblePriorityIDs[rec.IssueID] {
 			config.PriorityRecommendations = append(config.PriorityRecommendations, rec)
-			if len(config.PriorityRecommendations) >= 5 {
+			if len(config.PriorityRecommendations) >= limit {
 				break
 			}
 		}
 	}
 
-	if len(stats.Cycles()) > 0 {
+	if cycles := stats.Cycles(); len(cycles) > 0 {
 		advCfg := analysis.DefaultAdvancedInsightsConfig()
-		advCfg.CycleBreakLimit = 5
+		advCfg.CycleBreakLimit = limit
+		if ctx.CandidateIDs != nil {
+			advCfg.CycleBreakLimit = max(limit, len(cycles)*4)
+		}
 		if adv := analyzer.GenerateAdvancedInsightsFromStats(&stats, advCfg); adv != nil && adv.CycleBreak != nil {
 			for _, cb := range adv.CycleBreak.Suggestions {
 				if visibleIDs[cb.EdgeFrom] && visibleIDs[cb.EdgeTo] {
 					config.CycleBreaks = append(config.CycleBreaks, cb)
-					if len(config.CycleBreaks) >= 5 {
+					if len(config.CycleBreaks) >= limit {
 						break
 					}
 				}
@@ -13844,7 +13862,8 @@ func buildExportLabelsPayload(ctx RobotContext, exportIssues []model.Issue, stat
 				if blockingExtIssues[dep.FromLabel] == nil {
 					blockingExtIssues[dep.FromLabel] = make(map[string]bool)
 				}
-				blockingExtIssues[dep.FromLabel][pair.BlockerID] = true
+				// Match pkg/analysis/label_health.go: BlockingExternal counts distinct external blocked issues.
+				blockingExtIssues[dep.FromLabel][pair.BlockedID] = true
 			}
 		} else {
 			for _, id := range dep.IssueIDs {
@@ -13854,6 +13873,10 @@ func buildExportLabelsPayload(ctx RobotContext, exportIssues []model.Issue, stat
 						blockedExtIssues[dep.ToLabel] = make(map[string]bool)
 					}
 					blockedExtIssues[dep.ToLabel][id] = true
+					if blockingExtIssues[dep.FromLabel] == nil {
+						blockingExtIssues[dep.FromLabel] = make(map[string]bool)
+					}
+					blockingExtIssues[dep.FromLabel][id] = true
 				}
 			}
 		}
@@ -13868,7 +13891,11 @@ func buildExportLabelsPayload(ctx RobotContext, exportIssues []model.Issue, stat
 		scopedDep := dep
 		scopedDep.IssueIDs = keptIDs
 		scopedDep.BlockingPairs = keptPairs
-		scopedDep.IssueCount = len(keptIDs)
+		if len(dep.BlockingPairs) > 0 {
+			scopedDep.IssueCount = len(keptPairs)
+		} else {
+			scopedDep.IssueCount = len(keptIDs)
+		}
 		filteredDeps = append(filteredDeps, scopedDep)
 		totalCross += scopedDep.IssueCount
 		outgoingByLabel[scopedDep.FromLabel] += scopedDep.IssueCount
@@ -13903,8 +13930,24 @@ func buildExportLabelsPayload(ctx RobotContext, exportIssues []model.Issue, stat
 			filteredFlowLabels = append(filteredFlowLabels, l)
 		}
 	}
+	flowLabelIndex := make(map[string]int, len(filteredFlowLabels))
+	for idx, l := range filteredFlowLabels {
+		flowLabelIndex[l] = idx
+	}
+	flowMatrix := make([][]int, len(filteredFlowLabels))
+	for i := range flowMatrix {
+		flowMatrix[i] = make([]int, len(filteredFlowLabels))
+	}
+	for _, dep := range filteredDeps {
+		fromIdx, okFrom := flowLabelIndex[dep.FromLabel]
+		toIdx, okTo := flowLabelIndex[dep.ToLabel]
+		if okFrom && okTo {
+			flowMatrix[fromIdx][toIdx] = dep.IssueCount
+		}
+	}
 	flowOut := analysis.CrossLabelFlow{
 		Labels:              filteredFlowLabels,
+		FlowMatrix:          flowMatrix,
 		Dependencies:        filteredDeps,
 		BottleneckLabels:    filteredBottlenecks,
 		TotalCrossLabelDeps: totalCross,
