@@ -9,6 +9,12 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
+type actionableWhatIf struct {
+	DirectUnblocks     int
+	TransitiveUnblocks int
+	EstimatedDaysSaved float64
+}
+
 // ActionableModel represents the actionable items view grouped by tracks
 type ActionableModel struct {
 	plan          analysis.ExecutionPlan
@@ -18,6 +24,24 @@ type ActionableModel struct {
 	width         int
 	height        int
 	theme         Theme
+	capacityText  string
+	etaByID       map[string]string
+	whatIfByID    map[string]actionableWhatIf
+}
+
+// SetCapacitySummary attaches a compact inline capacity summary rendered in the header bar.
+func (m *ActionableModel) SetCapacitySummary(text string) {
+	m.capacityText = text
+}
+
+// SetETAByID attaches compact per-item ETA labels (e.g. "~1.5d") for track cards.
+func (m *ActionableModel) SetETAByID(eta map[string]string) {
+	m.etaByID = eta
+}
+
+// SetWhatIfByID attaches transitive What-If unblock summaries for track cards.
+func (m *ActionableModel) SetWhatIfByID(whatIf map[string]actionableWhatIf) {
+	m.whatIfByID = whatIf
 }
 
 // NewActionableModel creates a new actionable view from execution plan
@@ -254,8 +278,12 @@ func (m *ActionableModel) Render() string {
 		Padding(0, 2).
 		Width(headerWidth)
 
+	headerText := fmt.Sprintf("⚡ ACTIONABLE ITEMS  │  %d items in %d tracks", totalItems, len(m.plan.Tracks))
+	if m.capacityText != "" {
+		headerText += "  │  " + m.capacityText
+	}
 	header := truncateRunesHelper(
-		fmt.Sprintf("⚡ ACTIONABLE ITEMS  │  %d items in %d tracks", totalItems, len(m.plan.Tracks)),
+		headerText,
 		innerBannerWidth,
 		"…",
 	)
@@ -363,7 +391,12 @@ func (m *ActionableModel) Render() string {
 			itemLine.WriteString(" ")
 
 			// Title with selection highlighting
-			maxTitleLen := m.width - lipgloss.Width(itemLine.String()) - 20
+			etaLabel := m.etaByID[item.ID]
+			suffixReserve := 20
+			if etaLabel != "" {
+				suffixReserve += len(etaLabel) + 2
+			}
+			maxTitleLen := m.width - lipgloss.Width(itemLine.String()) - suffixReserve
 			if maxTitleLen < 10 {
 				maxTitleLen = 10
 			}
@@ -376,6 +409,13 @@ func (m *ActionableModel) Render() string {
 				titleStyle = titleStyle.Foreground(lipgloss.AdaptiveColor{Light: "#333333", Dark: "#E8E8E8"})
 			}
 			itemLine.WriteString(titleStyle.Render(title))
+
+			if etaLabel != "" {
+				etaBadge := t.Renderer.NewStyle().
+					Foreground(t.Muted).
+					Render(" " + etaLabel)
+				itemLine.WriteString(etaBadge)
+			}
 
 			// Unblocks count badge
 			if len(item.UnblocksIDs) > 0 {
@@ -401,6 +441,18 @@ func (m *ActionableModel) Render() string {
 					Italic(true).
 					PaddingLeft(8)
 				unblocksText := "↳ Unblocks: " + strings.Join(item.UnblocksIDs, ", ")
+				if wi, ok := m.whatIfByID[item.ID]; ok {
+					var extra []string
+					if wi.TransitiveUnblocks > len(item.UnblocksIDs) {
+						extra = append(extra, fmt.Sprintf("%d total cascade", wi.TransitiveUnblocks))
+					}
+					if wi.EstimatedDaysSaved >= 0.1 {
+						extra = append(extra, fmt.Sprintf("~%.1fd saved", wi.EstimatedDaysSaved))
+					}
+					if len(extra) > 0 {
+						unblocksText += " (" + strings.Join(extra, ", ") + ")"
+					}
+				}
 				unblocksText = truncateRunesHelper(unblocksText, m.width-12, "...")
 				lines = append(lines, unblocksStyle.Render(unblocksText))
 			}

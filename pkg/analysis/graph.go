@@ -4285,12 +4285,16 @@ func (a *Analyzer) GetBlockerChain(issueID string) *BlockerChainResult {
 	// DFS to find all blockers, detect cycles, and collect roots
 	visited := make(map[string]bool)  // fully processed
 	visiting := make(map[string]bool) // in current path
+	seenCycleID := make(map[string]bool)
 
 	var dfs func(id string, depth int)
 	dfs = func(id string, depth int) {
 		if visiting[id] {
 			result.HasCycle = true
-			result.CycleIDs = append(result.CycleIDs, id)
+			if !seenCycleID[id] {
+				seenCycleID[id] = true
+				result.CycleIDs = append(result.CycleIDs, id)
+			}
 			return
 		}
 		if visited[id] {

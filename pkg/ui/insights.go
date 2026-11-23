@@ -892,6 +892,9 @@ func (m *InsightsModel) getPanelItems(panel MetricPanel) []analysis.InsightItem 
 
 // SelectedIssueID returns the currently selected issue ID
 func (m *InsightsModel) SelectedIssueID() string {
+	if m.focusedPanel < 0 || m.focusedPanel >= PanelCount {
+		return ""
+	}
 	// For cycles panel, return first item in selected cycle
 	if m.focusedPanel == PanelCycles {
 		idx := m.selectedIndex[PanelCycles]
@@ -2520,6 +2523,9 @@ Navigate to a metric panel and select an item to view its details here.
 `
 		if advMD := m.renderAdvancedInsightsMD(); advMD != "" {
 			emptyContent += "\n---\n\n" + advMD
+		}
+		if extraMD := m.renderPriorityExtrasMD(); extraMD != "" {
+			emptyContent += "\n---\n\n" + extraMD
 		}
 		if m.mdRenderer != nil {
 			rendered, err := m.mdRenderer.Render(emptyContent)

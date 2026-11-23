@@ -4323,6 +4323,24 @@ func (m *Model) recordTriageFeedback(action string) {
 	m.statusIsError = false
 }
 
+func triageWeightsDiffer(a, b analysis.Weights) bool {
+	const eps = 1e-9
+	diff := func(x, y float64) bool {
+		if x > y {
+			return x-y > eps
+		}
+		return y-x > eps
+	}
+	return diff(a.PageRank, b.PageRank) ||
+		diff(a.Betweenness, b.Betweenness) ||
+		diff(a.BlockerRatio, b.BlockerRatio) ||
+		diff(a.Staleness, b.Staleness) ||
+		diff(a.PriorityBoost, b.PriorityBoost) ||
+		diff(a.TimeToImpact, b.TimeToImpact) ||
+		diff(a.Urgency, b.Urgency) ||
+		diff(a.Risk, b.Risk)
+}
+
 func (m *Model) syncBoardReadinessAndFullIssues() {
 	refNow := m.analysisReferenceTime()
 	m.board.SetReferenceTime(refNow)
@@ -4443,6 +4461,7 @@ func (m *Model) rebuildInsightsPanel() {
 	}
 
 	prev := m.insightsPanel
+	prevSelectedID := prev.SelectedIssueID()
 	panel := NewInsightsModel(ins, issueMap, m.theme)
 	panel.focusedPanel = prev.focusedPanel
 	panel.selectedIndex = prev.selectedIndex
@@ -4490,6 +4509,51 @@ func (m *Model) rebuildInsightsPanel() {
 		panelHeight = 3
 	}
 	panel.ClampSelections()
+	if prevSelectedID != "" && panel.focusedPanel == PanelPriority {
+		if panel.showHeatmap && panel.heatmapDrill {
+			relocated := false
+			for idx, id := range panel.heatmapIssues {
+				if id == prevSelectedID {
+					panel.heatmapDrillIdx = idx
+					relocated = true
+					break
+				}
+			}
+			if !relocated && panel.heatmapIssueMap != nil {
+				for r := range panel.heatmapIssueMap {
+					for c := range panel.heatmapIssueMap[r] {
+						for idx, id := range panel.heatmapIssueMap[r][c] {
+							if id == prevSelectedID {
+								panel.heatmapRow = r
+								panel.heatmapCol = c
+								panel.heatmapIssues = panel.heatmapIssueMap[r][c]
+								panel.heatmapDrillIdx = idx
+								relocated = true
+								break
+							}
+						}
+						if relocated {
+							break
+						}
+					}
+					if relocated {
+						break
+					}
+				}
+			}
+		} else if !panel.showHeatmap {
+			for idx, pick := range panel.topPicks {
+				if pick.ID == prevSelectedID {
+					panel.selectedIndex[PanelPriority] = idx
+					if panel.scrollOffset[PanelPriority] > idx {
+						panel.scrollOffset[PanelPriority] = idx
+					}
+					break
+				}
+			}
+		}
+		panel.ClampSelections()
+	}
 	panel.SetSize(m.mainContentWidth(), panelHeight)
 	m.insightsPanel = panel
 }
@@ -5232,10 +5296,10 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if msg.prepared != nil {
 			if msg.preparationCtx == nil || msg.preparationCtx.Err() != nil ||
-				msg.sourceSnapshot != m.snapshot || msg.sourceAnalyzer != m.analyzer {
+				msg.sourceSnapshot != m.snapshot || m.analyzer == nil {
 				return m, nil
 			}
-			if msg.sourceWeights != m.analyzer.Weights() || !msg.sourceNow.Equal(m.analyzer.Now()) {
+			if msg.sourceAnalyzer != m.analyzer || msg.sourceWeights != m.analyzer.Weights() || !msg.sourceNow.Equal(m.analyzer.Now()) {
 				return m, m.preparePhase2Cmd()
 			}
 			m.cancelPhase2Preparation()
@@ -5725,7 +5789,8 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.analysis = msg.Snapshot.Analysis
 		reloadedWeights, reloadedFeedbackSummary := loadFeedbackForBeadsPath(m.beadsPath)
 		m.feedbackSummary = reloadedFeedbackSummary
-		if m.candidateIDs != nil || !m.referenceNow.IsZero() {
+		weightsDiverged := reloadedWeights != nil && m.analyzer != nil && triageWeightsDiffer(m.analyzer.Weights(), *reloadedWeights)
+		if m.candidateIDs != nil || !m.referenceNow.IsZero() || weightsDiverged {
 			// The worker owns its analyzer. Bind a UI-owned analyzer to the
 			// fresh authority without mutating analysis still used off-thread.
 			m.analyzer = analysis.NewAnalyzer(m.issues)
@@ -5775,7 +5840,7 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.pooledIssues = nil
 		// Preserve existing triage data unless the snapshot has Phase 2 results.
 		// Avoid flicker when Phase 1 snapshots arrive without triage data.
-		if m.candidateIDs != nil || !m.referenceNow.IsZero() {
+		if m.candidateIDs != nil || !m.referenceNow.IsZero() || weightsDiverged {
 			m.refreshScopedTriageData()
 		} else if msg.Snapshot.IsPhase2Ready() || len(msg.Snapshot.TriageScores) > 0 {
 			m.triageScores = msg.Snapshot.TriageScores
@@ -6541,6 +6606,8 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.insightsPanel.SetInsights(m.generateModelInsights(m.analysis, len(m.issues)))
 			m.insightsPanel.SetIssueMap(m.issueMap)
 			m.insightsPanel.SetAdvancedInsights(nil)
+			m.insightsPanel.SetGlobalCapacity(nil)
+			m.insightsPanel.SetFeedbackSummary(m.feedbackSummary)
 			m.insightsPanel.ClampSelections()
 		}
 		if underlyingFocus == focusAttention {
@@ -11002,6 +11069,9 @@ func (m *Model) renderMainView() (body string, overlay bool) {
 			m.graphView.SetETAContext(m.etaContext())
 			body = m.graphView.View(bodyWidth, bodyHeight)
 		case m.isBoardView:
+			m.board.SetAnalyzer(m.analyzer)
+			m.board.SetAnalysis(m.analysis)
+			m.board.SetETAContext(m.etaContext())
 			m.board.SetSize(bodyWidth, bodyHeight)
 			body = m.board.View(bodyWidth, bodyHeight)
 		case m.isActionableView:
@@ -14309,43 +14379,78 @@ func (m *Model) updateViewportContent() {
 	// Transitive Root-Blocker Chain ("Start Here") for blocked active issues
 	if !isClosedLikeStatus(item.Status) && m.analyzer != nil {
 		if chain := m.analyzer.GetBlockerChain(item.ID); chain != nil && chain.IsBlocked && (len(chain.RootBlockers) > 0 || chain.HasCycle) {
-			sb.WriteString("### 🎯 Start Here: Root Blockers\n")
-			if chain.ChainLength > 0 {
-				fmt.Fprintf(&sb, "- **Chain:** %d upstream blocker(s)\n", chain.ChainLength)
-			}
-			if chain.HasCycle {
-				cycleHint := "dependency cycle detected"
-				if len(chain.CycleIDs) > 0 {
-					cycleHint = fmt.Sprintf("dependency cycle (%s)", strings.Join(chain.CycleIDs, " → "))
+			blockerVisible := func(id string) bool {
+				if m.workspaceMode && m.activeRepos != nil {
+					iss, ok := m.issueMap[id]
+					if !ok || iss == nil {
+						return false
+					}
+					if rk := issueRepoKey(*iss); rk != "" && !m.activeRepos[rk] {
+						return false
+					}
 				}
-				fmt.Fprintf(&sb, "- ⚠ **Warning:** %s\n", cycleHint)
-			}
-			maxRoots := 5
-			shown := chain.RootBlockers
-			if len(shown) > maxRoots {
-				shown = shown[:maxRoots]
-			}
-			for _, rb := range shown {
-				actionTag := "withheld"
-				if rb.Actionable {
-					actionTag = "actionable now"
+				if m.candidateIDs != nil {
+					if _, ok := m.issueMap[id]; !ok {
+						return false
+					}
 				}
-				depthTag := ""
-				if rb.Depth > 1 {
-					depthTag = fmt.Sprintf(", depth %d", rb.Depth)
-				}
-				if rb.Status == "missing" {
-					fmt.Fprintf(&sb, "- ▶ **%s** (missing • %s%s) — %s\n",
-						rb.ID, actionTag, depthTag, truncateRunesHelper(rb.Title, 48, "..."))
-				} else {
-					fmt.Fprintf(&sb, "- ▶ **%s** (P%d • %s • %s%s) — %s\n",
-						rb.ID, rb.Priority, rb.Status, actionTag, depthTag, truncateRunesHelper(rb.Title, 48, "..."))
+				return true
+			}
+			visibleRoots := make([]analysis.BlockerChainEntry, 0, len(chain.RootBlockers))
+			for _, rb := range chain.RootBlockers {
+				if blockerVisible(rb.ID) {
+					visibleRoots = append(visibleRoots, rb)
 				}
 			}
-			if len(chain.RootBlockers) > maxRoots {
-				fmt.Fprintf(&sb, "- *…and %d more root blocker(s)*\n", len(chain.RootBlockers)-maxRoots)
+			hiddenRoots := len(chain.RootBlockers) - len(visibleRoots)
+			visibleCycleIDs := make([]string, 0, len(chain.CycleIDs))
+			for _, cid := range chain.CycleIDs {
+				if blockerVisible(cid) {
+					visibleCycleIDs = append(visibleCycleIDs, cid)
+				}
 			}
-			sb.WriteString("\n")
+			if len(visibleRoots) > 0 || chain.HasCycle || hiddenRoots > 0 {
+				sb.WriteString("### 🎯 Start Here: Root Blockers\n")
+				if chain.ChainLength > 0 {
+					fmt.Fprintf(&sb, "- **Chain:** %d upstream blocker(s)\n", chain.ChainLength)
+				}
+				if chain.HasCycle {
+					cycleHint := "dependency cycle detected"
+					if len(visibleCycleIDs) > 0 {
+						cycleHint = fmt.Sprintf("dependency cycle involving %s", strings.Join(visibleCycleIDs, ", "))
+					}
+					fmt.Fprintf(&sb, "- ⚠ **Warning:** %s\n", cycleHint)
+				}
+				maxRoots := 5
+				shown := visibleRoots
+				if len(shown) > maxRoots {
+					shown = shown[:maxRoots]
+				}
+				for _, rb := range shown {
+					actionTag := "withheld"
+					if rb.Actionable {
+						actionTag = "actionable now"
+					}
+					depthTag := ""
+					if rb.Depth > 1 {
+						depthTag = fmt.Sprintf(", depth %d", rb.Depth)
+					}
+					if rb.Status == "missing" {
+						fmt.Fprintf(&sb, "- ▶ **%s** (missing • %s%s) — %s\n",
+							rb.ID, actionTag, depthTag, truncateRunesHelper(rb.Title, 48, "..."))
+					} else {
+						fmt.Fprintf(&sb, "- ▶ **%s** (P%d • %s • %s%s) — %s\n",
+							rb.ID, rb.Priority, rb.Status, actionTag, depthTag, truncateRunesHelper(rb.Title, 48, "..."))
+					}
+				}
+				if len(visibleRoots) > maxRoots {
+					fmt.Fprintf(&sb, "- *…and %d more root blocker(s)*\n", len(visibleRoots)-maxRoots)
+				}
+				if hiddenRoots > 0 {
+					fmt.Fprintf(&sb, "- *…and %d out-of-scope upstream blocker(s)*\n", hiddenRoots)
+				}
+				sb.WriteString("\n")
+			}
 		}
 	}
 
@@ -14373,7 +14478,44 @@ func (m *Model) updateViewportContent() {
 			}
 			sb.WriteString("\n")
 		}
-		rootNode := BuildDependencyTree(item.ID, m.issueMap, 3) // Max depth 3
+		treeMap := m.issueMap
+		if m.candidateIDs != nil || (m.workspaceMode && m.activeRepos != nil) {
+			treeMap = make(map[string]*model.Issue, len(m.issueMap))
+			for id, iss := range m.issueMap {
+				if iss == nil {
+					continue
+				}
+				if m.workspaceMode && m.activeRepos != nil {
+					if rk := issueRepoKey(*iss); rk != "" && !m.activeRepos[rk] {
+						continue
+					}
+				}
+				if id != item.ID && len(iss.Dependencies) > 0 {
+					cloned := *iss
+					kept := make([]*model.Dependency, 0, len(iss.Dependencies))
+					for _, dep := range iss.Dependencies {
+						if dep == nil {
+							continue
+						}
+						target, exists := m.issueMap[dep.DependsOnID]
+						if !exists || target == nil {
+							continue
+						}
+						if m.workspaceMode && m.activeRepos != nil {
+							if rk := issueRepoKey(*target); rk != "" && !m.activeRepos[rk] {
+								continue
+							}
+						}
+						kept = append(kept, dep)
+					}
+					cloned.Dependencies = kept
+					treeMap[id] = &cloned
+				} else {
+					treeMap[id] = iss
+				}
+			}
+		}
+		rootNode := BuildDependencyTree(item.ID, treeMap, 3) // Max depth 3
 		treeStr := RenderDependencyTree(rootNode)
 		// This generated tree is plain text. An unspecified language makes the
 		// highlighter scan its lexer registry again on every selected issue.
@@ -17165,6 +17307,47 @@ func (m *Model) refreshActionableView() {
 	}
 	plan := analyzer.GetExecutionPlan()
 	m.actionableView = NewActionableModel(plan, m.theme)
+	if capSum := m.computeGlobalCapacitySummary(scopedIssues, nil); capSum != nil && capSum.TotalMinutes > 0 {
+		m.actionableView.SetCapacitySummary(fmt.Sprintf("1a %.1fd · 2a %.1fd · 4a %.1fd · %.0f%% par",
+			capSum.Days1Agent, capSum.Days2Min, capSum.Days4Min, capSum.ParallelizablePct))
+	}
+	etaStats := m.analysis
+	if m.workspaceMode && m.activeRepos != nil {
+		s := analyzer.Analyze()
+		etaStats = &s
+	}
+	etaCtx := analysis.NewETAContext(scopedIssues, etaStats, analyzer.Now())
+	issueByID := make(map[string]model.Issue, len(scopedIssues))
+	for _, iss := range scopedIssues {
+		issueByID[iss.ID] = iss
+	}
+	etaMap := make(map[string]string)
+	whatIfMap := make(map[string]actionableWhatIf)
+	for _, track := range plan.Tracks {
+		for _, item := range track.Items {
+			if iss, ok := issueByID[item.ID]; ok {
+				eta := etaCtx.EstimateForIssue(iss, 1)
+				if eta.EstimatedDays > 0 && !eta.ETADate.IsZero() {
+					etaMap[item.ID] = fmt.Sprintf("~%.1fd", eta.EstimatedDays)
+				}
+			}
+			if len(item.UnblocksIDs) > 0 {
+				if delta, err := analyzer.ComputeWhatIfDeltaFromStats(item.ID, etaStats); err == nil && delta != nil {
+					whatIfMap[item.ID] = actionableWhatIf{
+						DirectUnblocks:     delta.DirectUnblocks,
+						TransitiveUnblocks: delta.TransitiveUnblocks,
+						EstimatedDaysSaved: delta.EstimatedDaysSaved,
+					}
+				}
+			}
+		}
+	}
+	if len(etaMap) > 0 {
+		m.actionableView.SetETAByID(etaMap)
+	}
+	if len(whatIfMap) > 0 {
+		m.actionableView.SetWhatIfByID(whatIfMap)
+	}
 	m.actionableView.SetSize(m.mainContentWidth(), m.height-2)
 	if prevSelectedID != "" {
 		_ = m.actionableView.SelectIssueByID(prevSelectedID)
@@ -18064,25 +18247,37 @@ func (m *Model) renderAlertsPanel() string {
 			}
 		}
 
-		if startIdx > 0 {
+		showTopInd := startIdx > 0
+		showBotInd := endIdx < totalAlerts
+		indLines := 0
+		if showTopInd {
+			indLines++
+		}
+		if showBotInd {
+			indLines++
+		}
+		// Never let scroll indicators starve the selected alert or push footer past MaxHeight.
+		if indLines > lineBudget-1 {
+			if lineBudget <= 1 {
+				showTopInd, showBotInd, indLines = false, false, 0
+			} else if showTopInd && showBotInd && lineBudget == 2 {
+				showTopInd = false
+				indLines = 1
+			}
+		}
+
+		if showTopInd {
 			sb.WriteString(t.Renderer.NewStyle().Foreground(t.Muted).Italic(true).Render(
 				fmt.Sprintf("  ↑ %d more", startIdx)))
 			sb.WriteString("\n")
 		}
 
 		// Render visible alert window
+		availSelectedLines := max(1, lineBudget-indLines)
 		for i := startIdx; i < endIdx; i++ {
 			a := visibleAlerts[i]
 			selected := i == cursorIdx
 			if selected {
-				indLines := 0
-				if startIdx > 0 {
-					indLines++
-				}
-				if endIdx < totalAlerts {
-					indLines++
-				}
-				availSelectedLines := max(1, lineBudget-indLines)
 				if alertRenderedLineCount(a, true, innerWidth) > availSelectedLines {
 					a.Message = truncateRunesHelper(strings.ReplaceAll(a.Message, "\n", " "), max(12, innerWidth-6), "…")
 					if a.SuggestedAction != "" && alertRenderedLineCount(a, true, innerWidth) > availSelectedLines {
@@ -18113,43 +18308,60 @@ func (m *Model) renderAlertsPanel() string {
 			}
 
 			// Alert line
-			line := fmt.Sprintf("%s%s %s", cursor, severityIcon, a.Message)
+			plainMain := fmt.Sprintf("%s%s %s", cursor, severityIcon, a.Message)
+			line := plainMain
 			if selected {
 				line = t.Renderer.NewStyle().Bold(true).Render(line)
 			}
 			sb.WriteString(severityStyle.Render(line))
 			sb.WriteString("\n")
 
-			// Show issue ID if available and selected
-			if selected && a.IssueID != "" {
-				issueHint := t.Renderer.NewStyle().Foreground(t.Muted).Italic(true).Render(
-					fmt.Sprintf("     Issue: %s (press Enter to jump)", a.IssueID))
-				sb.WriteString(issueHint)
-				sb.WriteString("\n")
-			}
-
-			// Show unblocks info for blocking cascade alerts
-			if selected && a.UnblocksCount > 0 {
-				unblockHint := t.Renderer.NewStyle().Foreground(t.Open).Render(
-					fmt.Sprintf("     Unblocks %d items (priority sum: %d)", a.UnblocksCount, a.DownstreamPrioritySum))
-				sb.WriteString(unblockHint)
-				sb.WriteString("\n")
-			}
-
-			// Pairwise alerts name their partner; every alert says what to do.
-			if selected && a.RelatedIssueID != "" {
-				sb.WriteString(t.Renderer.NewStyle().Foreground(t.Muted).Italic(true).Render(
-					fmt.Sprintf("     Related: %s", a.RelatedIssueID)))
-				sb.WriteString("\n")
-			}
-			if selected && a.SuggestedAction != "" {
-				sb.WriteString(t.Renderer.NewStyle().Foreground(t.Secondary).Render(
-					"     Suggested: " + a.SuggestedAction))
-				sb.WriteString("\n")
+			if selected {
+				type alertDetailEntry struct {
+					text  string
+					style lipgloss.Style
+				}
+				var details []alertDetailEntry
+				if a.IssueID != "" {
+					details = append(details, alertDetailEntry{
+						text:  fmt.Sprintf("     Issue: %s (press Enter to jump)", a.IssueID),
+						style: t.Renderer.NewStyle().Foreground(t.Muted).Italic(true),
+					})
+				}
+				if a.UnblocksCount > 0 {
+					details = append(details, alertDetailEntry{
+						text:  fmt.Sprintf("     Unblocks %d items (priority sum: %d)", a.UnblocksCount, a.DownstreamPrioritySum),
+						style: t.Renderer.NewStyle().Foreground(t.Open),
+					})
+				}
+				if a.RelatedIssueID != "" {
+					details = append(details, alertDetailEntry{
+						text:  fmt.Sprintf("     Related: %s", a.RelatedIssueID),
+						style: t.Renderer.NewStyle().Foreground(t.Muted).Italic(true),
+					})
+				}
+				if a.SuggestedAction != "" {
+					details = append(details, alertDetailEntry{
+						text:  "     Suggested: " + a.SuggestedAction,
+						style: t.Renderer.NewStyle().Foreground(t.Secondary),
+					})
+				}
+				selLines := wrappedAlertTextLines(plainMain, innerWidth)
+				for _, d := range details {
+					selLines += wrappedAlertTextLines(d.text, innerWidth)
+				}
+				for len(details) > 0 && selLines > availSelectedLines {
+					selLines -= wrappedAlertTextLines(details[len(details)-1].text, innerWidth)
+					details = details[:len(details)-1]
+				}
+				for _, d := range details {
+					sb.WriteString(d.style.Render(d.text))
+					sb.WriteString("\n")
+				}
 			}
 		}
 
-		if endIdx < totalAlerts {
+		if showBotInd {
 			sb.WriteString(t.Renderer.NewStyle().Foreground(t.Muted).Italic(true).Render(
 				fmt.Sprintf("  ↓ %d more", totalAlerts-endIdx)))
 			sb.WriteString("\n")
@@ -18234,6 +18446,9 @@ func (m *Model) RenderDebugView(viewName string, width, height int) string {
 		m.isBoardView = true
 		m.focused = focusBoard
 		m.refreshBoardAndGraphForCurrentFilter()
+		m.board.SetAnalyzer(m.analyzer)
+		m.board.SetAnalysis(m.analysis)
+		m.board.SetETAContext(m.etaContext())
 		m.board.SetSize(width, bodyHeight)
 		return m.board.View(width, bodyHeight)
 	case "history":

@@ -154,13 +154,17 @@ type HistoryModel struct {
 	expandedBeads map[string]bool // Track which beads have commits expanded
 
 	// File tree state (bv-190l)
-	showFileTree    bool            // Whether file tree panel is visible
-	fileTree        []*FileTreeNode // Root-level nodes of the file tree
-	flatFileList    []*FileTreeNode // Flattened visible nodes for navigation
-	selectedFileIdx int             // Index in flatFileList
-	fileTreeScroll  int             // Scroll offset for file tree
-	fileFilter      string          // Current file filter (empty = no filter)
-	fileTreeFocus   bool            // True when file tree has focus
+	showFileTree       bool                                     // Whether file tree panel is visible
+	fileTree           []*FileTreeNode                          // Root-level nodes of the file tree
+	flatFileList       []*FileTreeNode                          // Flattened visible nodes for navigation
+	selectedFileIdx    int                                      // Index in flatFileList
+	fileTreeScroll     int                                      // Scroll offset for file tree
+	fileFilter         string                                   // Current file filter (empty = no filter)
+	fileTreeFocus      bool                                     // True when file tree has focus
+	fileLookup         *correlation.FileLookup                  // Prebuilt file-to-bead reverse index for hotspots & related work
+	hotspotOpenCounts  map[string]int                           // Normalized file path -> active bead count
+	hotspotTotalCounts map[string]int                           // Normalized file path -> total bead count
+	relatedCache       map[string][]correlation.RelatedWorkBead // Memoized related beads per bead ID
 
 	// Cass session integration state (bv-pr1l)
 	sessionCache map[string][]cass.ScoredResult // Cached sessions per bead ID
@@ -180,7 +184,81 @@ type HistoryModel struct {
 
 // SetReferenceTime sets an optional reference clock for relative/timeline timestamps (e.g. --as-of).
 func (h *HistoryModel) SetReferenceTime(now time.Time) {
-	h.referenceNow = now
+	if !h.referenceNow.Equal(now) {
+		h.referenceNow = now
+		h.relatedCache = nil
+	}
+}
+
+func (h *HistoryModel) refreshFileIntelligence() {
+	h.relatedCache = nil
+	if h.report == nil || len(h.report.Histories) == 0 {
+		h.fileLookup = nil
+		h.hotspotOpenCounts = nil
+		h.hotspotTotalCounts = nil
+		return
+	}
+	h.fileLookup = correlation.NewFileLookup(h.report)
+	hotspots := h.fileLookup.GetHotspots(0)
+	h.hotspotOpenCounts = make(map[string]int, len(hotspots))
+	h.hotspotTotalCounts = make(map[string]int, len(hotspots))
+	for _, hs := range hotspots {
+		cleanPath := strings.TrimPrefix(hs.FilePath, "./")
+		h.hotspotOpenCounts[cleanPath] = hs.OpenBeads
+		h.hotspotTotalCounts[cleanPath] = hs.TotalBeads
+	}
+}
+
+func (h *HistoryModel) relatedBeadsFor(beadID string) []correlation.RelatedWorkBead {
+	if h.report == nil || beadID == "" {
+		return nil
+	}
+	if cached, ok := h.relatedCache[beadID]; ok {
+		return cached
+	}
+	if h.fileLookup == nil {
+		h.refreshFileIntelligence()
+	}
+	res := h.report.FindRelatedWorkAt(beadID, correlation.RelatedWorkOptions{
+		MinRelevance:  20,
+		MaxResults:    4,
+		IncludeClosed: true,
+		FileLookup:    h.fileLookup,
+	}, h.effectiveNow())
+	if res == nil {
+		return nil
+	}
+	byID := make(map[string]correlation.RelatedWorkBead)
+	add := func(items []correlation.RelatedWorkBead) {
+		for _, item := range items {
+			if item.BeadID == "" || item.BeadID == beadID {
+				continue
+			}
+			if prev, ok := byID[item.BeadID]; !ok || item.Relevance > prev.Relevance {
+				byID[item.BeadID] = item
+			}
+		}
+	}
+	add(res.CommitOverlap)
+	add(res.FileOverlap)
+	out := make([]correlation.RelatedWorkBead, 0, len(byID))
+	for _, item := range byID {
+		out = append(out, item)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Relevance != out[j].Relevance {
+			return out[i].Relevance > out[j].Relevance
+		}
+		return out[i].BeadID < out[j].BeadID
+	})
+	if len(out) > 3 {
+		out = out[:3]
+	}
+	if h.relatedCache == nil {
+		h.relatedCache = make(map[string][]correlation.RelatedWorkBead)
+	}
+	h.relatedCache[beadID] = out
+	return out
 }
 
 func (h *HistoryModel) effectiveNow() time.Time {
@@ -241,6 +319,7 @@ func NewHistoryModel(report *correlation.HistoryReport, theme Theme) HistoryMode
 		searchMode:    searchModeOff,
 		sessionCache:  make(map[string][]cass.ScoredResult), // bv-pr1l
 	}
+	h.refreshFileIntelligence()
 	h.rebuildFilteredList()
 	return h
 }
@@ -276,6 +355,7 @@ func (h *HistoryModel) SetReport(report *correlation.HistoryReport) {
 	}
 
 	h.report = report
+	h.refreshFileIntelligence()
 	// Keep the user's query, search focus, filters, and view mode while applying
 	// the refreshed report. Rebuilding only the base bead list would silently
 	// drop an active query and leave git-mode results tied to the old report.
@@ -3140,11 +3220,25 @@ func (h *HistoryModel) renderFileTreeLine(idx int, node *FileTreeNode, width int
 		icon = "  "
 	}
 
-	// Change count
+	// Change count + hotspot contention indicator
 	countStr := fmt.Sprintf("(%d)", node.ChangeCount)
+	hotspotTag := ""
+	hotspotStyled := ""
+	if !node.IsDir {
+		cleanPath := strings.TrimPrefix(node.Path, "./")
+		openCnt := h.hotspotOpenCounts[cleanPath]
+		totalCnt := h.hotspotTotalCounts[cleanPath]
+		if openCnt >= 2 {
+			hotspotTag = fmt.Sprintf(" 🔥%d", openCnt)
+			hotspotStyled = t.Renderer.NewStyle().Foreground(t.Blocked).Bold(true).Render(hotspotTag)
+		} else if totalCnt >= 2 {
+			hotspotTag = fmt.Sprintf(" ·%db", totalCnt)
+			hotspotStyled = t.Renderer.NewStyle().Foreground(t.Feature).Render(hotspotTag)
+		}
+	}
 
 	// Calculate max name length
-	maxNameLen := width - len(indent) - len(indicator) - len(icon) - len(countStr) - 2
+	maxNameLen := width - len(indent) - lipgloss.Width(indicator) - lipgloss.Width(icon) - len(countStr) - lipgloss.Width(hotspotTag) - 2
 	if maxNameLen < 5 {
 		maxNameLen = 5
 	}
@@ -3168,12 +3262,13 @@ func (h *HistoryModel) renderFileTreeLine(idx int, node *FileTreeNode, width int
 		}
 	}
 
-	line := fmt.Sprintf("%s%s%s%s %s",
+	line := fmt.Sprintf("%s%s%s%s %s%s",
 		indent,
 		indicator,
 		icon,
 		nameStyle.Render(name),
 		countStyle.Render(countStr),
+		hotspotStyled,
 	)
 
 	return line
@@ -3231,6 +3326,17 @@ func (h *HistoryModel) renderDetailPanel(width, height int) string {
 			sessionInfo = truncateRunesHelper(sessionInfo, width-6, "…")
 		}
 		lines = append(lines, t.Renderer.NewStyle().Foreground(t.InProgress).Render(sessionInfo))
+	}
+	if related := h.relatedBeadsFor(hist.BeadID); len(related) > 0 {
+		parts := make([]string, 0, len(related))
+		for _, r := range related {
+			parts = append(parts, fmt.Sprintf("%s (%d%%)", r.BeadID, r.Relevance))
+		}
+		relInfo := "🔗 Related: " + strings.Join(parts, ", ")
+		if width > 10 {
+			relInfo = truncateRunesHelper(relInfo, width-6, "…")
+		}
+		lines = append(lines, t.Renderer.NewStyle().Foreground(t.Feature).Render(relInfo))
 	}
 	detailSepWidth := width - 4
 	if detailSepWidth < 1 {

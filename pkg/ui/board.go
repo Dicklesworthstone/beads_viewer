@@ -8,6 +8,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 
 	"github.com/charmbracelet/bubbles/viewport"
@@ -44,6 +45,12 @@ type BoardModel struct {
 	// Optional full-graph readiness authority so hidden/cross-filter blockers
 	// and closed/tombstone blockers resolve accurately.
 	readiness *model.ReadinessIndex
+
+	// Optional graph intelligence for the Kanban detail pane (What-If cascade,
+	// transitive root blockers, structural metrics, and ETA forecast).
+	analyzer *analysis.Analyzer
+	analysis *analysis.GraphStats
+	etaCtx   *analysis.ETAContext
 
 	// Optional reference clock (e.g. --as-of) for time-gated deferral and card age.
 	referenceNow time.Time
@@ -84,11 +91,12 @@ type BoardModel struct {
 // frames so repeated redraws of the same selected issue at the same width/theme
 // do not re-render Glamour markdown on every keypress.
 type boardDetailCache struct {
-	issueID  string
-	width    int
-	darkMode bool
-	rendered string
-	renders  int
+	issueID     string
+	width       int
+	darkMode    bool
+	phase2Ready bool
+	rendered    string
+	renders     int
 }
 
 func (b *BoardModel) invalidateDetailCache() {
@@ -138,7 +146,37 @@ type ColumnStats struct {
 
 // SetReadiness attaches an optional ReadinessIndex for authoritative blocker checks.
 func (b *BoardModel) SetReadiness(r *model.ReadinessIndex) {
+	if b.readiness == r {
+		return
+	}
 	b.readiness = r
+	b.invalidateDetailCache()
+}
+
+// SetAnalyzer attaches an optional Analyzer for What-If cascades and root-blocker inspection.
+func (b *BoardModel) SetAnalyzer(a *analysis.Analyzer) {
+	if b.analyzer == a {
+		return
+	}
+	b.analyzer = a
+	b.invalidateDetailCache()
+}
+
+// SetAnalysis attaches optional GraphStats for structural metrics and What-If cascades.
+func (b *BoardModel) SetAnalysis(s *analysis.GraphStats) {
+	if b.analysis == s {
+		return
+	}
+	b.analysis = s
+	b.invalidateDetailCache()
+}
+
+// SetETAContext attaches an optional ETAContext for per-issue ETA forecasts in the detail pane.
+func (b *BoardModel) SetETAContext(ctx *analysis.ETAContext) {
+	if b.etaCtx == ctx {
+		return
+	}
+	b.etaCtx = ctx
 	b.invalidateDetailCache()
 }
 
@@ -2240,6 +2278,7 @@ func (b *BoardModel) syncDetailContent() {
 	prevYOffset := b.detailVP.YOffset
 	curWidth := max(b.detailVP.Width, 20)
 	wantDark := boardDarkMode(t)
+	phase2Ready := b.analysis != nil && b.analysis.IsPhase2Ready()
 	issue := b.SelectedIssue()
 	if issue == nil {
 		if prevID == "_none_" && b.lastDetailWidth == curWidth {
@@ -2276,13 +2315,15 @@ func (b *BoardModel) syncDetailContent() {
 		return
 	}
 
-	if prevID == issue.ID && b.lastDetailWidth == curWidth {
+	if prevID == issue.ID && b.lastDetailWidth == curWidth &&
+		(b.detailCache == nil || (b.detailCache.darkMode == wantDark && b.detailCache.phase2Ready == phase2Ready)) {
 		return
 	}
 	b.lastDetailID = issue.ID
 	b.lastDetailWidth = curWidth
 
-	if b.detailCache != nil && b.detailCache.issueID == issue.ID && b.detailCache.width == curWidth && b.detailCache.darkMode == wantDark {
+	if b.detailCache != nil && b.detailCache.issueID == issue.ID && b.detailCache.width == curWidth &&
+		b.detailCache.darkMode == wantDark && b.detailCache.phase2Ready == phase2Ready {
 		b.detailVP.SetContent(b.detailCache.rendered)
 		if prevID != issue.ID {
 			b.detailVP.GotoTop()
@@ -2332,6 +2373,79 @@ func (b *BoardModel) syncDetailContent() {
 		content.WriteString(fmt.Sprintf("**Labels:** %s\n\n", strings.Join(issue.Labels, ", ")))
 	}
 
+	isActive := !isClosedLikeStatus(issue.Status)
+	if isActive && b.etaCtx != nil {
+		eta := b.etaCtx.EstimateForIssue(*issue, 1)
+		if eta.EstimatedDays > 0 && !eta.ETADate.IsZero() {
+			content.WriteString(fmt.Sprintf("**ETA Forecast:** ~%.1fd (est. %s, %.0f%% conf)\n\n",
+				eta.EstimatedDays, eta.ETADate.UTC().Format("2006-01-02"), eta.Confidence*100))
+		}
+	}
+
+	if isActive && b.analysis != nil {
+		var metricParts []string
+		if pr := b.analysis.GetPageRankScore(issue.ID); pr > 0 {
+			metricParts = append(metricParts, fmt.Sprintf("PR %.3f", pr))
+		}
+		if kcore := b.analysis.CoreNumber()[issue.ID]; kcore > 0 {
+			metricParts = append(metricParts, fmt.Sprintf("K-Core k=%d", kcore))
+		}
+		if len(b.analysis.Cycles()) == 0 {
+			if slackMap := b.analysis.ActiveSlack(); slackMap != nil {
+				if slack, ok := slackMap[issue.ID]; ok {
+					if slack == 0 {
+						metricParts = append(metricParts, "Slack 0 (Crit)")
+					} else {
+						metricParts = append(metricParts, fmt.Sprintf("Slack %.0f", slack))
+					}
+				}
+			}
+		}
+		if slices.Contains(b.analysis.ActiveArticulationPoints(), issue.ID) {
+			metricParts = append(metricParts, "🔗 Cut Vertex")
+		}
+		if len(metricParts) > 0 {
+			content.WriteString(fmt.Sprintf("**Graph:** %s\n\n", strings.Join(metricParts, " • ")))
+		}
+	}
+
+	// Transitive Root-Blocker Chain ("Start Here") scoped strictly to visible board items
+	if isActive && b.analyzer != nil {
+		if chain := b.analyzer.GetBlockerChain(issue.ID); chain != nil && chain.IsBlocked && (len(chain.RootBlockers) > 0 || chain.HasCycle) {
+			visibleRoots := make([]analysis.BlockerChainEntry, 0, len(chain.RootBlockers))
+			for _, rb := range chain.RootBlockers {
+				if _, ok := b.issueMap[rb.ID]; ok {
+					visibleRoots = append(visibleRoots, rb)
+				}
+			}
+			hiddenRoots := len(chain.RootBlockers) - len(visibleRoots)
+			if len(visibleRoots) > 0 || chain.HasCycle || hiddenRoots > 0 {
+				content.WriteString("**🎯 Start Here (Root Blockers):**\n")
+				if chain.HasCycle {
+					content.WriteString("- ⚠ Blocked by dependency cycle\n")
+				}
+				shown := visibleRoots
+				if len(shown) > 4 {
+					shown = shown[:4]
+				}
+				for _, rb := range shown {
+					tag := "withheld"
+					if rb.Actionable {
+						tag = "actionable now"
+					}
+					content.WriteString(fmt.Sprintf("- ▶ %s (P%d, %s): %s\n", rb.ID, rb.Priority, tag, rb.Title))
+				}
+				if len(visibleRoots) > 4 {
+					content.WriteString(fmt.Sprintf("- *…and %d more root blocker(s)*\n", len(visibleRoots)-4))
+				}
+				if hiddenRoots > 0 {
+					content.WriteString(fmt.Sprintf("- *…and %d out-of-scope upstream blocker(s)*\n", hiddenRoots))
+				}
+				content.WriteString("\n")
+			}
+		}
+	}
+
 	// Dependencies - show with titles and active/resolved state (bv-kklp)
 	var blockingDeps []*model.Dependency
 	for _, dep := range issue.Dependencies {
@@ -2356,7 +2470,14 @@ func (b *BoardModel) syncDetailContent() {
 		content.WriteString("\n")
 	}
 
-	// Show what this issue blocks (bv-kklp)
+	// Show what this issue blocks (bv-kklp) + real What-If close cascade when analyzer is attached
+	var whatIfDelta *analysis.WhatIfDelta
+	if isActive && b.analyzer != nil {
+		if delta, err := b.analyzer.ComputeWhatIfDeltaFromStats(issue.ID, b.analysis); err == nil && delta != nil &&
+			(delta.DirectUnblocks > 0 || delta.TransitiveUnblocks > 0) {
+			whatIfDelta = delta
+		}
+	}
 	if blockedIDs, ok := b.blocksIndex[issue.ID]; ok && len(blockedIDs) > 0 {
 		content.WriteString("**Blocks:**\n")
 		for _, blockedID := range blockedIDs {
@@ -2366,7 +2487,23 @@ func (b *BoardModel) syncDetailContent() {
 				content.WriteString(fmt.Sprintf("- %s\n", blockedID))
 			}
 		}
-		content.WriteString(fmt.Sprintf("\n💡 Completing this would unblock %d issue(s)\n\n", len(blockedIDs)))
+		if whatIfDelta != nil {
+			daysHint := ""
+			if whatIfDelta.EstimatedDaysSaved >= 0.1 {
+				daysHint = fmt.Sprintf(" (~%.1fd saved)", whatIfDelta.EstimatedDaysSaved)
+			}
+			content.WriteString(fmt.Sprintf("\n💡 **What-If Close:** Unblocks %d direct / %d total%s\n\n",
+				whatIfDelta.DirectUnblocks, whatIfDelta.TransitiveUnblocks, daysHint))
+		} else {
+			content.WriteString(fmt.Sprintf("\n💡 Completing this would unblock %d issue(s)\n\n", len(blockedIDs)))
+		}
+	} else if whatIfDelta != nil {
+		daysHint := ""
+		if whatIfDelta.EstimatedDaysSaved >= 0.1 {
+			daysHint = fmt.Sprintf(" (~%.1fd saved)", whatIfDelta.EstimatedDaysSaved)
+		}
+		content.WriteString(fmt.Sprintf("💡 **What-If Close:** Unblocks %d direct / %d total%s\n\n",
+			whatIfDelta.DirectUnblocks, whatIfDelta.TransitiveUnblocks, daysHint))
 	}
 
 	// Description
@@ -2393,6 +2530,7 @@ func (b *BoardModel) syncDetailContent() {
 		b.detailCache.issueID = issue.ID
 		b.detailCache.width = curWidth
 		b.detailCache.darkMode = wantDark
+		b.detailCache.phase2Ready = phase2Ready
 		b.detailCache.rendered = rendered
 		b.detailCache.renders++
 	}
