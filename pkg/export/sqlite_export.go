@@ -558,8 +558,8 @@ func (e *SQLiteExporter) insertMetrics(db *sql.DB) error {
 	defer tx.Rollback()
 
 	stmt, err := tx.Prepare(`
-		INSERT INTO issue_metrics (issue_id, pagerank, betweenness, eigenvector, critical_path_depth, triage_score, blocks_count, blocked_by_count, eta_days, eta_date, eta_confidence)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO issue_metrics (issue_id, pagerank, betweenness, eigenvector, critical_path_depth, triage_score, blocks_count, blocked_by_count, eta_days, eta_date, eta_confidence, risk_score, risk_explanation)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
@@ -639,6 +639,15 @@ func (e *SQLiteExporter) insertMetrics(db *sql.DB) error {
 	}
 
 	if e.Stats != nil {
+		// Compute operational risk signals for active non-template/non-pinned issues.
+		issueValMap := make(map[string]model.Issue, len(e.Issues))
+		for _, issue := range e.Issues {
+			if issue != nil {
+				issueValMap[issue.ID] = *issue
+			}
+		}
+		riskMap := analysis.ComputeAllRiskSignalsWithReadiness(issueValMap, e.Stats, e.readiness, e.exportTimestamp())
+
 		// Get metrics maps from stats (using active-subgraph betweenness when closed/tombstone issues exist)
 		pageRankMap := e.Stats.PageRank()
 		betweennessMap := e.activeBetweennessMap()
@@ -661,8 +670,18 @@ func (e *SQLiteExporter) insertMetrics(db *sql.DB) error {
 			blocks := blocksCount[id]
 			blockedBy := blockedByCount[id]
 			etaDays, etaDate, etaConf := etaColsFor(issue)
+			riskScore := 0.0
+			var riskExplanation any
+			if isActiveCounterpart(id) && !issue.IsTemplate && !issue.Pinned && issue.Status != model.StatusPinned {
+				if sig, ok := riskMap[id]; ok {
+					riskScore = sig.CompositeRisk
+					if sig.Explanation != "" {
+						riskExplanation = sig.Explanation
+					}
+				}
+			}
 
-			_, err := stmt.Exec(id, pr, bw, ev, cp, score, blocks, blockedBy, etaDays, etaDate, etaConf)
+			_, err := stmt.Exec(id, pr, bw, ev, cp, score, blocks, blockedBy, etaDays, etaDate, etaConf, riskScore, riskExplanation)
 			if err != nil {
 				return fmt.Errorf("insert metrics for %s: %w", id, err)
 			}
@@ -697,7 +716,7 @@ func (e *SQLiteExporter) insertMetrics(db *sql.DB) error {
 			}
 			etaDays, etaDate, etaConf := etaColsFor(issue)
 
-			_, err := stmt.Exec(id, pr, bw, 0.0, cp, score, blocks, blockedBy, etaDays, etaDate, etaConf)
+			_, err := stmt.Exec(id, pr, bw, 0.0, cp, score, blocks, blockedBy, etaDays, etaDate, etaConf, 0.0, nil)
 			if err != nil {
 				return fmt.Errorf("insert metrics for %s: %w", id, err)
 			}
@@ -729,7 +748,7 @@ func (e *SQLiteExporter) insertMetrics(db *sql.DB) error {
 				if blockedBy == 0 {
 					blockedBy = blockedByCount[id]
 				}
-				if _, err := stmt.Exec(id, m.PageRank, m.Betweenness, 0.0, m.CriticalPathDepth, score, blocks, blockedBy, nil, nil, nil); err != nil {
+				if _, err := stmt.Exec(id, m.PageRank, m.Betweenness, 0.0, m.CriticalPathDepth, score, blocks, blockedBy, nil, nil, nil, 0.0, nil); err != nil {
 					return fmt.Errorf("insert metrics for %s: %w", id, err)
 				}
 			}

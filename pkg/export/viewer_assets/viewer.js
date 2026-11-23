@@ -2658,6 +2658,9 @@ function queryIssues(filters = {}, sort = 'priority', limit = 50, offset = 0) {
     'eta': mvCols.has('eta_days')
       ? "CASE WHEN LOWER(status) IN ('closed', 'tombstone') OR eta_days IS NULL OR typeof(eta_days) NOT IN ('integer', 'real') OR eta_days < 0 THEN 1 ELSE 0 END ASC, CASE WHEN LOWER(status) IN ('closed', 'tombstone') OR eta_days IS NULL OR typeof(eta_days) NOT IN ('integer', 'real') OR eta_days < 0 THEN NULL ELSE eta_days END ASC, priority ASC"
       : 'priority ASC',
+    'risk': mvCols.has('risk_score')
+      ? "CASE WHEN LOWER(status) IN ('closed', 'tombstone') OR risk_score IS NULL OR typeof(risk_score) NOT IN ('integer', 'real') THEN 1 ELSE 0 END ASC, COALESCE(risk_score, 0) DESC, priority ASC"
+      : 'priority ASC',
     'created': 'created_at DESC',
     'title': 'title ASC',
     'id': 'id ASC',
@@ -2976,6 +2979,8 @@ function getGraphViewData() {
     'eta_days',
     'eta_date',
     'eta_confidence',
+    'risk_score',
+    'risk_explanation',
   ].filter(c => mvCols.has(c));
   const extraSelect = extraCols.length > 0 ? `, ${extraCols.join(', ')}` : '';
   const issues = execQuery(`
@@ -3010,6 +3015,8 @@ function getGraphViewData() {
     eta_days: row.eta_days != null && Number.isFinite(Number(row.eta_days)) ? Number(row.eta_days) : null,
     eta_date: row.eta_date || null,
     eta_confidence: row.eta_confidence != null && Number.isFinite(Number(row.eta_confidence)) ? Number(row.eta_confidence) : null,
+    risk_score: row.risk_score != null && Number.isFinite(Number(row.risk_score)) ? Number(row.risk_score) : 0,
+    risk_explanation: row.risk_explanation || '',
     in_cycle: Boolean(row.in_cycle),
     // Pre-computed active-blocker / active-dependent counts from the
     // materialized view (which excludes closed/tombstoned endpoints).
@@ -6877,6 +6884,20 @@ function beadsApp() {
       if (issue.eta_days == null || !Number.isFinite(Number(issue.eta_days)) || !issue.eta_date) return '';
       if (!formatCalendarDateUTC(issue.eta_date)) return '';
       return `~${Number(issue.eta_days).toFixed(1)}d`;
+    },
+
+    formatRiskPill(issue) {
+      if (!issue || !this.isActiveNodeStatus(issue.status)) return '';
+      const score = Number(issue.risk_score);
+      if (!Number.isFinite(score) || score < 0.25) return '';
+      return `Risk ${Math.round(score * 100)}%`;
+    },
+
+    riskBadgeClass(score) {
+      const n = Number(score);
+      if (!Number.isFinite(n) || n < 0.25) return 'bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300';
+      if (n >= 0.6) return 'bg-red-100 dark:bg-red-900/40 text-red-700 dark:text-red-300 border border-red-200 dark:border-red-800';
+      return 'bg-amber-100 dark:bg-amber-900/40 text-amber-800 dark:text-amber-300 border border-amber-200 dark:border-amber-800';
     },
 
     getSortedLabelIntelligence() {

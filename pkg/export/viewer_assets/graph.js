@@ -2125,6 +2125,8 @@ function prepareGraphData(layout = null) {
             eta_days: issue.eta_days ?? null,
             eta_date: issue.eta_date || null,
             eta_confidence: issue.eta_confidence ?? null,
+            risk_score: Number.isFinite(Number(issue.risk_score)) ? Number(issue.risk_score) : 0,
+            risk_explanation: issue.risk_explanation || '',
 
             // Metrics computed on the currently loaded graph.
             pagerank: idx !== undefined && metrics.pagerank ? metrics.pagerank[idx] : 0,

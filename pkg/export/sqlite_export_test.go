@@ -1823,3 +1823,78 @@ func TestSQLiteExportSourceRepoColumnAndFTS(t *testing.T) {
 		t.Fatalf("GetExportedIssues() SourceRepo mismatch: %+v", repoByID)
 	}
 }
+
+func TestWave29_A15_4_And_W29_4_SQLiteRiskAndETASuppression(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+	closedAt := now.Add(-24 * time.Hour)
+	est := 120
+	rawIssues := []model.Issue{
+		{ID: "api-blk", Title: "Stale cross-repo blocker", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, SourceRepo: "api", EstimatedMinutes: &est, CreatedAt: now.Add(-30 * 24 * time.Hour), UpdatedAt: now.Add(-20 * 24 * time.Hour)},
+		{
+			ID: "web-risky", Title: "Blocked high-churn web issue", Status: model.StatusInProgress, Priority: 0, IssueType: model.TypeBug, SourceRepo: "web", EstimatedMinutes: &est,
+			CreatedAt: now.Add(-14 * 24 * time.Hour), UpdatedAt: now.Add(-10 * 24 * time.Hour),
+			Dependencies: []*model.Dependency{{IssueID: "web-risky", DependsOnID: "api-blk", Type: model.DepBlocks}},
+			Comments: []*model.Comment{
+				{ID: "1", Author: "a", Text: "churn 1", CreatedAt: now.Add(-13 * 24 * time.Hour)},
+				{ID: "2", Author: "b", Text: "churn 2", CreatedAt: now.Add(-12 * 24 * time.Hour)},
+				{ID: "3", Author: "c", Text: "churn 3", CreatedAt: now.Add(-11 * 24 * time.Hour)},
+			},
+		},
+		{ID: "tmpl-1", Title: "Checklist template", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, IsTemplate: true, CreatedAt: now.Add(-5 * 24 * time.Hour), UpdatedAt: now},
+		{ID: "pin-1", Title: "Pinned anchor", Status: model.StatusPinned, Priority: 2, IssueType: model.TypeTask, Pinned: true, CreatedAt: now.Add(-5 * 24 * time.Hour), UpdatedAt: now},
+		{ID: "closed-1", Title: "Closed history sample", Status: model.StatusClosed, Priority: 1, IssueType: model.TypeTask, CreatedAt: now.Add(-10 * 24 * time.Hour), UpdatedAt: closedAt, ClosedAt: &closedAt},
+	}
+	an := analysis.NewAnalyzer(rawIssues)
+	an.SetNow(now)
+	stats := an.AnalyzeWithConfig(analysis.FullAnalysisConfig())
+
+	ptrs := make([]*model.Issue, len(rawIssues))
+	var deps []*model.Dependency
+	for i := range rawIssues {
+		iss := rawIssues[i]
+		ptrs[i] = &iss
+		deps = append(deps, iss.Dependencies...)
+	}
+	outDir := t.TempDir()
+	exp := NewSQLiteExporter(ptrs, deps, &stats, nil)
+	exp.Config.Readiness = an.Readiness()
+	if err := exp.Export(outDir); err != nil {
+		t.Fatalf("SQLite Export failed: %v", err)
+	}
+
+	db, err := sql.Open("sqlite", filepath.Join(outDir, "beads.sqlite3"))
+	if err != nil {
+		t.Fatalf("sql.Open: %v", err)
+	}
+	defer db.Close()
+
+	// W29-4: Active high-risk issue gets positive risk_score & non-empty risk_explanation in issue_overview_mv.
+	var riskyScore float64
+	var riskyExpl sql.NullString
+	var riskyETA sql.NullFloat64
+	if err := db.QueryRow(`SELECT risk_score, risk_explanation, eta_days FROM issue_overview_mv WHERE id = 'web-risky'`).Scan(&riskyScore, &riskyExpl, &riskyETA); err != nil {
+		t.Fatalf("query web-risky: %v", err)
+	}
+	if riskyScore <= 0.25 || !riskyExpl.Valid || riskyExpl.String == "" {
+		t.Fatalf("W29-4 regression: web-risky expected risk_score>0.25 and explanation, got score=%v expl=%+v", riskyScore, riskyExpl)
+	}
+	if !riskyETA.Valid || riskyETA.Float64 <= 0 {
+		t.Fatalf("expected active web-risky to have positive eta_days, got %+v", riskyETA)
+	}
+
+	// A15-4 + W29-4: Templates, pinned, and closed issues must suppress BOTH ETA and operational risk.
+	for _, id := range []string{"tmpl-1", "pin-1", "closed-1"} {
+		var rScore float64
+		var rExpl sql.NullString
+		var etaDays sql.NullFloat64
+		if err := db.QueryRow(`SELECT risk_score, risk_explanation, eta_days FROM issue_overview_mv WHERE id = ?`, id).Scan(&rScore, &rExpl, &etaDays); err != nil {
+			t.Fatalf("query %s: %v", id, err)
+		}
+		if etaDays.Valid {
+			t.Fatalf("A15-4 regression: %s must suppress eta_days (NULL), got %v", id, etaDays.Float64)
+		}
+		if rScore != 0 || rExpl.Valid {
+			t.Fatalf("W29-4 regression: %s must suppress risk_score/risk_explanation, got score=%v expl=%+v", id, rScore, rExpl)
+		}
+	}
+}

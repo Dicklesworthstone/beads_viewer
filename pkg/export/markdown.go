@@ -1861,6 +1861,44 @@ func GenerateHTMLReport(issues []model.Issue, title string, opts ReportOptions) 
 					html.EscapeString(metricsAcc.formatValue(mKey, iss.ID))))
 			}
 		}
+		if !isClosedLikeStatus(iss.Status) {
+			if opts.ETAContext != nil && !iss.IsTemplate && !iss.Pinned && iss.Status != model.StatusPinned {
+				eta := opts.ETAContext.EstimateForIssue(iss, 1)
+				if eta.EstimatedDays > 0 && !eta.ETADate.IsZero() {
+					sb.WriteString(fmt.Sprintf("<tr><th>ETA Forecast</th><td>~%.1fd (%s, %.0f%% conf)</td></tr>\n",
+						eta.EstimatedDays, html.EscapeString(eta.ETADate.UTC().Format("2006-01-02")), eta.Confidence*100))
+				}
+			}
+			if opts.Analyzer != nil {
+				if chain := opts.Analyzer.GetBlockerChain(iss.ID); chain != nil && chain.IsBlocked && (len(chain.RootBlockers) > 0 || chain.HasCycle) {
+					var rootParts []string
+					for _, rb := range chain.RootBlockers {
+						if opts.VisibleIDs != nil && !opts.VisibleIDs[rb.ID] {
+							continue
+						}
+						if len(rootParts) >= 4 {
+							break
+						}
+						if rb.Status == "missing" {
+							rootParts = append(rootParts, fmt.Sprintf("<code>%s</code> (missing)", html.EscapeString(rb.ID)))
+						} else {
+							rootParts = append(rootParts, fmt.Sprintf("<code>%s</code> (P%d)", html.EscapeString(rb.ID), rb.Priority))
+						}
+					}
+					if len(rootParts) > 0 || chain.HasCycle {
+						val := strings.Join(rootParts, ", ")
+						if chain.HasCycle {
+							if val != "" {
+								val += " · ⚠ cycle detected"
+							} else {
+								val = "⚠ dependency cycle detected"
+							}
+						}
+						sb.WriteString(fmt.Sprintf("<tr><th>Start Here (Root Blockers)</th><td>%s</td></tr>\n", val))
+					}
+				}
+			}
+		}
 		sb.WriteString("</tbody></table>\n")
 		if iss.Description != "" {
 			sb.WriteString(fmt.Sprintf("<h3>Description</h3><pre>%s</pre>\n", html.EscapeString(iss.Description)))
@@ -2270,9 +2308,11 @@ func GeneratePriorityBriefFromTriageJSON(triageJSON []byte, config PriorityBrief
 			Reasons     []string `json:"reasons"`
 			UnblocksIDs []string `json:"unblocks_ids"`
 			Breakdown   struct {
-				PageRankNorm     float64 `json:"pagerank_norm"`
-				BetweennessNorm  float64 `json:"betweenness_norm"`
-				TimeToImpactNorm float64 `json:"time_to_impact_norm"`
+				PageRankNorm     float64               `json:"pagerank_norm"`
+				BetweennessNorm  float64               `json:"betweenness_norm"`
+				TimeToImpactNorm float64               `json:"time_to_impact_norm"`
+				RiskNorm         float64               `json:"risk_norm"`
+				RiskSignals      *analysis.RiskSignals `json:"risk_signals,omitempty"`
 			} `json:"breakdown"`
 		} `json:"recommendations"`
 		QuickWins []struct {
@@ -2340,11 +2380,24 @@ func GeneratePriorityBriefFromTriageJSON(triageJSON []byte, config PriorityBrief
 
 	// Top Recommendations
 	sb.WriteString("## 🎯 Top Recommendations\n\n")
+	type highRiskEntry struct {
+		id          string
+		title       string
+		score       float64
+		explanation string
+	}
+	var highRiskItems []highRiskEntry
+	recRiskScore := func(riskNorm float64, sig *analysis.RiskSignals) float64 {
+		if sig != nil && sig.CompositeRisk > 0 {
+			return sig.CompositeRisk
+		}
+		return riskNorm
+	}
 	if len(triage.Recommendations) == 0 {
 		sb.WriteString("*No recommendations available.*\n\n")
 	} else {
-		sb.WriteString("| # | Issue | Type | P | Score | PR | BW | TI | Top Reason |\n")
-		sb.WriteString("|:-:|-------|:----:|:-:|:-----:|:--:|:--:|:--:|------------|\n")
+		sb.WriteString("| # | Issue | Type | P | Score | PR | BW | TI | Risk | Top Reason |\n")
+		sb.WriteString("|:-:|-------|:----:|:-:|:-----:|:--:|:--:|:--:|:----:|------------|\n")
 
 		limit := config.MaxRecommendations
 		if limit > len(triage.Recommendations) {
@@ -2358,7 +2411,16 @@ func GeneratePriorityBriefFromTriageJSON(triageJSON []byte, config PriorityBrief
 			if len(rec.Reasons) > 0 {
 				reason = truncateString(rec.Reasons[0], 30)
 			}
-			sb.WriteString(fmt.Sprintf("| %d | **%s** %s | %s | P%d | %.2f | %s | %s | %s | %s |\n",
+			riskVal := recRiskScore(rec.Breakdown.RiskNorm, rec.Breakdown.RiskSignals)
+			riskCell := "-"
+			if riskVal >= 0.60 {
+				riskCell = fmt.Sprintf("🔴 %.0f%%", riskVal*100)
+			} else if riskVal >= 0.35 {
+				riskCell = fmt.Sprintf("🟡 %.0f%%", riskVal*100)
+			} else if riskVal > 0 {
+				riskCell = fmt.Sprintf("%.0f%%", riskVal*100)
+			}
+			sb.WriteString(fmt.Sprintf("| %d | **%s** %s | %s | P%d | %.2f | %s | %s | %s | %s | %s |\n",
 				i+1,
 				escapeTableText(rec.ID),
 				escapeTableText(truncateString(rec.Title, 25)),
@@ -2368,7 +2430,47 @@ func GeneratePriorityBriefFromTriageJSON(triageJSON []byte, config PriorityBrief
 				barChart(rec.Breakdown.PageRankNorm),
 				barChart(rec.Breakdown.BetweennessNorm),
 				barChart(rec.Breakdown.TimeToImpactNorm),
+				riskCell,
 				escapeTableText(reason),
+			))
+		}
+		sb.WriteString("\n")
+	}
+	for _, rec := range triage.Recommendations {
+		riskVal := recRiskScore(rec.Breakdown.RiskNorm, rec.Breakdown.RiskSignals)
+		if riskVal >= 0.50 {
+			expl := "Elevated operational volatility"
+			if rec.Breakdown.RiskSignals != nil && strings.TrimSpace(rec.Breakdown.RiskSignals.Explanation) != "" {
+				expl = rec.Breakdown.RiskSignals.Explanation
+			}
+			highRiskItems = append(highRiskItems, highRiskEntry{
+				id:          rec.ID,
+				title:       rec.Title,
+				score:       riskVal,
+				explanation: expl,
+			})
+		}
+	}
+	if len(highRiskItems) > 0 {
+		sort.SliceStable(highRiskItems, func(i, j int) bool {
+			return highRiskItems[i].score > highRiskItems[j].score
+		})
+		limit := min(len(highRiskItems), max(config.MaxRecommendations, 5))
+		sb.WriteString("## 🚨 High-Risk Watchlist\n\n")
+		sb.WriteString("| Issue | Risk | Assessment |\n")
+		sb.WriteString("|-------|:----:|------------|\n")
+		for i := 0; i < limit; i++ {
+			hr := highRiskItems[i]
+			icon := "🟡"
+			if hr.score >= 0.60 {
+				icon = "🔴"
+			}
+			sb.WriteString(fmt.Sprintf("| **%s** %s | %s %.0f%% | %s |\n",
+				escapeTableText(hr.id),
+				escapeTableText(truncateString(hr.title, 28)),
+				icon,
+				hr.score*100,
+				escapeTableText(truncateString(hr.explanation, 55)),
 			))
 		}
 		sb.WriteString("\n")
@@ -2577,6 +2679,7 @@ func GeneratePriorityBriefFromTriageJSON(triageJSON []byte, config PriorityBrief
 		sb.WriteString("| **PR** | PageRank - dependency importance |\n")
 		sb.WriteString("| **BW** | Betweenness - critical path frequency |\n")
 		sb.WriteString("| **TI** | Time-to-Impact - urgency factor |\n")
+		sb.WriteString("| **Risk** | Operational volatility/risk composite (🔴 ≥60%, 🟡 ≥35%) |\n")
 		sb.WriteString("| █░░░ | Low (0-25%) |\n")
 		sb.WriteString("| ██░░ | Medium (25-50%) |\n")
 		sb.WriteString("| ███░ | High (50-75%) |\n")

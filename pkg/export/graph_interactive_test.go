@@ -942,3 +942,80 @@ func TestGenerateInteractiveGraphHTML_CyclesWhatIfTriageTabsAndMetadata(t *testi
 		}
 	}
 }
+
+func TestWave29_W29_4_InteractiveGraphRiskAndCollateralCycleBreaks(t *testing.T) {
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	closedAt := now.Add(-12 * time.Hour)
+	// Build a 2-node cycle A <-> B where B also has 2 external active dependents D1, D2
+	// (so breaking A->B has higher collateral than breaking B->A).
+	issues := []model.Issue{
+		{ID: "A", Title: "Cycle node A", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, SourceRepo: "api", CreatedAt: now.Add(-20 * 24 * time.Hour), UpdatedAt: now.Add(-15 * 24 * time.Hour), Dependencies: []*model.Dependency{{IssueID: "A", DependsOnID: "B", Type: model.DepBlocks}}},
+		{ID: "B", Title: "Cycle hub B", Status: model.StatusInProgress, Priority: 0, IssueType: model.TypeBug, SourceRepo: "web", CreatedAt: now.Add(-20 * 24 * time.Hour), UpdatedAt: now.Add(-14 * 24 * time.Hour), Dependencies: []*model.Dependency{{IssueID: "B", DependsOnID: "A", Type: model.DepBlocks}}},
+		{ID: "D1", Title: "Dependent 1 on B", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, SourceRepo: "web", CreatedAt: now.Add(-5 * 24 * time.Hour), UpdatedAt: now, Dependencies: []*model.Dependency{{IssueID: "D1", DependsOnID: "B", Type: model.DepBlocks}}},
+		{ID: "D2", Title: "Dependent 2 on B", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, SourceRepo: "web", CreatedAt: now.Add(-5 * 24 * time.Hour), UpdatedAt: now, Dependencies: []*model.Dependency{{IssueID: "D2", DependsOnID: "B", Type: model.DepBlocks}}},
+		{ID: "TMPL", Title: "Template", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, IsTemplate: true, CreatedAt: now, UpdatedAt: now},
+		{ID: "DONE", Title: "Closed", Status: model.StatusClosed, Priority: 2, IssueType: model.TypeTask, CreatedAt: now.Add(-48 * time.Hour), UpdatedAt: closedAt, ClosedAt: &closedAt},
+	}
+	an := analysis.NewAnalyzer(issues)
+	an.SetNow(now)
+	stats := an.AnalyzeWithConfig(analysis.FullAnalysisConfig())
+	written, err := GenerateInteractiveGraphHTML(InteractiveGraphOptions{
+		Issues:     issues,
+		Stats:      &stats,
+		Readiness:  an.Readiness(),
+		ExportedAt: now,
+		Path:       filepath.Join(t.TempDir(), "w29_risk_graph.html"),
+	})
+	if err != nil {
+		t.Fatalf("GenerateInteractiveGraphHTML: %v", err)
+	}
+	raw, err := os.ReadFile(written)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	html := string(raw)
+	if !strings.Contains(html, `<option value="risk">Size: Risk</option>`) {
+		t.Fatalf("W29-4 regression: standalone HTML missing Size: Risk option")
+	}
+
+	const prefix = "const DATA = "
+	start := strings.Index(html, prefix)
+	end := strings.Index(html[start+len(prefix):], ";\nconst STATUS_COLORS")
+	var payload struct {
+		Nodes       []graphNode `json:"nodes"`
+		CycleBreaks []struct {
+			From         string `json:"from"`
+			To           string `json:"to"`
+			CyclesBroken int    `json:"cycles_broken"`
+			Collateral   *int   `json:"collateral"`
+			Rationale    string `json:"rationale"`
+		} `json:"cycle_breaks"`
+	}
+	if err := json.Unmarshal([]byte(html[start+len(prefix):start+len(prefix)+end]), &payload); err != nil {
+		t.Fatalf("Unmarshal DATA: %v", err)
+	}
+	byID := make(map[string]graphNode, len(payload.Nodes))
+	for _, n := range payload.Nodes {
+		byID[n.ID] = n
+	}
+	if byID["B"].RiskScore <= 0.25 || byID["B"].RiskExplanation == "" {
+		t.Fatalf("W29-4 regression: active high-risk node B missing risk_score/explanation: %+v", byID["B"])
+	}
+	if byID["TMPL"].RiskScore != 0 || byID["DONE"].RiskScore != 0 {
+		t.Fatalf("W29-4 regression: template/closed nodes must suppress risk_score: TMPL=%+v DONE=%+v", byID["TMPL"], byID["DONE"])
+	}
+	if len(payload.CycleBreaks) < 2 {
+		t.Fatalf("W29-4 regression: expected collateral-aware cycle_breaks for both cycle edges, got %+v", payload.CycleBreaks)
+	}
+	colByEdge := make(map[string]int, len(payload.CycleBreaks))
+	for _, cb := range payload.CycleBreaks {
+		if cb.Collateral == nil || cb.Rationale == "" {
+			t.Fatalf("W29-4 regression: cycle_breaks missing collateral/rationale from GenerateAdvancedInsightsFromStats: %+v", cb)
+		}
+		colByEdge[cb.From+"->"+cb.To] = *cb.Collateral
+	}
+	// A->B impacts B (3 active dependents: A, D1, D2) while B->A impacts only A (1 active dependent: B).
+	if colByEdge["A->B"] <= colByEdge["B->A"] {
+		t.Fatalf("W29-4 regression: expected collateral(A->B) > collateral(B->A), got %+v", colByEdge)
+	}
+}

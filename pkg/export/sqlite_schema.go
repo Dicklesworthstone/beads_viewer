@@ -128,6 +128,8 @@ func createMetricsTables(tx *sql.Tx) error {
 			eta_days REAL,
 			eta_date TEXT,
 			eta_confidence REAL,
+			risk_score REAL DEFAULT 0,
+			risk_explanation TEXT,
 			FOREIGN KEY (issue_id) REFERENCES issues(id)
 		)
 	`
@@ -297,6 +299,8 @@ func CreateMaterializedViews(db *sql.DB) error {
 			m.eta_days as eta_days,
 			m.eta_date as eta_date,
 			m.eta_confidence as eta_confidence,
+			COALESCE(m.risk_score, 0) as risk_score,
+			m.risk_explanation as risk_explanation,
 			COALESCE(m.blocks_count, (
 				SELECT COUNT(*)
 				FROM dependencies d
@@ -378,6 +382,7 @@ func CreateMaterializedViews(db *sql.DB) error {
 		`CREATE INDEX IF NOT EXISTS idx_mv_score ON issue_overview_mv(triage_score DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_mv_actionable ON issue_overview_mv(is_actionable)`,
 		`CREATE INDEX IF NOT EXISTS idx_mv_source_repo ON issue_overview_mv(source_repo)`,
+		`CREATE INDEX IF NOT EXISTS idx_mv_risk ON issue_overview_mv(risk_score DESC)`,
 	}
 
 	for _, sql := range mvIndexes {

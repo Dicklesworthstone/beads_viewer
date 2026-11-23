@@ -1253,6 +1253,7 @@
                   <option value="due">Due Date</option>
                   <option value="estimate">Estimate</option>
                   <option value="eta">ETA (Soonest)</option>
+                  <option value="risk">Risk Score</option>
                   <option value="blocks">Blocks Count</option>
                   <option value="title">Title</option>
                 </select>
@@ -1397,6 +1398,13 @@
                         :title="'ETA Forecast: ' + formatETAPill(issue)"
                         class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-sky-50 dark:bg-sky-900/30 text-sky-700 dark:text-sky-300 font-mono">
                     📅 <span x-text="formatETAPillCompact(issue)"></span>
+                  </span>
+                  <span x-show="formatRiskPill(issue)"
+                        data-risk-pill
+                        :title="issue.risk_explanation || 'Composite operational risk'"
+                        :class="riskBadgeClass(issue.risk_score)"
+                        class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded font-mono font-semibold">
+                    ⚠ <span x-text="formatRiskPill(issue)"></span>
                   </span>
                   <span x-show="isActiveNodeStatus(issue.status) && getIssuePriorityHint(issue.id)"
                         :title="(getIssuePriorityHint(issue.id)?.reasoning || []).join(' · ')"
@@ -4180,12 +4188,18 @@
             </div>
           </div>
           <h2 class="text-base font-semibold text-gray-900 dark:text-white leading-snug line-clamp-2" x-text="graphDetailNode?.title" :title="graphDetailNode?.title"></h2>
-          <div x-show="formatETAPill(graphDetailNode) || (isActiveNodeStatus(graphDetailNode?.status) && getIssuePriorityHint(graphDetailNode?.id))"
+          <div x-show="formatETAPill(graphDetailNode) || formatRiskPill(graphDetailNode) || (isActiveNodeStatus(graphDetailNode?.status) && getIssuePriorityHint(graphDetailNode?.id))"
                class="flex flex-wrap items-center gap-1.5 mt-2">
             <span x-show="formatETAPill(graphDetailNode)"
                   id="graph-detail-eta"
                   class="px-2 py-0.5 text-[11px] font-mono rounded bg-teal-50 dark:bg-teal-900/40 text-teal-700 dark:text-teal-300 border border-teal-200/70 dark:border-teal-800/60"
                   x-text="'⏱ ' + formatETAPill(graphDetailNode)"></span>
+            <span x-show="formatRiskPill(graphDetailNode)"
+                  id="graph-detail-risk"
+                  :title="graphDetailNode?.risk_explanation || 'Composite operational risk'"
+                  :class="riskBadgeClass(graphDetailNode?.risk_score)"
+                  class="px-2 py-0.5 text-[11px] font-mono font-semibold rounded"
+                  x-text="'⚠ ' + formatRiskPill(graphDetailNode)"></span>
             <span x-show="isActiveNodeStatus(graphDetailNode?.status) && getIssuePriorityHint(graphDetailNode?.id)"
                   id="graph-detail-priority-hint"
                   :title="(getIssuePriorityHint(graphDetailNode?.id)?.reasoning || []).join(' · ')"
@@ -4897,6 +4911,12 @@
                             data-eta-pill
                             class="px-2 py-0.5 text-xs font-mono font-medium rounded-full bg-teal-100 dark:bg-teal-900/40 text-teal-800 dark:text-teal-200 border border-teal-200 dark:border-teal-800"
                             x-text="'⏱ ' + formatETAPill(selectedIssue)"></span>
+                      <span x-show="formatRiskPill(selectedIssue)"
+                            data-risk-pill
+                            :title="selectedIssue.risk_explanation || 'Composite operational risk'"
+                            :class="riskBadgeClass(selectedIssue.risk_score)"
+                            class="px-2 py-0.5 text-xs font-mono font-semibold rounded-full"
+                            x-text="'⚠ ' + formatRiskPill(selectedIssue)"></span>
                       <span x-show="isActiveNodeStatus(selectedIssue.status) && getIssuePriorityHint(selectedIssue.id)"
                             data-priority-hint-pill
                             :title="(getIssuePriorityHint(selectedIssue.id)?.reasoning || []).join(' · ')"

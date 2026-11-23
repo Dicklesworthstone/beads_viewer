@@ -2902,12 +2902,14 @@ async function capabilitiesJourney(page) {
     const prIssues = queryIssues({}, 'pagerank', 10, 0).map(i => i.id);
     const bwIssues = queryIssues({}, 'betweenness', 10, 0).map(i => i.id);
     const dueIssues = queryIssues({}, 'due', 10, 0).map(i => i.id);
+    const riskIssues = queryIssues({}, 'risk', 10, 0);
     const issue = getIssue('cap-auth-root');
     const closedIssue = getIssue('cap-closed-prereq');
     const commits = ${app}.getIssueCommits('cap-auth-root');
     return {
-      hasNewSorts: ['pagerank', 'betweenness', 'due', 'estimate', 'eta'].every(v => sortVals.includes(v)),
-      sortsReturnAll6: prIssues.length === 6 && bwIssues.length === 6 && dueIssues.length === 6 && queryIssues({}, 'eta', 10, 0).length === 6,
+      hasNewSorts: ['pagerank', 'betweenness', 'due', 'estimate', 'eta', 'risk'].every(v => sortVals.includes(v)),
+      sortsReturnAll6: prIssues.length === 6 && bwIssues.length === 6 && dueIssues.length === 6 && queryIssues({}, 'eta', 10, 0).length === 6 && riskIssues.length === 6,
+      riskSortClosedLast: riskIssues[riskIssues.length - 1]?.status === 'closed',
       kcoreType: typeof issue?.kcore,
       isCutVertex: issue?.is_articulation_point === true,
       closedSuppressesCutVertex: closedIssue?.is_articulation_point === false && closedIssue?.kcore === null,
@@ -2923,6 +2925,7 @@ async function capabilitiesJourney(page) {
   assert.deepEqual(wave25DetailMetrics, {
     hasNewSorts: true,
     sortsReturnAll6: true,
+    riskSortClosedLast: true,
     kcoreType: 'number',
     isCutVertex: true,
     closedSuppressesCutVertex: true,
@@ -3913,6 +3916,21 @@ async function capabilitiesJourney(page) {
   await waitFor(page, `!${app}.graphContextMenu.open`, 'Escape closes context menu');
   assert.equal(await evaluate(page, `${app}.cycleNavigatorActive`), true, 'Escape on context menu does not leak to tear down Cycle Navigator');
 
+  // A15-10: Filtering out the node backing an open graphContextMenu must dismiss it via bv-graph:filterChange!
+  await evaluate(page, `(() => {
+    const node = ${app}.forceGraphModule.getGraph().graphData().nodes.find(n => n.id === 'cap-auth-root');
+    document.dispatchEvent(new CustomEvent('bv-graph:nodeContextMenu', { detail: { node, x: 180, y: 180 } }));
+  })()`);
+  await waitFor(page, `${app}.graphContextMenu.open`, 'context menu opened for A15-10 filter-dismiss check');
+  await evaluate(page, `(() => {
+    ${app}.forceGraphModule.setFilter('status', 'closed');
+  })()`);
+  await waitFor(page, `!${app}.graphContextMenu.open`, 'A15-10: bv-graph:filterChange closes context menu when its node is filtered out');
+  await evaluate(page, `(() => {
+    ${app}.forceGraphModule.setFilter('status', null);
+  })()`);
+  await waitFor(page, `(${app}.forceGraphModule.getGraph().graphData().nodes || []).some(n => n.id === 'cap-auth-root')`, 'restored graph status filter after A15-10 check');
+
   // Re-open context menu -> click What-If Close -> clears Cycle Navigator & activates #graph-whatif-hud with synced graphWhatIfBatchIds!
   await evaluate(page, `(() => {
     const node = ${app}.forceGraphModule.getGraph().graphData().nodes.find(n => n.id === 'cap-auth-root');
@@ -4479,6 +4497,16 @@ async function standaloneGraphJourney(page) {
       DATA.links = origLinks2;
     }
 
+    // Wave 29 W29-4: Size: Risk option works cleanly & DATA.cycle_breaks carries collateral + rationale
+    const sizeSelect = document.getElementById('size-by');
+    const hasRiskSizeOption = [...sizeSelect.options].some(o => o.value === 'risk');
+    sizeSelect.value = 'risk';
+    sizeSelect.dispatchEvent(new Event('change', { bubbles: true }));
+    const riskSizedFinite = (Graph.graphData().nodes || []).every(n => Number.isFinite(getNodeSize(n)));
+    sizeSelect.value = 'pagerank';
+    sizeSelect.dispatchEvent(new Event('change', { bubbles: true }));
+    const cycleBreaksHaveCollateral = cycleBreaks.every(b => typeof b.collateral === 'number' && typeof b.rationale === 'string' && b.rationale.length > 0);
+
     return {
       cyclesCount,
       cycleBreaksCount,
@@ -4504,6 +4532,9 @@ async function standaloneGraphJourney(page) {
       b133HoverAndCtxCleared,
       b133HiddenCycleBlocked,
       b134SelfLoopCycleOk,
+      hasRiskSizeOption,
+      riskSizedFinite,
+      cycleBreaksHaveCollateral,
     };
   })()`);
   assert.equal(wave25StandaloneAudit.cyclesCount, 2, 'standalone HTML DATA.cycles exports both active cycles');
@@ -4532,6 +4563,9 @@ async function standaloneGraphJourney(page) {
   assert.equal(wave25StandaloneAudit.b133HoverAndCtxCleared, true, 'Wave 28 B13-3 standalone applyFilters clears stale hover highlights and hidden context-menu');
   assert.equal(wave25StandaloneAudit.b133HiddenCycleBlocked, true, 'Wave 28 B13-3 standalone showCycleInspector skips hidden-by-filter cycles without dimming visible nodes');
   assert.equal(wave25StandaloneAudit.b134SelfLoopCycleOk, true, 'Wave 28 B13-4 standalone computeStandaloneRootBlockers detects self-loop cycles');
+  assert.equal(wave25StandaloneAudit.hasRiskSizeOption, true, 'Wave 29 W29-4 standalone #size-by includes Size: Risk');
+  assert.equal(wave25StandaloneAudit.riskSizedFinite, true, 'Wave 29 W29-4 Size: Risk produces finite node radii');
+  assert.equal(wave25StandaloneAudit.cycleBreaksHaveCollateral, true, 'Wave 29 W29-4 standalone DATA.cycle_breaks carries collateral + rationale');
 
   await capture(page, 'standalone-graph');
   clean(page);

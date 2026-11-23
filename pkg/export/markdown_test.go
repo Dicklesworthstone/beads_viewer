@@ -3564,3 +3564,93 @@ func TestWave28_Pass13AndW28_ExportParity(t *testing.T) {
 		t.Fatalf("W28-6/A14-7 regression: closed node DONE-1 must suppress active structural metrics (incl. critical_path): %+v", byID["DONE-1"])
 	}
 }
+
+func TestWave29_W29_4_HTMLReportParity_And_PriorityBriefRisk(t *testing.T) {
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	closedAt := now.Add(-24 * time.Hour)
+	est := 120
+	issues := []model.Issue{
+		{ID: "ROOT-1", Title: "Database schema", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask, EstimatedMinutes: &est, CreatedAt: now.Add(-72 * time.Hour), UpdatedAt: now},
+		{ID: "CHILD-1", Title: "API handler", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeFeature, EstimatedMinutes: &est, CreatedAt: now.Add(-48 * time.Hour), UpdatedAt: now, Dependencies: []*model.Dependency{{IssueID: "CHILD-1", DependsOnID: "ROOT-1", Type: model.DepBlocks}}},
+		{ID: "TMPL-1", Title: "Release template", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, IsTemplate: true, CreatedAt: now.Add(-48 * time.Hour), UpdatedAt: now},
+		{ID: "DONE-1", Title: "Completed baseline", Status: model.StatusClosed, Priority: 1, IssueType: model.TypeTask, CreatedAt: now.Add(-96 * time.Hour), UpdatedAt: closedAt, ClosedAt: &closedAt},
+	}
+	an := analysis.NewAnalyzer(issues)
+	an.SetNow(now)
+	stats := an.AnalyzeWithConfig(analysis.FullAnalysisConfig())
+	etaCtx := analysis.NewETAContext(issues, &stats, now)
+
+	// 1. W29-4 HTML Report Parity: renders ETA Forecast & Start Here (Root Blockers) while suppressing template/closed ETA.
+	htmlBytes, err := GenerateReport(issues, nil, ReportOptions{
+		Format:            "html",
+		Title:             "Wave 29 HTML Parity",
+		GeneratedAt:       now,
+		GraphIssues:       issues,
+		GraphStats:        &stats,
+		Readiness:         an.Readiness(),
+		Analyzer:          an,
+		ETAContext:        etaCtx,
+		VisibleIDs:        map[string]bool{"ROOT-1": true, "CHILD-1": true, "TMPL-1": true, "DONE-1": true},
+		AuthorityComplete: true,
+	})
+	if err != nil {
+		t.Fatalf("GenerateReport(html): %v", err)
+	}
+	htmlOut := string(htmlBytes)
+	if !strings.Contains(htmlOut, "<tr><th>ETA Forecast</th><td>~") {
+		t.Fatalf("W29-4 regression: HTML report missing ETA Forecast row:\n%s", htmlOut)
+	}
+	if !strings.Contains(htmlOut, "<tr><th>Start Here (Root Blockers)</th><td><code>ROOT-1</code> (P0)</td></tr>") {
+		t.Fatalf("W29-4 regression: HTML report missing Start Here (Root Blockers) row for CHILD-1:\n%s", htmlOut)
+	}
+	// Template & closed sections must not contain ETA Forecast.
+	for _, suppressedSlug := range []string{`id="tmpl-1`, `id="done-1`} {
+		idx := strings.Index(htmlOut, suppressedSlug)
+		if idx < 0 {
+			t.Fatalf("HTML report missing section for %s", suppressedSlug)
+		}
+		endIdx := strings.Index(htmlOut[idx:], "</section>")
+		sec := htmlOut[idx : idx+endIdx]
+		if strings.Contains(sec, "ETA Forecast") {
+			t.Fatalf("W29-4 regression: HTML report emitted ETA Forecast on %s:\n%s", suppressedSlug, sec)
+		}
+	}
+
+	// 2. W29-4 Priority Brief Operational Risk Column & High-Risk Watchlist.
+	briefJSON := `{
+		"meta": {"version":"1.0","generated_at":"2026-11-20T12:00:00Z","phase2_ready":true,"issue_count":2},
+		"quick_ref": {"open_count":2,"actionable_count":1,"blocked_count":1,"in_progress_count":0},
+		"recommendations": [
+			{
+				"id":"RISK-HI","title":"Volatile cross-repo migration","type":"bug","status":"open","priority":0,"score":0.88,
+				"reasons":["Unblocks 3 items"],
+				"breakdown":{
+					"pagerank_norm":0.8,"betweenness_norm":0.7,"time_to_impact_norm":0.6,
+					"risk_norm":0.74,
+					"risk_signals":{"composite_risk":0.74,"explanation":"High risk: cross-repo deps + high churn"}
+				}
+			},
+			{
+				"id":"RISK-LO","title":"Steady doc update","type":"task","status":"open","priority":2,"score":0.42,
+				"reasons":["Quick win"],
+				"breakdown":{
+					"pagerank_norm":0.2,"betweenness_norm":0.1,"time_to_impact_norm":0.3,
+					"risk_norm":0.10,
+					"risk_signals":{"composite_risk":0.10,"explanation":"Low risk"}
+				}
+			}
+		]
+	}`
+	brief, err := GeneratePriorityBriefFromTriageJSON([]byte(briefJSON), DefaultPriorityBriefConfig())
+	if err != nil {
+		t.Fatalf("GeneratePriorityBriefFromTriageJSON: %v", err)
+	}
+	for _, want := range []string{"| Risk |", "🔴 74%", "## 🚨 High-Risk Watchlist", "High risk: cross-repo deps + high churn"} {
+		if !strings.Contains(brief, want) {
+			t.Fatalf("W29-4 regression: Priority Brief missing %q:\n%s", want, brief)
+		}
+	}
+	if strings.Contains(brief[strings.Index(brief, "High-Risk Watchlist"):], "RISK-LO") {
+		t.Fatalf("W29-4 regression: Low-risk issue RISK-LO should not appear in High-Risk Watchlist:\n%s", brief)
+	}
+}

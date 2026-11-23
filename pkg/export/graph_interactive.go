@@ -103,10 +103,12 @@ type graphNode struct {
 	LastAuthor  string                         `json:"last_author,omitempty"`
 	Commits     []correlation.CorrelatedCommit `json:"commits,omitempty"`
 
-	// Forecasts & priority hints (active issues only)
+	// Forecasts, operational risk, & priority hints (active issues only)
 	ETADays           *float64 `json:"eta_days,omitempty"`
 	ETADate           string   `json:"eta_date,omitempty"`
 	ETAConfidence     *float64 `json:"eta_confidence,omitempty"`
+	RiskScore         float64  `json:"risk_score,omitempty"`
+	RiskExplanation   string   `json:"risk_explanation,omitempty"`
 	SuggestedPriority *int     `json:"suggested_priority,omitempty"`
 	PriorityDirection string   `json:"priority_direction,omitempty"`
 	PriorityReason    string   `json:"priority_reason,omitempty"`
@@ -468,6 +470,8 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 	var etaCtx *analysis.ETAContext
 	var priorityHints map[string]analysis.PriorityRecommendation
 
+	var advAn *analysis.Analyzer
+	var riskSignals map[string]analysis.RiskSignals
 	if opts.Stats != nil {
 		etaSource := opts.VelocityIssues
 		etaStats := opts.Stats
@@ -520,6 +524,12 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 		if opts.Weights != nil {
 			prioAn.SetWeights(*opts.Weights)
 		}
+		advAn = prioAn
+		issueValMap := make(map[string]model.Issue, len(opts.Issues))
+		for _, iss := range opts.Issues {
+			issueValMap[iss.ID] = iss
+		}
+		riskSignals = analysis.ComputeAllRiskSignalsWithReadiness(issueValMap, opts.Stats, readiness, exportTime)
 		selectionMode := analysis.SelectionReadyLeaf
 		if opts.IncludeInactive {
 			selectionMode = analysis.SelectionAllScopedCandidates
@@ -706,12 +716,18 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 		} else {
 			if etaCtx != nil && !iss.IsTemplate && !iss.Pinned && iss.Status != model.StatusPinned {
 				est := etaCtx.EstimateForIssue(iss, 1)
-				if !est.ETADate.IsZero() {
+				if !est.ETADate.IsZero() && est.EstimatedDays > 0 {
 					days := est.EstimatedDays
 					conf := est.Confidence
 					node.ETADays = &days
 					node.ETADate = est.ETADate.UTC().Format("2006-01-02")
 					node.ETAConfidence = &conf
+				}
+			}
+			if !iss.IsTemplate && !iss.Pinned && iss.Status != model.StatusPinned {
+				if sig, ok := riskSignals[iss.ID]; ok {
+					node.RiskScore = sig.CompositeRisk
+					node.RiskExplanation = sig.Explanation
 				}
 			}
 			if hint, ok := priorityHints[iss.ID]; ok && hint.SuggestedPriority != iss.Priority {
@@ -762,7 +778,6 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 		if len(rawCycles) > 0 {
 			limit := min(len(rawCycles), 50)
 			exportedCycles = make([][]string, 0, limit)
-			edgeFreq := make(map[[2]string]int)
 			for _, cyc := range rawCycles[:limit] {
 				if len(cyc) == 0 {
 					continue
@@ -775,36 +790,23 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 				}
 				cloned := append([]string(nil), open...)
 				exportedCycles = append(exportedCycles, cloned)
-				for i := 0; i < len(open); i++ {
-					edgeFreq[[2]string{open[i], open[(i+1)%len(open)]}]++
-				}
 			}
-			type breakCand struct {
-				from, to string
-				count    int
-			}
-			cands := make([]breakCand, 0, len(edgeFreq))
-			for pair, count := range edgeFreq {
-				cands = append(cands, breakCand{from: pair[0], to: pair[1], count: count})
-			}
-			sort.Slice(cands, func(i, j int) bool {
-				if cands[i].count != cands[j].count {
-					return cands[i].count > cands[j].count
+			// Use collateral-aware cycle-break scoring from analysis.GenerateAdvancedInsightsFromStats
+			// instead of raw edge frequency so recommendations minimize collateral disruption.
+			if advAn != nil {
+				advCfg := analysis.DefaultAdvancedInsightsConfig()
+				advCfg.CycleBreakLimit = 10
+				if adv := advAn.GenerateAdvancedInsightsFromStats(opts.Stats, advCfg); adv != nil && adv.CycleBreak != nil {
+					for _, s := range adv.CycleBreak.Suggestions {
+						cycleBreaks = append(cycleBreaks, map[string]interface{}{
+							"from":          s.EdgeFrom,
+							"to":            s.EdgeTo,
+							"cycles_broken": s.Impact,
+							"collateral":    s.Collateral,
+							"rationale":     s.Rationale,
+						})
+					}
 				}
-				if cands[i].from != cands[j].from {
-					return cands[i].from < cands[j].from
-				}
-				return cands[i].to < cands[j].to
-			})
-			for i, c := range cands {
-				if i >= 10 {
-					break
-				}
-				cycleBreaks = append(cycleBreaks, map[string]interface{}{
-					"from":          c.from,
-					"to":            c.to,
-					"cycles_broken": c.count,
-				})
 			}
 		}
 	}

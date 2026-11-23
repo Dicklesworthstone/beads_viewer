@@ -727,6 +727,7 @@ func generateUltimateHTMLWithTime(title, dataHash, graphDataJSON string, nodeCou
                     <option value="betweenness">Size: Betweenness</option>
                     <option value="critical">Size: Critical Path</option>
                     <option value="indegree">Size: In-Degree</option>
+                    <option value="risk">Size: Risk</option>
                 </select>
             </div>
             <div class="toolbar-group">
@@ -1283,6 +1284,7 @@ const maxPR = Math.max(...DATA.nodes.map(n => n.pagerank || 0), 0.001);
 const maxBW = Math.max(...DATA.nodes.map(n => n.betweenness || 0), 0.001);
 const maxCP = Math.max(...DATA.nodes.map(n => n.critical_path || 0), 1);
 const maxInDeg = Math.max(...DATA.nodes.map(n => n.in_degree || 0), 1);
+const maxRisk = Math.max(...DATA.nodes.map(n => n.risk_score || 0), 0.001);
 
 let sizeMetric = 'pagerank', heatmapMode = false, hoveredNode = null, highlightedNodes = new Set(), activePathNodes = null, isDarkMode = true;
 const recentlyViewed = [];
@@ -1295,6 +1297,7 @@ function getNodeSize(n) {
         case 'betweenness': return base + ((n.betweenness || 0) / maxBW) * scale;
         case 'critical': return base + ((n.critical_path || 0) / maxCP) * scale;
         case 'indegree': return base + ((n.in_degree || 0) / maxInDeg) * scale;
+        case 'risk': return base + ((n.risk_score || 0) / maxRisk) * scale;
         default: return base + ((n.pagerank || 0) / maxPR) * scale;
     }
 }
@@ -1306,6 +1309,7 @@ function getHeatmapColor(n, alpha) {
         case 'betweenness': val = n.betweenness || 0; max = maxBW; break;
         case 'critical': val = n.critical_path || 0; max = maxCP; break;
         case 'indegree': val = n.in_degree || 0; max = maxInDeg; break;
+        case 'risk': val = n.risk_score || 0; max = maxRisk; break;
     }
     const ratio = val / max;
     const hue = 120 - ratio * 120; // Green to red
@@ -1772,6 +1776,10 @@ function populatePanelContent(prefix, node) {
     addMetric('Slack', node.slack_available === false ? (DATA.has_cycles ? 'N/A (cycle)' : 'N/A') : fmt(node.slack, 1));
     addMetric('In-Degree', node.in_degree ?? '-');
     addMetric('Out-Degree', node.out_degree ?? '-');
+    if (isActiveNodeStatus(node.status) && node.risk_score > 0) {
+        const riskPct = fmt(node.risk_score * 100, 0) + '%%';
+        addMetric('Risk', node.risk_explanation ? riskPct + ' (' + node.risk_explanation + ')' : riskPct);
+    }
 }
 
 // Focus a visible node or inform the user when hidden by active filters
@@ -2460,8 +2468,19 @@ function showCycleInspector(idx, step = 1) {
     const textEl = document.getElementById('cycle-banner-text');
     if (banner && textEl) {
         const pathStr = openCycle.concat([openCycle[0]]).join(' → ');
-        textEl.textContent = '🔄 Cycle [' + (activeCycleIndex + 1) + '/' + cycles.length + ']: ' + pathStr +
-            (breakSug ? ' · Cut: ' + breakSug.from + ' → ' + breakSug.to : '');
+        let cutSuffix = '';
+        if (breakSug) {
+            cutSuffix = ' · Cut: ' + breakSug.from + ' → ' + breakSug.to;
+            if (typeof breakSug.collateral === 'number') {
+                cutSuffix += ' (collateral: ' + breakSug.collateral + ')';
+            }
+        }
+        textEl.textContent = '🔄 Cycle [' + (activeCycleIndex + 1) + '/' + cycles.length + ']: ' + pathStr + cutSuffix;
+        if (breakSug && breakSug.rationale) {
+            textEl.title = breakSug.rationale;
+        } else {
+            textEl.removeAttribute('title');
+        }
         banner.style.display = 'flex';
         banner.classList.add('visible');
     }
