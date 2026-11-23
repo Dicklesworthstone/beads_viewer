@@ -2835,13 +2835,15 @@ async function capabilitiesJourney(page) {
     try {
       appData.historyData = {
         ...(origHistory || {}),
-        file_hotspots: [{ path: 'pkg/auth/gateway.go', open_beads: 2, total_beads: 2, commits: 3, bead_ids: ['cap-auth-root', 'cap-auth-ui'], co_changed: ['pkg/auth/callback.go'] }],
-        clusters: [{ id: 1, bead_ids: ['cap-auth-root', 'cap-auth-ui'], files: ['pkg/auth/gateway.go'], commit_count: 3, internal_connectivity: 0.75 }],
+        file_hotspots: [{ path: 'pkg/auth/gateway.go', open_beads: 2, closed_beads: 0, total_beads: 2, open_bead_ids: ['cap-auth-root', 'cap-auth-ui'], co_changed: ['pkg/auth/callback.go'] }],
+        clusters: [{ cluster_id: 1, label: 'auth', central_bead: 'cap-auth-root', bead_ids: ['cap-auth-root', 'cap-auth-ui'], shared_files: ['pkg/auth/gateway.go'], internal_edges: 3, connectivity: 0.75 }],
         orphan_ratio: 0.25,
         orphans: [{ sha: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', short_sha: 'aaaaaaa', message: 'fix: auth timeout', author: 'alice', suspicion_score: 72, probable_bead_id: 'cap-auth-root', probable_confidence: 65, confirm_command: 'bv --robot-confirm-correlation aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:cap-auth-root' }],
       };
       await new Promise(r => setTimeout(r, 60));
-      const clustersVis = Boolean(document.getElementById('insights-impact-clusters') && (${visible})(document.getElementById('insights-impact-clusters')));
+      const clustersEl = document.getElementById('insights-impact-clusters');
+      const clustersText = clustersEl?.textContent || '';
+      const clustersVis = Boolean(clustersEl && (${visible})(clustersEl) && clustersText.includes('75% dense') && clustersText.includes('3 links') && clustersText.includes('cap-auth-root') && clustersText.includes('gateway.go') && !clustersText.includes('undefined'));
       const orphansVis = Boolean(document.getElementById('insights-orphan-commits') && (${visible})(document.getElementById('insights-orphan-commits')));
       const coChangedShown = (document.getElementById('insights-code-hotspots')?.textContent || '').includes('callback.go');
       const confirmBtn = document.querySelector('#insights-orphan-commits button[title*="robot-confirm-correlation"]');
@@ -4425,12 +4427,13 @@ async function standaloneGraphJourney(page) {
     stSel.value = 'closed';
     stSel.onchange({ target: stSel });
     const b147SelectedPanelKept = selectedNode?.id === 'cap-closed-prereq' && document.getElementById('docked-panel')?.classList.contains('visible');
-    selectNode(null);
+    clearSelection();
+    const b1512ClearedBeforeSearch = selectedNode === null;
     // B14-6: performSearch click on a filtered-out node while status=closed must NOT select it and must toast.
     performSearch('cap-auth-root');
     const hiddenSearchItem = document.querySelector('#search-results .search-result-item[data-id="cap-auth-root"]');
     hiddenSearchItem?.click();
-    const b146SearchHiddenGuarded = selectedNode === null && (document.getElementById('toast')?.textContent || '').includes('hidden');
+    const b146SearchHiddenGuarded = b1512ClearedBeforeSearch && selectedNode === null && (document.getElementById('toast')?.textContent || '').includes('hidden');
     // Original B13-3 filter clear check
     stSel.value = 'all';
     stSel.onchange({ target: stSel });

@@ -6243,7 +6243,7 @@ function beadsApp() {
                 showClosed: detail.filters.showClosed !== false,
               };
             }
-            if (this.graphSearchResult?.id || this.graphDetailNode?.id) {
+            if (this.graphSearchResult?.id || this.graphDetailNode?.id || (this.graphContextMenu?.open && this.graphContextMenu?.node?.id)) {
               const visibleNodes = this.forceGraphModule?.getGraph?.()?.graphData?.()?.nodes || [];
               if (this.graphSearchResult?.id && !visibleNodes.some(n => n.id === this.graphSearchResult.id)) {
                 this.graphSearchResult = null;
@@ -6251,6 +6251,9 @@ function beadsApp() {
               if (this.graphDetailNode?.id && !visibleNodes.some(n => n.id === this.graphDetailNode.id)) {
                 this.graphDetailNode = null;
                 setTimeout(() => this.resizeForceGraph(), 250);
+              }
+              if (this.graphContextMenu?.open && this.graphContextMenu?.node?.id && !visibleNodes.some(n => n.id === this.graphContextMenu.node.id)) {
+                this.graphContextMenu = { open: false, x: 0, y: 0, node: null };
               }
             }
           });
