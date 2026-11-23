@@ -357,7 +357,7 @@ func TestVelocityComparisonWiredInLabelDashboard(t *testing.T) {
 		t.Fatalf("expected focusLabelDashboard after '[', got %v", m.focused)
 	}
 	view := m.View()
-	if !strings.Contains(view, "Velocity 7d/30d") {
+	if !strings.Contains(view, "Velocity 7d/30d") || !strings.Contains(view, "Trend 4w") {
 		t.Fatalf("expected wide-terminal Label Dashboard view to render LabelDashboardModel table, got:\n%s", view)
 	}
 

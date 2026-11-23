@@ -10528,7 +10528,7 @@ func TestWave29_Pass15Fixes_And_W29_TUI(t *testing.T) {
 		m.showAlertsPanel = true
 		m.alertsTab = 0
 		panelBefore := ansi.Strip(m.renderAlertsPanel())
-		if !strings.Contains(panelBefore, "Baseline:") || !strings.Contains(panelBefore, "S: save baseline") {
+		if !strings.Contains(panelBefore, "Baseline:") || !strings.Contains(panelBefore, "S: save") {
 			t.Fatalf("W29-6 regression: Alerts panel missing baseline status or S footer hint:\n%s", panelBefore)
 		}
 		updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'S'}})
@@ -10573,6 +10573,124 @@ func TestWave29_Pass15Fixes_And_W29_TUI(t *testing.T) {
 		plain := ansi.Strip(m.viewportContent)
 		if !strings.Contains(plain, "Agent Sessions:") || !strings.Contains(plain, "3 correlated cass session") {
 			t.Fatalf("Micro-Win A regression: Detail Pane missing cached CASS session hint:\n%s", plain)
+		}
+
+		// P16A-12: Empty cached Results must NOT advertise "Agent Sessions:" even if ResultCount > 0.
+		cache.Set("CASS-1", &cass.CorrelationHint{BeadID: "CASS-1", ResultCount: 2, Results: nil})
+		m.updateViewportContent()
+		if strings.Contains(ansi.Strip(m.viewportContent), "Agent Sessions:") {
+			t.Fatalf("P16A-12 regression: empty cached Results leaked Agent Sessions hint")
+		}
+	})
+
+	t.Run("Pass16_TrackA_Regressions", func(t *testing.T) {
+		tmp := t.TempDir()
+		beadsDir := filepath.Join(tmp, ".beads")
+		if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+			t.Fatalf("mkdir .beads: %v", err)
+		}
+		closedAt := refNow.Add(-12 * time.Hour)
+		issues := []model.Issue{
+			{ID: "P16-CLOSED", Title: "Closed prereq", Status: model.StatusClosed, Priority: 1, IssueType: model.TypeTask, CreatedAt: refNow.Add(-72 * time.Hour), UpdatedAt: closedAt, ClosedAt: &closedAt},
+			{ID: "P16-OPEN", Title: "Active child", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: refNow.Add(-48 * time.Hour), UpdatedAt: refNow, Dependencies: []*model.Dependency{{IssueID: "P16-OPEN", DependsOnID: "P16-CLOSED", Type: model.DepBlocks}}},
+		}
+		var jb strings.Builder
+		for _, iss := range issues {
+			raw, _ := json.Marshal(iss)
+			jb.Write(raw)
+			jb.WriteByte('\n')
+		}
+		jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
+		if err := os.WriteFile(jsonlPath, []byte(jb.String()), 0o644); err != nil {
+			t.Fatalf("write issues.jsonl: %v", err)
+		}
+		t.Chdir(tmp)
+		t.Setenv("BV_NO_SAVED_CONFIG", "")
+
+		m := NewModel(copyIssues(issues), nil, jsonlPath, ReadinessScope{Authority: model.NewReadinessIndex(issues)})
+		defer m.Stop()
+		m.Update(tea.WindowSizeMsg{Width: 140, Height: 42})
+
+		// P16A-1 + P16A-7: Saving baseline with Phase 2 complete uses CriticalPathScore()
+		// so immediately recomputed alerts have ZERO false-positive critical-path drift!
+		m.analysis.WaitForPhase2()
+		m.alertsCursor = 99
+		m.showAlertsPanel = true
+		m.alertsTab = 0
+		m.saveBaselineInteractive()
+		if !strings.Contains(m.statusMsg, "Baseline saved") {
+			t.Fatalf("P16A-1 setup: saveBaselineInteractive failed: %q", m.statusMsg)
+		}
+		for _, a := range m.alerts {
+			if strings.Contains(strings.ToLower(a.Message), "critical") {
+				t.Fatalf("P16A-1 regression: fresh baseline save triggered false-positive CriticalPath drift alert: %+v", a)
+			}
+		}
+		if len(m.activeScopedAlerts()) == 0 && m.alertsCursor != 0 {
+			t.Fatalf("P16A-7 regression: alertsCursor not clamped after saveBaselineInteractive: %d", m.alertsCursor)
+		}
+
+		// P16A-5 + P16A-6 + P16A-8: Orphans mode disables FileTree/Timeline, clears on SetReport(nil),
+		// filters out inactive-repo orphans, and handles MoveToStart/MoveToEnd cleanly.
+		theme := DefaultTheme(lipgloss.NewRenderer(os.Stdout))
+		hv := NewHistoryModel(&correlation.HistoryReport{GeneratedAt: refNow}, theme)
+		hv.SetSize(140, 30)
+		hv.ToggleFileTree()
+		hv.SetOrphans([]correlation.OrphanCandidate{
+			{SHA: "aaa1111", ShortSHA: "aaa1111", Author: "alice", Message: "first", SuspicionScore: 90, ProbableBeads: []correlation.ProbableBead{{BeadID: "A-1", Confidence: 80}}},
+			{SHA: "bbb2222", ShortSHA: "bbb2222", Author: "bob", Message: "second", SuspicionScore: 60},
+		}, 0.5)
+		hv.ToggleOrphansMode()
+		if hv.FileTreeRendered() || hv.TimelineAvailable() {
+			t.Fatalf("P16A-5 regression: Orphans mode must disable FileTreeRendered and TimelineAvailable")
+		}
+		hv.MoveToEnd()
+		if sel := hv.SelectedOrphan(); sel == nil || sel.ShortSHA != "bbb2222" {
+			t.Fatalf("P16A-8 regression: MoveToEnd in Orphans mode got %+v", sel)
+		}
+		hv.MoveToStart()
+		if sel := hv.SelectedOrphan(); sel == nil || sel.ShortSHA != "aaa1111" {
+			t.Fatalf("P16A-8 regression: MoveToStart in Orphans mode got %+v", sel)
+		}
+		hv.SetAuthorFilter("bob")
+		if sel := hv.SelectedOrphan(); sel == nil || sel.ShortSHA != "bbb2222" {
+			t.Fatalf("P16A-8 regression: author filter in Orphans mode got %+v", sel)
+		}
+		hv.SetReport(nil)
+		if hv.OrphanCount() != 0 {
+			t.Fatalf("P16A-6 regression: SetReport(nil) retained stale orphans (%d)", hv.OrphanCount())
+		}
+		m.workspaceMode = true
+		m.activeRepos = map[string]bool{"api": true}
+		m.historyOrphanRepoKeys = map[string]string{"aaa1111": "api", "bbb2222": "web"}
+		scopedOrphs := m.scopeHistoryOrphansForActiveRepos([]correlation.OrphanCandidate{
+			{SHA: "aaa1111"}, {SHA: "bbb2222"},
+		})
+		if len(scopedOrphs) != 1 || scopedOrphs[0].SHA != "aaa1111" {
+			t.Fatalf("P16A-6 regression: inactive-repo orphan leaked through scopeHistoryOrphansForActiveRepos: %+v", scopedOrphs)
+		}
+
+		// P16A-10: Empty/backtick/newline field changes render clean markdown & open cycle closes cleanly.
+		m.workspaceMode = false
+		m.activeRepos = nil
+		m.timeTravelMode = true
+		m.timeTravelDiff = &analysis.SnapshotDiff{
+			FromRevision: "HEAD~1",
+			ModifiedIssues: []analysis.ModifiedIssue{{
+				IssueID: "P16-OPEN",
+				Changes: []analysis.FieldChange{
+					{Field: "assignee", OldValue: "", NewValue: "alice"},
+					{Field: "title", OldValue: "Fix `foo`\nbar", NewValue: "Fix `baz`"},
+				},
+			}},
+			NewCycles: [][]string{{"P16-OPEN", "P16-CLOSED"}},
+		}
+		m.timeTravelModMap = map[string]*analysis.ModifiedIssue{"P16-OPEN": &m.timeTravelDiff.ModifiedIssues[0]}
+		var ttBuf strings.Builder
+		m.appendTimeTravelIssueDiffMarkdown(&ttBuf, "P16-OPEN")
+		ttOut := ttBuf.String()
+		if strings.Contains(ttOut, "**assignee:** ``") || !strings.Contains(ttOut, "_(none)_") || !strings.Contains(ttOut, "P16-OPEN` → `P16-CLOSED` → `P16-OPEN") {
+			t.Fatalf("P16A-10 regression: Time-Travel markdown formatting broken:\n%s", ttOut)
 		}
 	})
 }

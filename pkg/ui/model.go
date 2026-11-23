@@ -1087,6 +1087,7 @@ type HistoryLoadedMsg struct {
 	BeadRepoKeys      map[string]string
 	Orphans           []correlation.OrphanCandidate
 	OrphanRatio       float64
+	OrphanRepoKeys    map[string]string
 	Error             error
 }
 
@@ -2023,16 +2024,21 @@ func loadWorkspaceHistoryAtRevisionCmd(
 		prefixFiles := len(distinctRoots) > 1
 		mergedHistories := make(map[string]correlation.BeadHistory, len(captured))
 		commitRepoDirs := make(map[string]string)
+		orphanRepoKeys := make(map[string]string)
+		seenOrphanSHAs := make(map[string]bool)
 		var (
-			allStrategies      []correlation.StrategyRun
-			mergedFeedback     *correlation.FeedbackApplied
-			gitRange           string
-			latestSHA          string
-			latestTime         time.Time
-			totalWalkedCommits int
-			countedRoots       = make(map[string]bool)
-			successCount       int
-			lastErr            error
+			allStrategies        []correlation.StrategyRun
+			mergedFeedback       *correlation.FeedbackApplied
+			gitRange             string
+			latestSHA            string
+			latestTime           time.Time
+			totalWalkedCommits   int
+			countedRoots         = make(map[string]bool)
+			wsOrphans            []correlation.OrphanCandidate
+			wsTotalOrphanCommits int
+			wsOrphanCommitsCount int
+			successCount         int
+			lastErr              error
 		)
 
 		for tIdx, target := range targets {
@@ -2141,6 +2147,53 @@ func loadWorkspaceHistoryAtRevisionCmd(
 				}
 			}
 
+			// Detect workspace orphans per repo target and qualify probable bead IDs (P16A-6).
+			if ctx.Err() == nil && part != nil && gitRoot != "" {
+				var storeDirs []string
+				if correlationPath != "" {
+					if rel, rErr := filepath.Rel(gitRoot, filepath.Dir(correlationPath)); rErr == nil && rel != "." && rel != "" && !strings.HasPrefix(rel, "..") {
+						storeDirs = append(storeDirs, filepath.ToSlash(rel))
+					}
+				}
+				if oRep, oErr := correlation.NewOrphanDetectorAt(part, gitRoot, time.Now().UTC()).
+					WithStoreDirs(storeDirs...).
+					DetectOrphans(correlation.ExtractOptions{Limit: 500, Revision: targetRev}); oErr == nil && oRep != nil {
+					wsTotalOrphanCommits += oRep.Stats.TotalCommits
+					wsOrphanCommitsCount += oRep.Stats.OrphanCount
+					for _, cand := range oRep.Candidates {
+						if cand.SuspicionScore < 30 {
+							continue
+						}
+						lowSHA := strings.ToLower(strings.TrimSpace(cand.SHA))
+						if lowSHA == "" || seenOrphanSHAs[lowSHA] {
+							continue
+						}
+						seenOrphanSHAs[lowSHA] = true
+						commitRepoDirs[lowSHA] = gitRoot
+						if lowShort := strings.ToLower(strings.TrimSpace(cand.ShortSHA)); lowShort != "" {
+							commitRepoDirs[lowShort] = gitRoot
+						}
+						if targetRepoKey != "" {
+							orphanRepoKeys[lowSHA] = targetRepoKey
+						}
+						cloned := cand
+						if len(cand.ProbableBeads) > 0 {
+							probs := make([]correlation.ProbableBead, len(cand.ProbableBeads))
+							for pi, pb := range cand.ProbableBeads {
+								if qid := localToQualified[pb.BeadID]; qid != "" {
+									pb.BeadID = qid
+								} else if target.prefix != "" {
+									pb.BeadID = workspace.QualifyID(pb.BeadID, target.prefix)
+								}
+								probs[pi] = pb
+							}
+							cloned.ProbableBeads = probs
+						}
+						wsOrphans = append(wsOrphans, cloned)
+					}
+				}
+			}
+
 			for localID, hist := range part.Histories {
 				qualID := localToQualified[localID]
 				if qualID == "" && target.prefix != "" {
@@ -2231,12 +2284,31 @@ func loadWorkspaceHistoryAtRevisionCmd(
 			Histories:   mergedHistories,
 			CommitIndex: commitIndex,
 		}
+		sort.Slice(wsOrphans, func(i, j int) bool {
+			if wsOrphans[i].SuspicionScore != wsOrphans[j].SuspicionScore {
+				return wsOrphans[i].SuspicionScore > wsOrphans[j].SuspicionScore
+			}
+			if !wsOrphans[i].Timestamp.Equal(wsOrphans[j].Timestamp) {
+				return wsOrphans[i].Timestamp.After(wsOrphans[j].Timestamp)
+			}
+			return wsOrphans[i].SHA < wsOrphans[j].SHA
+		})
+		if len(wsOrphans) > 50 {
+			wsOrphans = wsOrphans[:50]
+		}
+		var wsOrphanRatio float64
+		if wsTotalOrphanCommits > 0 {
+			wsOrphanRatio = float64(wsOrphanCommitsCount) / float64(wsTotalOrphanCommits)
+		}
 		return HistoryLoadedMsg{
 			DataGeneration:    dataGeneration,
 			RequestGeneration: requestGeneration,
 			Report:            report,
 			CommitRepoDirs:    commitRepoDirs,
 			BeadRepoKeys:      beadRepoKeys,
+			Orphans:           wsOrphans,
+			OrphanRatio:       wsOrphanRatio,
+			OrphanRepoKeys:    orphanRepoKeys,
 		}
 	}
 }
@@ -2514,6 +2586,7 @@ type Model struct {
 	timeTravelDensityDelta float64
 	historyFullOrphans     []correlation.OrphanCandidate
 	historyOrphanRatio     float64
+	historyOrphanRepoKeys  map[string]string
 	newIssueIDs            map[string]bool // Issues in diff.NewIssues
 	closedIssueIDs         map[string]bool // Issues in diff.ClosedIssues
 	modifiedIssueIDs       map[string]bool // Issues in diff.ModifiedIssues
@@ -3406,7 +3479,11 @@ func (m *Model) startHistoryLoadForce(force bool) tea.Cmd {
 		m.historyFullReport = nil
 		m.historyCommitRepoDirs = nil
 		m.historyBeadRepoKeys = nil
+		m.historyFullOrphans = nil
+		m.historyOrphanRatio = 0
+		m.historyOrphanRepoKeys = nil
 		m.historyView.SetReport(nil)
+		m.historyView.SetOrphans(nil, 0)
 		m.historyReportDataGeneration = 0
 		return nil
 	}
@@ -3573,7 +3650,11 @@ func (m *Model) SetAsOfRevision(rev string) {
 	m.historyReportDataGeneration = 0
 	m.historyFullReport = nil
 	m.historyCommitRepoDirs = nil
+	m.historyFullOrphans = nil
+	m.historyOrphanRatio = 0
+	m.historyOrphanRepoKeys = nil
 	m.historyView.SetReport(nil)
+	m.historyView.SetOrphans(nil, 0)
 	if m.analysis != nil && m.analyzer != nil {
 		m.alerts, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlertsWithOptions(m.issues, m.analysis, m.analyzer, m.alertOptions())
 		m.recomputeVisibleAlertCounts()
@@ -5990,6 +6071,7 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.historyBeadRepoKeys = msg.BeadRepoKeys
 			m.historyFullOrphans = msg.Orphans
 			m.historyOrphanRatio = msg.OrphanRatio
+			m.historyOrphanRepoKeys = msg.OrphanRepoKeys
 			m.historyView.SetReport(m.scopeHistoryReportForActiveRepos(msg.Report))
 			m.historyView.SetOrphans(m.scopeHistoryOrphansForActiveRepos(msg.Orphans), msg.OrphanRatio)
 			m.syncHistoryCassSessions()
@@ -6094,6 +6176,11 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.historyView.SetSessionsForBead(msg.request.beadID, msg.result.TopSessions)
+		if m.isSplitView || m.showDetails {
+			if sel, ok := m.list.SelectedItem().(IssueItem); ok && sel.Issue.ID == msg.request.beadID {
+				m.updateViewportContent()
+			}
+		}
 		if msg.result.Error != "" {
 			m.statusMsg = "⚠️ Session lookup incomplete; showing available matches"
 			m.statusIsError = false
@@ -10164,7 +10251,11 @@ func (m *Model) handleHistoryKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 	case "A":
 		// Toggle author filter for the currently selected commit/item
 		var author string
-		if m.historyView.IsGitMode() {
+		if m.historyView.IsOrphansMode() {
+			if orph := m.historyView.SelectedOrphan(); orph != nil {
+				author = strings.TrimSpace(orph.Author)
+			}
+		} else if m.historyView.IsGitMode() {
 			if commit := m.historyView.SelectedGitCommit(); commit != nil {
 				author = strings.TrimSpace(commit.Author)
 			}
@@ -10187,7 +10278,12 @@ func (m *Model) handleHistoryKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 			m.statusIsError = true
 		}
 	case "f", "F":
-		// Toggle file tree panel (bv-190l)
+		// Toggle file tree panel (bv-190l); unavailable in Orphans Audit mode (P16A-5).
+		if m.historyView.IsOrphansMode() {
+			m.statusMsg = "📁 File tree is unavailable in Orphans mode (press O to exit)"
+			m.statusIsError = false
+			break
+		}
 		m.historyView.ToggleFileTree()
 		if m.historyView.IsFileTreeVisible() {
 			if m.historyView.FileTreeSuppressedForWidth() {
@@ -10256,7 +10352,11 @@ func (m *Model) handleHistoryKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 	case "g":
 		// Jump to graph view for selected bead (bv-xf4p)
 		var selectedID string
-		if m.historyView.IsGitMode() {
+		if m.historyView.IsOrphansMode() {
+			if pb := m.historyView.SelectedOrphanProbableBead(); pb != nil {
+				selectedID = pb.BeadID
+			}
+		} else if m.historyView.IsGitMode() {
 			selectedID = m.historyView.SelectedRelatedBeadID()
 		} else {
 			selectedID = m.historyView.SelectedBeadID()
@@ -10348,7 +10448,11 @@ func (m *Model) resolveCommitRepoDir(sha string) string {
 
 	var focusedBeadID string
 	if m.isHistoryView || m.focused == focusHistory {
-		if m.historyView.IsGitMode() {
+		if m.historyView.IsOrphansMode() {
+			if pb := m.historyView.SelectedOrphanProbableBead(); pb != nil {
+				focusedBeadID = pb.BeadID
+			}
+		} else if m.historyView.IsGitMode() {
 			focusedBeadID = m.historyView.SelectedRelatedBeadID()
 		} else {
 			focusedBeadID = m.historyView.SelectedBeadID()
@@ -10768,6 +10872,14 @@ func (m *Model) handleRepoPickerKeys(msg tea.KeyMsg) *Model {
 			m.applyRecipe(m.activeRecipe)
 		} else {
 			m.applyFilter()
+		}
+		if m.timeTravelMode {
+			// P16A-10: Keep time-travel diff/modMap scoped to the newly active repo selection.
+			if strings.TrimSpace(m.timeTravelSince) != "" {
+				m.enterTimeTravelMode(m.timeTravelSince)
+			} else {
+				m.exitTimeTravelMode()
+			}
 		}
 		m.updateListDelegate()
 
@@ -14772,16 +14884,14 @@ func (m *Model) updateViewportContent() {
 		sb.WriteString(fmt.Sprintf("**Labels:** %s\n\n", strings.Join(item.Labels, ", ")))
 	}
 
-	// Live CASS session hint from existing debounced prefetch cache (Micro-Win A)
+	// Live CASS session hint from existing debounced prefetch cache (Micro-Win A + P16A-12)
 	if m.cassCorrelator != nil {
-		if cached := m.cassCorrelator.GetCached(item.ID); cached != nil {
+		if cached := m.cassCorrelator.GetCached(item.ID); cached != nil && len(cached.Results) > 0 {
 			count := cached.ResultCount
-			if count == 0 {
+			if count < len(cached.Results) {
 				count = len(cached.Results)
 			}
-			if count > 0 {
-				sb.WriteString(fmt.Sprintf("**🤖 Agent Sessions:** %d correlated cass session(s) — press `V` to preview\n\n", count))
-			}
+			sb.WriteString(fmt.Sprintf("**🤖 Agent Sessions:** %d correlated cass session(s) — press `V` to preview\n\n", count))
 		}
 	}
 
@@ -16385,12 +16495,50 @@ func (m *Model) appendTimeTravelIssueDiffMarkdown(sb *strings.Builder, issueID s
 	if m.reopenedIssueIDs[issueID] {
 		statusLines = append(statusLines, "- **Transition:** ↺ **REOPENED** since `"+since+"`")
 	}
+	formatTimeTravelCodeSpan := func(raw string) string {
+		clean := strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(raw, "\r", " "), "\n", " "))
+		if clean == "" {
+			return "_(none)_"
+		}
+		maxRun, curRun := 0, 0
+		for i := 0; i < len(clean); i++ {
+			if clean[i] == '`' {
+				curRun++
+				if curRun > maxRun {
+					maxRun = curRun
+				}
+			} else {
+				curRun = 0
+			}
+		}
+		fence := strings.Repeat("`", maxRun+1)
+		if strings.HasPrefix(clean, "`") || strings.HasSuffix(clean, "`") {
+			return fence + " " + clean + " " + fence
+		}
+		return fence + clean + fence
+	}
+	formatTimeTravelCycle := func(cyc []string) string {
+		if len(cyc) == 0 {
+			return ""
+		}
+		closed := cyc
+		if len(cyc) > 1 && cyc[0] != cyc[len(cyc)-1] {
+			closed = make([]string, len(cyc)+1)
+			copy(closed, cyc)
+			closed[len(cyc)] = cyc[0]
+		}
+		parts := make([]string, len(closed))
+		for i, id := range closed {
+			parts[i] = formatTimeTravelCodeSpan(id)
+		}
+		return strings.Join(parts, " → ")
+	}
 	if mod := m.timeTravelModMap[issueID]; mod != nil && len(mod.Changes) > 0 {
 		statusLines = append(statusLines, fmt.Sprintf("- **Modified Fields (%d):**", len(mod.Changes)))
 		limit := min(10, len(mod.Changes))
 		for i := 0; i < limit; i++ {
 			ch := mod.Changes[i]
-			statusLines = append(statusLines, fmt.Sprintf("  - **%s:** `%s` → `%s`", ch.Field, ch.OldValue, ch.NewValue))
+			statusLines = append(statusLines, fmt.Sprintf("  - **%s:** %s → %s", ch.Field, formatTimeTravelCodeSpan(ch.OldValue), formatTimeTravelCodeSpan(ch.NewValue)))
 		}
 		if len(mod.Changes) > limit {
 			statusLines = append(statusLines, fmt.Sprintf("  - … (+%d more field changes)", len(mod.Changes)-limit))
@@ -16406,12 +16554,12 @@ func (m *Model) appendTimeTravelIssueDiffMarkdown(sb *strings.Builder, issueID s
 	}
 	for _, cyc := range diff.NewCycles {
 		if cycleContains(cyc, issueID) {
-			statusLines = append(statusLines, fmt.Sprintf("- **⚠ Introduced Cycle:** `%s`", strings.Join(cyc, "` → `")))
+			statusLines = append(statusLines, fmt.Sprintf("- **⚠ Introduced Cycle:** %s", formatTimeTravelCycle(cyc)))
 		}
 	}
 	for _, cyc := range diff.ResolvedCycles {
 		if cycleContains(cyc, issueID) {
-			statusLines = append(statusLines, fmt.Sprintf("- **✓ Resolved Cycle:** `%s`", strings.Join(cyc, "` → `")))
+			statusLines = append(statusLines, fmt.Sprintf("- **✓ Resolved Cycle:** %s", formatTimeTravelCycle(cyc)))
 		}
 	}
 
@@ -16462,11 +16610,20 @@ func (m *Model) appendTimeTravelOverviewLines(sb *strings.Builder) {
 		}
 		sb.WriteString(fmt.Sprintf("- **Removed Issues (%d):** %s%s\n", len(diff.RemovedIssues), strings.Join(ids, ", "), extra))
 	}
+	closeCycle := func(cyc []string) []string {
+		if len(cyc) > 1 && cyc[0] != cyc[len(cyc)-1] {
+			out := make([]string, len(cyc)+1)
+			copy(out, cyc)
+			out[len(cyc)] = cyc[0]
+			return out
+		}
+		return cyc
+	}
 	if len(diff.NewCycles) > 0 {
 		limit := min(3, len(diff.NewCycles))
 		parts := make([]string, 0, limit)
 		for i := 0; i < limit; i++ {
-			parts = append(parts, "`"+strings.Join(diff.NewCycles[i], " → ")+"`")
+			parts = append(parts, "`"+strings.Join(closeCycle(diff.NewCycles[i]), " → ")+"`")
 		}
 		sb.WriteString(fmt.Sprintf("- **New Cycles (%d):** %s\n", len(diff.NewCycles), strings.Join(parts, "; ")))
 	}
@@ -16474,7 +16631,7 @@ func (m *Model) appendTimeTravelOverviewLines(sb *strings.Builder) {
 		limit := min(3, len(diff.ResolvedCycles))
 		parts := make([]string, 0, limit)
 		for i := 0; i < limit; i++ {
-			parts = append(parts, "`"+strings.Join(diff.ResolvedCycles[i], " → ")+"`")
+			parts = append(parts, "`"+strings.Join(closeCycle(diff.ResolvedCycles[i]), " → ")+"`")
 		}
 		sb.WriteString(fmt.Sprintf("- **Resolved Cycles (%d):** %s\n", len(diff.ResolvedCycles), strings.Join(parts, "; ")))
 	}
@@ -16489,6 +16646,11 @@ func (m *Model) scopeHistoryOrphansForActiveRepos(orphans []correlation.OrphanCa
 	}
 	out := make([]correlation.OrphanCandidate, 0, len(orphans))
 	for _, o := range orphans {
+		if lowSHA := strings.ToLower(strings.TrimSpace(o.SHA)); lowSHA != "" && m.historyOrphanRepoKeys != nil {
+			if rk := m.historyOrphanRepoKeys[lowSHA]; rk != "" && !m.activeRepos[rk] {
+				continue
+			}
+		}
 		cloned := o
 		var kept []correlation.ProbableBead
 		for _, pb := range o.ProbableBeads {
@@ -16538,6 +16700,9 @@ func (m *Model) baselineStatusSummary() string {
 	}
 	bl, err := baseline.Load(baselinePath)
 	if err != nil || bl == nil {
+		if m.baselineSaveBlockedReason() != "" {
+			return "Baseline: unreadable (read-only)"
+		}
 		return "Baseline: unreadable (press S to overwrite)"
 	}
 	scopedNodes, _, _ := scopedGraphTotalsForSnapshot(m.issues, m.analysis, opts.CandidateIDs)
@@ -16571,6 +16736,11 @@ func (m *Model) saveBaselineInteractive() {
 	if m.analyzer == nil || m.analysis == nil {
 		m.statusMsg = "❌ Analysis not ready to save baseline"
 		m.statusIsError = true
+		return
+	}
+	if !m.analysis.IsPhase2Ready() {
+		m.statusMsg = "⏳ Wait for Phase 2 graph analysis to finish before saving baseline"
+		m.statusIsError = false
 		return
 	}
 	opts := m.alertOptions()
@@ -16608,7 +16778,7 @@ func (m *Model) saveBaselineInteractive() {
 	topMetrics := baseline.TopMetrics{
 		PageRank:     buildScopedBaselineMetricItems(m.analysis.PageRank(), 10, opts.CandidateIDs),
 		Betweenness:  buildScopedBaselineMetricItems(m.analysis.ActiveBetweenness(), 10, opts.CandidateIDs),
-		CriticalPath: buildScopedBaselineMetricItems(m.analysis.ActiveCriticalPathScore(), 10, opts.CandidateIDs),
+		CriticalPath: buildScopedBaselineMetricItems(m.analysis.CriticalPathScore(), 10, opts.CandidateIDs),
 		Hubs:         buildScopedBaselineMetricItems(m.analysis.Hubs(), 10, opts.CandidateIDs),
 		Authorities:  buildScopedBaselineMetricItems(m.analysis.Authorities(), 10, opts.CandidateIDs),
 	}
@@ -16622,6 +16792,12 @@ func (m *Model) saveBaselineInteractive() {
 	}
 	m.alerts, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlertsWithOptions(m.issues, m.analysis, m.analyzer, opts)
 	m.recomputeVisibleAlertCounts()
+	activeAfter := len(m.activeScopedAlerts())
+	if activeAfter == 0 {
+		m.alertsCursor = 0
+	} else if m.alertsCursor >= activeAfter {
+		m.alertsCursor = activeAfter - 1
+	}
 	m.statusMsg = fmt.Sprintf("✓ Baseline saved (%d nodes, %d edges, %d cycles)", bl.Stats.NodeCount, bl.Stats.EdgeCount, bl.Stats.CycleCount)
 	m.statusIsError = false
 }
@@ -19173,7 +19349,7 @@ func (m *Model) renderAlertsPanel() string {
 	boxWidth := max(24, min(80, m.width-4))
 	maxBoxHeight := max(10, m.height-4)
 	innerWidth := max(16, boxWidth-4)
-	footerText := "Tab: suggest • j/k • Enter • d: dismiss • S: save baseline • Esc: close"
+	footerText := "Tab: suggest • j/k • Enter • d: dismiss • S: save • Esc: close"
 	if m.alertsTab == 1 {
 		footerText = "Tab: alerts • j/k: nav • Enter: jump • c: copy cmd • Esc: close"
 	}
@@ -19263,9 +19439,9 @@ func (m *Model) renderAlertsPanel() string {
 		}
 		chrome := calcChrome()
 		if maxBoxHeight-chrome < 1 {
-			hdrPlain = ansi.Truncate(hdrPlain, innerWidth, "…")
+			hdrPlain = ansi.Truncate(strings.ReplaceAll(hdrPlain, "\n", " • "), innerWidth, "…")
 			hdr = titleStyle.Render(hdrPlain)
-			sumPlain = ansi.Truncate(sumPlain, innerWidth, "…")
+			sumPlain = ansi.Truncate(strings.ReplaceAll(sumPlain, "\n", " • "), innerWidth, "…")
 			footerText = compactFooter
 			chrome = calcChrome()
 		}
@@ -19294,9 +19470,9 @@ func (m *Model) renderAlertsPanel() string {
 			sb.WriteString("\n\n")
 			return "\n"
 		}
-		sb.WriteString(titleStyle.Render(ansi.Truncate(headerPlain, innerWidth, "…")))
+		sb.WriteString(titleStyle.Render(ansi.Truncate(strings.ReplaceAll(headerPlain, "\n", " • "), innerWidth, "…")))
 		sb.WriteString("\n")
-		sb.WriteString(t.Renderer.NewStyle().Foreground(ColorSuccess).Render(ansi.Truncate(msg, innerWidth, "…")))
+		sb.WriteString(t.Renderer.NewStyle().Foreground(ColorSuccess).Render(ansi.Truncate(strings.ReplaceAll(msg, "\n", " • "), innerWidth, "…")))
 		sb.WriteString("\n")
 		footerText = compactFooter
 		return ""

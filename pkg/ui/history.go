@@ -247,11 +247,82 @@ func (h *HistoryModel) refreshFileIntelligence() {
 func (h *HistoryModel) SetOrphans(orphans []correlation.OrphanCandidate, ratio float64) {
 	h.orphans = append([]correlation.OrphanCandidate(nil), orphans...)
 	h.orphanRatio = ratio
-	if h.selectedOrphan >= len(h.orphans) {
-		h.selectedOrphan = max(0, len(h.orphans)-1)
+	h.clampOrphanSelection()
+}
+
+// orphansVisibleRows returns the exact number of list rows rendered in the Orphans left pane (P16A-8).
+func (h *HistoryModel) orphansVisibleRows(panelHeight int) int {
+	return max(1, panelHeight-5)
+}
+
+// filteredOrphans returns orphans filtered by active searchInput and authorFilter (P16A-8).
+func (h *HistoryModel) filteredOrphans() []correlation.OrphanCandidate {
+	if len(h.orphans) == 0 {
+		return nil
+	}
+	q := strings.ToLower(strings.TrimSpace(h.searchInput.Value()))
+	af := strings.TrimSpace(h.authorFilter)
+	if q == "" && af == "" {
+		return h.orphans
+	}
+	out := make([]correlation.OrphanCandidate, 0, len(h.orphans))
+	for _, o := range h.orphans {
+		if af != "" && !strings.EqualFold(strings.TrimSpace(o.Author), af) {
+			continue
+		}
+		if q != "" {
+			matched := strings.Contains(strings.ToLower(o.SHA), q) ||
+				strings.Contains(strings.ToLower(o.ShortSHA), q) ||
+				strings.Contains(strings.ToLower(o.Message), q) ||
+				strings.Contains(strings.ToLower(o.Author), q)
+			if !matched {
+				for _, f := range o.Files {
+					if strings.Contains(strings.ToLower(f), q) {
+						matched = true
+						break
+					}
+				}
+			}
+			if !matched {
+				for _, pb := range o.ProbableBeads {
+					if strings.Contains(strings.ToLower(pb.BeadID), q) || strings.Contains(strings.ToLower(pb.BeadTitle), q) {
+						matched = true
+						break
+					}
+				}
+			}
+			if !matched {
+				continue
+			}
+		}
+		out = append(out, o)
+	}
+	return out
+}
+
+func (h *HistoryModel) clampOrphanSelection() {
+	list := h.filteredOrphans()
+	if len(list) == 0 {
+		h.selectedOrphan = 0
+		h.orphanScrollOffset = 0
+		h.selectedOrphanProbIdx = 0
+		return
+	}
+	if h.selectedOrphan < 0 {
+		h.selectedOrphan = 0
+	}
+	if h.selectedOrphan >= len(list) {
+		h.selectedOrphan = len(list) - 1
 	}
 	if h.orphanScrollOffset > h.selectedOrphan {
 		h.orphanScrollOffset = h.selectedOrphan
+	}
+	vis := h.orphansVisibleRows(h.currentPanelHeight())
+	if h.selectedOrphan >= h.orphanScrollOffset+vis {
+		h.orphanScrollOffset = h.selectedOrphan - vis + 1
+	}
+	if h.orphanScrollOffset < 0 {
+		h.orphanScrollOffset = 0
 	}
 	h.clampSelectedOrphanProb()
 }
@@ -272,7 +343,8 @@ func (h *HistoryModel) ToggleOrphansMode() {
 	} else {
 		h.prevNonOrphanMode = h.viewMode
 		h.viewMode = historyModeOrphans
-		h.clampSelectedOrphanProb()
+		h.fileTreeFocus = false
+		h.clampOrphanSelection()
 	}
 	h.modeChangedAt = time.Now()
 }
@@ -284,10 +356,16 @@ func (h *HistoryModel) OrphanCount() int {
 
 // SelectedOrphan returns the currently highlighted orphan commit, or nil.
 func (h *HistoryModel) SelectedOrphan() *correlation.OrphanCandidate {
-	if len(h.orphans) == 0 || h.selectedOrphan < 0 || h.selectedOrphan >= len(h.orphans) {
+	list := h.filteredOrphans()
+	if len(list) == 0 {
 		return nil
 	}
-	return &h.orphans[h.selectedOrphan]
+	idx := h.selectedOrphan
+	if idx < 0 || idx >= len(list) {
+		return nil
+	}
+	o := list[idx]
+	return &o
 }
 
 // SelectedOrphanProbableBead returns the currently highlighted probable bead for the selected orphan.
@@ -398,7 +476,7 @@ func (h *HistoryModel) effectiveNow() time.Time {
 // bead mode (git mode has no per-bead timeline) at a width that fits three
 // or more panes.
 func (h *HistoryModel) TimelineAvailable() bool {
-	return h.viewMode != historyModeGit && h.determineLayout() != layoutNarrow
+	return h.viewMode == historyModeBead && h.determineLayout() != layoutNarrow
 }
 
 // TimelineVisible reports whether the timeline pane is currently shown: the
@@ -481,6 +559,13 @@ func (h *HistoryModel) SetReport(report *correlation.HistoryReport) {
 	}
 
 	h.report = report
+	if report == nil {
+		h.orphans = nil
+		h.orphanRatio = 0
+		h.selectedOrphan = 0
+		h.orphanScrollOffset = 0
+		h.selectedOrphanProbIdx = 0
+	}
 	h.refreshFileIntelligence()
 	// Keep the user's query, search focus, filters, and view mode while applying
 	// the refreshed report. Rebuilding only the base bead list would silently
@@ -975,8 +1060,11 @@ func (h *HistoryModel) IsFileTreeVisible() bool {
 }
 
 // FileTreeRendered returns whether the file tree panel is currently rendered
-// (toggled on and terminal width is wide enough, or width is not yet initialized).
+// (toggled on, not in Orphans mode, and terminal width is wide enough, or width is not yet initialized).
 func (h *HistoryModel) FileTreeRendered() bool {
+	if h.viewMode == historyModeOrphans {
+		return false
+	}
 	return h.showFileTree && (h.width == 0 || h.width >= fileTreeMinWidth)
 }
 
@@ -1133,10 +1221,11 @@ func (h *HistoryModel) MoveUp() {
 // MoveDown moves selection down in the current focus pane
 func (h *HistoryModel) MoveDown() {
 	if h.viewMode == historyModeOrphans {
-		if h.selectedOrphan < len(h.orphans)-1 {
+		list := h.filteredOrphans()
+		if h.selectedOrphan < len(list)-1 {
 			h.selectedOrphan++
 			h.selectedOrphanProbIdx = 0
-			vis := max(1, h.currentPanelHeight()-4)
+			vis := h.orphansVisibleRows(h.currentPanelHeight())
 			if h.selectedOrphan >= h.orphanScrollOffset+vis {
 				h.orphanScrollOffset = h.selectedOrphan - vis + 1
 			}
@@ -1176,8 +1265,16 @@ func (h *HistoryModel) MoveDown() {
 	}
 }
 
-// MoveToStart jumps to the first item in the currently focused bead-mode pane
+// MoveToStart jumps to the first item in the currently focused pane
 func (h *HistoryModel) MoveToStart() {
+	if h.viewMode == historyModeOrphans {
+		if len(h.filteredOrphans()) > 0 {
+			h.selectedOrphan = 0
+			h.orphanScrollOffset = 0
+			h.selectedOrphanProbIdx = 0
+		}
+		return
+	}
 	if h.focused == historyFocusList {
 		if len(h.histories) > 0 {
 			h.selectedBead = 0
@@ -1197,8 +1294,22 @@ func (h *HistoryModel) MoveToStart() {
 	}
 }
 
-// MoveToEnd jumps to the last item in the currently focused bead-mode pane
+// MoveToEnd jumps to the last item in the currently focused pane
 func (h *HistoryModel) MoveToEnd() {
+	if h.viewMode == historyModeOrphans {
+		list := h.filteredOrphans()
+		if len(list) > 0 {
+			h.selectedOrphan = len(list) - 1
+			h.selectedOrphanProbIdx = 0
+			vis := h.orphansVisibleRows(h.currentPanelHeight())
+			if h.selectedOrphan >= vis {
+				h.orphanScrollOffset = h.selectedOrphan - vis + 1
+			} else {
+				h.orphanScrollOffset = 0
+			}
+		}
+		return
+	}
 	if h.focused == historyFocusList {
 		if len(h.histories) > 0 {
 			h.selectedBead = len(h.histories) - 1
@@ -1504,6 +1615,9 @@ func (h *HistoryModel) applySearchFilter() {
 	h.rebuildFilteredList()
 	if h.viewMode == historyModeGit {
 		h.buildCommitList()
+	}
+	if h.viewMode == historyModeOrphans {
+		h.clampOrphanSelection()
 	}
 
 	query := strings.TrimSpace(h.searchInput.Value())
@@ -4679,6 +4793,7 @@ func (h *HistoryModel) renderOrphansView() string {
 	header := h.renderHeader()
 	panelHeight := h.panelHeightForHeader(header)
 
+	visibleOrphans := h.filteredOrphans()
 	if len(h.orphans) == 0 {
 		emptyBox := t.Renderer.NewStyle().
 			Width(totalW).
@@ -4686,6 +4801,15 @@ func (h *HistoryModel) renderOrphansView() string {
 			Align(lipgloss.Center, lipgloss.Center).
 			Foreground(t.Open).
 			Render("✓ No suspicious unlinked orphan commits detected\n\nPress O to return to History view")
+		return lipgloss.JoinVertical(lipgloss.Left, header, emptyBox)
+	}
+	if len(visibleOrphans) == 0 {
+		emptyBox := t.Renderer.NewStyle().
+			Width(totalW).
+			Height(panelHeight).
+			Align(lipgloss.Center, lipgloss.Center).
+			Foreground(t.Muted).
+			Render("No orphan commits match current search/author filter\n\nPress / or A to adjust filter, or O to return to History view")
 		return lipgloss.JoinVertical(lipgloss.Left, header, emptyBox)
 	}
 
@@ -4703,19 +4827,24 @@ func (h *HistoryModel) renderOrphansView() string {
 		Width(leftWidth - 2).
 		Height(panelHeight - 2)
 	var leftLines []string
-	leftLines = append(leftLines, t.Renderer.NewStyle().Bold(true).Foreground(t.Primary).Render(fmt.Sprintf("ORPHAN COMMITS (%d)", len(h.orphans))))
+	listTitle := fmt.Sprintf("ORPHAN COMMITS (%d)", len(visibleOrphans))
+	if len(visibleOrphans) != len(h.orphans) {
+		listTitle = fmt.Sprintf("ORPHAN COMMITS (%d/%d)", len(visibleOrphans), len(h.orphans))
+	}
+	leftLines = append(leftLines, t.Renderer.NewStyle().Bold(true).Foreground(t.Primary).Render(listTitle))
 	leftLines = append(leftLines, t.Renderer.NewStyle().Foreground(t.Muted).Render(strings.Repeat("─", max(4, leftWidth-4))))
-	visRows := max(1, panelHeight-5)
+	visRows := h.orphansVisibleRows(panelHeight)
+	h.clampOrphanSelection()
 	start := h.orphanScrollOffset
 	if start < 0 {
 		start = 0
 	}
-	if start >= len(h.orphans) {
-		start = max(0, len(h.orphans)-1)
+	if start >= len(visibleOrphans) {
+		start = max(0, len(visibleOrphans)-1)
 	}
-	end := min(len(h.orphans), start+visRows)
+	end := min(len(visibleOrphans), start+visRows)
 	for i := start; i < end; i++ {
-		o := h.orphans[i]
+		o := visibleOrphans[i]
 		cursor := "  "
 		rowStyle := t.Renderer.NewStyle().Foreground(t.Secondary)
 		if i == h.selectedOrphan {
@@ -4765,10 +4894,17 @@ func (h *HistoryModel) renderOrphansView() string {
 		}
 		if len(orph.ProbableBeads) > 0 {
 			rightLines = append(rightLines, t.Renderer.NewStyle().Bold(true).Foreground(t.Open).Render("Probable Bead Matches (J/K select • + confirm):"))
-			for i, pb := range orph.ProbableBeads {
-				if i >= 5 {
-					break
-				}
+			const maxVisibleProb = 5
+			probStart := 0
+			if h.selectedOrphanProbIdx >= maxVisibleProb {
+				probStart = h.selectedOrphanProbIdx - maxVisibleProb + 1
+			}
+			probEnd := min(len(orph.ProbableBeads), probStart+maxVisibleProb)
+			if probStart > 0 {
+				rightLines = append(rightLines, t.Renderer.NewStyle().Foreground(t.Muted).Italic(true).Render(fmt.Sprintf("  ↑ %d earlier", probStart)))
+			}
+			for i := probStart; i < probEnd; i++ {
+				pb := orph.ProbableBeads[i]
 				mark := "  "
 				st := t.Renderer.NewStyle().Foreground(t.Secondary)
 				if i == h.selectedOrphanProbIdx {
@@ -4777,6 +4913,9 @@ func (h *HistoryModel) renderOrphansView() string {
 				}
 				line := fmt.Sprintf("%s%s (%d%%) — %s", mark, pb.BeadID, pb.Confidence, pb.BeadTitle)
 				rightLines = append(rightLines, st.Render(ansi.Truncate(line, max(10, rightWidth-4), "…")))
+			}
+			if probEnd < len(orph.ProbableBeads) {
+				rightLines = append(rightLines, t.Renderer.NewStyle().Foreground(t.Muted).Italic(true).Render(fmt.Sprintf("  ↓ +%d more", len(orph.ProbableBeads)-probEnd)))
 			}
 		} else {
 			rightLines = append(rightLines, t.Renderer.NewStyle().Foreground(t.Muted).Italic(true).Render("No probable bead matches found for this commit"))
