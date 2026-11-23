@@ -2632,12 +2632,25 @@ function applyFilters() {
     };
     Graph.nodeVisibility(currentVisibilityFilter);
     const visibleIds = new Set(DATA.nodes.filter(currentVisibilityFilter).map(n => n.id));
+    let hidActivePanel = false;
     if (selectedNode && !visibleIds.has(selectedNode.id)) {
         selectedNode = null;
         document.getElementById('node-detail').classList.remove('visible');
         document.getElementById('no-selection').style.display = 'block';
+        hidActivePanel = true;
+    }
+    if (hoveredNode && !visibleIds.has(hoveredNode.id)) {
+        hoveredNode = null;
+        hidActivePanel = true;
+    }
+    if (hidActivePanel) {
+        hideHoverPanel();
+    }
+    if (pathStart && !visibleIds.has(pathStart)) {
+        cancelPathFinder();
     }
     if (highlightedNodes.size > 0 && ![...highlightedNodes].some(id => visibleIds.has(id))) {
+        cancelPathFinder();
         closeCycleInspector();
         clearWhatIfSimulation();
         activePathNodes = null;

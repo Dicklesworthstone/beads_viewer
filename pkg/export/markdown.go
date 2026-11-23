@@ -1503,7 +1503,7 @@ func writeMarkdownIssueSection(sb *strings.Builder, i model.Issue, slug string, 
 					if len(rootParts) >= 4 {
 						break
 					}
-					rootParts = append(rootParts, fmt.Sprintf("`%s` (P%d)", escapeTableText(rb.ID), rb.Priority))
+					rootParts = append(rootParts, fmt.Sprintf("`%s` (P%d)", escapeTableCodeSpan(rb.ID), rb.Priority))
 				}
 				if len(rootParts) > 0 || chain.HasCycle {
 					val := strings.Join(rootParts, ", ")
@@ -2205,12 +2205,18 @@ type PriorityBriefConfig struct {
 	MaxRecommendations      int                               // Max recommendations to include (default: 5)
 	MaxQuickWins            int                               // Max quick wins to include (default: 3)
 	MaxBlockers             int                               // Max blockers to include (default: 3)
+	MaxPriorityAlerts       int                               // Max priority misalignment alerts (default: 5)
+	MaxCycleBreaks          int                               // Max cycle-break suggestions (default: 5)
 	IncludeWhatIf           bool                              // Include what-if deltas
 	IncludeLegend           bool                              // Include metric legend
 	DataHash                string                            // Optional data hash for verification
 	GlobalCapacity          *PriorityBriefCapacity            // Optional global Graham-bound capacity summary
 	PriorityRecommendations []analysis.PriorityRecommendation // Optional priority misalignment alerts
 	CycleBreaks             []analysis.CycleBreakItem         // Optional cycle-break edge suggestions
+}
+
+func escapeTableCodeSpan(s string) string {
+	return strings.ReplaceAll(escapeTableText(s), "`", "'")
 }
 
 // DefaultPriorityBriefConfig returns sensible defaults for the priority brief
@@ -2475,13 +2481,17 @@ func GeneratePriorityBriefFromTriageJSON(triageJSON []byte, config PriorityBrief
 	// Global Backlog Capacity (Graham Bounds)
 	if config.GlobalCapacity != nil && config.GlobalCapacity.TotalMinutes > 0 {
 		cap := config.GlobalCapacity
+		critPathDur := formatEstimatedDuration(cap.CriticalPathMinutes)
+		if critPathDur == "" {
+			critPathDur = "0m"
+		}
 		sb.WriteString("## ⚡ Global Backlog Capacity (Graham Bounds)\n\n")
 		sb.WriteString("| Open | Total Work | Critical Path | Parallelizable | 1 Agent | 2 Agents | 4 Agents |\n")
 		sb.WriteString("|:----:|:----------:|:-------------:|:--------------:|:-------:|:--------:|:--------:|\n")
 		sb.WriteString(fmt.Sprintf("| %d | %s | %s | %.0f%% | %.1fd | %.1f–%.1fd | %.1f–%.1fd |\n\n",
 			cap.OpenCount,
 			formatEstimatedDuration(cap.TotalMinutes),
-			formatEstimatedDuration(cap.CriticalPathMinutes),
+			critPathDur,
 			cap.ParallelizablePct,
 			cap.Days1Agent,
 			cap.Days2AgentsMin, cap.Days2AgentsMax,
@@ -2493,7 +2503,7 @@ func GeneratePriorityBriefFromTriageJSON(triageJSON []byte, config PriorityBrief
 				if len(escapedCP) >= 6 {
 					break
 				}
-				escapedCP = append(escapedCP, "`"+escapeTableText(id)+"`")
+				escapedCP = append(escapedCP, "`"+escapeTableCodeSpan(id)+"`")
 			}
 			sb.WriteString(fmt.Sprintf("**Critical Chain:** %s\n\n", strings.Join(escapedCP, " → ")))
 		}
@@ -2504,7 +2514,11 @@ func GeneratePriorityBriefFromTriageJSON(triageJSON []byte, config PriorityBrief
 		sb.WriteString("## ⚖️ Priority Misalignment Alerts\n\n")
 		sb.WriteString("| Issue | Change | Confidence | Primary Signal |\n")
 		sb.WriteString("|-------|:------:|:----------:|----------------|\n")
-		limit := min(len(config.PriorityRecommendations), 5)
+		maxAlerts := config.MaxPriorityAlerts
+		if maxAlerts <= 0 {
+			maxAlerts = 5
+		}
+		limit := min(len(config.PriorityRecommendations), maxAlerts)
 		for i := 0; i < limit; i++ {
 			pr := config.PriorityRecommendations[i]
 			arrow := "↓"
@@ -2531,12 +2545,16 @@ func GeneratePriorityBriefFromTriageJSON(triageJSON []byte, config PriorityBrief
 		sb.WriteString("## ↻ Cycle Break Suggestions\n\n")
 		sb.WriteString("| Remove Edge | Cycles Broken | Collateral | Rationale |\n")
 		sb.WriteString("|-------------|:-------------:|:----------:|-----------|\n")
-		limit := min(len(config.CycleBreaks), 5)
+		maxBreaks := config.MaxCycleBreaks
+		if maxBreaks <= 0 {
+			maxBreaks = 5
+		}
+		limit := min(len(config.CycleBreaks), maxBreaks)
 		for i := 0; i < limit; i++ {
 			cb := config.CycleBreaks[i]
 			sb.WriteString(fmt.Sprintf("| `%s` → `%s` | %d | %d | %s |\n",
-				escapeTableText(cb.EdgeFrom),
-				escapeTableText(cb.EdgeTo),
+				escapeTableCodeSpan(cb.EdgeFrom),
+				escapeTableCodeSpan(cb.EdgeTo),
 				cb.Impact,
 				cb.Collateral,
 				escapeTableText(truncateString(cb.Rationale, 45)),

@@ -4841,7 +4841,7 @@ function formatCalendarDateUTC(isoString) {
   try {
     const s = String(isoString).trim();
     if (/^\d{4}-\d{2}-\d{2}/.test(s)) {
-      const isoPrefix = s.match(/^(\d{4})-(\d{2})-(\d{2})(?:$|[T\s](?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z|[+-](?:[01]\d|2[0-3]):?[0-5]\d)?$)/);
+      const isoPrefix = s.match(/^(\d{4})-(\d{2})-(\d{2})(?:$|[T\s](?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z|[+-](?:[01]\d|2[0-3]):?[0-5]\d)?$)/i);
       if (!isoPrefix) return '';
       const y = Number(isoPrefix[1]);
       const m = Number(isoPrefix[2]);
@@ -7794,7 +7794,7 @@ function beadsApp() {
 
     getFileHotspots() {
       const list = Array.isArray(this.historyData?.file_hotspots) ? this.historyData.file_hotspots : [];
-      return list.slice(0, 12);
+      return list.filter(h => Number(h?.total_beads || 0) >= 2).slice(0, 12);
     },
 
     getIssueRelatedWork(id) {

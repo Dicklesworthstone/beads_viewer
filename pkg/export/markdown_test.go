@@ -3306,21 +3306,21 @@ func TestWave27_PriorityBriefAndMarkdownReportExecutiveSections(t *testing.T) {
 	cfg.GlobalCapacity = &PriorityBriefCapacity{
 		OpenCount:           2,
 		TotalMinutes:        240,
-		CriticalPathMinutes: 240,
-		ParallelizablePct:   0,
+		CriticalPathMinutes: 0, // A12-9: 0m fallback (never empty cell)
+		ParallelizablePct:   100,
 		Days1Agent:          4.0,
 		Days2AgentsMin:      2.0,
 		Days2AgentsMax:      4.0,
 		Days4AgentsMin:      2.0,
 		Days4AgentsMax:      4.0,
-		CriticalPathIDs:     []string{"EX-ROOT", "EX-MID"},
+		CriticalPathIDs:     []string{"EX-ROOT", "EX`MID"},
 	}
 	cfg.PriorityRecommendations = []analysis.PriorityRecommendation{{
 		IssueID: "PR|1", Title: "Misaligned|Task", CurrentPriority: 3, SuggestedPriority: 1,
 		Direction: "increase", Confidence: 0.85, Reasoning: []string{"High PR|BW impact"},
 	}}
 	cfg.CycleBreaks = []analysis.CycleBreakItem{{
-		EdgeFrom: "CYC|A", EdgeTo: "CYC|B", Impact: 2, Collateral: 1, Rationale: "Lowest|collateral edge",
+		EdgeFrom: "CYC|`A", EdgeTo: "CYC|B", Impact: 2, Collateral: 1, Rationale: "Lowest|collateral edge",
 	}}
 	brief, err := GeneratePriorityBriefFromTriageJSON([]byte(briefJSON), cfg)
 	if err != nil {
@@ -3328,12 +3328,13 @@ func TestWave27_PriorityBriefAndMarkdownReportExecutiveSections(t *testing.T) {
 	}
 	for _, want := range []string{
 		"## ⚡ Global Backlog Capacity (Graham Bounds)",
-		"**Critical Chain:** `EX-ROOT` → `EX-MID`",
+		"| 2 | 4h (240m) | 0m | 100% |",
+		"**Critical Chain:** `EX-ROOT` → `EX'MID`",
 		"## ⚖️ Priority Misalignment Alerts",
 		`**PR\|1** Misaligned\|Task`,
 		`High PR\|BW impact`,
 		"## ↻ Cycle Break Suggestions",
-		"`CYC\\|A` → `CYC\\|B`",
+		"`CYC\\|'A` → `CYC\\|B`",
 		`Lowest\|collateral edge`,
 	} {
 		if !strings.Contains(brief, want) {
