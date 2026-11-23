@@ -2,7 +2,7 @@
 
 All notable changes to **Beads Viewer (`bv`)** are documented here. Versions are listed newest-first, with GitHub Releases distinguished from tag-only versions.
 
-Scope window: this update covers `v0.26.0..v0.27.0` (Go 1.26.11 and `x/net`
+Scope window: this update covers `v0.27.0..v0.28.0` (time-travel clusters, orphan-commit audit, one-pass export companions, operational risk and collateral-aware cycle cuts, Darwin/ARM64 parity, and `modernc.org/sqlite` v1.63.0) on top of `v0.26.0..v0.27.0` (Go 1.26.11 and `x/net`
 v0.63.0 security toolchain, 11-stage source+binary `govulncheck` release gate,
 Wave 18–21 reality-check fixes across analysis, correlation, TUI, WASM, and the
 46-command robot CLI, and refreshed Go dependencies) on top of `v0.25.2..v0.26.0`
@@ -24,6 +24,7 @@ the latest tag, including installer changes usable with already released binarie
 
 | Version | Date | Publication | Orientation |
 |---|---|---|---|
+| [`v0.28.0`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.28.0) | 2026-11-23 | GitHub Release | Orphan-commit audit, time-travel clusters, one-pass export companions, operational risk & collateral-aware cycle cuts, Darwin kqueue/ARM64 parity, and `modernc.org/sqlite` v1.63.0. |
 | [`v0.27.0`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.27.0) | 2026-11-21 | GitHub Release | Go 1.26.11 and `x/net` v0.63.0 security toolchain (#215), 11-stage source+binary `govulncheck` release gate, Wave 18–21 reality-check fixes across analysis/correlation/TUI/WASM/46-command robot CLI, and refreshed Go dependencies. |
 | [`v0.26.0`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.26.0) | 2026-11-02 | GitHub Release | Live SQLite trackers load from one consistent snapshot and recover from lost notifications and transient failures; correlation and exports stay on the selected source; TUI state survives refreshes; native deadlines and external references everywhere; GH #210–#214 and a #197 export fix. |
 | [`v0.25.2`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.25.2) | 2026-09-30 | GitHub Release | Every view and the footer stay inside the terminal; `install.sh` installs the release binary with only `jq`, and its Go `.pkg` fallback works and checks the download. |
@@ -36,6 +37,69 @@ the latest tag, including installer changes usable with already released binarie
 | [`v0.21.2`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.21.2) | 2026-08-24 | GitHub Release | Publishes the 50-pass performance campaign, verified binaries, checksums, SBOM, and corrected Nix guidance. |
 | [`v0.21.1`](https://github.com/Dicklesworthstone/beads_viewer/tree/v0.21.1) | 2026-08-24 | Tag only | Staged the performance and license work; superseded before binary publication. |
 | [`v0.21.0`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.21.0) | 2026-08-23 | GitHub Release | Strict robot-count semantics, bounded history liveness, theme selection, and cache-path repairs. |
+
+---
+
+## v0.28.0 — 2026-11-23
+
+Time-travel clusters, orphan-commit audit, one-pass static export companions,
+operational risk and collateral-aware cycle cuts, Darwin/ARM64 parity fixes,
+and updated `modernc.org/sqlite` v1.63.0 with refreshed checked-in vendor
+sources.
+
+### TUI and Interactive Views
+
+- Add an orphan-commit audit view beside bead and git history (`d27e18c3`).
+- Add time-travel clusters and one-pass export companions (`9e58c163`).
+- Surface priority hints, correlation feedback (accept/ignore triage
+  recommendations), workspace badges, root blockers in the graph view, and
+  capacity/what-if/file-hotspot panels without leaking hidden IDs (`50b26e1f`,
+  `57fcf8b1`, `36d8bde9`, `afe77d21`).
+- Step sprint burndown by calendar days, add sprint bead cursor bindings,
+  forecast from cached snapshot ETAs, watch sibling beads externally, scope
+  board/capacity/hygiene alerts, and avoid duplicate repo columns (`9767f654`,
+  `2bb11fad`, `8e33fefe`, `2af3db8c`, `c3973d9d`, `95ec5965`, `adc83ab8`,
+  `17bfe2ad`, `5b3e2973`, `dfbc7b08`).
+
+### Static Pages Export and Viewer
+
+- Publish operational risk and collateral-aware cycle cuts, draw bridge and
+  cycle-break overlays, sort real root blockers ahead of synthetic ones, keep
+  what-if unlocks on active resolvable blockers, and collect SCC cycle IDs
+  without repeated closers (`57f50143`, `102f88f9`, `41e24fa7`, `668e3d96`,
+  `ddaf3044`, `39c9ff7e`, `09cde1e2`).
+- Export label intelligence, forecast, sprint, and suggestion pages from a
+  single full-graph analysis pass, attaching history, Graham capacity, label
+  cascades, and per-bead commits to bundle metadata (`c5bdef92`, `9a1659e5`,
+  `b935ee43`, `9529d445`, `cb5fe2cd`, `fe7640be`).
+- Index and display `source_repo` across search, HTML tables, and the graph HUD
+  with interactive source-repo filtering (`09cde1e2`, `91c0c50b`, `ca1669fb`).
+- Render sprint dates in UTC, close the graph context menu when its node is
+  filtered out, omit ETA rows for templates/pins/non-positive estimates, escape
+  table code spans, and preserve distinct duplicate drift alerts (`b6e24247`,
+  `1c38fbc2`, `a4fc5d29`, `01cebdac`, `81bf17fa`).
+
+### Analysis, Correlation, and Cross-Platform Reliability
+
+- Pass feedback weights into the priority-brief executive section (`e925dc78`).
+- Cache snapshot ETAs with parity verification, count tombstones on calendar-day
+  sprint burndowns, project sprint burndowns, canonicalize feedback SHAs
+  (allowing a newer short confirm to replace an older reject), and contain bead
+  paths (`81b08024`, `7019d3c0`, `ec64c6b6`, `f0bcc28b`, `5c1737d6`,
+  `893c1e55`).
+- Fix Darwin `kqueue` file watching, ARM64 FMADD rounding parity, macOS symlink
+  parity, and Wave 22 metadata/cache/narrow-layout handling (`d14840ed`,
+  `137b8731`, `c49f413f`).
+
+### Dependencies and Documentation
+
+- Update `modernc.org/sqlite` from `v1.58.0` to `v1.63.0` (with matching
+  `modernc.org/libc` `v1.80.1`, `github.com/dustin/go-humanize` `v1.1.0`, and
+  `github.com/ncruces/go-strftime` `v1.1.0`) and regenerate checked-in Go vendor
+  sources (`go mod verify` clean, 0 `govulncheck` vulnerabilities across all 5
+  release targets).
+- Align sprint, board, and worker-log documentation with runtime behavior
+  (`8fd27a77`, `6bbe32e4`).
 
 ---
 
