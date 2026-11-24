@@ -11602,3 +11602,138 @@ func TestWave30_Pass17AndLabelAndExportIntelligence(t *testing.T) {
 		}
 	})
 }
+
+func TestPass18_CLIRegressions(t *testing.T) {
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+
+	t.Run("P18A-5_CheckDepClosedIntermediateParentStopsPropagation", func(t *testing.T) {
+		issues := []model.Issue{
+			{ID: "BLK", Title: "Existing blocker", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask},
+			{ID: "GP", Title: "Grandparent", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeEpic,
+				Dependencies: []*model.Dependency{{IssueID: "GP", DependsOnID: "BLK", Type: model.DepBlocks}}},
+			{ID: "MID", Title: "Closed parent", Status: model.StatusClosed, Priority: 1, IssueType: model.TypeTask,
+				Dependencies: []*model.Dependency{{IssueID: "MID", DependsOnID: "GP", Type: model.DepParentChild}}},
+			{ID: "LEAF", Title: "Ready leaf under closed parent", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask,
+				Dependencies: []*model.Dependency{{IssueID: "LEAF", DependsOnID: "MID", Type: model.DepParentChild}}},
+			{ID: "TGT", Title: "New blocker target", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask},
+		}
+		var buf bytes.Buffer
+		ctx := RobotContext{
+			Issues:         issues,
+			FullIssues:     issues,
+			Readiness:      model.NewReadinessIndex(issues),
+			Stdout:         &buf,
+			AsOfCommitTime: now,
+		}
+		spec := "GP:TGT"
+		if err := handleRobotCheckDep(ctx, phaseThreeRobotHandlerConfig{RobotCheckDepFlag: &spec}); err != nil {
+			t.Fatalf("handleRobotCheckDep: %v", err)
+		}
+		var resp struct {
+			Results []robotCheckDepEdgeResult `json:"results"`
+		}
+		if err := json.Unmarshal(buf.Bytes(), &resp); err != nil {
+			t.Fatalf("unmarshal check-dep: %v", err)
+		}
+		if len(resp.Results) != 1 || resp.Results[0].WouldBlockActionable {
+			t.Fatalf("P18A-5 regression: closed intermediate parent MID must stop parent-child readiness propagation, got %+v", resp.Results)
+		}
+	})
+
+	t.Run("P18A-6_CheckDepStrictOriginEqualityAndCrossRepoGuard", func(t *testing.T) {
+		issues := []model.Issue{
+			{
+				ID: "ws-a-1", Title: "A1", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, SourceRepo: "repoA",
+				Origin: &model.IssueOrigin{Tracker: "br", Database: "/tmp/a.db", WorkingDirectory: "/tmp/a", TrackerDirectory: "/tmp/a/.beads", Executable: "/usr/bin/br", LocalID: "a-1"},
+			},
+			{
+				ID: "ws-a-2", Title: "A2 mismatched exe", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, SourceRepo: "repoA",
+				Origin: &model.IssueOrigin{Tracker: "br", Database: "/tmp/a.db", WorkingDirectory: "/tmp/a", TrackerDirectory: "/tmp/a/.beads", Executable: "/opt/other/br", LocalID: "a-2"},
+			},
+			{
+				ID: "ws-b-1", Title: "B1 cross repo", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, SourceRepo: "repoB",
+				Origin: &model.IssueOrigin{Tracker: "br", Database: "/tmp/a.db", WorkingDirectory: "/tmp/a", TrackerDirectory: "/tmp/a/.beads", Executable: "/usr/bin/br", LocalID: "b-1"},
+			},
+		}
+		var buf bytes.Buffer
+		ctx := RobotContext{
+			SourceKind:     "workspace",
+			Issues:         issues,
+			FullIssues:     issues,
+			Readiness:      model.NewReadinessIndex(issues),
+			Stdout:         &buf,
+			AsOfCommitTime: now,
+		}
+		spec := "ws-a-1:ws-a-2,ws-a-1:ws-b-1"
+		if err := handleRobotCheckDep(ctx, phaseThreeRobotHandlerConfig{RobotCheckDepFlag: &spec}); err != nil {
+			t.Fatalf("handleRobotCheckDep: %v", err)
+		}
+		var resp struct {
+			Results []robotCheckDepEdgeResult `json:"results"`
+		}
+		if err := json.Unmarshal(buf.Bytes(), &resp); err != nil {
+			t.Fatalf("unmarshal check-dep: %v", err)
+		}
+		if len(resp.Results) != 2 {
+			t.Fatalf("expected 2 results, got %d", len(resp.Results))
+		}
+		if resp.Results[0].Command != "" {
+			t.Fatalf("P18A-6 regression: mismatched Origin.Executable emitted command %q", resp.Results[0].Command)
+		}
+		if resp.Results[1].Command != "" || !resp.Results[1].CrossRepo {
+			t.Fatalf("P18A-6 regression: cross-repo workspace edge emitted command or missed cross_repo: %+v", resp.Results[1])
+		}
+	})
+
+	t.Run("P18A-14_LabelHealthMaxResultsCapsCooccurrenceAndSubgraphTopIssues", func(t *testing.T) {
+		issues := []model.Issue{
+			{ID: "LH-1", Title: "One", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, Labels: []string{"backend", "api", "db"}, CreatedAt: now, UpdatedAt: now},
+			{ID: "LH-2", Title: "Two", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, Labels: []string{"backend", "db"}, CreatedAt: now, UpdatedAt: now,
+				Dependencies: []*model.Dependency{{IssueID: "LH-2", DependsOnID: "LH-1", Type: model.DepBlocks}}},
+			{ID: "LH-3", Title: "Three", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, Labels: []string{"frontend", "ui"}, CreatedAt: now, UpdatedAt: now},
+		}
+		maxOne := 1
+		// Unscoped with max-results=1
+		var buf bytes.Buffer
+		ctx := RobotContext{
+			Issues:         issues,
+			FullIssues:     issues,
+			Readiness:      model.NewReadinessIndex(issues),
+			Stdout:         &buf,
+			AsOfCommitTime: now,
+		}
+		if err := handleRobotLabelHealth(ctx, phaseThreeRobotHandlerConfig{RobotMaxResults: &maxOne}); err != nil {
+			t.Fatalf("handleRobotLabelHealth(unscoped): %v", err)
+		}
+		var unscoped struct {
+			Cooccurrence map[string]map[string]int `json:"cooccurrence"`
+		}
+		if err := json.Unmarshal(buf.Bytes(), &unscoped); err != nil {
+			t.Fatalf("unmarshal unscoped: %v", err)
+		}
+		if len(unscoped.Cooccurrence) > 1 {
+			t.Fatalf("P18A-14 regression: unscoped cooccurrence exceeded --robot-max-results=1: %+v", unscoped.Cooccurrence)
+		}
+		for lbl, peers := range unscoped.Cooccurrence {
+			if _, self := peers[lbl]; self {
+				t.Fatalf("P18A-14 regression: self-pair %q present in cooccurrence: %+v", lbl, peers)
+			}
+		}
+
+		// Scoped --label backend with max-results=1
+		buf.Reset()
+		ctx.LabelScope = "backend"
+		if err := handleRobotLabelHealth(ctx, phaseThreeRobotHandlerConfig{RobotMaxResults: &maxOne}); err != nil {
+			t.Fatalf("handleRobotLabelHealth(scoped): %v", err)
+		}
+		var scoped struct {
+			SubgraphPageRank *analysis.LabelPageRankResult `json:"subgraph_pagerank"`
+		}
+		if err := json.Unmarshal(buf.Bytes(), &scoped); err != nil {
+			t.Fatalf("unmarshal scoped: %v", err)
+		}
+		if scoped.SubgraphPageRank == nil || len(scoped.SubgraphPageRank.TopIssues) > 1 {
+			t.Fatalf("P18A-14 regression: subgraph_pagerank.top_issues exceeded --robot-max-results=1: %+v", scoped.SubgraphPageRank)
+		}
+	})
+}

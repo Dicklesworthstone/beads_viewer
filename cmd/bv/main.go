@@ -9883,6 +9883,9 @@ func generateHistoryForExportContext(ctx RobotContext) (*TimeTravelHistory, erro
 
 	exportedIDSet := make(map[string]bool, len(issues))
 	for _, iss := range issues {
+		if ctx.CandidateIDs != nil && !ctx.CandidateIDs[iss.ID] {
+			continue
+		}
 		exportedIDSet[iss.ID] = true
 	}
 	// P17-6: Enforce exported scope even when a filter/recipe matches 0 issues.
@@ -10068,7 +10071,19 @@ func generateHistoryForExportContext(ctx RobotContext) (*TimeTravelHistory, erro
 				orphanBaseReport = fullRep
 			}
 		}
-		if rep, oErr := correlation.NewOrphanDetectorAt(orphanBaseReport, orphanGitRoot, relNow).
+		orphanDetectorReport := orphanBaseReport
+		if enforceScope && orphanBaseReport != nil {
+			filteredHist := make(map[string]correlation.BeadHistory, len(orphanBaseReport.Histories))
+			for bid, hist := range orphanBaseReport.Histories {
+				if exportedIDSet[bid] {
+					filteredHist[bid] = hist
+				}
+			}
+			cp := *orphanBaseReport
+			cp.Histories = filteredHist
+			orphanDetectorReport = &cp
+		}
+		if rep, oErr := correlation.NewOrphanDetectorAt(orphanDetectorReport, orphanGitRoot, relNow).
 			WithStoreDirs(orphanStoreDirs...).
 			DetectOrphans(correlation.ExtractOptions{Limit: commitLimit, Revision: ctx.AsOfCommit}); oErr == nil && rep != nil {
 			rawOrphanReport = rep

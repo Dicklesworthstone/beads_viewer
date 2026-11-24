@@ -2756,8 +2756,9 @@ func handleRobotLabelHealth(ctx RobotContext, hcfg phaseThreeRobotHandlerConfig)
 	cfg := analysis.DefaultLabelHealthConfig()
 	baseIssues := labelAnalysisIssuesForContext(ctx)
 	results := analysis.ComputeAllLabelHealthWithScope(baseIssues, cfg, ctx.ReferenceNow(), nil, ctx.Readiness, ctx.CandidateIDs)
+	maxN := 0
 	if hcfg.RobotMaxResults != nil && *hcfg.RobotMaxResults > 0 {
-		maxN := *hcfg.RobotMaxResults
+		maxN = *hcfg.RobotMaxResults
 		if len(results.Labels) > maxN {
 			results.Labels = results.Labels[:maxN]
 		}
@@ -2769,7 +2770,7 @@ func handleRobotLabelHealth(ctx RobotContext, hcfg phaseThreeRobotHandlerConfig)
 		}
 	}
 
-	// W30-5: Compute scoped label co-occurrence matrix and optional --label subgraph keystones.
+	// W30-5 / P18A-14: Compute scoped label co-occurrence matrix and optional --label subgraph keystones.
 	scopedIssues := baseIssues
 	if ctx.CandidateIDs != nil {
 		scopedIssues = make([]model.Issue, 0, len(ctx.CandidateIDs))
@@ -2781,12 +2782,43 @@ func handleRobotLabelHealth(ctx RobotContext, hcfg phaseThreeRobotHandlerConfig)
 	}
 	var cooc map[string]map[string]int
 	if rawCooc := analysis.GetLabelCooccurrence(scopedIssues); len(rawCooc) > 0 {
+		cleanPeers := func(label string, peers map[string]int) map[string]int {
+			out := make(map[string]int, len(peers))
+			for peer, cnt := range peers {
+				if peer == label || cnt <= 0 {
+					continue
+				}
+				out[peer] = cnt
+			}
+			if len(out) == 0 {
+				return nil
+			}
+			return out
+		}
 		if targetLabel := strings.TrimSpace(ctx.LabelScope); targetLabel != "" {
-			if peers := rawCooc[targetLabel]; len(peers) > 0 {
-				cooc = map[string]map[string]int{targetLabel: peers}
+			if cleaned := cleanPeers(targetLabel, rawCooc[targetLabel]); len(cleaned) > 0 {
+				cooc = map[string]map[string]int{targetLabel: cleaned}
 			}
 		} else {
-			cooc = rawCooc
+			var retainedLabels map[string]bool
+			if maxN > 0 {
+				retainedLabels = make(map[string]bool, len(results.Labels))
+				for _, lh := range results.Labels {
+					retainedLabels[lh.Label] = true
+				}
+			}
+			filtered := make(map[string]map[string]int, len(rawCooc))
+			for lbl, peers := range rawCooc {
+				if retainedLabels != nil && !retainedLabels[lbl] {
+					continue
+				}
+				if cleaned := cleanPeers(lbl, peers); len(cleaned) > 0 {
+					filtered[lbl] = cleaned
+				}
+			}
+			if len(filtered) > 0 {
+				cooc = filtered
+			}
 		}
 	}
 	var subgraphPR *analysis.LabelPageRankResult
@@ -2794,6 +2826,9 @@ func handleRobotLabelHealth(ctx RobotContext, hcfg phaseThreeRobotHandlerConfig)
 	if targetLabel := strings.TrimSpace(ctx.LabelScope); targetLabel != "" {
 		if sg := analysis.ComputeLabelSubgraph(scopedIssues, targetLabel); !sg.IsEmpty() {
 			pr := analysis.ComputeLabelPageRank(sg)
+			if maxN > 0 && len(pr.TopIssues) > maxN {
+				pr.TopIssues = pr.TopIssues[:maxN]
+			}
 			cp := analysis.ComputeLabelCriticalPath(sg)
 			subgraphPR = &pr
 			subgraphCP = &cp
@@ -6939,6 +6974,10 @@ func handleRobotCheckDep(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 				continue
 			}
 			visited[curr] = true
+			// P18A-5: Closed/tombstone intermediate parents stop DepParentChild readiness propagation.
+			if idx, ok := idxByID[curr]; ok && (workingIssues[idx].Status.IsClosed() || workingIssues[idx].Status.IsTombstone()) {
+				continue
+			}
 			if readiness.Ready(curr, refNow) {
 				return true
 			}
@@ -7011,39 +7050,42 @@ func handleRobotCheckDep(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 		res.CyclePath = cyclePath
 		res.Warning = warning
 		if canAdd {
-			// P17-8: Gate br/bd dep add on endpoint writability & shared tracker origin,
-			// using Origin.LocalID when both endpoints live in the same writable tracker.
+			// P17-8 / P18A-6: Gate br/bd dep add on cross-repo workspace isolation,
+			// endpoint writability, and strict shared tracker origin (matching Issue.MutationAction).
 			canEmitEdgeCmd := canEmitCommand
 			cmdFrom, cmdTo := p.from, p.to
 			trackerCLI := "br"
-			if canEmitEdgeCmd {
-				if fromIss.Origin != nil || toIss.Origin != nil {
-					o, pOrig := fromIss.Origin, toIss.Origin
-					if o == nil || pOrig == nil ||
-						strings.TrimSpace(o.ReadOnlyReason) != "" ||
-						strings.TrimSpace(pOrig.ReadOnlyReason) != "" {
+			if canEmitEdgeCmd && res.CrossRepo && ctx.SourceKind == "workspace" {
+				canEmitEdgeCmd = false
+			}
+			if canEmitEdgeCmd && (fromIss.Origin != nil || toIss.Origin != nil) {
+				o, pOrig := fromIss.Origin, toIss.Origin
+				if o == nil || pOrig == nil ||
+					strings.TrimSpace(o.ReadOnlyReason) != "" ||
+					strings.TrimSpace(pOrig.ReadOnlyReason) != "" {
+					canEmitEdgeCmd = false
+				} else {
+					sameTracker := o.Tracker == pOrig.Tracker &&
+						o.Database == pOrig.Database &&
+						o.WorkingDirectory == pOrig.WorkingDirectory &&
+						o.TrackerDirectory == pOrig.TrackerDirectory &&
+						o.Executable == pOrig.Executable
+					if !sameTracker {
 						canEmitEdgeCmd = false
 					} else {
-						sameTracker := (o.Tracker == "" || pOrig.Tracker == "" || o.Tracker == pOrig.Tracker) &&
-							(o.Database == "" || pOrig.Database == "" || o.Database == pOrig.Database) &&
-							(o.WorkingDirectory == "" || pOrig.WorkingDirectory == "" || o.WorkingDirectory == pOrig.WorkingDirectory) &&
-							(o.TrackerDirectory == "" || pOrig.TrackerDirectory == "" || o.TrackerDirectory == pOrig.TrackerDirectory)
-						if !sameTracker {
+						if lid := strings.TrimSpace(o.LocalID); lid != "" {
+							cmdFrom = lid
+						}
+						if lid := strings.TrimSpace(pOrig.LocalID); lid != "" {
+							cmdTo = lid
+						}
+						if cmdFrom == cmdTo {
 							canEmitEdgeCmd = false
-						} else {
-							if lid := strings.TrimSpace(o.LocalID); lid != "" {
-								cmdFrom = lid
-							}
-							if lid := strings.TrimSpace(pOrig.LocalID); lid != "" {
-								cmdTo = lid
-							}
-							if strings.EqualFold(strings.TrimSpace(o.Tracker), "bd") {
-								trackerCLI = "bd"
-							}
+						}
+						if strings.EqualFold(strings.TrimSpace(o.Tracker), "bd") {
+							trackerCLI = "bd"
 						}
 					}
-				} else if res.CrossRepo && ctx.SourceKind == "workspace" {
-					canEmitEdgeCmd = false
 				}
 			}
 			if canEmitEdgeCmd {
