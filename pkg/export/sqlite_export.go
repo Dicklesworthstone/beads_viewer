@@ -1438,8 +1438,11 @@ func (e *SQLiteExporter) GetExportedIssues() []ExportIssue {
 	}
 	etaCtx := e.resolveETAContext()
 
-	result := make([]ExportIssue, len(e.Issues))
-	for i, issue := range e.Issues {
+	result := make([]ExportIssue, 0, len(e.Issues))
+	for _, issue := range e.Issues {
+		if issue == nil {
+			continue
+		}
 		extRef := ""
 		if issue.ExternalRef != nil {
 			extRef = *issue.ExternalRef
@@ -1532,7 +1535,7 @@ func (e *SQLiteExporter) GetExportedIssues() []ExportIssue {
 			}
 		}
 
-		result[i] = exp
+		result = append(result, exp)
 	}
 
 	return result

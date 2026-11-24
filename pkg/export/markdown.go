@@ -184,6 +184,12 @@ func normalizeReportMetricKey(raw string) (string, bool) {
 		return "in_degree", true
 	case "out_degree", "outdegree":
 		return "out_degree", true
+	case "triage", "triage_score":
+		return "triage", true
+	case "risk", "risk_score":
+		return "risk", true
+	case "eta", "eta_days":
+		return "eta", true
 	default:
 		return "", false
 	}
@@ -211,6 +217,12 @@ func reportMetricHeader(key string) string {
 		return "In-Degree"
 	case "out_degree":
 		return "Out-Degree"
+	case "triage":
+		return "Triage Score"
+	case "risk":
+		return "Risk"
+	case "eta":
+		return "ETA (d)"
 	default:
 		return key
 	}
@@ -230,10 +242,17 @@ type reportMetricsAccessor struct {
 	resolvedIDs    map[string]bool
 	inDegree       map[string]int
 	outDegree      map[string]int
+	triageScore    map[string]float64
+	riskScore      map[string]float64
+	etaDays        map[string]float64
+}
+
+func isDecisionIneligibleIssue(iss model.Issue) bool {
+	return isClosedLikeStatus(iss.Status) || iss.IsTemplate || iss.Pinned || iss.Status == model.StatusPinned
 }
 
 func newReportMetricsAccessor(opts ReportOptions, issueSlices ...[]model.Issue) *reportMetricsAccessor {
-	if opts.GraphStats == nil || (!opts.View.ShowMetrics && len(opts.Metrics) == 0) {
+	if (opts.GraphStats == nil && opts.Analyzer == nil && opts.ETAContext == nil) || (!opts.View.ShowMetrics && len(opts.Metrics) == 0) {
 		return nil
 	}
 	var keys []string
@@ -265,47 +284,128 @@ func newReportMetricsAccessor(opts ReportOptions, issueSlices ...[]model.Issue) 
 		return nil
 	}
 	resolvedIDs := make(map[string]bool)
-	if !opts.IncludeInactive {
-		if opts.Readiness != nil {
-			for _, id := range opts.Readiness.ResolvedIDs() {
+	decisionExcluded := make(map[string]bool)
+	issueByID := make(map[string]model.Issue)
+	collectIssues := func(list []model.Issue) {
+		for _, iss := range list {
+			if _, exists := issueByID[iss.ID]; !exists {
+				issueByID[iss.ID] = iss
+			}
+			if isClosedLikeStatus(iss.Status) {
+				if !opts.IncludeInactive {
+					resolvedIDs[iss.ID] = true
+				}
+				decisionExcluded[iss.ID] = true
+			} else if isDecisionIneligibleIssue(iss) {
+				decisionExcluded[iss.ID] = true
+			}
+		}
+	}
+	if opts.Readiness != nil {
+		for _, id := range opts.Readiness.ResolvedIDs() {
+			if !opts.IncludeInactive {
 				resolvedIDs[id] = true
 			}
+			decisionExcluded[id] = true
 		}
-		for _, iss := range opts.GraphIssues {
-			if isClosedLikeStatus(iss.Status) {
-				resolvedIDs[iss.ID] = true
+	}
+	collectIssues(opts.GraphIssues)
+	for _, slice := range issueSlices {
+		collectIssues(slice)
+	}
+
+	acc := &reportMetricsAccessor{
+		keys:        keys,
+		resolvedIDs: resolvedIDs,
+	}
+	if opts.GraphStats != nil {
+		betweenness := opts.GraphStats.ActiveBetweenness()
+		kcore := opts.GraphStats.ActiveCoreNumber()
+		if opts.IncludeInactive {
+			betweenness = opts.GraphStats.Betweenness()
+			kcore = opts.GraphStats.CoreNumber()
+		}
+		slack := opts.GraphStats.Slack()
+		acc.pageRank = opts.GraphStats.PageRank()
+		acc.betweenness = betweenness
+		acc.eigenvector = opts.GraphStats.Eigenvector()
+		acc.hubs = opts.GraphStats.Hubs()
+		acc.authorities = opts.GraphStats.Authorities()
+		acc.criticalPath = opts.GraphStats.CriticalPathScore()
+		acc.kcore = kcore
+		acc.slack = slack
+		acc.slackAvailable = len(slack) > 0 && len(opts.GraphStats.Cycles()) == 0
+		acc.inDegree = opts.GraphStats.InDegree
+		acc.outDegree = opts.GraphStats.OutDegree
+	}
+
+	now := opts.GeneratedAt
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+
+	if seen["triage"] {
+		an := opts.Analyzer
+		if an == nil && len(issueByID) > 0 {
+			all := make([]model.Issue, 0, len(issueByID))
+			for _, iss := range issueByID {
+				all = append(all, iss)
+			}
+			an = analysis.NewAnalyzer(all)
+			an.SetNow(now)
+			if opts.Readiness != nil {
+				an.SetReadinessScope(opts.Readiness, opts.VisibleIDs)
 			}
 		}
-		for _, slice := range issueSlices {
-			for _, iss := range slice {
-				if isClosedLikeStatus(iss.Status) {
-					resolvedIDs[iss.ID] = true
+		if an != nil {
+			scores := an.ComputeImpactScores()
+			acc.triageScore = make(map[string]float64, len(scores))
+			for _, sc := range scores {
+				if !decisionExcluded[sc.IssueID] {
+					acc.triageScore[sc.IssueID] = sc.Score
 				}
 			}
 		}
 	}
-	betweenness := opts.GraphStats.ActiveBetweenness()
-	kcore := opts.GraphStats.ActiveCoreNumber()
-	if opts.IncludeInactive {
-		betweenness = opts.GraphStats.Betweenness()
-		kcore = opts.GraphStats.CoreNumber()
+	if seen["risk"] && opts.GraphStats != nil && len(issueByID) > 0 {
+		issuePtrMap := make(map[string]model.Issue, len(issueByID))
+		for id, iss := range issueByID {
+			issuePtrMap[id] = iss
+		}
+		readiness := opts.Readiness
+		if readiness == nil {
+			all := make([]model.Issue, 0, len(issueByID))
+			for _, iss := range issueByID {
+				all = append(all, iss)
+			}
+			readiness = model.NewReadinessIndex(all)
+		}
+		weights := analysis.DefaultRiskWeights()
+		acc.riskScore = make(map[string]float64, len(issueByID))
+		for id, iss := range issueByID {
+			if decisionExcluded[id] {
+				continue
+			}
+			issCopy := iss
+			sig := analysis.ComputeRiskSignalsWithReadiness(&issCopy, opts.GraphStats, issuePtrMap, readiness, now, weights)
+			acc.riskScore[id] = sig.CompositeRisk
+		}
 	}
-	slack := opts.GraphStats.Slack()
-	return &reportMetricsAccessor{
-		keys:           keys,
-		pageRank:       opts.GraphStats.PageRank(),
-		betweenness:    betweenness,
-		eigenvector:    opts.GraphStats.Eigenvector(),
-		hubs:           opts.GraphStats.Hubs(),
-		authorities:    opts.GraphStats.Authorities(),
-		criticalPath:   opts.GraphStats.CriticalPathScore(),
-		kcore:          kcore,
-		slack:          slack,
-		slackAvailable: len(slack) > 0 && len(opts.GraphStats.Cycles()) == 0,
-		resolvedIDs:    resolvedIDs,
-		inDegree:       opts.GraphStats.InDegree,
-		outDegree:      opts.GraphStats.OutDegree,
+	if seen["eta"] && opts.ETAContext != nil && len(issueByID) > 0 {
+		acc.etaDays = make(map[string]float64, len(issueByID))
+		for id, iss := range issueByID {
+			if decisionExcluded[id] {
+				continue
+			}
+			eta := opts.ETAContext.EstimateForIssue(iss, 1)
+			if eta.EstimatedDays > 0 && !eta.ETADate.IsZero() {
+				acc.etaDays[id] = eta.EstimatedDays
+			}
+		}
 	}
+	return acc
 }
 
 func (m *reportMetricsAccessor) betweennessForIssue(issueID string) (float64, bool) {
@@ -360,6 +460,12 @@ func (m *reportMetricsAccessor) floatValue(key, issueID string) float64 {
 		return float64(m.inDegree[issueID])
 	case "out_degree":
 		return float64(m.outDegree[issueID])
+	case "triage":
+		return m.triageScore[issueID]
+	case "risk":
+		return m.riskScore[issueID]
+	case "eta":
+		return m.etaDays[issueID]
 	default:
 		return 0
 	}
@@ -383,6 +489,24 @@ func (m *reportMetricsAccessor) formatValue(key, issueID string) string {
 			return "N/A"
 		}
 		return fmt.Sprintf("%.2f", val)
+	case "triage":
+		val, ok := m.triageScore[issueID]
+		if !ok {
+			return "N/A"
+		}
+		return fmt.Sprintf("%.3f", val)
+	case "risk":
+		val, ok := m.riskScore[issueID]
+		if !ok {
+			return "N/A"
+		}
+		return fmt.Sprintf("%.2f", val)
+	case "eta":
+		val, ok := m.etaDays[issueID]
+		if !ok {
+			return "N/A"
+		}
+		return fmt.Sprintf("%.1f", val)
 	case "critical_path":
 		return fmt.Sprintf("%.2f", m.floatValue(key, issueID))
 	default:
@@ -396,15 +520,34 @@ func (m *reportMetricsAccessor) mapForIssue(issueID string) map[string]float64 {
 	}
 	out := make(map[string]float64, len(m.keys))
 	for _, k := range m.keys {
-		if k == "slack" {
+		switch k {
+		case "slack":
 			val, ok := m.slackForIssue(issueID)
 			if !ok {
 				continue
 			}
 			out[k] = val
-			continue
+		case "triage":
+			val, ok := m.triageScore[issueID]
+			if !ok {
+				continue
+			}
+			out[k] = val
+		case "risk":
+			val, ok := m.riskScore[issueID]
+			if !ok {
+				continue
+			}
+			out[k] = val
+		case "eta":
+			val, ok := m.etaDays[issueID]
+			if !ok {
+				continue
+			}
+			out[k] = val
+		default:
+			out[k] = m.floatValue(k, issueID)
 		}
-		out[k] = m.floatValue(k, issueID)
 	}
 	return out
 }
@@ -669,17 +812,21 @@ func writeCSVReport(selected, context []model.Issue, opts ReportOptions, metrics
 				},
 			}, true
 		default:
-			if opts.GraphStats != nil {
+			if opts.GraphStats != nil || opts.Analyzer != nil || opts.ETAContext != nil {
 				if mKey, ok := normalizeReportMetricKey(norm); ok {
 					acc := metricsAcc
 					if acc == nil {
-						acc = newReportMetricsAccessor(ReportOptions{Metrics: []string{mKey}, GraphStats: opts.GraphStats, Readiness: opts.Readiness, GraphIssues: opts.GraphIssues}, selected, context)
+						colOpts := opts
+						colOpts.Metrics = []string{mKey}
+						acc = newReportMetricsAccessor(colOpts, selected, context)
 					}
-					return csvColSpec{
-						key:    mKey,
-						header: mKey,
-						render: func(i model.Issue) string { return acc.formatValue(mKey, i.ID) },
-					}, true
+					if acc != nil {
+						return csvColSpec{
+							key:    mKey,
+							header: mKey,
+							render: func(i model.Issue) string { return acc.formatValue(mKey, i.ID) },
+						}, true
+					}
 				}
 			}
 			return csvColSpec{}, false
@@ -963,6 +1110,242 @@ func sanitizeMermaidText(text string) string {
 	return result
 }
 
+type reportHighRiskItem struct {
+	IssueID     string
+	RiskScore   float64
+	Explanation string
+}
+
+type reportDecisionIntel struct {
+	riskByID      map[string]analysis.RiskSignals
+	whatIfByID    map[string]*analysis.WhatIfResult
+	priorityByID  map[string]analysis.PriorityRecommendation
+	highRisk      []reportHighRiskItem
+	priorityHints []analysis.PriorityRecommendation
+	cycleBreaks   []analysis.CycleBreakItem
+}
+
+func buildReportDecisionIntel(issues []model.Issue, opts ReportOptions) *reportDecisionIntel {
+	if (opts.Analyzer == nil && opts.GraphStats == nil) || len(issues) == 0 {
+		return nil
+	}
+	visibleSet := opts.VisibleIDs
+	if visibleSet == nil {
+		visibleSet = make(map[string]bool, len(issues))
+		for _, iss := range issues {
+			visibleSet[iss.ID] = true
+		}
+	}
+	now := opts.GeneratedAt
+	if now.IsZero() {
+		now = time.Now().UTC()
+	} else {
+		now = now.UTC()
+	}
+
+	di := &reportDecisionIntel{
+		riskByID:     make(map[string]analysis.RiskSignals),
+		whatIfByID:   make(map[string]*analysis.WhatIfResult),
+		priorityByID: make(map[string]analysis.PriorityRecommendation),
+	}
+
+	if opts.GraphStats != nil {
+		issueMap := make(map[string]model.Issue, len(opts.GraphIssues)+len(issues))
+		for _, iss := range opts.GraphIssues {
+			issueMap[iss.ID] = iss
+		}
+		for _, iss := range issues {
+			if _, ok := issueMap[iss.ID]; !ok {
+				issueMap[iss.ID] = iss
+			}
+		}
+		readiness := opts.Readiness
+		if readiness == nil {
+			all := make([]model.Issue, 0, len(issueMap))
+			for _, iss := range issueMap {
+				all = append(all, iss)
+			}
+			readiness = model.NewReadinessIndex(all)
+		}
+		weights := analysis.DefaultRiskWeights()
+		for _, iss := range issues {
+			if !visibleSet[iss.ID] || isDecisionIneligibleIssue(iss) {
+				continue
+			}
+			issCopy := iss
+			sig := analysis.ComputeRiskSignalsWithReadiness(&issCopy, opts.GraphStats, issueMap, readiness, now, weights)
+			if sig.CompositeRisk > 0 {
+				di.riskByID[iss.ID] = sig
+				if sig.CompositeRisk >= 0.50 {
+					di.highRisk = append(di.highRisk, reportHighRiskItem{
+						IssueID:     iss.ID,
+						RiskScore:   sig.CompositeRisk,
+						Explanation: sig.Explanation,
+					})
+				}
+			}
+		}
+		sort.Slice(di.highRisk, func(i, j int) bool {
+			if di.highRisk[i].RiskScore != di.highRisk[j].RiskScore {
+				return di.highRisk[i].RiskScore > di.highRisk[j].RiskScore
+			}
+			return di.highRisk[i].IssueID < di.highRisk[j].IssueID
+		})
+		if len(di.highRisk) > 5 {
+			di.highRisk = di.highRisk[:5]
+		}
+	}
+
+	if opts.Analyzer != nil {
+		for _, rec := range opts.Analyzer.GenerateRecommendations() {
+			if !visibleSet[rec.IssueID] || rec.SuggestedPriority == rec.CurrentPriority {
+				continue
+			}
+			di.priorityByID[rec.IssueID] = rec
+			di.priorityHints = append(di.priorityHints, rec)
+		}
+		sort.Slice(di.priorityHints, func(i, j int) bool {
+			if di.priorityHints[i].Confidence != di.priorityHints[j].Confidence {
+				return di.priorityHints[i].Confidence > di.priorityHints[j].Confidence
+			}
+			return di.priorityHints[i].IssueID < di.priorityHints[j].IssueID
+		})
+		if len(di.priorityHints) > 5 {
+			di.priorityHints = di.priorityHints[:5]
+		}
+
+		if opts.GraphStats != nil {
+			for _, iss := range issues {
+				if !visibleSet[iss.ID] || isClosedLikeStatus(iss.Status) {
+					continue
+				}
+				wi := opts.Analyzer.ComputeWhatIf(iss.ID, opts.GraphStats)
+				if wi == nil || (wi.Delta.DirectUnblocks <= 0 && wi.Delta.TransitiveUnblocks <= 0) {
+					continue
+				}
+				filteredIDs := make([]string, 0, len(wi.Delta.UnblockedIssueIDs))
+				for _, uid := range wi.Delta.UnblockedIssueIDs {
+					if visibleSet[uid] {
+						filteredIDs = append(filteredIDs, uid)
+					}
+				}
+				wiCopy := *wi
+				wiCopy.Delta.UnblockedIssueIDs = filteredIDs
+				if opts.VisibleIDs != nil {
+					if len(filteredIDs) == 0 {
+						continue
+					}
+					if wiCopy.Delta.DirectUnblocks > len(filteredIDs) {
+						wiCopy.Delta.DirectUnblocks = len(filteredIDs)
+					}
+				}
+				di.whatIfByID[iss.ID] = &wiCopy
+			}
+
+			adv := opts.Analyzer.GenerateAdvancedInsightsFromStats(opts.GraphStats, analysis.DefaultAdvancedInsightsConfig())
+			if adv != nil && adv.CycleBreak != nil {
+				for _, cb := range adv.CycleBreak.Suggestions {
+					if !visibleSet[cb.EdgeFrom] || !visibleSet[cb.EdgeTo] {
+						continue
+					}
+					di.cycleBreaks = append(di.cycleBreaks, cb)
+					if len(di.cycleBreaks) >= 5 {
+						break
+					}
+				}
+			}
+		}
+	}
+
+	return di
+}
+
+func (di *reportDecisionIntel) hasExecutiveSummary() bool {
+	return di != nil && (len(di.priorityHints) > 0 || len(di.cycleBreaks) > 0 || len(di.highRisk) > 0)
+}
+
+func writeMarkdownDecisionIntel(sb *strings.Builder, di *reportDecisionIntel) {
+	if !di.hasExecutiveSummary() {
+		return
+	}
+	sb.WriteString("## Decision Intelligence\n\n")
+	if len(di.highRisk) > 0 {
+		sb.WriteString("### High Operational Risk\n\n")
+		sb.WriteString("| Issue | Risk | Rationale |\n|-------|------|-----------|\n")
+		for _, hr := range di.highRisk {
+			sb.WriteString(fmt.Sprintf("| `%s` | %.0f%% | %s |\n",
+				escapeTableCodeSpan(hr.IssueID), hr.RiskScore*100, escapeTableText(hr.Explanation)))
+		}
+		sb.WriteString("\n")
+	}
+	if len(di.priorityHints) > 0 {
+		sb.WriteString("### Priority Alignment Hints\n\n")
+		sb.WriteString("| Issue | Change | Confidence | Reasoning |\n|-------|--------|------------|-----------|\n")
+		for _, ph := range di.priorityHints {
+			arrow := "↓"
+			if ph.Direction == "increase" {
+				arrow = "↑"
+			}
+			reason := ""
+			if len(ph.Reasoning) > 0 {
+				reason = ph.Reasoning[0]
+			}
+			sb.WriteString(fmt.Sprintf("| `%s` | %s P%d → P%d | %.0f%% | %s |\n",
+				escapeTableCodeSpan(ph.IssueID), arrow, ph.CurrentPriority, ph.SuggestedPriority, ph.Confidence*100, escapeTableText(reason)))
+		}
+		sb.WriteString("\n")
+	}
+	if len(di.cycleBreaks) > 0 {
+		sb.WriteString("### Cycle-Break Suggestions\n\n")
+		sb.WriteString("| Remove Edge | Cycles Broken | Collateral | Rationale |\n|-------------|---------------|------------|-----------|\n")
+		for _, cb := range di.cycleBreaks {
+			sb.WriteString(fmt.Sprintf("| `%s` → `%s` | %d | %d | %s |\n",
+				escapeTableCodeSpan(cb.EdgeFrom), escapeTableCodeSpan(cb.EdgeTo), cb.Impact, cb.Collateral, escapeTableText(cb.Rationale)))
+		}
+		sb.WriteString("\n")
+	}
+}
+
+func writeHTMLDecisionIntel(sb *strings.Builder, di *reportDecisionIntel) {
+	if !di.hasExecutiveSummary() {
+		return
+	}
+	sb.WriteString("<section class=\"decision-intelligence\">\n<h2>Decision Intelligence</h2>\n")
+	if len(di.highRisk) > 0 {
+		sb.WriteString("<h3>High Operational Risk</h3>\n<table><thead><tr><th>Issue</th><th>Risk</th><th>Rationale</th></tr></thead><tbody>\n")
+		for _, hr := range di.highRisk {
+			sb.WriteString(fmt.Sprintf("<tr><td><code>%s</code></td><td>%.0f%%</td><td>%s</td></tr>\n",
+				html.EscapeString(hr.IssueID), hr.RiskScore*100, html.EscapeString(hr.Explanation)))
+		}
+		sb.WriteString("</tbody></table>\n")
+	}
+	if len(di.priorityHints) > 0 {
+		sb.WriteString("<h3>Priority Alignment Hints</h3>\n<table><thead><tr><th>Issue</th><th>Change</th><th>Confidence</th><th>Reasoning</th></tr></thead><tbody>\n")
+		for _, ph := range di.priorityHints {
+			arrow := "↓"
+			if ph.Direction == "increase" {
+				arrow = "↑"
+			}
+			reason := ""
+			if len(ph.Reasoning) > 0 {
+				reason = ph.Reasoning[0]
+			}
+			sb.WriteString(fmt.Sprintf("<tr><td><code>%s</code></td><td>%s P%d → P%d</td><td>%.0f%%</td><td>%s</td></tr>\n",
+				html.EscapeString(ph.IssueID), arrow, ph.CurrentPriority, ph.SuggestedPriority, ph.Confidence*100, html.EscapeString(reason)))
+		}
+		sb.WriteString("</tbody></table>\n")
+	}
+	if len(di.cycleBreaks) > 0 {
+		sb.WriteString("<h3>Cycle-Break Suggestions</h3>\n<table><thead><tr><th>Remove Edge</th><th>Cycles Broken</th><th>Collateral</th><th>Rationale</th></tr></thead><tbody>\n")
+		for _, cb := range di.cycleBreaks {
+			sb.WriteString(fmt.Sprintf("<tr><td><code>%s</code> → <code>%s</code></td><td>%d</td><td>%d</td><td>%s</td></tr>\n",
+				html.EscapeString(cb.EdgeFrom), html.EscapeString(cb.EdgeTo), cb.Impact, cb.Collateral, html.EscapeString(cb.Rationale)))
+		}
+		sb.WriteString("</tbody></table>\n")
+	}
+	sb.WriteString("</section>\n")
+}
+
 // GenerateMarkdown creates a comprehensive markdown report of all issues
 func GenerateMarkdown(issues []model.Issue, title string, options ...ReportOptions) (string, error) {
 	opts := ReportOptions{IncludeGraph: true, GeneratedAt: time.Now(), GraphIssues: issues}
@@ -1012,7 +1395,9 @@ func GenerateMarkdown(issues []model.Issue, title string, options ...ReportOptio
 	}
 	sb.WriteString(fmt.Sprintf("| Closed | %d |\n\n", closed))
 	metricsAcc := newReportMetricsAccessor(opts, issues)
+	decisionIntel := buildReportDecisionIntel(issues, opts)
 	writeSummaryTable(&sb, issues, opts, metricsAcc)
+	writeMarkdownDecisionIntel(&sb, decisionIntel)
 
 	// Quick Actions Section
 	sb.WriteString(generateQuickActions(issues, opts))
@@ -1057,12 +1442,12 @@ func GenerateMarkdown(issues []model.Issue, title string, options ...ReportOptio
 		for _, grp := range groups {
 			sb.WriteString(fmt.Sprintf("## Group: %s (%d)\n\n", grp.Label, len(grp.Indices)))
 			for _, idx := range grp.Indices {
-				writeMarkdownIssueSection(&sb, issues[idx], issueSlugs[idx], opts, metricsAcc)
+				writeMarkdownIssueSection(&sb, issues[idx], issueSlugs[idx], opts, metricsAcc, decisionIntel)
 			}
 		}
 	} else {
 		for idx, i := range issues {
-			writeMarkdownIssueSection(&sb, i, issueSlugs[idx], opts, metricsAcc)
+			writeMarkdownIssueSection(&sb, i, issueSlugs[idx], opts, metricsAcc, decisionIntel)
 		}
 	}
 
@@ -1356,16 +1741,20 @@ func writeSummaryTable(sb *strings.Builder, issues []model.Issue, opts ReportOpt
 				},
 			}, "blocks", true
 		default:
-			if opts.GraphStats != nil {
+			if opts.GraphStats != nil || opts.Analyzer != nil || opts.ETAContext != nil {
 				if mKey, ok := normalizeReportMetricKey(norm); ok {
 					acc := metricsAcc
 					if acc == nil {
-						acc = newReportMetricsAccessor(ReportOptions{Metrics: []string{mKey}, GraphStats: opts.GraphStats, Readiness: opts.Readiness, GraphIssues: opts.GraphIssues}, issues)
+						colOpts := opts
+						colOpts.Metrics = []string{mKey}
+						acc = newReportMetricsAccessor(colOpts, issues)
 					}
-					return summaryColumnSpec{
-						header: reportMetricHeader(mKey),
-						render: func(i model.Issue) string { return acc.formatValue(mKey, i.ID) },
-					}, mKey, true
+					if acc != nil {
+						return summaryColumnSpec{
+							header: reportMetricHeader(mKey),
+							render: func(i model.Issue) string { return acc.formatValue(mKey, i.ID) },
+						}, mKey, true
+					}
 				}
 			}
 			return summaryColumnSpec{}, "", false
@@ -1434,7 +1823,7 @@ func formatEstimatedDuration(minutes int) string {
 	return fmt.Sprintf("%dh %dm (%dm)", hours, rem, minutes)
 }
 
-func writeMarkdownIssueSection(sb *strings.Builder, i model.Issue, slug string, opts ReportOptions, metricsAcc *reportMetricsAccessor) {
+func writeMarkdownIssueSection(sb *strings.Builder, i model.Issue, slug string, opts ReportOptions, metricsAcc *reportMetricsAccessor, decisionIntel *reportDecisionIntel) {
 	typeIcon := getTypeEmoji(string(i.IssueType))
 	sb.WriteString(fmt.Sprintf("<a id=\"%s\"></a>\n\n", slug))
 	sb.WriteString(fmt.Sprintf("## %s\n\n", issueHeadingText(i)))
@@ -1523,6 +1912,44 @@ func writeMarkdownIssueSection(sb *strings.Builder, i model.Issue, slug string, 
 				}
 			}
 		}
+		if decisionIntel != nil {
+			if sig, ok := decisionIntel.riskByID[i.ID]; ok && sig.CompositeRisk >= 0.25 {
+				riskVal := fmt.Sprintf("%.0f%%", sig.CompositeRisk*100)
+				if sig.Explanation != "" {
+					riskVal += " — " + escapeTableText(sig.Explanation)
+				}
+				sb.WriteString(fmt.Sprintf("| **Operational Risk** | %s |\n", riskVal))
+			}
+			if wi := decisionIntel.whatIfByID[i.ID]; wi != nil && (wi.Delta.DirectUnblocks > 0 || wi.Delta.TransitiveUnblocks > 0) {
+				ub := fmt.Sprintf("+%d direct", wi.Delta.DirectUnblocks)
+				if wi.Delta.TransitiveUnblocks > wi.Delta.DirectUnblocks {
+					ub += fmt.Sprintf(" (+%d total)", wi.Delta.TransitiveUnblocks)
+				}
+				if len(wi.Delta.UnblockedIssueIDs) > 0 {
+					limit := min(4, len(wi.Delta.UnblockedIssueIDs))
+					idSpans := make([]string, 0, limit)
+					for k := 0; k < limit; k++ {
+						idSpans = append(idSpans, "`"+escapeTableCodeSpan(wi.Delta.UnblockedIssueIDs[k])+"`")
+					}
+					ub += " → " + strings.Join(idSpans, ", ")
+					if len(wi.Delta.UnblockedIssueIDs) > limit {
+						ub += fmt.Sprintf(" (+%d more)", len(wi.Delta.UnblockedIssueIDs)-limit)
+					}
+				}
+				sb.WriteString(fmt.Sprintf("| **What-If Unblocks** | %s |\n", ub))
+			}
+			if ph, ok := decisionIntel.priorityByID[i.ID]; ok {
+				arrow := "↓"
+				if ph.Direction == "increase" {
+					arrow = "↑"
+				}
+				hintVal := fmt.Sprintf("%s P%d → P%d (%.0f%%)", arrow, ph.CurrentPriority, ph.SuggestedPriority, ph.Confidence*100)
+				if len(ph.Reasoning) > 0 {
+					hintVal += " — " + escapeTableText(ph.Reasoning[0])
+				}
+				sb.WriteString(fmt.Sprintf("| **Priority Hint** | %s |\n", hintVal))
+			}
+		}
 	}
 	sb.WriteString("\n")
 
@@ -1592,6 +2019,7 @@ func GenerateHTMLReport(issues []model.Issue, title string, opts ReportOptions) 
 	}
 
 	metricsAcc := newReportMetricsAccessor(opts, issues)
+	decisionIntel := buildReportDecisionIntel(issues, opts)
 	blocksByID := buildBlockingReverseMap(issues)
 
 	var sb strings.Builder
@@ -1720,17 +2148,21 @@ func GenerateHTMLReport(issues []model.Issue, title string, opts ReportOptions) 
 				},
 			}, true
 		default:
-			if opts.GraphStats != nil {
+			if opts.GraphStats != nil || opts.Analyzer != nil || opts.ETAContext != nil {
 				if mKey, ok := normalizeReportMetricKey(norm); ok {
 					acc := metricsAcc
 					if acc == nil {
-						acc = newReportMetricsAccessor(ReportOptions{Metrics: []string{mKey}, GraphStats: opts.GraphStats, Readiness: opts.Readiness, GraphIssues: opts.GraphIssues}, issues)
+						colOpts := opts
+						colOpts.Metrics = []string{mKey}
+						acc = newReportMetricsAccessor(colOpts, issues)
 					}
-					return htmlCol{
-						key:    mKey,
-						header: reportMetricHeader(mKey),
-						render: func(i model.Issue) string { return html.EscapeString(acc.formatValue(mKey, i.ID)) },
-					}, true
+					if acc != nil {
+						return htmlCol{
+							key:    mKey,
+							header: reportMetricHeader(mKey),
+							render: func(i model.Issue) string { return html.EscapeString(acc.formatValue(mKey, i.ID)) },
+						}, true
+					}
 				}
 			}
 			return htmlCol{}, false
@@ -1780,6 +2212,7 @@ func GenerateHTMLReport(issues []model.Issue, title string, opts ReportOptions) 
 		sb.WriteString("</tr>\n")
 	}
 	sb.WriteString("</tbody>\n</table>\n")
+	writeHTMLDecisionIntel(&sb, decisionIntel)
 
 	if opts.includeActions() {
 		var quickCmds []string
@@ -1896,6 +2329,44 @@ func GenerateHTMLReport(issues []model.Issue, title string, opts ReportOptions) 
 						}
 						sb.WriteString(fmt.Sprintf("<tr><th>Start Here (Root Blockers)</th><td>%s</td></tr>\n", val))
 					}
+				}
+			}
+			if decisionIntel != nil {
+				if sig, ok := decisionIntel.riskByID[iss.ID]; ok && sig.CompositeRisk >= 0.25 {
+					riskVal := fmt.Sprintf("%.0f%%", sig.CompositeRisk*100)
+					if sig.Explanation != "" {
+						riskVal += " — " + html.EscapeString(sig.Explanation)
+					}
+					sb.WriteString(fmt.Sprintf("<tr><th>Operational Risk</th><td>%s</td></tr>\n", riskVal))
+				}
+				if wi := decisionIntel.whatIfByID[iss.ID]; wi != nil && (wi.Delta.DirectUnblocks > 0 || wi.Delta.TransitiveUnblocks > 0) {
+					ub := fmt.Sprintf("+%d direct", wi.Delta.DirectUnblocks)
+					if wi.Delta.TransitiveUnblocks > wi.Delta.DirectUnblocks {
+						ub += fmt.Sprintf(" (+%d total)", wi.Delta.TransitiveUnblocks)
+					}
+					if len(wi.Delta.UnblockedIssueIDs) > 0 {
+						limit := min(4, len(wi.Delta.UnblockedIssueIDs))
+						idSpans := make([]string, 0, limit)
+						for k := 0; k < limit; k++ {
+							idSpans = append(idSpans, "<code>"+html.EscapeString(wi.Delta.UnblockedIssueIDs[k])+"</code>")
+						}
+						ub += " → " + strings.Join(idSpans, ", ")
+						if len(wi.Delta.UnblockedIssueIDs) > limit {
+							ub += fmt.Sprintf(" (+%d more)", len(wi.Delta.UnblockedIssueIDs)-limit)
+						}
+					}
+					sb.WriteString(fmt.Sprintf("<tr><th>What-If Unblocks</th><td>%s</td></tr>\n", ub))
+				}
+				if ph, ok := decisionIntel.priorityByID[iss.ID]; ok {
+					arrow := "↓"
+					if ph.Direction == "increase" {
+						arrow = "↑"
+					}
+					hintVal := fmt.Sprintf("%s P%d → P%d (%.0f%%)", arrow, ph.CurrentPriority, ph.SuggestedPriority, ph.Confidence*100)
+					if len(ph.Reasoning) > 0 {
+						hintVal += " — " + html.EscapeString(ph.Reasoning[0])
+					}
+					sb.WriteString(fmt.Sprintf("<tr><th>Priority Hint</th><td>%s</td></tr>\n", hintVal))
 				}
 			}
 		}

@@ -1317,20 +1317,58 @@
           </div>
         </div>
 
-        <!-- Results count - responsive -->
-        <div class="mb-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-1 sm:gap-0">
+        <!-- Results count & List | Board | Tree mode switcher - responsive -->
+        <div class="mb-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
           <p class="text-xs sm:text-sm text-gray-600 dark:text-gray-400">
-            Showing <span class="font-medium" x-text="issues.length"></span> of
-            <span class="font-medium" x-text="totalIssues"></span> issues
+            <span x-show="issuesViewMode === 'list'">
+              Showing <span class="font-medium" x-text="issues.length"></span> of
+              <span class="font-medium" x-text="totalIssues"></span> issues
+            </span>
+            <span x-show="issuesViewMode !== 'list'">
+              Showing <span class="font-medium" x-text="issuesModeRows.length"></span> of
+              <span class="font-medium" x-text="totalIssues"></span> issues
+              <span x-show="totalIssues > issuesModeRows.length" class="text-amber-600 dark:text-amber-400">(first 500 matching)</span>
+            </span>
             <span x-show="searchQuery && searchBackend === 'substring'" class="ml-2 text-gray-500" title="This browser SQLite engine does not include FTS5. Graph ranking still applies in Hybrid mode.">· Substring text matching</span>
           </p>
-          <div class="text-xs sm:text-sm text-gray-500">
-            Page <span x-text="page"></span> of <span x-text="Math.ceil(totalIssues / pageSize) || 1"></span>
+          <div class="flex flex-wrap items-center gap-3">
+            <div id="issues-view-mode-switcher"
+                 role="group"
+                 aria-label="Issues display mode"
+                 class="inline-flex items-center rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 p-0.5 text-xs">
+              <button type="button"
+                      id="issues-mode-list"
+                      @click="setIssuesViewMode('list')"
+                      :aria-pressed="issuesViewMode === 'list'"
+                      :class="issuesViewMode === 'list' ? 'bg-beads-500 text-white shadow-sm' : 'text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700'"
+                      class="px-2.5 py-1 rounded-md font-medium transition-colors">
+                List
+              </button>
+              <button type="button"
+                      id="issues-mode-board"
+                      @click="setIssuesViewMode('board')"
+                      :aria-pressed="issuesViewMode === 'board'"
+                      :class="issuesViewMode === 'board' ? 'bg-beads-500 text-white shadow-sm' : 'text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700'"
+                      class="px-2.5 py-1 rounded-md font-medium transition-colors">
+                Board
+              </button>
+              <button type="button"
+                      id="issues-mode-tree"
+                      @click="setIssuesViewMode('tree')"
+                      :aria-pressed="issuesViewMode === 'tree'"
+                      :class="issuesViewMode === 'tree' ? 'bg-beads-500 text-white shadow-sm' : 'text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700'"
+                      class="px-2.5 py-1 rounded-md font-medium transition-colors">
+                Tree
+              </button>
+            </div>
+            <div x-show="issuesViewMode === 'list'" class="text-xs sm:text-sm text-gray-500">
+              Page <span x-text="page"></span> of <span x-text="Math.ceil(totalIssues / pageSize) || 1"></span>
+            </div>
           </div>
         </div>
 
         <!-- Issues list -->
-        <div class="bg-white dark:bg-gray-800 rounded-xl shadow-sm border border-gray-200 dark:border-gray-700">
+        <div x-show="issuesViewMode === 'list'" class="bg-white dark:bg-gray-800 rounded-xl shadow-sm border border-gray-200 dark:border-gray-700">
           <div class="divide-y divide-gray-200 dark:divide-gray-700">
             <template x-for="(issue, idx) in issues" :key="issue.id">
               <div class="p-4 hover:bg-gray-50 dark:hover:bg-gray-700/50 cursor-pointer transition-all duration-150 group active:bg-gray-100 dark:active:bg-gray-600 hover:pl-5"
@@ -1494,6 +1532,95 @@
                 </button>
               </div>
             </div>
+          </div>
+        </div>
+
+        <!-- Issues Kanban Board View (W30-6) -->
+        <div x-show="issuesViewMode === 'board'" id="issues-board-view" x-cloak class="space-y-4">
+          <div x-show="issuesModeRows.length === 0" class="bg-white dark:bg-gray-800 rounded-xl shadow-sm border border-gray-200 dark:border-gray-700 p-10 text-center text-sm text-gray-500 dark:text-gray-400">
+            No issues match the current filters.
+          </div>
+          <div x-show="issuesModeRows.length > 0" class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4 items-start">
+            <template x-for="col in getIssuesBoardColumns()" :key="col.key">
+              <section :data-board-col="col.key"
+                       class="bg-white dark:bg-gray-800 rounded-xl shadow-sm border border-gray-200 dark:border-gray-700 overflow-hidden">
+                <header class="px-3.5 py-2.5 border-b border-gray-200 dark:border-gray-700 flex items-center justify-between bg-gray-50/80 dark:bg-gray-900/40">
+                  <span class="text-xs font-bold uppercase tracking-wider text-gray-700 dark:text-gray-200" x-text="col.label"></span>
+                  <span class="px-2 py-0.5 rounded-full text-[11px] font-mono font-semibold bg-gray-200/80 dark:bg-gray-700 text-gray-700 dark:text-gray-200"
+                        x-text="col.items.length"></span>
+                </header>
+                <div class="p-2.5 space-y-2 max-h-[68vh] overflow-y-auto">
+                  <template x-for="issue in col.items" :key="'board-' + issue.id">
+                    <button type="button"
+                            @click="showIssue(issue.id)"
+                            class="w-full text-left p-3 rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-50/60 dark:bg-gray-900/40 hover:border-beads-400 dark:hover:border-beads-500 hover:bg-white dark:hover:bg-gray-800 transition-colors">
+                      <div class="flex items-center justify-between gap-2 mb-1">
+                        <span class="text-[11px] font-mono font-semibold text-beads-600 dark:text-beads-400 truncate" x-text="issue.id"></span>
+                        <span class="px-1.5 py-0.5 rounded text-[10px] font-bold shrink-0 bg-gray-200/80 dark:bg-gray-700 text-gray-700 dark:text-gray-200"
+                              x-text="'P' + issue.priority"></span>
+                      </div>
+                      <div class="text-xs font-medium text-gray-900 dark:text-gray-100 line-clamp-2" x-text="issue.title"></div>
+                      <div class="mt-2 flex flex-wrap items-center gap-1.5 text-[10px] font-mono text-gray-500 dark:text-gray-400">
+                        <span class="px-1.5 py-0.5 rounded bg-gray-100 dark:bg-gray-700/80" x-text="issue.issue_type"></span>
+                        <span x-show="issue.blocks_count > 0" class="text-emerald-600 dark:text-emerald-400" x-text="'unblocks ' + issue.blocks_count"></span>
+                        <span x-show="formatRiskPill(issue)" :class="riskBadgeClass(issue.risk_score)" class="px-1.5 py-0.5 rounded" x-text="formatRiskPill(issue)"></span>
+                        <span x-show="formatETAPillCompact(issue)" class="text-sky-600 dark:text-sky-400" x-text="formatETAPillCompact(issue)"></span>
+                      </div>
+                    </button>
+                  </template>
+                  <div x-show="col.items.length === 0" class="py-6 text-center text-xs text-gray-400 dark:text-gray-500">
+                    Empty
+                  </div>
+                </div>
+              </section>
+            </template>
+          </div>
+        </div>
+
+        <!-- Issues Epic Hierarchy Tree View (W30-6) -->
+        <div x-show="issuesViewMode === 'tree'" id="issues-tree-view" x-cloak class="bg-white dark:bg-gray-800 rounded-xl shadow-sm border border-gray-200 dark:border-gray-700 overflow-hidden">
+          <div x-show="issuesTreeFlatRows.length > 0" class="px-4 py-2.5 border-b border-gray-200 dark:border-gray-700 bg-gray-50/70 dark:bg-gray-900/40 flex items-center justify-between gap-2 text-xs">
+            <span class="text-gray-600 dark:text-gray-400">Parent-child hierarchy with descendant completion rollups</span>
+            <div class="flex items-center gap-2">
+              <button type="button" @click="expandAllIssuesTree()" class="px-2 py-0.5 rounded border border-gray-200 dark:border-gray-700 hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-700 dark:text-gray-300">Expand all</button>
+              <button type="button" @click="collapseAllIssuesTree()" class="px-2 py-0.5 rounded border border-gray-200 dark:border-gray-700 hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-700 dark:text-gray-300">Collapse all</button>
+            </div>
+          </div>
+          <div x-show="issuesTreeFlatRows.length === 0" class="p-10 text-center text-sm text-gray-500 dark:text-gray-400">
+            No issues match the current filters.
+          </div>
+          <div x-show="issuesTreeFlatRows.length > 0" class="divide-y divide-gray-200 dark:divide-gray-700">
+            <template x-for="row in issuesTreeFlatRows" :key="'tree-' + row.issue.id">
+              <div class="px-4 py-2.5 hover:bg-gray-50 dark:hover:bg-gray-700/50 cursor-pointer flex items-center justify-between gap-3 transition-colors"
+                   :data-tree-id="row.issue.id"
+                   :data-tree-depth="row.depth"
+                   :style="'padding-left: ' + (16 + Math.min(row.depth, 6) * 20) + 'px'"
+                   @click="showIssue(row.issue.id)"
+                   role="button"
+                   tabindex="0"
+                   @keydown.enter="showIssue(row.issue.id)">
+                <div class="flex items-center gap-2 min-w-0 flex-1">
+                  <button x-show="row.hasChildren"
+                          type="button"
+                          :data-tree-toggle="row.issue.id"
+                          @click.stop="toggleIssuesTreeNode(row.issue.id)"
+                          :aria-expanded="!row.collapsed"
+                          class="w-5 h-5 inline-flex items-center justify-center rounded hover:bg-gray-200 dark:hover:bg-gray-600 text-gray-500 dark:text-gray-300 shrink-0 font-mono text-xs"
+                          x-text="row.collapsed ? '▸' : '▾'"></button>
+                  <span x-show="!row.hasChildren" class="w-5 h-5 inline-flex items-center justify-center text-gray-300 dark:text-gray-600 shrink-0 font-mono text-xs">·</span>
+                  <span class="text-xs font-mono text-beads-600 dark:text-beads-400 shrink-0" x-text="row.issue.id"></span>
+                  <span class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-200 shrink-0" x-text="'P' + row.issue.priority"></span>
+                  <span class="text-sm font-medium text-gray-900 dark:text-gray-100 truncate" x-text="row.issue.title"></span>
+                </div>
+                <div class="flex items-center gap-2 shrink-0 text-[11px] font-mono">
+                  <span x-show="row.totalDescendants > 0"
+                        class="px-2 py-0.5 rounded-full bg-indigo-50 dark:bg-indigo-900/40 text-indigo-700 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-800/60"
+                        :title="row.closedDescendants + ' of ' + row.totalDescendants + ' descendants closed'"
+                        x-text="'[' + row.closedDescendants + '/' + row.totalDescendants + ']'"></span>
+                  <span class="px-2 py-0.5 rounded bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300" x-text="row.issue.status"></span>
+                </div>
+              </div>
+            </template>
           </div>
         </div>
       </div>
@@ -3136,6 +3263,13 @@
                           x-text="formatVelocitySparkline(lbl.weekly_closed)"></span>
                     <span x-show="lbl.stale_count > 0" class="text-red-500 dark:text-red-400" x-text="lbl.stale_count + ' stale'"></span>
                     <span x-show="lbl.attention_rank > 0" class="text-indigo-600 dark:text-indigo-400" x-text="'Att #' + lbl.attention_rank"></span>
+                    <span x-show="lbl.top_core_issue_id" class="text-violet-600 dark:text-violet-400" :title="'Subgraph keystone bead: ' + (lbl.top_core_issue_id || '')" x-text="'★ ' + (lbl.top_core_issue_id || '')"></span>
+                  </div>
+                  <div x-show="(lbl.cooccurring_labels || []).length > 0" class="mt-1.5 flex flex-wrap items-center gap-1 text-[10px] text-gray-500 dark:text-gray-400 font-mono">
+                    <span class="opacity-70">pairs:</span>
+                    <template x-for="co in (lbl.cooccurring_labels || []).slice(0, 3)" :key="lbl.label + '-co-' + co.label">
+                      <span class="px-1.5 py-0.5 rounded bg-gray-200/70 dark:bg-gray-800 text-gray-700 dark:text-gray-300" x-text="co.label + ' (' + co.count + ')'"></span>
+                    </template>
                   </div>
                 </button>
               </template>
@@ -3160,26 +3294,47 @@
                 </template>
               </div>
             </div>
-            <!-- Blockage Cascade Impact -->
-            <div x-show="getLabelCascades().length > 0"
+            <!-- Blockage Cascade Impact & Top Unblock Targets -->
+            <div x-show="getLabelCascades().length > 0 || getLabelTopUnblocks().length > 0"
                  id="insights-label-cascades"
-                 class="pt-3 border-t border-gray-200 dark:border-gray-700">
-              <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
-                <span class="text-xs font-semibold text-gray-600 dark:text-gray-300 uppercase tracking-wider">🌊 Blockage Cascade Impact</span>
-                <span class="text-[11px] text-gray-500 dark:text-gray-400">Downstream labels rippled by blocked work</span>
+                 class="pt-3 border-t border-gray-200 dark:border-gray-700 space-y-2.5">
+              <div x-show="getLabelCascades().length > 0">
+                <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
+                  <span class="text-xs font-semibold text-gray-600 dark:text-gray-300 uppercase tracking-wider">🌊 Blockage Cascade Impact</span>
+                  <span class="text-[11px] text-gray-500 dark:text-gray-400">Downstream labels rippled by blocked work</span>
+                </div>
+                <div class="flex flex-wrap gap-2">
+                  <template x-for="cas in getLabelCascades()" :key="'cas-' + cas.source_label">
+                    <button type="button"
+                            @click="navigateToIssuesWithFilter({ labels: [cas.source_label] })"
+                            class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-mono bg-rose-50 dark:bg-rose-900/25 text-rose-800 dark:text-rose-200 border border-rose-200 dark:border-rose-800/60 hover:bg-rose-100 dark:hover:bg-rose-900/40 transition-colors max-w-full">
+                      <span class="font-semibold truncate" x-text="cas.source_label"></span>
+                      <span class="text-rose-400 shrink-0">⇒</span>
+                      <span class="truncate text-[11px]" x-text="(cas.affected_labels || []).slice(0, 3).join(', ')"></span>
+                      <span class="px-1.5 py-0.5 rounded bg-rose-200/80 dark:bg-rose-800/70 text-[10px] font-bold shrink-0"
+                            x-text="cas.total_impact + ' impact'"></span>
+                    </button>
+                  </template>
+                </div>
               </div>
-              <div class="flex flex-wrap gap-2">
-                <template x-for="cas in getLabelCascades()" :key="'cas-' + cas.source_label">
-                  <button type="button"
-                          @click="navigateToIssuesWithFilter({ labels: [cas.source_label] })"
-                          class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-mono bg-rose-50 dark:bg-rose-900/25 text-rose-800 dark:text-rose-200 border border-rose-200 dark:border-rose-800/60 hover:bg-rose-100 dark:hover:bg-rose-900/40 transition-colors max-w-full">
-                    <span class="font-semibold truncate" x-text="cas.source_label"></span>
-                    <span class="text-rose-400 shrink-0">⇒</span>
-                    <span class="truncate text-[11px]" x-text="(cas.affected_labels || []).slice(0, 3).join(', ')"></span>
-                    <span class="px-1.5 py-0.5 rounded bg-rose-200/80 dark:bg-rose-800/70 text-[10px] font-bold shrink-0"
-                          x-text="cas.total_impact + ' impact'"></span>
-                  </button>
-                </template>
+              <div x-show="getLabelTopUnblocks().length > 0" id="insights-label-top-unblocks">
+                <div class="flex flex-wrap items-center justify-between gap-2 mb-1.5">
+                  <span class="text-[11px] font-semibold text-rose-700 dark:text-rose-300 uppercase tracking-wider">🔓 Top Cascade Unblock Targets</span>
+                  <span class="text-[11px] text-gray-500 dark:text-gray-400">Click to inspect highest-leverage blocker</span>
+                </div>
+                <div class="flex flex-wrap gap-2">
+                  <template x-for="ub in getLabelTopUnblocks()" :key="'top-ub-' + ub.issue_id">
+                    <button type="button"
+                            @click="showIssue(ub.issue_id)"
+                            :title="ub.reason || ub.issue_title || ub.issue_id"
+                            class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-mono bg-amber-50 dark:bg-amber-900/25 text-amber-900 dark:text-amber-200 border border-amber-200 dark:border-amber-800/60 hover:bg-amber-100 dark:hover:bg-amber-900/40 transition-colors max-w-full">
+                      <span class="font-bold shrink-0" x-text="ub.issue_id"></span>
+                      <span x-show="ub.label" class="text-[10px] opacity-75 truncate" x-text="'[' + ub.label + ']'"></span>
+                      <span class="px-1.5 py-0.5 rounded bg-amber-200/80 dark:bg-amber-800/70 text-[10px] font-bold shrink-0"
+                            x-text="'+' + ub.unblocks_count + ' unblocks'"></span>
+                    </button>
+                  </template>
+                </div>
               </div>
             </div>
           </div>
@@ -4561,6 +4716,48 @@
             </button>
           </div>
 
+          <!-- Active Pre-Flight Check Add Dep HUD Pill (W30-4) -->
+          <div x-show="graphCheckDepMode || graphCheckDepResult"
+               id="graph-checkdep-hud"
+               x-cloak
+               class="bg-white/95 dark:bg-gray-800/95 backdrop-blur-sm rounded-lg shadow-lg border px-2.5 py-2 flex flex-wrap items-center gap-2 max-w-[380px]"
+               :class="graphCheckDepResult ? (graphCheckDepResult.wouldCycle ? 'border-red-400 dark:border-red-600' : 'border-emerald-400 dark:border-emerald-600') : 'border-indigo-300 dark:border-indigo-700'">
+            <template x-if="graphCheckDepMode && !graphCheckDepResult">
+              <div class="flex items-center gap-2 text-xs">
+                <span class="font-semibold text-indigo-700 dark:text-indigo-300">🧪 Check Dep:</span>
+                <span class="font-mono font-bold text-indigo-800 dark:text-indigo-200" x-text="graphCheckDepFromId"></span>
+                <span class="text-gray-500 dark:text-gray-400">→ click target node</span>
+              </div>
+            </template>
+            <template x-if="graphCheckDepResult">
+              <div class="flex flex-wrap items-center gap-1.5 text-xs">
+                <span class="font-semibold"
+                      :class="graphCheckDepResult.wouldCycle ? 'text-red-700 dark:text-red-300' : (graphCheckDepResult.alreadyExists ? 'text-blue-700 dark:text-blue-300' : 'text-emerald-700 dark:text-emerald-300')"
+                      x-text="graphCheckDepResult.wouldCycle ? '⛔ Cycle' : (graphCheckDepResult.alreadyExists ? 'ℹ Exists' : '✓ Safe')"></span>
+                <span class="font-mono text-gray-800 dark:text-gray-200"
+                      x-text="graphCheckDepResult.wouldCycle && graphCheckDepResult.cyclePath?.length ? graphCheckDepResult.cyclePath.join(' → ') : (graphCheckDepResult.fromId + ' → ' + graphCheckDepResult.toId)"></span>
+                <span x-show="graphCheckDepResult.wouldBlockActionable"
+                      class="px-1.5 py-0.5 rounded bg-amber-100 dark:bg-amber-900/50 text-amber-800 dark:text-amber-200 text-[10px] font-semibold">Blocks ready work</span>
+                <span x-show="graphCheckDepResult.crossRepo"
+                      class="px-1.5 py-0.5 rounded bg-cyan-100 dark:bg-cyan-900/50 text-cyan-800 dark:text-cyan-200 text-[10px] font-semibold">Cross-repo</span>
+                <button x-show="graphCheckDepResult.command"
+                        id="graph-checkdep-copy-cmd"
+                        type="button"
+                        @click="copyShellCommand(graphCheckDepResult.command)"
+                        :title="graphCheckDepResult.command"
+                        class="px-1.5 py-0.5 rounded bg-emerald-600 text-white hover:bg-emerald-700 text-[10px] font-mono">
+                  Copy br dep add
+                </button>
+              </div>
+            </template>
+            <button type="button"
+                    id="graph-checkdep-reset"
+                    @click="resetGraphCheckDep()"
+                    class="px-1.5 py-0.5 rounded bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-600 text-[10px] font-medium">
+              Reset
+            </button>
+          </div>
+
           <!-- Active Cycle Navigator HUD Pill (with recommended cut edge) -->
           <div x-show="cycleNavigatorActive && totalCycles > 0"
                id="graph-cycle-hud"
@@ -4732,6 +4929,13 @@
                 @click="toggleGraphWhatIfBatch(graphContextMenu.node?.id)"
                 class="w-full text-left px-3 py-2 hover:bg-teal-50 dark:hover:bg-teal-900/30 text-teal-700 dark:text-teal-300">
           <span x-text="isNodeInWhatIfBatch(graphContextMenu.node?.id) ? 'Remove from Batch What-If' : 'Add to Batch What-If'"></span>
+        </button>
+        <button type="button" role="menuitem"
+                id="graph-ctx-check-dep"
+                @click="startGraphCheckDep(graphContextMenu.node?.id)"
+                class="w-full text-left px-3 py-2 hover:bg-indigo-50 dark:hover:bg-indigo-900/30 text-indigo-700 dark:text-indigo-300 flex items-center justify-between">
+          <span>Check Add Dep → …</span>
+          <span class="text-[10px] text-indigo-500">Cycle check</span>
         </button>
         <button type="button" role="menuitem"
                 @click="const id = graphContextMenu.node?.id; closeGraphContextMenu(); if (id) focusNodeDependencyCone(id)"

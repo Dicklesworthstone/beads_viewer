@@ -3093,6 +3093,53 @@ export function isWhatIfActive() {
 }
 
 /**
+ * Highlight a proposed-dependency path (or cycle path) on the force-graph canvas (W30-4).
+ * Clears competing visual overlays so the cycle/proposed edge stands out cleanly.
+ * @param {string[]} nodeIds
+ */
+export function highlightCheckDepPath(nodeIds = []) {
+    resetWhatIf();
+    resetCycleNavigator();
+    resetCriticalPath();
+    resetDependencyCone({ refresh: false });
+    store.highlightedNodes.clear();
+    store.highlightedLinks.clear();
+    const graphData = store.graph?.graphData?.();
+    if (!graphData || !Array.isArray(nodeIds) || nodeIds.length === 0) {
+        refreshGraph();
+        return;
+    }
+    const idSet = new Set(nodeIds);
+    for (const n of graphData.nodes || []) {
+        if (idSet.has(n.id)) {
+            store.highlightedNodes.add(n);
+        }
+    }
+    const pairSet = new Set();
+    for (let i = 0; i + 1 < nodeIds.length; i++) {
+        pairSet.add(`${nodeIds[i]}\0${nodeIds[i + 1]}`);
+        pairSet.add(`${nodeIds[i + 1]}\0${nodeIds[i]}`);
+    }
+    for (const l of graphData.links || []) {
+        const s = typeof l.source === 'object' ? l.source.id : l.source;
+        const t = typeof l.target === 'object' ? l.target.id : l.target;
+        if (pairSet.has(`${s}\0${t}`)) {
+            store.highlightedLinks.add(l);
+        }
+    }
+    refreshGraph();
+}
+
+/**
+ * Clear proposed-dependency path highlight from the force-graph canvas (W30-4).
+ */
+export function clearCheckDepHighlight() {
+    store.highlightedNodes.clear();
+    store.highlightedLinks.clear();
+    refreshGraph();
+}
+
+/**
  * Get what-if state
  */
 export function getWhatIfState() {

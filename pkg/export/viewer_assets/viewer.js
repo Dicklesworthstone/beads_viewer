@@ -1271,6 +1271,204 @@ function buildCompanionWhatIfGraph(wasmModule, resolvedIds, blockingDeps) {
   return wg;
 }
 
+function shellQuoteArg(word) {
+  const s = String(word ?? '');
+  if (/^[A-Za-z0-9_./:@%+-]+$/.test(s)) return s;
+  return "'" + s.replace(/'/g, "'\"'\"'") + "'";
+}
+
+/**
+ * Pure pre-flight dependency addition validator matching `bv --robot-check-dep` (W30-4).
+ * Checks self-dependency, existing blocking edge, directed blocking cycle path,
+ * cross-repo endpoints, and actionable work blocking (including open parent-child descendants).
+ */
+function checkProposedDependency(fromIdRaw, toIdRaw, opts = {}) {
+  const fromId = String(fromIdRaw || '').trim();
+  const toId = String(toIdRaw || '').trim();
+  const base = {
+    fromId,
+    toId,
+    canAdd: false,
+    wouldCycle: false,
+    alreadyExists: false,
+    wouldBlockActionable: false,
+    crossRepo: false,
+    cyclePath: [],
+    warning: '',
+    command: '',
+  };
+  if (!fromId || !toId) {
+    base.warning = 'Both source and target issue IDs are required';
+    return base;
+  }
+
+  const repoCol = hasSourceRepoColumn() ? ', source_repo' : '';
+  const rows = execQuery(`SELECT id, status${repoCol} FROM issue_overview_mv WHERE id IN (?, ?)`, [fromId, toId]);
+  const byId = new Map();
+  for (const r of rows) byId.set(r.id, r);
+  const fromRow = byId.get(fromId);
+  const toRow = byId.get(toId);
+  if (!fromRow || !toRow) {
+    const missing = [];
+    if (!fromRow) missing.push(fromId);
+    if (!toRow && toId !== fromId) missing.push(toId);
+    base.warning = `Unknown issue ID(s): ${missing.join(', ')}`;
+    return base;
+  }
+
+  const fromRepo = String(fromRow.source_repo || '').trim();
+  const toRepo = String(toRow.source_repo || '').trim();
+  base.crossRepo = Boolean(fromRepo && toRepo && fromRepo.toLowerCase() !== toRepo.toLowerCase());
+
+  if (fromId === toId) {
+    base.wouldCycle = true;
+    base.cyclePath = [fromId, toId];
+    base.warning = `Self-dependency ${fromId} → ${toId} would create a 1-node cycle`;
+    return base;
+  }
+
+  const blockingRows = execQuery(`
+    SELECT issue_id, depends_on_id
+    FROM dependencies
+    WHERE type IN ('blocks', 'conditional-blocks', 'waits-for')
+  `);
+  const adj = new Map();
+  for (const r of blockingRows) {
+    if (!r.issue_id || !r.depends_on_id) continue;
+    let set = adj.get(r.issue_id);
+    if (!set) {
+      set = new Set();
+      adj.set(r.issue_id, set);
+    }
+    set.add(r.depends_on_id);
+  }
+
+  if (adj.get(fromId)?.has(toId)) {
+    base.canAdd = true;
+    base.alreadyExists = true;
+    base.warning = `Blocking dependency ${fromId} → ${toId} already exists`;
+    return base;
+  }
+
+  // BFS from toId -> fromId along existing blocking dependencies.
+  const queue = [[toId]];
+  const visited = new Set([toId]);
+  let foundPath = null;
+  while (queue.length > 0) {
+    const path = queue.shift();
+    const cur = path[path.length - 1];
+    if (cur === fromId) {
+      foundPath = path;
+      break;
+    }
+    const nexts = adj.get(cur);
+    if (!nexts) continue;
+    for (const nxt of nexts) {
+      if (!visited.has(nxt)) {
+        visited.add(nxt);
+        queue.push([...path, nxt]);
+      }
+    }
+  }
+  if (foundPath) {
+    base.canAdd = false;
+    base.wouldCycle = true;
+    base.cyclePath = [fromId, ...foundPath];
+    base.warning = `Adding ${fromId} → ${toId} would introduce cycle: ${base.cyclePath.join(' → ')}`;
+    return base;
+  }
+
+  // Check whether adding fromId -> toId would block currently-ready work (self or open parent-child descendants).
+  const isResolvedStatus = (st) => {
+    const norm = String(st || '').trim().toLowerCase();
+    return norm === 'closed' || norm === 'tombstone';
+  };
+  if (!isResolvedStatus(fromRow.status) && !isResolvedStatus(toRow.status)) {
+    if (GRAPH_STATE.whatIfModel && GRAPH_STATE.nodeMap.has(fromId)) {
+      const model = GRAPH_STATE.whatIfModel;
+      const readyMask = evaluateWhatIfReadyMask(model, model.baseClosed);
+      const startIdx = GRAPH_STATE.nodeMap.get(fromId);
+      const seen = new Set([startIdx]);
+      const descQueue = [startIdx];
+      while (descQueue.length > 0) {
+        const cur = descQueue.shift();
+        if (readyMask[cur]) {
+          base.wouldBlockActionable = true;
+          break;
+        }
+        for (const childIdx of (model.openChildren[cur] || [])) {
+          if (!seen.has(childIdx)) {
+            seen.add(childIdx);
+            descQueue.push(childIdx);
+          }
+        }
+      }
+    } else {
+      // Fallback when WASM graph model is not yet built: check readiness directly via SQLite rows.
+      const statusRows = execQuery(`SELECT id, status FROM issue_overview_mv`);
+      const resolvedSet = new Set();
+      const statusMap = new Map();
+      for (const r of statusRows) {
+        statusMap.set(r.id, String(r.status || '').trim().toLowerCase());
+        if (isResolvedStatus(r.status)) resolvedSet.add(r.id);
+      }
+      const pcRows = execQuery(`SELECT issue_id, depends_on_id FROM dependencies WHERE type = 'parent-child'`);
+      const childrenByParent = new Map();
+      const parentsByChild = new Map();
+      for (const r of pcRows) {
+        if (!r.issue_id || !r.depends_on_id) continue;
+        if (!childrenByParent.has(r.depends_on_id)) childrenByParent.set(r.depends_on_id, []);
+        childrenByParent.get(r.depends_on_id).push(r.issue_id);
+        if (!parentsByChild.has(r.issue_id)) parentsByChild.set(r.issue_id, []);
+        parentsByChild.get(r.issue_id).push(r.depends_on_id);
+      }
+      const isNodeReadyFallback = (id, stack = new Set()) => {
+        const st = statusMap.get(id);
+        if (st !== 'open' && st !== 'in_progress') return false;
+        if (stack.has(id)) return false;
+        stack.add(id);
+        for (const blk of (adj.get(id) || [])) {
+          if (!resolvedSet.has(blk)) return false;
+        }
+        for (const p of (parentsByChild.get(id) || [])) {
+          if (resolvedSet.has(p)) continue;
+          if (!statusMap.has(p)) return false;
+          for (const pBlk of (adj.get(p) || [])) {
+            if (!resolvedSet.has(pBlk)) return false;
+          }
+          if (!isNodeReadyFallback(p, stack)) return false;
+        }
+        return true;
+      };
+      const seen = new Set([fromId]);
+      const descQueue = [fromId];
+      while (descQueue.length > 0) {
+        const cur = descQueue.shift();
+        if (isNodeReadyFallback(cur)) {
+          base.wouldBlockActionable = true;
+          break;
+        }
+        for (const childId of (childrenByParent.get(cur) || [])) {
+          if (!seen.has(childId) && !resolvedSet.has(childId)) {
+            seen.add(childId);
+            descQueue.push(childId);
+          }
+        }
+      }
+    }
+  }
+
+  base.canAdd = true;
+  if (opts.allowCommand !== false && !base.crossRepo) {
+    base.command = `br dep add ${shellQuoteArg(fromId)} ${shellQuoteArg(toId)}`;
+  }
+  return base;
+}
+
+if (typeof window !== 'undefined') {
+  window.bvCheckProposedDependency = checkProposedDependency;
+}
+
 function createWhatIfDepsEvaluator(model, closedMask) {
   const memo = new Uint8Array(model.realCount); // 0 = unknown, 1 = satisfied, 2 = unsatisfied
   const visiting = new Uint8Array(model.realCount);
@@ -5249,6 +5447,10 @@ function beadsApp() {
     showDepGraph: false,
     issueNavList: [], // List of issue IDs for j/k navigation
     focusedIssueIndex: -1, // Highlighted row cursor in #/issues list view
+    issuesViewMode: 'list', // 'list' | 'board' | 'tree' (W30-6)
+    issuesModeRows: [], // Capped unpaginated rows for Board / Tree modes
+    issuesTreeCollapsed: {}, // Map<issueId, boolean> for collapsible Tree nodes
+    issuesTreeFlatRows: [], // Precomputed DFS rows for Tree mode
     showKeyboardHelp: false, // Keyboard shortcuts help modal
 
     // Graph search state (top-center search overlay in #/graph)
@@ -5276,6 +5478,9 @@ function beadsApp() {
     graphWhatIfTransitiveUnblocks: 0,
     graphWhatIfUnblockedIds: [],
     graphWhatIfBatchIds: [],
+    graphCheckDepMode: false, // Two-click pre-flight dependency validator (W30-4)
+    graphCheckDepFromId: '',
+    graphCheckDepResult: null,
     graphFiltersOpen: false,
     graphFilters: {
       status: '',
@@ -5514,6 +5719,12 @@ function beadsApp() {
           this.graphContextMenu = { open: false, x: 0, y: 0, node: null };
           return;
         }
+        if (e.key === 'Escape' && (this.graphCheckDepMode || this.graphCheckDepResult)) {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+          this.resetGraphCheckDep();
+          return;
+        }
         if (e.key === 'Escape' && this.graphFiltersOpen) {
           e.preventDefault();
           e.stopImmediatePropagation();
@@ -5576,7 +5787,7 @@ function beadsApp() {
         }
 
         // Issues list keyboard navigation (j/k cursor + Enter/o open when no modal or input is active)
-        if (!isInput && this.view === 'issues' && !this.selectedIssue && !this.showKeyboardHelp && !this.showDiagnostics) {
+        if (!isInput && this.view === 'issues' && this.issuesViewMode === 'list' && !this.selectedIssue && !this.showKeyboardHelp && !this.showDiagnostics) {
           if (e.key === 'j') {
             if (this.issues.length > 0) {
               e.preventDefault();
@@ -5696,6 +5907,11 @@ function beadsApp() {
         this.timeTravelAvailable = (e.detail?.commits || 0) > 0;
       });
       document.addEventListener('bv-graph:timeTravelStart', () => {
+        if (this.graphCheckDepMode || this.graphCheckDepResult) {
+          this.graphCheckDepMode = false;
+          this.graphCheckDepFromId = '';
+          this.graphCheckDepResult = null;
+        }
         this.timeTravelActive = true;
       });
       document.addEventListener('bv-graph:timeTravelCommit', () => {
@@ -6219,6 +6435,10 @@ function beadsApp() {
             if (this.graphContextMenu?.open) {
               this.graphContextMenu = { open: false, x: 0, y: 0, node: null };
             }
+            if (this.graphCheckDepMode && this.graphCheckDepFromId && e.detail?.node?.id) {
+              this.evaluateGraphCheckDep(this.graphCheckDepFromId, e.detail.node.id);
+              return;
+            }
             handleGraphNodeDetail(e);
           });
           document.addEventListener('bv-graph:nodeSelect', handleGraphNodeDetail);
@@ -6277,6 +6497,11 @@ function beadsApp() {
 
           // Sync What-If cascade state for Graph HUD
           document.addEventListener('bv-graph:whatIfStart', (e) => {
+            if (this.graphCheckDepMode || this.graphCheckDepResult) {
+              this.graphCheckDepMode = false;
+              this.graphCheckDepFromId = '';
+              this.graphCheckDepResult = null;
+            }
             const nodes = Array.isArray(e.detail?.nodes) && e.detail.nodes.length > 0
               ? e.detail.nodes
               : (e.detail?.node ? [e.detail.node] : []);
@@ -6326,6 +6551,11 @@ function beadsApp() {
 
           // Sync transitive dependency cone isolation state
           document.addEventListener('bv-graph:dependencyConeChange', (e) => {
+            if (e.detail?.active && (this.graphCheckDepMode || this.graphCheckDepResult)) {
+              this.graphCheckDepMode = false;
+              this.graphCheckDepFromId = '';
+              this.graphCheckDepResult = null;
+            }
             this.dependencyConeActive = Boolean(e.detail?.active);
             this.dependencyConeFocusId = e.detail?.focusNodeId || null;
             this.dependencyConeCount = Number(e.detail?.count ?? e.detail?.coneCount ?? 0);
@@ -6541,6 +6771,27 @@ function beadsApp() {
       } else {
         this.issues = queryIssues(filters, this.sort, this.pageSize, offset);
         this.totalIssues = countIssues(filters);
+      }
+
+      if (this.issuesViewMode === 'board' || this.issuesViewMode === 'tree') {
+        const modeCap = 500;
+        if (this.searchQuery) {
+          this.issuesModeRows = searchIssues(this.searchQuery, {
+            mode: this.searchMode,
+            preset: this.searchPreset,
+            limit: modeCap,
+            offset: 0,
+            filters,
+          });
+        } else {
+          this.issuesModeRows = queryIssues(filters, this.sort, modeCap, 0);
+        }
+        if (this.issuesViewMode === 'tree') {
+          this.rebuildIssuesTreeRows();
+        }
+      } else {
+        this.issuesModeRows = [];
+        this.issuesTreeFlatRows = [];
       }
 
       if (this.issues.length === 0) {
@@ -6875,7 +7126,7 @@ function beadsApp() {
       if (!opts.skipCounts) {
         this.syncGraphVisibleCounts();
       }
-      if (this.graphSearchResult?.id || this.graphDetailNode?.id || (this.graphContextMenu?.open && this.graphContextMenu?.node?.id)) {
+      if (this.graphSearchResult?.id || this.graphDetailNode?.id || (this.graphContextMenu?.open && this.graphContextMenu?.node?.id) || this.graphCheckDepMode || this.graphCheckDepResult) {
         const visibleNodes = this.forceGraphModule?.getGraph?.()?.graphData?.()?.nodes || [];
         if (this.graphSearchResult?.id && !visibleNodes.some(n => n.id === this.graphSearchResult.id)) {
           this.graphSearchResult = null;
@@ -6886,6 +7137,14 @@ function beadsApp() {
         }
         if (this.graphContextMenu?.open && this.graphContextMenu?.node?.id && !visibleNodes.some(n => n.id === this.graphContextMenu.node.id)) {
           this.graphContextMenu = { open: false, x: 0, y: 0, node: null };
+        }
+        if (this.graphCheckDepMode && this.graphCheckDepFromId && !visibleNodes.some(n => n.id === this.graphCheckDepFromId)) {
+          this.resetGraphCheckDep();
+        } else if (this.graphCheckDepResult && (
+          !visibleNodes.some(n => n.id === this.graphCheckDepResult.fromId) ||
+          !visibleNodes.some(n => n.id === this.graphCheckDepResult.toId)
+        )) {
+          this.resetGraphCheckDep();
         }
       }
     },
@@ -7870,6 +8129,11 @@ function beadsApp() {
       return list.slice(0, 6);
     },
 
+    getLabelTopUnblocks() {
+      const list = Array.isArray(this.labelsData?.top_unblocks) ? this.labelsData.top_unblocks : [];
+      return list.slice(0, 6);
+    },
+
     formatLabelTrend(dir) {
       if (dir === 'accelerating') return '↗';
       if (dir === 'decelerating') return '↘';
@@ -8022,6 +8286,222 @@ function beadsApp() {
     resetGraphWhatIf() {
       this.graphWhatIfBatchIds = [];
       this.forceGraphModule?.resetWhatIf?.();
+    },
+
+    // W30-4: Pre-Flight Dependency Validator ("Check Add Dep A → B")
+    startGraphCheckDep(fromId) {
+      const id = String(fromId || '').trim();
+      this.closeGraphContextMenu();
+      if (!id) return false;
+      this.graphCheckDepMode = true;
+      this.graphCheckDepFromId = id;
+      this.graphCheckDepResult = null;
+      this.forceGraphModule?.highlightCheckDepPath?.([id]);
+      showToast(`Check Add Dep: click target blocker node for ${id}`, 'info');
+      return true;
+    },
+
+    evaluateGraphCheckDep(fromId, toId) {
+      const allowCommand = !this.hasProvisionalSourceAuthority() &&
+        !this.meta?.as_of &&
+        !this.meta?.as_of_commit &&
+        !this.timeTravelActive;
+      const result = checkProposedDependency(fromId, toId, { allowCommand });
+      this.graphCheckDepMode = false;
+      this.graphCheckDepFromId = result.fromId;
+      this.graphCheckDepResult = result;
+      const highlightIds = result.wouldCycle && result.cyclePath.length > 0
+        ? result.cyclePath
+        : [result.fromId, result.toId].filter(Boolean);
+      this.forceGraphModule?.highlightCheckDepPath?.(highlightIds);
+      if (result.wouldCycle) {
+        showToast(result.warning || `Cycle detected: ${result.cyclePath.join(' → ')}`, 'error');
+      } else if (result.alreadyExists) {
+        showToast(result.warning || 'Dependency already exists', 'info');
+      } else {
+        showToast(
+          result.wouldBlockActionable
+            ? `Safe to add ${result.fromId} → ${result.toId} (blocks currently ready work)`
+            : `Safe to add ${result.fromId} → ${result.toId}`,
+          result.wouldBlockActionable ? 'warning' : 'success'
+        );
+      }
+      return result;
+    },
+
+    resetGraphCheckDep() {
+      const had = this.graphCheckDepMode || Boolean(this.graphCheckDepResult) || Boolean(this.graphCheckDepFromId);
+      this.graphCheckDepMode = false;
+      this.graphCheckDepFromId = '';
+      this.graphCheckDepResult = null;
+      if (had) {
+        this.forceGraphModule?.clearCheckDepHighlight?.();
+      }
+    },
+
+    // W30-6: Static Site Issues List | Board | Tree Mode Switcher
+    setIssuesViewMode(mode) {
+      const normalized = ['list', 'board', 'tree'].includes(mode) ? mode : 'list';
+      if (this.issuesViewMode === normalized) return;
+      this.issuesViewMode = normalized;
+      this.loadIssues();
+    },
+
+    getIssuesBoardColumns() {
+      const cols = [
+        { key: 'open', label: 'Open', items: [] },
+        { key: 'in_progress', label: 'In Progress', items: [] },
+        { key: 'blocked', label: 'Blocked', items: [] },
+        { key: 'closed', label: 'Closed', items: [] },
+      ];
+      for (const issue of (this.issuesModeRows || [])) {
+        const st = String(issue.status || '').trim().toLowerCase();
+        if (st === 'closed' || st === 'tombstone') {
+          cols[3].items.push(issue);
+        } else if (st === 'blocked' || st === 'deferred') {
+          cols[2].items.push(issue);
+        } else if (st === 'in_progress') {
+          cols[1].items.push(issue);
+        } else {
+          cols[0].items.push(issue);
+        }
+      }
+      return cols;
+    },
+
+    rebuildIssuesTreeRows() {
+      const rows = this.issuesModeRows || [];
+      if (rows.length === 0) {
+        this.issuesTreeFlatRows = [];
+        return;
+      }
+      const byId = new Map();
+      const orderIndex = new Map();
+      rows.forEach((iss, idx) => {
+        byId.set(iss.id, iss);
+        orderIndex.set(iss.id, idx);
+      });
+
+      const pcRows = execQuery(`
+        SELECT issue_id, depends_on_id
+        FROM dependencies
+        WHERE type = 'parent-child'
+        ORDER BY issue_id, depends_on_id
+      `);
+      const parentOf = new Map();
+      const childrenOf = new Map();
+      const createsCycle = (childId, candParentId) => {
+        if (childId === candParentId) return true;
+        const seen = new Set([childId]);
+        let cur = candParentId;
+        while (cur) {
+          if (seen.has(cur)) return true;
+          seen.add(cur);
+          cur = parentOf.get(cur);
+        }
+        return false;
+      };
+      for (const r of pcRows) {
+        const childId = r.issue_id;
+        const parentId = r.depends_on_id;
+        if (!byId.has(childId) || !byId.has(parentId)) continue;
+        if (parentOf.has(childId)) continue; // Deterministic single primary parent (first sorted parentId)
+        if (createsCycle(childId, parentId)) continue;
+        parentOf.set(childId, parentId);
+        if (!childrenOf.has(parentId)) childrenOf.set(parentId, []);
+        childrenOf.get(parentId).push(childId);
+      }
+
+      // Preserve user's active sort order among sibling groups.
+      for (const kids of childrenOf.values()) {
+        kids.sort((a, b) => (orderIndex.get(a) ?? 0) - (orderIndex.get(b) ?? 0));
+      }
+      const roots = rows.filter(iss => !parentOf.has(iss.id)).map(iss => iss.id);
+
+      // Compute recursive descendant completion rollups [closed/total].
+      const rollupCache = new Map();
+      const computeRollup = (id, stack = new Set()) => {
+        if (rollupCache.has(id)) return rollupCache.get(id);
+        if (stack.has(id)) return { total: 0, closed: 0 };
+        stack.add(id);
+        let total = 0;
+        let closed = 0;
+        for (const kidId of (childrenOf.get(id) || [])) {
+          const kid = byId.get(kidId);
+          if (!kid) continue;
+          total += 1;
+          const st = String(kid.status || '').trim().toLowerCase();
+          if (st === 'closed' || st === 'tombstone') closed += 1;
+          const sub = computeRollup(kidId, stack);
+          total += sub.total;
+          closed += sub.closed;
+        }
+        stack.delete(id);
+        const res = { total, closed };
+        rollupCache.set(id, res);
+        return res;
+      };
+
+      const flat = [];
+      const visited = new Set();
+      const walk = (id, depth) => {
+        if (visited.has(id)) return;
+        visited.add(id);
+        const issue = byId.get(id);
+        if (!issue) return;
+        const kids = childrenOf.get(id) || [];
+        const hasChildren = kids.length > 0;
+        const collapsed = Boolean(this.issuesTreeCollapsed[id]);
+        const roll = computeRollup(id);
+        flat.push({
+          issue,
+          depth,
+          hasChildren,
+          collapsed,
+          totalDescendants: roll.total,
+          closedDescendants: roll.closed,
+        });
+        if (hasChildren && !collapsed) {
+          for (const kidId of kids) {
+            walk(kidId, depth + 1);
+          }
+        }
+      };
+      for (const rootId of roots) {
+        walk(rootId, 0);
+      }
+      // Safety fallback: include any unvisited nodes as roots.
+      for (const iss of rows) {
+        if (!visited.has(iss.id)) walk(iss.id, 0);
+      }
+      this.issuesTreeFlatRows = flat;
+    },
+
+    toggleIssuesTreeNode(id) {
+      if (!id) return;
+      this.issuesTreeCollapsed = {
+        ...this.issuesTreeCollapsed,
+        [id]: !this.issuesTreeCollapsed[id],
+      };
+      this.rebuildIssuesTreeRows();
+    },
+
+    expandAllIssuesTree() {
+      this.issuesTreeCollapsed = {};
+      this.rebuildIssuesTreeRows();
+    },
+
+    collapseAllIssuesTree() {
+      const next = {};
+      for (const row of (this.issuesTreeFlatRows || [])) {
+        if (row.hasChildren) next[row.issue.id] = true;
+      }
+      // Also mark any collapsed parent nodes already in the tree.
+      for (const row of (this.issuesModeRows || [])) {
+        if (this.issuesTreeCollapsed[row.id]) next[row.id] = true;
+      }
+      this.issuesTreeCollapsed = next;
+      this.rebuildIssuesTreeRows();
     },
 
     async copyGraphNodeId(nodeId) {

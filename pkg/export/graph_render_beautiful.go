@@ -853,6 +853,11 @@ func generateUltimateHTMLWithTime(title, dataHash, graphDataJSON string, nodeCou
                 <span id="whatif-banner-text">⚡ What-If</span>
                 <button type="button" id="btn-whatif-close" style="padding:0.15rem 0.45rem;font-size:0.75rem">Reset</button>
             </div>
+            <div class="pathfinder-banner" id="checkdep-banner" style="top:3.5rem;border-color:#6366f1;display:none;gap:0.5rem;align-items:center">
+                <span id="checkdep-banner-text">🧪 Check Add Dep</span>
+                <button type="button" id="btn-checkdep-copy" style="display:none;padding:0.15rem 0.45rem;font-size:0.75rem">Copy cmd</button>
+                <button type="button" id="btn-checkdep-close" style="padding:0.15rem 0.45rem;font-size:0.75rem">Reset</button>
+            </div>
             <div class="edge-tooltip" id="edge-tooltip"></div>
             <div id="hover-panel">
                 <button class="hover-close" id="hover-close">×</button>
@@ -993,6 +998,7 @@ func generateUltimateHTMLWithTime(title, dataHash, graphDataJSON string, nodeCou
         <div class="context-menu-item" id="ctx-dependents">📤 Show dependents</div>
         <div class="context-menu-item" id="ctx-connected">✨ Highlight connected</div>
         <div class="context-menu-item" id="ctx-whatif">⚡ What-If: simulate close</div>
+        <div class="context-menu-item" id="ctx-checkdep">🧪 Check Add Dep → …</div>
         <div class="context-menu-divider"></div>
         <div class="context-menu-item" id="ctx-path">🛤️ Find path to...</div>
         <div class="context-menu-item" id="ctx-copy">📋 Copy ID</div>
@@ -1909,6 +1915,7 @@ function clearSelection() {
     activePathNodes = null;
     highlightedNodes = new Set();
     closeCycleInspector();
+    cancelCheckDep();
     clearWhatIfSimulation();
     document.getElementById('node-detail').classList.remove('visible');
     document.getElementById('no-selection').style.display = 'block';
@@ -2054,11 +2061,12 @@ async function copyContextField(value, fieldName) {
 }
 document.getElementById('ctx-focus').onclick = () => { if (contextNode) { Graph.centerAt(contextNode.x, contextNode.y, 500); Graph.zoom(3, 500); } hideContextMenu(); };
 document.getElementById('ctx-details').onclick = () => { if (contextNode) showHoverPanel(contextNode); hideContextMenu(); };
-document.getElementById('ctx-deps').onclick = () => { if (contextNode) { cancelPathFinder(); closeCycleInspector(); clearWhatIfSimulation(); highlightDependencies(contextNode, 'deps'); } hideContextMenu(); };
-document.getElementById('ctx-dependents').onclick = () => { if (contextNode) { cancelPathFinder(); closeCycleInspector(); clearWhatIfSimulation(); highlightDependencies(contextNode, 'dependents'); } hideContextMenu(); };
+document.getElementById('ctx-deps').onclick = () => { if (contextNode) { cancelPathFinder(); cancelCheckDep(); closeCycleInspector(); clearWhatIfSimulation(); highlightDependencies(contextNode, 'deps'); } hideContextMenu(); };
+document.getElementById('ctx-dependents').onclick = () => { if (contextNode) { cancelPathFinder(); cancelCheckDep(); closeCycleInspector(); clearWhatIfSimulation(); highlightDependencies(contextNode, 'dependents'); } hideContextMenu(); };
 document.getElementById('ctx-connected').onclick = () => {
     if (contextNode) {
         cancelPathFinder();
+        cancelCheckDep();
         closeCycleInspector();
         clearWhatIfSimulation();
         const connected = getConnectedNodes(contextNode.id, 3);
@@ -2073,6 +2081,10 @@ document.getElementById('ctx-connected').onclick = () => {
 };
 document.getElementById('ctx-whatif').onclick = () => {
     if (contextNode && isActiveNodeStatus(contextNode.status)) runWhatIfSimulation(contextNode.id);
+    hideContextMenu();
+};
+document.getElementById('ctx-checkdep').onclick = () => {
+    if (contextNode) startStandaloneCheckDep(contextNode.id);
     hideContextMenu();
 };
 
@@ -2382,6 +2394,7 @@ function runWhatIfSimulation(nodeId) {
     const targetNode = lookupStandaloneNode(nodeId);
     if (!targetNode || !isActiveNodeStatus(targetNode.status)) return;
     cancelPathFinder();
+    cancelCheckDep();
     closeCycleInspector();
     const res = simulateWhatIfClose(nodeId);
     activeWhatIfId = nodeId;
@@ -2412,6 +2425,184 @@ document.getElementById('btn-whatif-close').onclick = () => {
 };
 document.getElementById('btn-detail-whatif').onclick = () => {
     if (selectedNode && isActiveNodeStatus(selectedNode.status)) runWhatIfSimulation(selectedNode.id);
+};
+
+// Pre-flight Dependency Validator ("Check Add Dep A → B", W30-4)
+let checkDepMode = false;
+let checkDepFromId = null;
+let checkDepCommand = '';
+function quoteStandaloneWord(word) {
+    const s = String(word || '');
+    if (/^[A-Za-z0-9_./:@+-]+$/.test(s)) return s;
+    return "'" + s.replace(/'/g, "'\"'\"'") + "'";
+}
+function cancelCheckDep() {
+    checkDepMode = false;
+    checkDepFromId = null;
+    checkDepCommand = '';
+    const banner = document.getElementById('checkdep-banner');
+    if (banner) { banner.style.display = 'none'; banner.classList.remove('visible'); }
+    const copyBtn = document.getElementById('btn-checkdep-copy');
+    if (copyBtn) copyBtn.style.display = 'none';
+}
+function checkStandaloneDep(fromId, toId) {
+    const fromNode = lookupStandaloneNode(fromId);
+    const toNode = lookupStandaloneNode(toId);
+    const res = {
+        fromId, toId,
+        canAdd: false, wouldCycle: false, alreadyExists: false,
+        wouldBlockActionable: false, crossRepo: false,
+        cyclePath: [], warning: '', command: ''
+    };
+    if (!fromNode || !toNode) {
+        res.warning = 'Unknown issue ID';
+        return res;
+    }
+    const fromRepo = String(fromNode.source_repo || '').trim();
+    const toRepo = String(toNode.source_repo || '').trim();
+    res.crossRepo = Boolean(fromRepo && toRepo && fromRepo.toLowerCase() !== toRepo.toLowerCase());
+    if (fromId === toId) {
+        res.wouldCycle = true;
+        res.cyclePath = [fromId, toId];
+        res.warning = 'Self-dependency ' + fromId + ' → ' + toId + ' would create a 1-node cycle';
+        return res;
+    }
+    const adj = new Map();
+    DATA.links.forEach(l => {
+        const s = typeof l.source === 'object' ? l.source.id : l.source;
+        const t = typeof l.target === 'object' ? l.target.id : l.target;
+        const lt = l.type || 'blocks';
+        if (lt !== 'blocks' && lt !== 'conditional-blocks' && lt !== 'waits-for') return;
+        if (!adj.has(s)) adj.set(s, new Set());
+        adj.get(s).add(t);
+    });
+    if (adj.get(fromId) && adj.get(fromId).has(toId)) {
+        res.canAdd = true;
+        res.alreadyExists = true;
+        res.warning = 'Blocking dependency ' + fromId + ' → ' + toId + ' already exists';
+        return res;
+    }
+    const queue = [[toId]];
+    const visited = new Set([toId]);
+    let foundPath = null;
+    while (queue.length > 0) {
+        const path = queue.shift();
+        const cur = path[path.length - 1];
+        if (cur === fromId) { foundPath = path; break; }
+        const nexts = adj.get(cur);
+        if (!nexts) continue;
+        nexts.forEach(nxt => {
+            if (!visited.has(nxt)) {
+                visited.add(nxt);
+                queue.push([...path, nxt]);
+            }
+        });
+    }
+    if (foundPath) {
+        res.wouldCycle = true;
+        res.cyclePath = [fromId, ...foundPath];
+        res.warning = 'Cycle detected: ' + res.cyclePath.join(' → ');
+        return res;
+    }
+    if (isActiveNodeStatus(fromNode.status) && isActiveNodeStatus(toNode.status)) {
+        const model = buildStandaloneWhatIfModel();
+        const readySet = evaluateStandaloneReadySet(model, new Set());
+        const seen = new Set([fromId]);
+        const descQ = [fromId];
+        while (descQ.length > 0) {
+            const cur = descQ.shift();
+            if (readySet.has(cur)) {
+                res.wouldBlockActionable = true;
+                break;
+            }
+            const kids = model.openChildren.get(cur);
+            if (kids) {
+                kids.forEach(k => {
+                    if (!seen.has(k)) { seen.add(k); descQ.push(k); }
+                });
+            }
+        }
+    }
+    res.canAdd = true;
+    if (!res.crossRepo) {
+        res.command = 'br dep add ' + quoteStandaloneWord(fromId) + ' ' + quoteStandaloneWord(toId);
+    }
+    return res;
+}
+function startStandaloneCheckDep(fromId) {
+    if (!fromId) return;
+    cancelPathFinder();
+    closeCycleInspector();
+    clearWhatIfSimulation();
+    checkDepMode = true;
+    checkDepFromId = fromId;
+    checkDepCommand = '';
+    activePathNodes = new Set([fromId]);
+    highlightedNodes = new Set([fromId]);
+    Graph.nodeColor(Graph.nodeColor());
+    Graph.linkColor(Graph.linkColor());
+    Graph.linkWidth(Graph.linkWidth());
+    const banner = document.getElementById('checkdep-banner');
+    const textEl = document.getElementById('checkdep-banner-text');
+    const copyBtn = document.getElementById('btn-checkdep-copy');
+    if (copyBtn) copyBtn.style.display = 'none';
+    if (banner && textEl) {
+        banner.style.borderColor = '#6366f1';
+        textEl.textContent = '🧪 Check Add Dep: ' + fromId + ' → click target blocker node (Esc to cancel)';
+        banner.style.display = 'flex';
+        banner.classList.add('visible');
+    }
+    showToast('Check Add Dep: click target node for ' + fromId);
+}
+function runStandaloneCheckDep(fromId, toId) {
+    const res = checkStandaloneDep(fromId, toId);
+    checkDepMode = false;
+    checkDepFromId = fromId;
+    checkDepCommand = res.command || '';
+    const ids = new Set(res.wouldCycle && res.cyclePath.length ? res.cyclePath : [fromId, toId]);
+    activePathNodes = ids;
+    highlightedNodes = ids;
+    Graph.nodeColor(Graph.nodeColor());
+    Graph.linkColor(Graph.linkColor());
+    Graph.linkWidth(Graph.linkWidth());
+    const banner = document.getElementById('checkdep-banner');
+    const textEl = document.getElementById('checkdep-banner-text');
+    const copyBtn = document.getElementById('btn-checkdep-copy');
+    if (banner && textEl) {
+        if (res.wouldCycle) {
+            banner.style.borderColor = '#ef4444';
+            textEl.textContent = '⛔ Cycle: ' + res.cyclePath.join(' → ');
+        } else if (res.alreadyExists) {
+            banner.style.borderColor = '#3b82f6';
+            textEl.textContent = 'ℹ Already exists: ' + fromId + ' → ' + toId;
+        } else {
+            banner.style.borderColor = res.wouldBlockActionable ? '#f59e0b' : '#10b981';
+            let msg = '✓ Safe: ' + fromId + ' → ' + toId;
+            if (res.wouldBlockActionable) msg += ' (blocks ready work)';
+            if (res.crossRepo) msg += ' (cross-repo)';
+            textEl.textContent = msg;
+        }
+        banner.style.display = 'flex';
+        banner.classList.add('visible');
+    }
+    if (copyBtn) {
+        copyBtn.style.display = checkDepCommand ? 'inline-block' : 'none';
+        copyBtn.title = checkDepCommand;
+    }
+    return res;
+}
+window.bvCheckStandaloneDep = checkStandaloneDep;
+window.bvRunStandaloneCheckDep = runStandaloneCheckDep;
+document.getElementById('btn-checkdep-copy').onclick = () => {
+    if (checkDepCommand) void copyContextField(checkDepCommand, 'Command');
+};
+document.getElementById('btn-checkdep-close').onclick = () => {
+    cancelCheckDep();
+    activePathNodes = null;
+    highlightedNodes = new Set();
+    Graph.nodeColor(Graph.nodeColor());
+    Graph.linkColor(Graph.linkColor());
+    Graph.linkWidth(Graph.linkWidth());
 };
 
 // Cycle Inspector (uses exported DATA.cycles + DATA.cycle_breaks)
@@ -2451,6 +2642,7 @@ function showCycleInspector(idx, step = 1) {
         return;
     }
     cancelPathFinder();
+    cancelCheckDep();
     clearWhatIfSimulation();
     activeCycleIndex = chosenIdx;
     const nodeSet = new Set(openCycle);
@@ -2537,6 +2729,7 @@ document.getElementById('ctx-copy-description').onclick = () => {
 document.getElementById('ctx-path').onclick = () => {
     if (contextNode) {
         closeCycleInspector();
+        cancelCheckDep();
         clearWhatIfSimulation();
         pathFinderMode = true;
         pathStart = contextNode.id;
@@ -2564,6 +2757,10 @@ function highlightPath(path) {
 
 function handleNodeClick(d) {
     if (!d) return;
+    if (checkDepMode && checkDepFromId) {
+        runStandaloneCheckDep(checkDepFromId, d.id);
+        return;
+    }
     if (pathFinderMode) {
         if (!pathStart) {
             pathStart = d.id;
@@ -2713,8 +2910,12 @@ function applyFilters() {
     if (pathStart && !visibleIds.has(pathStart)) {
         cancelPathFinder();
     }
+    if ((checkDepMode || checkDepFromId) && !visibleIds.has(checkDepFromId)) {
+        cancelCheckDep();
+    }
     if (highlightedNodes.size > 0 && ![...highlightedNodes].some(id => visibleIds.has(id))) {
         cancelPathFinder();
+        cancelCheckDep();
         closeCycleInspector();
         clearWhatIfSimulation();
         activePathNodes = null;
@@ -2775,6 +2976,7 @@ document.getElementById('btn-reset').onclick = () => {
     activePathNodes = null;
     highlightedNodes = new Set();
     closeCycleInspector();
+    cancelCheckDep();
     clearWhatIfSimulation();
     Graph.dagMode(null);
     setGraphLinksMode(false);
@@ -2968,6 +3170,7 @@ function updatePathfinderBanner(text) {
 }
 function togglePathFinder() {
     closeCycleInspector();
+    cancelCheckDep();
     clearWhatIfSimulation();
     pathFinderMode = !pathFinderMode;
     document.getElementById('btn-path').classList.toggle('active', pathFinderMode);
@@ -3085,7 +3288,8 @@ document.onkeydown = e => {
         case 'r': document.getElementById('btn-reset').click(); break;
         case 'escape':
             hideContextMenu();
-            if (pathFinderMode) { pathFinderMode = false; pathStart = null; activePathNodes = null; highlightedNodes = new Set(); document.getElementById('pathfinder-banner').classList.remove('visible'); document.getElementById('btn-path').classList.remove('active'); Graph.nodeColor(computeNodeColor).linkColor(Graph.linkColor()).linkWidth(Graph.linkWidth()); }
+            if (checkDepMode || checkDepFromId) { cancelCheckDep(); activePathNodes = null; highlightedNodes = new Set(); Graph.nodeColor(computeNodeColor).linkColor(Graph.linkColor()).linkWidth(Graph.linkWidth()); }
+            else if (pathFinderMode) { pathFinderMode = false; pathStart = null; activePathNodes = null; highlightedNodes = new Set(); document.getElementById('pathfinder-banner').classList.remove('visible'); document.getElementById('btn-path').classList.remove('active'); Graph.nodeColor(computeNodeColor).linkColor(Graph.linkColor()).linkWidth(Graph.linkWidth()); }
             else { closeCycleInspector(); clearWhatIfSimulation(); clearSelection(); hideHoverPanel(); activePathNodes = null; highlightedNodes = new Set(); Graph.nodeColor(computeNodeColor).linkColor(Graph.linkColor()).linkWidth(Graph.linkWidth()); }
             break;
         case ' ': e.preventDefault(); document.getElementById('btn-fullscreen').click(); break;
