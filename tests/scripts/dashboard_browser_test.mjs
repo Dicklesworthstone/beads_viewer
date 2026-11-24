@@ -1287,6 +1287,38 @@ async function journey(page, mobile) {
   if (mobile) await click(page, 'button[aria-label="Toggle filters"]');
   await click(page, 'button', 'open');
   await resultIDs(page, ['browser-root', 'browser-detail']);
+  // W30-6: Static Site Issues List | Board | Tree mode switcher (zero SQLite schema changes)
+  await click(page, '#issues-mode-board');
+  await waitFor(page, `${app}.issuesViewMode === 'board' && (${visible})(document.querySelector('#issues-board-view'))`, 'Board mode renders visible Kanban columns');
+  const boardCount = await evaluate(page, `document.querySelectorAll('#issues-board-view [data-board-col="open"] button').length`);
+  assert.equal(boardCount, 2, `${page.name}: W30-6 Board mode renders 2 open issue cards in Open column`);
+  await click(page, '#issues-mode-tree');
+  await waitFor(page, `${app}.issuesViewMode === 'tree' && (${visible})(document.querySelector('#issues-tree-view'))`, 'Tree mode renders visible hierarchy');
+  const treeProbe = await evaluate(page, `(() => {
+    DB_STATE.db.run("INSERT INTO dependencies (issue_id, depends_on_id, type) VALUES ('browser-detail', 'browser-root', 'parent-child')");
+    try {
+      ${app}.rebuildIssuesTreeRows();
+      const expandedRows = ${app}.issuesTreeFlatRows.map(r => ({ id: r.issue.id, depth: r.depth, total: r.totalDescendants, closed: r.closedDescendants }));
+      ${app}.toggleIssuesTreeNode('browser-root');
+      const collapsedIds = ${app}.issuesTreeFlatRows.map(r => r.issue.id);
+      ${app}.toggleIssuesTreeNode('browser-root');
+      return { expandedRows, collapsedIds };
+    } finally {
+      DB_STATE.db.run("DELETE FROM dependencies WHERE issue_id = 'browser-detail' AND depends_on_id = 'browser-root' AND type = 'parent-child'");
+      ${app}.rebuildIssuesTreeRows();
+    }
+  })()`);
+  assert.deepEqual(
+    treeProbe.expandedRows,
+    [
+      { id: 'browser-root', depth: 0, total: 1, closed: 0 },
+      { id: 'browser-detail', depth: 1, total: 0, closed: 0 },
+    ],
+    `${page.name}: W30-6 Tree mode nests parent-child hierarchy with [closed/total] rollup`
+  );
+  assert.deepEqual(treeProbe.collapsedIds, ['browser-root'], `${page.name}: W30-6 Tree mode collapse hides descendants`);
+  await click(page, '#issues-mode-list');
+  await waitFor(page, `${app}.issuesViewMode === 'list'`, 'return to List mode cleanly');
   await capture(page, 'filtered');
   const route = await evaluate(page, 'location.href');
   await reload(page);
@@ -1455,6 +1487,20 @@ async function journey(page, mobile) {
   await click(page, '#graph-filter-clear');
   await waitFor(page, `${app}.graphVisibleTotal === 4`, 'reset restores all 4 graph nodes');
   await click(page, '#graph-filter-toggle-btn');
+  // W30-4: Interactive Pre-Flight Dependency Validator ("Check Add Dep A → B") in Static Site Graph
+  const checkDepCycle = await evaluate(page, `${app}.evaluateGraphCheckDep('browser-root', 'browser-detail')`);
+  assert.equal(checkDepCycle.canAdd, false, `${page.name}: W30-4 cycle check rejects browser-root -> browser-detail`);
+  assert.equal(checkDepCycle.wouldCycle, true, `${page.name}: W30-4 sets wouldCycle=true`);
+  assert.deepEqual(checkDepCycle.cyclePath, ['browser-root', 'browser-detail', 'browser-root'], `${page.name}: W30-4 returns full cycle path`);
+  assert.equal(checkDepCycle.command, '', `${page.name}: W30-4 emits no command on cycle`);
+  await waitFor(page, `(${visible})(document.querySelector('#graph-checkdep-hud')) && document.querySelector('#graph-checkdep-hud').textContent.includes('Cycle')`, 'Check Add Dep HUD shows cycle verdict');
+  const checkDepSafe = await evaluate(page, `${app}.evaluateGraphCheckDep('browser-other', 'browser-root')`);
+  assert.equal(checkDepSafe.canAdd, true, `${page.name}: W30-4 allows acyclic browser-other -> browser-root`);
+  assert.equal(checkDepSafe.wouldBlockActionable, true, `${page.name}: W30-4 flags blocking ready work`);
+  assert.equal(checkDepSafe.command, 'br dep add browser-other browser-root', `${page.name}: W30-4 emits authoritative br dep add command`);
+  await waitFor(page, `(${visible})(document.querySelector('#graph-checkdep-copy-cmd'))`, 'Check Add Dep HUD shows Copy br dep add button on safe edge');
+  await key(page, 'Escape');
+  await waitFor(page, `!${app}.graphCheckDepMode && !${app}.graphCheckDepResult`, 'Escape dismisses Check Add Dep HUD cleanly');
   // Verify showIssue on excluded ID displays warning toast instead of blank modal.
   const excludedToastOk = await evaluate(page, `(() => {
     const before = ${app}.toasts.length;
@@ -4255,6 +4301,16 @@ async function standaloneGraphJourney(page) {
       !document.getElementById('btn-recent').classList.contains('active');
     const allVisibleAfterReset = DATA.nodes.filter(n => currentVisibilityFilter(n)).length;
 
+    // W30-4: Standalone HTML Graph Check Add Dep cycle + safe + Escape reset
+    const standaloneCycle = window.bvRunStandaloneCheckDep('cap-auth-root', 'cap-hub-leaf');
+    const bannerCycleText = document.getElementById('checkdep-banner-text')?.textContent || '';
+    const copyVisibleOnCycle = document.getElementById('btn-checkdep-copy')?.style.display !== 'none';
+    const standaloneSafe = window.bvRunStandaloneCheckDep('cap-billing-a', 'cap-hub-leaf');
+    const bannerSafeText = document.getElementById('checkdep-banner-text')?.textContent || '';
+    const copyVisibleOnSafe = document.getElementById('btn-checkdep-copy')?.style.display !== 'none';
+    document.getElementById('btn-checkdep-close').click();
+    const checkDepClosed = !document.getElementById('checkdep-banner')?.classList.contains('visible');
+
     return {
       sidebarSlackText,
       sidebarSlackHighlighted,
@@ -4269,10 +4325,24 @@ async function standaloneGraphJourney(page) {
       billingColorAfterOff,
       recentClosedAfterReset,
       allVisibleAfterReset,
+      standaloneCycle,
+      bannerCycleText,
+      copyVisibleOnCycle,
+      standaloneSafe,
+      bannerSafeText,
+      copyVisibleOnSafe,
+      checkDepClosed,
     };
   })()`);
   assert.equal(recentAndPathAudit.sidebarSlackText, 'N/A (cycle)', 'selectNode sets #m-slack to N/A (cycle) when slack_available=false');
   assert.equal(recentAndPathAudit.sidebarSlackHighlighted, false, 'selectNode never adds .highlight to #m-slack when slack_available=false');
+  assert.equal(recentAndPathAudit.standaloneCycle.wouldCycle, true, 'W30-4 standalone graph detects cycle cap-auth-root -> cap-hub-leaf');
+  assert.equal(recentAndPathAudit.copyVisibleOnCycle, false, 'W30-4 standalone graph hides Copy cmd button on cycle');
+  assert.ok(recentAndPathAudit.bannerCycleText.includes('Cycle'), `W30-4 standalone cycle banner: ${recentAndPathAudit.bannerCycleText}`);
+  assert.equal(recentAndPathAudit.standaloneSafe.canAdd, true, 'W30-4 standalone graph allows acyclic cap-billing-a -> cap-hub-leaf');
+  assert.equal(recentAndPathAudit.copyVisibleOnSafe, true, 'W30-4 standalone graph shows Copy cmd button on safe edge');
+  assert.ok(recentAndPathAudit.bannerSafeText.includes('Safe'), `W30-4 standalone safe banner: ${recentAndPathAudit.bannerSafeText}`);
+  assert.equal(recentAndPathAudit.checkDepClosed, true, 'W30-4 standalone Check Add Dep Reset closes banner');
   assert.equal(recentAndPathAudit.recentOpenAfterClick, true);
   assert.deepEqual(recentAndPathAudit.recentIds, ['cap-hub-leaf']);
   assert.equal(recentAndPathAudit.startAfterFirst, 'cap-hub-leaf');

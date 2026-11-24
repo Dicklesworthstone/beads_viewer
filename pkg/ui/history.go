@@ -177,6 +177,10 @@ type HistoryModel struct {
 	selectedOrphanProbIdx int
 	prevNonOrphanMode     historyViewMode
 
+	// Temporal causality & wait-time analysis state (W30-2)
+	causalityCache map[string]*correlation.CausalityResult
+	showCausality  bool
+
 	// Cass session integration state (bv-pr1l)
 	sessionCache map[string][]cass.ScoredResult // Cached sessions per bead ID
 	cassLookup   func(string) []cass.ScoredResult
@@ -204,6 +208,7 @@ func (h *HistoryModel) SetReferenceTime(now time.Time) {
 func (h *HistoryModel) refreshFileIntelligence() {
 	h.relatedCache = nil
 	h.clusterPeersByBead = nil
+	h.causalityCache = nil
 	if h.report == nil || len(h.report.Histories) == 0 {
 		h.fileLookup = nil
 		h.hotspotOpenCounts = nil
@@ -340,6 +345,7 @@ func (h *HistoryModel) ToggleOrphansMode() {
 		} else {
 			h.viewMode = historyModeBead
 		}
+		h.applySearchFilter()
 	} else {
 		h.prevNonOrphanMode = h.viewMode
 		h.viewMode = historyModeOrphans
@@ -702,6 +708,116 @@ func (h *HistoryModel) sessionCountForCommit(commit CommitListEntry) int {
 		total += h.sessionCountForBead(beadID)
 	}
 	return total
+}
+
+// SetCausality stores a computed CausalityResult for beadID (W30-2).
+func (h *HistoryModel) SetCausality(beadID string, res *correlation.CausalityResult) {
+	if beadID == "" {
+		return
+	}
+	if h.causalityCache == nil {
+		h.causalityCache = make(map[string]*correlation.CausalityResult)
+	}
+	if res == nil {
+		delete(h.causalityCache, beadID)
+		return
+	}
+	h.causalityCache[beadID] = res
+}
+
+// GetCausality returns the cached CausalityResult for beadID, if computed.
+func (h *HistoryModel) GetCausality(beadID string) *correlation.CausalityResult {
+	if h.causalityCache == nil {
+		return nil
+	}
+	return h.causalityCache[beadID]
+}
+
+// SetShowCausality toggles visibility of the inline Causality & Wait Analysis block.
+func (h *HistoryModel) SetShowCausality(show bool) {
+	h.showCausality = show
+}
+
+// ShowCausality reports whether the Causality & Wait Analysis block is visible.
+func (h *HistoryModel) ShowCausality() bool {
+	return h.showCausality
+}
+
+func formatCausalDuration(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	if d < time.Minute {
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	}
+	if d < time.Hour {
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	}
+	hours := d.Hours()
+	if hours < 24 {
+		return fmt.Sprintf("%.1fh", hours)
+	}
+	return fmt.Sprintf("%.1fd", hours/24)
+}
+
+func (h *HistoryModel) renderCausalitySection(beadID string, innerWidth int) []string {
+	t := h.theme
+	maxW := max(16, innerWidth)
+	hdrStyle := t.Renderer.NewStyle().Foreground(t.InProgress).Bold(true)
+	bodyStyle := t.Renderer.NewStyle().Foreground(t.Base.GetForeground())
+	mutedStyle := t.Renderer.NewStyle().Foreground(t.Muted).Italic(true)
+
+	res := h.GetCausality(beadID)
+	if res == nil || res.Insights == nil {
+		return []string{
+			hdrStyle.Render("⏱ CAUSALITY & WAIT"),
+			mutedStyle.Render(truncateRunesHelper("Press W to compute wait & blocker timeline for "+beadID, maxW, "…")),
+		}
+	}
+	ins := res.Insights
+	cov := strings.TrimSpace(ins.Coverage)
+	if cov == "" {
+		cov = "unknown"
+	}
+	lines := []string{
+		hdrStyle.Render(truncateRunesHelper(fmt.Sprintf("⏱ CAUSALITY & WAIT [%s]", cov), maxW, "…")),
+	}
+	var metrics []string
+	if ins.DurationKnown {
+		metrics = append(metrics, "Total: "+formatCausalDuration(ins.TotalDuration))
+	}
+	if ins.BlockedDurationKnown {
+		if ins.DurationKnown && ins.TotalDuration > 0 {
+			metrics = append(metrics, fmt.Sprintf("Blocked: %s (%.0f%%)", formatCausalDuration(ins.BlockedDuration), ins.BlockedPercentage))
+		} else {
+			metrics = append(metrics, "Blocked: "+formatCausalDuration(ins.BlockedDuration))
+		}
+	}
+	if ins.ExplicitDurationKnown && ins.ExplicitBlockedDuration > 0 {
+		metrics = append(metrics, "Explicit: "+formatCausalDuration(ins.ExplicitBlockedDuration))
+	}
+	if ins.DependencyDurationKnown && ins.DependencyWaitDuration > 0 {
+		metrics = append(metrics, "Dep-Wait: "+formatCausalDuration(ins.DependencyWaitDuration))
+	}
+	if len(metrics) > 0 {
+		lines = append(lines, bodyStyle.Render(truncateRunesHelper(strings.Join(metrics, " • "), maxW, "…")))
+	} else {
+		lines = append(lines, mutedStyle.Render(truncateRunesHelper("Chronology only (duration unknown)", maxW, "…")))
+	}
+	if ins.LongestGap != nil && *ins.LongestGap > 0 {
+		gapText := "Longest gap: " + formatCausalDuration(*ins.LongestGap)
+		if desc := strings.TrimSpace(ins.LongestGapDesc); desc != "" {
+			gapText += " (" + desc + ")"
+		}
+		lines = append(lines, bodyStyle.Render(truncateRunesHelper(gapText, maxW, "…")))
+	}
+	if len(ins.Recommendations) > 0 && strings.TrimSpace(ins.Recommendations[0]) != "" {
+		lines = append(lines, bodyStyle.Render(truncateRunesHelper("Hint: "+strings.TrimSpace(ins.Recommendations[0]), maxW, "…")))
+	}
+	if len(ins.Limitations) > 0 && strings.TrimSpace(ins.Limitations[0]) != "" {
+		lines = append(lines, mutedStyle.Render(truncateRunesHelper("Note: "+strings.TrimSpace(ins.Limitations[0]), maxW, "…")))
+	}
+	return lines
 }
 
 // ClearSessionCache clears all cached sessions (bv-pr1l)
@@ -2265,6 +2381,9 @@ func (h *HistoryModel) hasActiveFilters() bool {
 
 // View renders the history view
 func (h *HistoryModel) View() string {
+	if h.report == nil && len(h.orphans) == 0 {
+		return h.renderEmpty("No history data loaded")
+	}
 	if h.viewMode == historyModeOrphans {
 		return h.renderOrphansView()
 	}
@@ -3189,7 +3308,7 @@ func (h *HistoryModel) renderFilterLine() string {
 	if h.authorFilter != "" {
 		activeFilters = append(activeFilters, fmt.Sprintf("@%s", h.authorFilter))
 	}
-	if h.minConfidence > 0 {
+	if h.viewMode != historyModeOrphans && h.minConfidence > 0 {
 		activeFilters = append(activeFilters, fmt.Sprintf("≥%.0f%% conf", h.minConfidence*100))
 	}
 	if query := strings.TrimSpace(h.searchInput.Value()); query != "" {
@@ -3197,11 +3316,13 @@ func (h *HistoryModel) renderFilterLine() string {
 	}
 
 	// Show file filter chip when active (bv-190l)
-	if h.fileFilter != "" {
-		parts = append(parts, activeFilterStyle.Render("File: "+h.fileFilter))
-	}
-	if h.FileTreeSuppressedForWidth() {
-		parts = append(parts, filterStyle.Render("[File tree hidden: widen ≥60 cols]"))
+	if h.viewMode != historyModeOrphans {
+		if h.fileFilter != "" {
+			parts = append(parts, activeFilterStyle.Render("File: "+h.fileFilter))
+		}
+		if h.FileTreeSuppressedForWidth() {
+			parts = append(parts, filterStyle.Render("[File tree hidden: widen ≥60 cols]"))
+		}
 	}
 
 	// Show filter status
@@ -3210,7 +3331,15 @@ func (h *HistoryModel) renderFilterLine() string {
 	}
 
 	// Show count based on mode
-	if h.viewMode == historyModeGit {
+	if h.viewMode == historyModeOrphans {
+		filtered := h.filteredOrphans()
+		totalOrphans := len(h.orphans)
+		if len(filtered) != totalOrphans {
+			parts = append(parts, filterStyle.Render(fmt.Sprintf("Showing %d/%d orphan commits", len(filtered), totalOrphans)))
+		} else {
+			parts = append(parts, filterStyle.Render(fmt.Sprintf("Showing all %d orphan commits", totalOrphans)))
+		}
+	} else if h.viewMode == historyModeGit {
 		commits := h.GetFilteredCommitList()
 		totalCommits := h.totalCommitCount
 		if totalCommits < len(h.commitList) {
@@ -3710,6 +3839,12 @@ func (h *HistoryModel) renderDetailPanel(width, height int) string {
 		detailSepWidth = 1
 	}
 	lines = append(lines, strings.Repeat("─", detailSepWidth))
+
+	// === TEMPORAL CAUSALITY & WAIT ANALYSIS SECTION (W30-2) ===
+	if h.showCausality {
+		lines = append(lines, h.renderCausalitySection(hist.BeadID, width-4)...)
+		lines = append(lines, strings.Repeat("─", detailSepWidth))
+	}
 
 	// === LIFECYCLE EVENTS SECTION (bv-7k8p) ===
 	// Show compact timeline of lifecycle events if available

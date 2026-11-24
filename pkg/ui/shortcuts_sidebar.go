@@ -326,6 +326,7 @@ func (s *ShortcutsSidebar) hardcodedSections() []shortcutSection {
 				{"y", "Copy SHA"},
 				{"+/-/x", "Feedback"},
 				{"O", "Orphans audit"},
+				{"W", "Causality / wait"},
 				{"o", "Open in browser"},
 				{"V", "Cass sessions"},
 			},

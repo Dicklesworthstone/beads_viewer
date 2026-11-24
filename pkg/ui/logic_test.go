@@ -10663,7 +10663,7 @@ func TestWave29_Pass15Fixes_And_W29_TUI(t *testing.T) {
 		m.workspaceMode = true
 		m.activeRepos = map[string]bool{"api": true}
 		m.historyOrphanRepoKeys = map[string]string{"aaa1111": "api", "bbb2222": "web"}
-		scopedOrphs := m.scopeHistoryOrphansForActiveRepos([]correlation.OrphanCandidate{
+		scopedOrphs, _ := m.scopeHistoryOrphansForActiveRepos([]correlation.OrphanCandidate{
 			{SHA: "aaa1111"}, {SHA: "bbb2222"},
 		})
 		if len(scopedOrphs) != 1 || scopedOrphs[0].SHA != "aaa1111" {
@@ -10691,6 +10691,302 @@ func TestWave29_Pass15Fixes_And_W29_TUI(t *testing.T) {
 		ttOut := ttBuf.String()
 		if strings.Contains(ttOut, "**assignee:** ``") || !strings.Contains(ttOut, "_(none)_") || !strings.Contains(ttOut, "P16-OPEN` → `P16-CLOSED` → `P16-OPEN") {
 			t.Fatalf("P16A-10 regression: Time-Travel markdown formatting broken:\n%s", ttOut)
+		}
+	})
+}
+
+func TestWave30_Pass17AndTUIPowerUpgrades(t *testing.T) {
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+
+	// 1. P17-2: Interactive recipe switch never corrupts baseline Scope.Recipe (pinned to startup scopeRecipeFilter).
+	t.Run("P17-2_BaselineScopeRecipeImmutableOnInteractiveSwitch", func(t *testing.T) {
+		issues := []model.Issue{
+			{ID: "B-1", Title: "Alpha", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
+			{ID: "B-2", Title: "Beta", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
+		}
+		m := NewModel(issues, nil, "")
+		defer m.Stop()
+		if opts := m.alertOptions(); opts.Scope != nil && opts.Scope.Recipe != "" {
+			t.Fatalf("expected unscoped startup alertOptions().Scope.Recipe == \"\", got %+v", opts.Scope)
+		}
+		// Simulate interactive recipe picker switch: m.activeRecipe changes, m.candidateIDs does not.
+		m.setActiveRecipe(&recipe.Recipe{Name: "high-impact"})
+		if opts := m.alertOptions(); opts.Scope != nil && opts.Scope.Recipe != "" {
+			t.Fatalf("P17-2 regression: interactive recipe switch polluted alertOptions().Scope.Recipe: %+v", opts.Scope)
+		}
+		// Startup with an active recipe pins scopeRecipeFilter.
+		mScoped := NewModel(issues, &recipe.Recipe{Name: "actionable"}, "")
+		defer mScoped.Stop()
+		mScoped.setActiveRecipe(&recipe.Recipe{Name: "high-impact"})
+		if opts := mScoped.alertOptions(); opts.Scope == nil || opts.Scope.Recipe != "actionable" {
+			t.Fatalf("P17-2 regression: startup scopeRecipeFilter overwritten on interactive switch: %+v", opts.Scope)
+		}
+	})
+
+	// 2. P17-3: Workspace repo picker Enter exits stale time-travel when newly selected repo has no git history.
+	t.Run("P17-3_RepoPickerTimeTravelFailureClearsStaleDiff", func(t *testing.T) {
+		noGitDir := t.TempDir()
+		issues := []model.Issue{
+			{ID: "api-1", Title: "API work", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, SourceRepo: "api",
+				Origin: &model.IssueOrigin{LocalID: "1", WorkingDirectory: noGitDir, TrackerDirectory: filepath.Join(noGitDir, ".beads")}},
+			{ID: "web-1", Title: "Web work", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, SourceRepo: "web",
+				Origin: &model.IssueOrigin{LocalID: "1", WorkingDirectory: noGitDir, TrackerDirectory: filepath.Join(noGitDir, ".beads")}},
+		}
+		m := NewModel(issues, nil, "")
+		defer m.Stop()
+		m.workspaceMode = true
+		m.availableRepos = []string{"api", "web"}
+		m.repoPicker = NewRepoPickerModel([]string{"api", "web"}, m.theme)
+		m.showRepoPicker = true
+		m.focused = focusRepoPicker
+		// Plant active time-travel diff that must be cleared when re-entry fails on non-git repo.
+		m.timeTravelMode = true
+		m.timeTravelSince = "HEAD~1"
+		m.timeTravelDiff = &analysis.SnapshotDiff{FromRevision: "HEAD~1", Summary: analysis.DiffSummary{IssuesAdded: 2}}
+		m.newIssueIDs = map[string]bool{"api-1": true}
+
+		m.handleRepoPickerKeys(tea.KeyMsg{Type: tea.KeyEnter})
+		if m.timeTravelMode || m.timeTravelDiff != nil || len(m.newIssueIDs) > 0 {
+			t.Fatalf("P17-3 regression: failed time-travel re-entry left stale timeTravelMode=%v diff=%v newIDs=%v",
+				m.timeTravelMode, m.timeTravelDiff, m.newIssueIDs)
+		}
+		if !m.statusIsError || !strings.Contains(m.statusMsg, "Time-travel") {
+			t.Fatalf("P17-3 regression: expected descriptive error status on failed re-entry, got err=%v msg=%q", m.statusIsError, m.statusMsg)
+		}
+	})
+
+	// 3. P17-7 & W30-2: History Orphans mode isolation + Causality & Wait panel (honoring *Known flags).
+	t.Run("P17-7_And_W30-2_HistoryOrphansAndCausality", func(t *testing.T) {
+		issues := []model.Issue{
+			{ID: "H-1", Title: "History primary", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
+			{ID: "H-2", Title: "Orphan probable match", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
+		}
+		m := NewModel(issues, nil, "")
+		defer m.Stop()
+		m.width = 130
+		m.height = 40
+		m.historyView.SetSize(128, 38)
+
+		// Unloaded history + 0 orphans even if in Orphans mode renders empty state cleanly.
+		m.historyView.ToggleOrphansMode()
+		if v := ansi.Strip(m.historyView.View()); !strings.Contains(v, "No history data loaded") {
+			t.Fatalf("P17-7 regression: unloaded Orphans view should render 'No history data loaded', got:\n%s", v)
+		}
+		m.historyView.ToggleOrphansMode() // back to Bead mode
+
+		rep := &correlation.HistoryReport{
+			Histories: map[string]correlation.BeadHistory{
+				"H-1": {
+					BeadID: "H-1", Title: "History primary", Status: "open",
+					Commits: []correlation.CorrelatedCommit{{SHA: "111111111111", ShortSHA: "1111111", Message: "feat H-1", Author: "alice", Timestamp: now.Add(-2 * time.Hour), Confidence: 0.9}},
+				},
+			},
+		}
+		m.historyFullReport = rep
+		m.historyReportDataGeneration = m.semanticDataGeneration
+		m.historyView.SetReport(rep)
+		m.historyView.SetOrphans([]correlation.OrphanCandidate{
+			{
+				SHA: "222222222222", ShortSHA: "2222222", Message: "orphan commit", Author: "bob", SuspicionScore: 65,
+				ProbableBeads: []correlation.ProbableBead{{BeadID: "H-2", BeadTitle: "Orphan probable match", Confidence: 70}},
+			},
+		}, 0.50)
+
+		m.isHistoryView = true
+		m.focused = focusHistory
+		m.historyView.ToggleOrphansMode()
+
+		// P17-7: Focused issue / actions resolve orphan probable bead H-2 (NOT hidden Bead-mode H-1).
+		if sessIss := m.focusedIssueForSessions(); sessIss == nil || sessIss.ID != "H-2" {
+			t.Fatalf("P17-7 regression: focusedIssueForSessions in Orphans mode = %+v, want H-2", sessIss)
+		}
+		if actIss, _ := m.selectedIssueForActionWithReason(); actIss == nil || actIss.ID != "H-2" {
+			t.Fatalf("P17-7 regression: selectedIssueForActionWithReason in Orphans mode = %+v, want H-2", actIss)
+		}
+		// Filter line in Orphans mode shows orphan counts, NOT bead counts.
+		filterLine := ansi.Strip(m.historyView.renderFilterLine())
+		if !strings.Contains(filterLine, "orphan commits") || strings.Contains(filterLine, "beads with commits") {
+			t.Fatalf("P17-7 regression: Orphans mode renderFilterLine leaked bead counts: %q", filterLine)
+		}
+		// Pressing 'c' in Orphans mode must NOT mutate hidden minConfidence.
+		m.historyView.SetMinConfidence(0)
+		m, _ = m.handleHistoryKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+		if m.historyView.GetMinConfidence() != 0 {
+			t.Fatalf("P17-7 regression: 'c' in Orphans mode mutated hidden minConfidence to %v", m.historyView.GetMinConfidence())
+		}
+		// W in Orphans mode informs user instead of starting causality.
+		m, cmdOrph := m.handleHistoryKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'W'}})
+		if cmdOrph != nil || !strings.Contains(m.statusMsg, "Causality requires Bead or Git") {
+			t.Fatalf("W30-2 regression: W in Orphans mode should refuse cleanly, got cmd=%v msg=%q", cmdOrph, m.statusMsg)
+		}
+
+		// Return to Bead mode and test W30-2 Causality & Wait rendering honoring *Known flags.
+		m.historyView.ToggleOrphansMode()
+		longest := 4 * time.Hour
+		m.historyView.SetCausality("H-1", &correlation.CausalityResult{
+			Chain: &correlation.CausalChain{BeadID: "H-1", Title: "History primary", Status: "open"},
+			Insights: &correlation.CausalInsights{
+				Coverage:                "partial",
+				DurationKnown:           true,
+				TotalDuration:           10 * time.Hour,
+				BlockedDurationKnown:    false, // Must NOT render fabricated "Blocked: 0s"!
+				BlockedDuration:         0,
+				DependencyDurationKnown: true,
+				DependencyWaitDuration:  3 * time.Hour,
+				LongestGap:              &longest,
+				LongestGapDesc:          "waiting on upstream",
+				Recommendations:         []string{"Resolve dependency wait earlier"},
+				Limitations:             []string{"Explicit blocked window incomplete"},
+			},
+		})
+		m, cmdCached := m.handleHistoryKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'W'}})
+		if cmdCached != nil || !m.historyView.ShowCausality() {
+			t.Fatalf("W30-2 regression: W with cached causality should open immediately without async cmd")
+		}
+		rendered := ansi.Strip(m.historyView.View())
+		for _, want := range []string{"CAUSALITY & WAIT [partial]", "Total: 10.0h", "Dep-Wait: 3.0h", "Longest gap: 4.0h", "Explicit blocked window incomplete"} {
+			if !strings.Contains(rendered, want) {
+				t.Fatalf("W30-2 regression: History detail missing %q:\n%s", want, rendered)
+			}
+		}
+		if strings.Contains(rendered, "Blocked: 0s") {
+			t.Fatalf("W30-2 regression: fabricated Blocked: 0s when BlockedDurationKnown=false:\n%s", rendered)
+		}
+		// Second W toggles panel off.
+		m, _ = m.handleHistoryKeys(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'W'}})
+		if m.historyView.ShowCausality() {
+			t.Fatalf("W30-2 regression: second W did not toggle causality panel off")
+		}
+	})
+
+	// 4. P17-9 & P17-10: Workspace scoped orphan ratio & safe markdown code-span fencing.
+	t.Run("P17-9_ScopedOrphanRatio_And_P17-10_MarkdownFencing", func(t *testing.T) {
+		m := NewModel(nil, nil, "")
+		defer m.Stop()
+		m.workspaceMode = true
+		m.historyOrphanRatio = 0.30
+		m.historyOrphanRootStats = []HistoryOrphanRootStat{
+			{RepoKeys: []string{"api"}, OrphanCount: 4, TotalCommits: 10},
+			{RepoKeys: []string{"web"}, OrphanCount: 2, TotalCommits: 10},
+		}
+		m.historyOrphanRepoKeys = map[string]string{"aaa": "api", "bbb": "web"}
+		orphs := []correlation.OrphanCandidate{{SHA: "aaa"}, {SHA: "bbb"}}
+
+		m.activeRepos = map[string]bool{"api": true}
+		gotOrphs, gotRatio := m.scopeHistoryOrphansForActiveRepos(orphs)
+		if len(gotOrphs) != 1 || gotOrphs[0].SHA != "aaa" || gotRatio < 0.399 || gotRatio > 0.401 {
+			t.Fatalf("P17-9 regression: api scoped orphans=%d ratio=%v, want 1 & 0.40", len(gotOrphs), gotRatio)
+		}
+		m.activeRepos = map[string]bool{"web": true}
+		gotOrphs, gotRatio = m.scopeHistoryOrphansForActiveRepos(orphs)
+		if len(gotOrphs) != 1 || gotOrphs[0].SHA != "bbb" || gotRatio < 0.199 || gotRatio > 0.201 {
+			t.Fatalf("P17-9 regression: web scoped orphans=%d ratio=%v, want 1 & 0.20", len(gotOrphs), gotRatio)
+		}
+
+		// P17-10: backtick & newline in since / removed / cycles safely fenced.
+		m.timeTravelSince = "v1`bad\nref"
+		m.timeTravelDiff = &analysis.SnapshotDiff{
+			RemovedIssues:  []model.Issue{{ID: "rem`1"}},
+			NewCycles:      [][]string{{"c`1", "c`2"}},
+			ResolvedCycles: [][]string{{"r`1", "r`2"}},
+		}
+		var sb strings.Builder
+		m.appendTimeTravelOverviewMarkdown(&sb)
+		out := sb.String()
+		if !strings.Contains(out, "``v1`bad ref``") || !strings.Contains(out, "``rem`1``") || !strings.Contains(out, "``c`1`` → ``c`2`` → ``c`1``") {
+			t.Fatalf("P17-10 regression: backtick/newline fencing failed:\n%s", out)
+		}
+	})
+
+	// 5. W30-3: Graph-aware List Sorting (Triage, Unblocks, Risk, ETA) + Graph View Structural/Risk/Cycle-Break Parity.
+	t.Run("W30-3_GraphAwareListSortAndGraphViewParity", func(t *testing.T) {
+		estFast := 60
+		estSlow := 480
+		oldTime := now.Add(-90 * 24 * time.Hour)
+		closedAt := now.Add(-24 * time.Hour)
+		issues := []model.Issue{
+			{ID: "S-ROOT", Title: "Keystone blocker", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, Labels: []string{"core", "backend"}, CreatedAt: oldTime, UpdatedAt: oldTime, EstimatedMinutes: &estFast},
+			{ID: "S-DEP1", Title: "Blocked slow high-risk", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeBug, Labels: []string{"core", "frontend"}, SourceRepo: "web", CreatedAt: oldTime, UpdatedAt: oldTime, EstimatedMinutes: &estSlow,
+				Dependencies: []*model.Dependency{{IssueID: "S-DEP1", DependsOnID: "S-ROOT", Type: model.DepBlocks}}},
+			{ID: "S-DEP2", Title: "Second dependent", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, SourceRepo: "api", CreatedAt: now.Add(-48 * time.Hour), UpdatedAt: now,
+				Dependencies: []*model.Dependency{{IssueID: "S-DEP2", DependsOnID: "S-ROOT", Type: model.DepBlocks}}},
+			{ID: "S-CLOSED", Title: "Done item", Status: model.StatusClosed, Priority: 0, IssueType: model.TypeTask, CreatedAt: oldTime, UpdatedAt: closedAt, ClosedAt: &closedAt},
+			{ID: "S-TMPL", Title: "Template item", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask, IsTemplate: true, CreatedAt: oldTime, UpdatedAt: oldTime},
+		}
+		m := NewModel(issues, nil, "")
+		defer m.Stop()
+		m.referenceNow = now
+		m.analysis.WaitForPhase2()
+		m.triageScores = map[string]float64{"S-ROOT": 0.95, "S-DEP1": 0.40, "S-DEP2": 0.60, "S-CLOSED": 0.99, "S-TMPL": 0.99}
+		m.unblocksMap = map[string][]string{"S-ROOT": {"S-DEP1", "S-DEP2"}, "S-DEP2": {"S-DEP1"}}
+
+		orderedIDs := func(mode SortMode) []string {
+			m.sortMode = mode
+			m.applyFilter()
+			var ids []string
+			for _, it := range m.list.Items() {
+				if ii, ok := it.(IssueItem); ok {
+					ids = append(ids, ii.Issue.ID)
+				}
+			}
+			return ids
+		}
+		if got := orderedIDs(SortTriage); got[0] != "S-ROOT" || got[len(got)-1] != "S-TMPL" && got[len(got)-2] != "S-CLOSED" {
+			t.Fatalf("W30-3 SortTriage expected S-ROOT first and closed/template last, got %v", got)
+		}
+		if got := orderedIDs(SortUnblocks); got[0] != "S-ROOT" || got[1] != "S-DEP2" {
+			t.Fatalf("W30-3 SortUnblocks expected [S-ROOT S-DEP2 ...], got %v", got)
+		}
+		if got := orderedIDs(SortETA); got[0] != "S-ROOT" {
+			t.Fatalf("W30-3 SortETA expected fastest active issue S-ROOT first, got %v", got)
+		}
+		riskOrder := orderedIDs(SortRisk)
+		// Closed and template issues must rank after all active issues in SortRisk.
+		for idx, id := range riskOrder[:3] {
+			if id == "S-CLOSED" || id == "S-TMPL" {
+				t.Fatalf("W30-3 SortRisk ranked ineligible issue %s at index %d: %v", id, idx, riskOrder)
+			}
+		}
+
+		// Graph View structural & risk parity: K-Core, Slack (acyclic), Cut Vertex, Operational Risk.
+		ins := m.generateModelInsights(m.analysis, len(issues))
+		gm := NewGraphModel(issues, &ins, m.theme)
+		gm.SetAnalyzer(m.analyzer, func() time.Time { return now })
+		gm.SetETAContext(m.etaContext())
+		panel := ansi.Strip(gm.renderMetricsPanel("S-ROOT", 64, m.theme))
+		for _, want := range []string{"Connections & Structure", "K-Core:", "Slack:", "Cut Vertex"} {
+			if !strings.Contains(panel, want) {
+				t.Fatalf("W30-3 GraphView metrics panel missing %q:\n%s", want, panel)
+			}
+		}
+
+		// Cyclic graph view shows scoped Cycle-Break cut suggestion and suppresses Slack.
+		cycIssues := []model.Issue{
+			{ID: "C-A", Title: "Cycle A", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: oldTime, UpdatedAt: oldTime,
+				Dependencies: []*model.Dependency{{IssueID: "C-A", DependsOnID: "C-B", Type: model.DepBlocks}}},
+			{ID: "C-B", Title: "Cycle B", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: oldTime, UpdatedAt: oldTime,
+				Dependencies: []*model.Dependency{{IssueID: "C-B", DependsOnID: "C-A", Type: model.DepBlocks}}},
+		}
+		cycAn := analysis.NewAnalyzer(cycIssues)
+		cycAn.SetNow(now)
+		cycStats := cycAn.Analyze()
+		cycIns := cycStats.GenerateInsights(10)
+		gmCyc := NewGraphModel(cycIssues, &cycIns, m.theme)
+		gmCyc.SetAnalyzer(cycAn, func() time.Time { return now })
+		cycPanel := ansi.Strip(gmCyc.renderMetricsPanel("C-A", 72, m.theme))
+		if strings.Contains(cycPanel, "Slack:") {
+			t.Fatalf("W30-3 regression: cyclic GraphView must suppress Slack:\n%s", cycPanel)
+		}
+		if !strings.Contains(cycPanel, "Cut cycle:") {
+			t.Fatalf("W30-3 regression: cyclic GraphView missing Cycle-Break suggestion:\n%s", cycPanel)
+		}
+
+		// W30-5: TUI Label Health Detail surfaces co-occurring labels.
+		m.labelHealthDetail = &analysis.LabelHealth{Label: "core", Health: 75, HealthLevel: analysis.HealthLevelWarning, IssueCount: 2, OpenCount: 2}
+		m.populateLabelHealthDetailExtras("core")
+		lhOut := ansi.Strip(m.renderLabelHealthDetail(*m.labelHealthDetail))
+		if !strings.Contains(lhOut, "Co-occurs with:") || !strings.Contains(lhOut, "backend") {
+			t.Fatalf("W30-5 regression: TUI Label Health Detail missing Co-occurs with:\n%s", lhOut)
 		}
 	})
 }

@@ -409,7 +409,15 @@ func TestRecipeCycleSortPreservesRecipeAndFilterSwitchClearsRecipe(t *testing.T)
 	if ids := assertRecipeScopeIntact("SortUpdated"); !reflect.DeepEqual(ids, []string{"api-1", "api-2"}) {
 		t.Fatalf("SortUpdated order=%v, want [api-1 api-2]", ids)
 	}
-	// 5. Back to SortDefault -> restores recipe's native id desc ["api-2", "api-1"]
+	// 5..8. Graph-aware sort modes (SortTriage, SortUnblocks, SortRisk, SortETA) preserve recipe scope
+	for _, wantMode := range []SortMode{SortTriage, SortUnblocks, SortRisk, SortETA} {
+		send("s")
+		if m.sortMode != wantMode {
+			t.Fatalf("expected sortMode %v, got %v", wantMode, m.sortMode)
+		}
+		assertRecipeScopeIntact(wantMode.String())
+	}
+	// 9. Back to SortDefault -> restores recipe's native id desc ["api-2", "api-1"]
 	send("s")
 	if m.sortMode != SortDefault {
 		t.Fatalf("expected wrap back to SortDefault, got %v", m.sortMode)

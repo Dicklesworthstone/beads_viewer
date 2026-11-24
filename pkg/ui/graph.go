@@ -1195,10 +1195,107 @@ func (g *GraphModel) renderMetricsPanel(id string, width int, t Theme) string {
 
 	rows = append(rows, "")
 
-	// Section: Degree
-	rows = append(rows, sectionStyle.Render("Connections"))
-	rows = append(rows, "  "+renderMetricRow("In-Degree", inDeg, rankIn, maxIn, true))
-	rows = append(rows, "  "+renderMetricRow("Out-Degree", outDeg, rankOut, maxOut, true))
+	// Section: Connections & Structure (W30-3: active K-Core, acyclic Slack, Cut Vertex, Risk, Cycle-Break)
+	// Gated on g.analyzer != nil (matching What-If & Forecast below) so bare GraphModel layouts stay deterministic.
+	if selIssue := g.issueMap[id]; selIssue != nil && g.analyzer != nil {
+		rows = append(rows, sectionStyle.Render("Connections & Structure"))
+		rows = append(rows, "  "+renderMetricRow("In-Degree", inDeg, rankIn, maxIn, true))
+		rows = append(rows, "  "+renderMetricRow("Out-Degree", outDeg, rankOut, maxOut, true))
+		detailStyle := t.Renderer.NewStyle().Foreground(ColorText)
+		mutedStyle := t.Renderer.NewStyle().Foreground(ColorMuted)
+		warnStyle := t.Renderer.NewStyle().Foreground(ColorWarning).Bold(true)
+		isActive := !isClosedLikeStatus(selIssue.Status)
+		var compactBadges []string
+		if isActive {
+			if activeCores := stats.ActiveCoreNumber(); activeCores != nil {
+				if kc, ok := activeCores[id]; ok {
+					compactBadges = append(compactBadges, fmt.Sprintf("K-Core: %d", kc))
+				}
+			}
+			if len(stats.Cycles()) == 0 {
+				if slackMap := stats.Slack(); slackMap != nil {
+					if sl, ok := slackMap[id]; ok {
+						slackLabel := fmt.Sprintf("Slack: %.2f", sl)
+						if sl == 0 {
+							slackLabel += " (critical)"
+						}
+						compactBadges = append(compactBadges, slackLabel)
+					}
+				}
+			}
+		}
+		if len(compactBadges) > 0 {
+			rows = append(rows, detailStyle.Render("  "+strings.Join(compactBadges, " • ")))
+		}
+		isCutVertex := false
+		for _, ap := range g.insights.Articulation {
+			if ap == id {
+				isCutVertex = true
+				break
+			}
+		}
+		if !isCutVertex {
+			for _, ap := range stats.ArticulationPoints() {
+				if ap == id {
+					isCutVertex = true
+					break
+				}
+			}
+		}
+		if isCutVertex {
+			rows = append(rows, warnStyle.Render("  ⚠ Cut Vertex (single point of failure)"))
+		}
+		if isActive && !selIssue.IsTemplate && !selIssue.Pinned && selIssue.Status != model.StatusPinned {
+			issueValMap := make(map[string]model.Issue, len(g.issues))
+			for _, iss := range g.issues {
+				issueValMap[iss.ID] = iss
+			}
+			now := time.Now().UTC()
+			if g.nowFunc != nil {
+				now = g.nowFunc().UTC()
+			} else if !g.analyzer.Now().IsZero() {
+				now = g.analyzer.Now().UTC()
+			}
+			sig := analysis.ComputeRiskSignalsWithReadiness(selIssue, stats, issueValMap, g.analyzer.Readiness(), now, analysis.DefaultRiskWeights())
+			if sig.CompositeRisk >= 0.15 {
+				riskLine := fmt.Sprintf("  Risk: %.0f%%", sig.CompositeRisk*100)
+				if sig.Explanation != "" {
+					riskLine += " — " + sig.Explanation
+				}
+				if sig.CompositeRisk >= 0.50 {
+					rows = append(rows, warnStyle.Render(truncateRunesHelper(riskLine, max(20, width-4), "…")))
+				} else {
+					rows = append(rows, detailStyle.Render(truncateRunesHelper(riskLine, max(20, width-4), "…")))
+				}
+			}
+		}
+		if len(stats.Cycles()) > 0 {
+			adv := g.analyzer.GenerateAdvancedInsightsFromStats(stats, analysis.DefaultAdvancedInsightsConfig())
+			if adv != nil && adv.CycleBreak != nil && len(adv.CycleBreak.Suggestions) > 0 {
+				var matched []analysis.CycleBreakItem
+				for _, cb := range adv.CycleBreak.Suggestions {
+					if _, okFrom := g.issueMap[cb.EdgeFrom]; !okFrom {
+						continue
+					}
+					if _, okTo := g.issueMap[cb.EdgeTo]; !okTo {
+						continue
+					}
+					if cb.EdgeFrom == id || cb.EdgeTo == id {
+						matched = append(matched, cb)
+					}
+				}
+				if len(matched) > 0 {
+					cb := matched[0]
+					cutLine := fmt.Sprintf("  Cut cycle: %s → %s (breaks %d, col %d)", cb.EdgeFrom, cb.EdgeTo, cb.Impact, cb.Collateral)
+					rows = append(rows, mutedStyle.Render(truncateRunesHelper(cutLine, max(20, width-4), "…")))
+				}
+			}
+		}
+	} else {
+		rows = append(rows, sectionStyle.Render("Connections"))
+		rows = append(rows, "  "+renderMetricRow("In-Degree", inDeg, rankIn, maxIn, true))
+		rows = append(rows, "  "+renderMetricRow("Out-Degree", outDeg, rankOut, maxOut, true))
+	}
 
 	// Section: What-If, Root Blockers & ETA Forecast (open issues only, when wired with scoped Analyzer)
 	if selIssue := g.issueMap[id]; selIssue != nil && !isClosedLikeStatus(selIssue.Status) && g.analyzer != nil {

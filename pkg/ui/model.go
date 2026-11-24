@@ -120,6 +120,10 @@ const (
 	SortCreatedDesc                 // By creation date, newest first
 	SortPriority                    // By priority only (ascending)
 	SortUpdated                     // By last update, newest first
+	SortTriage                      // By triage impact score (highest first; active before closed/pinned/template)
+	SortUnblocks                    // By direct unblock count (highest first; active before closed)
+	SortRisk                        // By operational risk score (highest first; active before closed/pinned/template)
+	SortETA                         // By estimated days to completion (soonest first; active before closed/pinned/template)
 	numSortModes                    // Keep this last - used for cycling
 )
 
@@ -134,6 +138,14 @@ func (s SortMode) String() string {
 		return "Priority"
 	case SortUpdated:
 		return "Updated"
+	case SortTriage:
+		return "Triage ↓"
+	case SortUnblocks:
+		return "Unblocks ↓"
+	case SortRisk:
+		return "Risk ↓"
+	case SortETA:
+		return "ETA ↑"
 	default:
 		return "Default"
 	}
@@ -1078,6 +1090,14 @@ func manualCheckUpdateCmd() tea.Cmd {
 	}
 }
 
+// HistoryOrphanRootStat captures per-git-root orphan detection counts so
+// workspace repo filtering can recompute an accurate scoped orphan ratio (P17-9).
+type HistoryOrphanRootStat struct {
+	RepoKeys     []string
+	OrphanCount  int
+	TotalCommits int
+}
+
 // HistoryLoadedMsg is sent when background history loading completes
 type HistoryLoadedMsg struct {
 	DataGeneration    uint64
@@ -1088,6 +1108,16 @@ type HistoryLoadedMsg struct {
 	Orphans           []correlation.OrphanCandidate
 	OrphanRatio       float64
 	OrphanRepoKeys    map[string]string
+	OrphanRootStats   []HistoryOrphanRootStat
+	Error             error
+}
+
+// CausalityLoadedMsg is sent when on-demand temporal causality analysis finishes (W30-2).
+type CausalityLoadedMsg struct {
+	DataGeneration    uint64
+	RequestGeneration uint64
+	BeadID            string
+	Result            *correlation.CausalityResult
 	Error             error
 }
 
@@ -2019,6 +2049,34 @@ func loadWorkspaceHistoryAtRevisionCmd(
 			}
 		}
 
+		type wsOrphanGroupKey struct {
+			gitRoot string
+			rev     string
+		}
+		type wsOrphanGroup struct {
+			gitRoot        string
+			rev            string
+			histories      map[string]correlation.BeadHistory
+			storeDirs      []string
+			seenStoreDir   map[string]bool
+			repoKeys       []string
+			seenRepoKey    map[string]bool
+			subtreesByRepo map[string]string
+		}
+		canonOrphanPath := func(p string) string {
+			p = strings.TrimSpace(p)
+			if p == "" {
+				return ""
+			}
+			if abs, aErr := filepath.Abs(p); aErr == nil {
+				p = abs
+			}
+			if eval, eErr := filepath.EvalSymlinks(p); eErr == nil && eval != "" {
+				p = eval
+			}
+			return filepath.Clean(p)
+		}
+
 		effectiveRev := strings.TrimSpace(revision)
 		normScopeRepo := normalizeRepoKey(scopeRepoFilter)
 		prefixFiles := len(distinctRoots) > 1
@@ -2026,6 +2084,8 @@ func loadWorkspaceHistoryAtRevisionCmd(
 		commitRepoDirs := make(map[string]string)
 		orphanRepoKeys := make(map[string]string)
 		seenOrphanSHAs := make(map[string]bool)
+		orphanGroups := make(map[wsOrphanGroupKey]*wsOrphanGroup)
+		var orphanGroupOrder []wsOrphanGroupKey
 		var (
 			allStrategies        []correlation.StrategyRun
 			mergedFeedback       *correlation.FeedbackApplied
@@ -2035,6 +2095,7 @@ func loadWorkspaceHistoryAtRevisionCmd(
 			totalWalkedCommits   int
 			countedRoots         = make(map[string]bool)
 			wsOrphans            []correlation.OrphanCandidate
+			wsOrphanRootStats    []HistoryOrphanRootStat
 			wsTotalOrphanCommits int
 			wsOrphanCommitsCount int
 			successCount         int
@@ -2147,49 +2208,40 @@ func loadWorkspaceHistoryAtRevisionCmd(
 				}
 			}
 
-			// Detect workspace orphans per repo target and qualify probable bead IDs (P16A-6).
-			if ctx.Err() == nil && part != nil && gitRoot != "" {
-				var storeDirs []string
-				if correlationPath != "" {
-					if rel, rErr := filepath.Rel(gitRoot, filepath.Dir(correlationPath)); rErr == nil && rel != "." && rel != "" && !strings.HasPrefix(rel, "..") {
-						storeDirs = append(storeDirs, filepath.ToSlash(rel))
+			// Register per-(gitRoot, targetRev) orphan group so shared-.git monorepos
+			// run OrphanDetector once across merged histories and all sibling storeDirs (P17-1).
+			var orphanGroup *wsOrphanGroup
+			if gitRoot != "" {
+				gKey := wsOrphanGroupKey{gitRoot: canonOrphanPath(gitRoot), rev: targetRev}
+				orphanGroup = orphanGroups[gKey]
+				if orphanGroup == nil {
+					orphanGroup = &wsOrphanGroup{
+						gitRoot:        gitRoot,
+						rev:            targetRev,
+						histories:      make(map[string]correlation.BeadHistory),
+						seenStoreDir:   make(map[string]bool),
+						seenRepoKey:    make(map[string]bool),
+						subtreesByRepo: make(map[string]string),
 					}
+					orphanGroups[gKey] = orphanGroup
+					orphanGroupOrder = append(orphanGroupOrder, gKey)
 				}
-				if oRep, oErr := correlation.NewOrphanDetectorAt(part, gitRoot, time.Now().UTC()).
-					WithStoreDirs(storeDirs...).
-					DetectOrphans(correlation.ExtractOptions{Limit: 500, Revision: targetRev}); oErr == nil && oRep != nil {
-					wsTotalOrphanCommits += oRep.Stats.TotalCommits
-					wsOrphanCommitsCount += oRep.Stats.OrphanCount
-					for _, cand := range oRep.Candidates {
-						if cand.SuspicionScore < 30 {
-							continue
+				if targetRepoKey != "" && !orphanGroup.seenRepoKey[targetRepoKey] {
+					orphanGroup.seenRepoKey[targetRepoKey] = true
+					orphanGroup.repoKeys = append(orphanGroup.repoKeys, targetRepoKey)
+				}
+				if targetRepoKey != "" && target.subtreePrefix != "" {
+					orphanGroup.subtreesByRepo[targetRepoKey] = strings.Trim(filepath.ToSlash(target.subtreePrefix), "/")
+				}
+				if correlationPath != "" {
+					canonRoot := canonOrphanPath(gitRoot)
+					canonStore := canonOrphanPath(filepath.Dir(correlationPath))
+					if rel, rErr := filepath.Rel(canonRoot, canonStore); rErr == nil && rel != "." && rel != "" && !strings.HasPrefix(rel, "..") {
+						relSlash := filepath.ToSlash(rel)
+						if !orphanGroup.seenStoreDir[relSlash] {
+							orphanGroup.seenStoreDir[relSlash] = true
+							orphanGroup.storeDirs = append(orphanGroup.storeDirs, relSlash)
 						}
-						lowSHA := strings.ToLower(strings.TrimSpace(cand.SHA))
-						if lowSHA == "" || seenOrphanSHAs[lowSHA] {
-							continue
-						}
-						seenOrphanSHAs[lowSHA] = true
-						commitRepoDirs[lowSHA] = gitRoot
-						if lowShort := strings.ToLower(strings.TrimSpace(cand.ShortSHA)); lowShort != "" {
-							commitRepoDirs[lowShort] = gitRoot
-						}
-						if targetRepoKey != "" {
-							orphanRepoKeys[lowSHA] = targetRepoKey
-						}
-						cloned := cand
-						if len(cand.ProbableBeads) > 0 {
-							probs := make([]correlation.ProbableBead, len(cand.ProbableBeads))
-							for pi, pb := range cand.ProbableBeads {
-								if qid := localToQualified[pb.BeadID]; qid != "" {
-									pb.BeadID = qid
-								} else if target.prefix != "" {
-									pb.BeadID = workspace.QualifyID(pb.BeadID, target.prefix)
-								}
-								probs[pi] = pb
-							}
-							cloned.ProbableBeads = probs
-						}
-						wsOrphans = append(wsOrphans, cloned)
 					}
 				}
 			}
@@ -2252,6 +2304,9 @@ func loadWorkspaceHistoryAtRevisionCmd(
 				}
 				hist.Commits = commits
 				mergedHistories[qualID] = hist
+				if orphanGroup != nil {
+					orphanGroup.histories[qualID] = hist
+				}
 			}
 			if latestSHA == "" && part.LatestCommitSHA != "" {
 				latestSHA = part.LatestCommitSHA
@@ -2265,6 +2320,85 @@ func loadWorkspaceHistoryAtRevisionCmd(
 				Error:             lastErr,
 			}
 		}
+
+		// Run OrphanDetector once per distinct (gitRoot, targetRev) over merged histories and union storeDirs (P17-1, P17-9).
+		for _, gKey := range orphanGroupOrder {
+			if ctx.Err() != nil {
+				break
+			}
+			grp := orphanGroups[gKey]
+			if grp == nil || grp.gitRoot == "" {
+				continue
+			}
+			grpReport := &correlation.HistoryReport{
+				Histories:   grp.histories,
+				CommitIndex: correlation.BuildCommitIndex(grp.histories),
+			}
+			oRep, oErr := correlation.NewOrphanDetectorAt(grpReport, grp.gitRoot, time.Now().UTC()).
+				WithStoreDirs(grp.storeDirs...).
+				DetectOrphans(correlation.ExtractOptions{Limit: 500, Revision: grp.rev})
+			if oErr != nil || oRep == nil {
+				continue
+			}
+			wsTotalOrphanCommits += oRep.Stats.TotalCommits
+			wsOrphanCommitsCount += oRep.Stats.OrphanCount
+			wsOrphanRootStats = append(wsOrphanRootStats, HistoryOrphanRootStat{
+				RepoKeys:     append([]string(nil), grp.repoKeys...),
+				OrphanCount:  oRep.Stats.OrphanCount,
+				TotalCommits: oRep.Stats.TotalCommits,
+			})
+			for _, cand := range oRep.Candidates {
+				if cand.SuspicionScore < 30 {
+					continue
+				}
+				lowSHA := strings.ToLower(strings.TrimSpace(cand.SHA))
+				if lowSHA == "" || seenOrphanSHAs[lowSHA] {
+					continue
+				}
+				seenOrphanSHAs[lowSHA] = true
+				commitRepoDirs[lowSHA] = grp.gitRoot
+				if lowShort := strings.ToLower(strings.TrimSpace(cand.ShortSHA)); lowShort != "" {
+					commitRepoDirs[lowShort] = grp.gitRoot
+				}
+				if len(grp.repoKeys) == 1 {
+					orphanRepoKeys[lowSHA] = grp.repoKeys[0]
+				} else if len(grp.repoKeys) > 1 {
+					matchedRepo := ""
+					ambiguous := false
+					for _, f := range cand.Files {
+						cleanPath := strings.TrimPrefix(filepath.ToSlash(strings.TrimSpace(f)), "./")
+						for rk, sub := range grp.subtreesByRepo {
+							if sub == "" {
+								continue
+							}
+							if cleanPath == sub || strings.HasPrefix(cleanPath, sub+"/") {
+								if matchedRepo == "" {
+									matchedRepo = rk
+								} else if matchedRepo != rk {
+									ambiguous = true
+								}
+							}
+						}
+					}
+					if matchedRepo == "" && !ambiguous && len(cand.ProbableBeads) > 0 {
+						for _, pb := range cand.ProbableBeads {
+							if rk := beadRepoKeys[pb.BeadID]; rk != "" {
+								if matchedRepo == "" {
+									matchedRepo = rk
+								} else if matchedRepo != rk {
+									ambiguous = true
+								}
+							}
+						}
+					}
+					if matchedRepo != "" && !ambiguous {
+						orphanRepoKeys[lowSHA] = matchedRepo
+					}
+				}
+				wsOrphans = append(wsOrphans, cand)
+			}
+		}
+
 		if effectiveRev != "" && latestSHA == "" {
 			latestSHA = effectiveRev
 		}
@@ -2309,6 +2443,7 @@ func loadWorkspaceHistoryAtRevisionCmd(
 			Orphans:           wsOrphans,
 			OrphanRatio:       wsOrphanRatio,
 			OrphanRepoKeys:    orphanRepoKeys,
+			OrphanRootStats:   wsOrphanRootStats,
 		}
 	}
 }
@@ -2389,6 +2524,7 @@ type Model struct {
 	candidateIDs             map[string]bool              // Owned selection; graph context remains in issues.
 	scopeLabelFilter         string                       // Optional CLI --label filter for dynamic historical scoping.
 	scopeRepoFilter          string                       // Optional CLI --repo filter for dynamic historical scoping.
+	scopeRecipeFilter        string                       // Immutable startup CLI --recipe scope paired with candidateIDs (P17-2).
 	authorityHash            string                       // Full authority hash (including tombstones) for export provenance.
 	authorityIncomplete      bool                         // True when authority is incomplete, historical, or warned.
 	sourceDegraded           bool                         // True when discovery fell back to a stale/degraded source.
@@ -2452,43 +2588,45 @@ type Model struct {
 	updateURL       string
 
 	// Focus and View State
-	focused                    focus
-	focusBeforeHelp            focus // Stores focus before opening help overlay
-	embeddedTextInputSession   embeddedTextInputSession
-	embeddedTextInputGen       uint64
-	isSplitView                bool
-	splitViewUserOverride      bool
-	splitViewUserWant          bool
-	splitPaneRatio             float64 // Ratio of list pane width (0.2-0.8), default 0.4
-	isBoardView                bool
-	isGraphView                bool
-	isActionableView           bool
-	isHistoryView              bool
-	showDetails                bool
-	showHelp                   bool
-	helpScroll                 int // Scroll offset for help overlay
-	showQuitConfirm            bool
-	ready                      bool
-	width                      int
-	height                     int
-	showLabelHealthDetail      bool
-	showLabelDrilldown         bool
-	showVelocityComparison     bool
-	labelHealthDetail          *analysis.LabelHealth
-	labelHealthDetailFlow      labelFlowSummary
-	labelHealthDetailSparkline string
-	labelHealthDetailTrendSym  string
-	labelHealthDetailAttention *analysis.LabelAttentionScore
-	labelHealthDetailCascade   *analysis.BlockageCascadeResult
-	labelDrilldownLabel        string
-	labelDrilldownIssues       []model.Issue
-	labelDrilldownCache        map[string][]model.Issue
-	showLabelGraphAnalysis     bool
-	labelGraphAnalysisResult   *LabelGraphAnalysisResult
-	attentionView              AttentionModel // ] ranked label attention view (bv-117)
-	attentionCache             analysis.LabelAttentionResult
-	attentionCached            bool
-	showShortcutsSidebar       bool // bv-3qi5 toggleable shortcuts sidebar
+	focused                       focus
+	focusBeforeHelp               focus // Stores focus before opening help overlay
+	embeddedTextInputSession      embeddedTextInputSession
+	embeddedTextInputGen          uint64
+	isSplitView                   bool
+	splitViewUserOverride         bool
+	splitViewUserWant             bool
+	splitPaneRatio                float64 // Ratio of list pane width (0.2-0.8), default 0.4
+	isBoardView                   bool
+	isGraphView                   bool
+	isActionableView              bool
+	isHistoryView                 bool
+	showDetails                   bool
+	showHelp                      bool
+	helpScroll                    int // Scroll offset for help overlay
+	showQuitConfirm               bool
+	ready                         bool
+	width                         int
+	height                        int
+	showLabelHealthDetail         bool
+	showLabelDrilldown            bool
+	showVelocityComparison        bool
+	labelHealthDetail             *analysis.LabelHealth
+	labelHealthDetailFlow         labelFlowSummary
+	labelHealthDetailSparkline    string
+	labelHealthDetailTrendSym     string
+	labelHealthDetailAttention    *analysis.LabelAttentionScore
+	labelHealthDetailCascade      *analysis.BlockageCascadeResult
+	labelHealthDetailCooccurrence []labelCount
+	labelHealthDetailTopUnblocks  []analysis.UnblockRecommendation
+	labelDrilldownLabel           string
+	labelDrilldownIssues          []model.Issue
+	labelDrilldownCache           map[string][]model.Issue
+	showLabelGraphAnalysis        bool
+	labelGraphAnalysisResult      *LabelGraphAnalysisResult
+	attentionView                 AttentionModel // ] ranked label attention view (bv-117)
+	attentionCache                analysis.LabelAttentionResult
+	attentionCached               bool
+	showShortcutsSidebar          bool // bv-3qi5 toggleable shortcuts sidebar
 
 	// Key combo state (bv-6fm0)
 	pendingComboKey   string    // Key waiting for potential combo (e.g., "g" for gg)
@@ -2587,6 +2725,10 @@ type Model struct {
 	historyFullOrphans     []correlation.OrphanCandidate
 	historyOrphanRatio     float64
 	historyOrphanRepoKeys  map[string]string
+	historyOrphanRootStats []HistoryOrphanRootStat
+	causalityCancel        context.CancelFunc
+	causalityRequestGen    uint64
+	causalityLoadingBead   string
 	newIssueIDs            map[string]bool // Issues in diff.NewIssues
 	closedIssueIDs         map[string]bool // Issues in diff.ClosedIssues
 	modifiedIssueIDs       map[string]bool // Issues in diff.ModifiedIssues
@@ -3469,6 +3611,7 @@ func (m *Model) startHistoryLoadForce(force bool) tea.Cmd {
 	}
 
 	m.cancelHistoryLoad()
+	m.cancelCausalityLoad()
 	m.historyLoadRequestGeneration++
 	m.historyLoadDataGeneration = m.semanticDataGeneration
 	m.historyLoadFailed = false
@@ -3482,6 +3625,7 @@ func (m *Model) startHistoryLoadForce(force bool) tea.Cmd {
 		m.historyFullOrphans = nil
 		m.historyOrphanRatio = 0
 		m.historyOrphanRepoKeys = nil
+		m.historyOrphanRootStats = nil
 		m.historyView.SetReport(nil)
 		m.historyView.SetOrphans(nil, 0)
 		m.historyReportDataGeneration = 0
@@ -3644,6 +3788,7 @@ func (m *Model) SetAsOfRevision(rev string) {
 	}
 	m.asOfRevision = trimmed
 	m.cancelHistoryLoad()
+	m.cancelCausalityLoad()
 	m.historyLoading = len(m.issues) > 0
 	m.historyLoadFailed = false
 	m.historyLoadDataGeneration = 0
@@ -3653,6 +3798,7 @@ func (m *Model) SetAsOfRevision(rev string) {
 	m.historyFullOrphans = nil
 	m.historyOrphanRatio = 0
 	m.historyOrphanRepoKeys = nil
+	m.historyOrphanRootStats = nil
 	m.historyView.SetReport(nil)
 	m.historyView.SetOrphans(nil, 0)
 	if m.analysis != nil && m.analyzer != nil {
@@ -3716,8 +3862,11 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 	// Graph Analysis - Phase 1 is instant, Phase 2 runs in background
 	analyzer := analysis.NewAnalyzer(issues)
 	var candidateIDs map[string]bool
-	var scopeLabelFilter, scopeRepoFilter string
+	var scopeLabelFilter, scopeRepoFilter, scopeRecipeFilter string
 	var referenceNow time.Time
+	if activeRecipe != nil {
+		scopeRecipeFilter = strings.TrimSpace(activeRecipe.Name)
+	}
 	if len(scope) > 0 {
 		if scope[0].CandidateIDs != nil {
 			candidateIDs = make(map[string]bool, len(scope[0].CandidateIDs))
@@ -4089,6 +4238,7 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 		candidateIDs:                   candidateIDs,
 		scopeLabelFilter:               scopeLabelFilter,
 		scopeRepoFilter:                scopeRepoFilter,
+		scopeRecipeFilter:              scopeRecipeFilter,
 		authorityHash:                  authorityHash,
 		referenceNow:                   referenceNow,
 		asOfRevision:                   asOfRevision,
@@ -6072,8 +6222,10 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.historyFullOrphans = msg.Orphans
 			m.historyOrphanRatio = msg.OrphanRatio
 			m.historyOrphanRepoKeys = msg.OrphanRepoKeys
+			m.historyOrphanRootStats = msg.OrphanRootStats
 			m.historyView.SetReport(m.scopeHistoryReportForActiveRepos(msg.Report))
-			m.historyView.SetOrphans(m.scopeHistoryOrphansForActiveRepos(msg.Orphans), msg.OrphanRatio)
+			scopedOrphans, scopedRatio := m.scopeHistoryOrphansForActiveRepos(msg.Orphans)
+			m.historyView.SetOrphans(scopedOrphans, scopedRatio)
 			m.syncHistoryCassSessions()
 			m.historyReportDataGeneration = msg.DataGeneration
 			m.historyView.SetSize(m.mainContentWidth(), m.height-1)
@@ -6081,6 +6233,29 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.isSplitView || m.showDetails {
 				m.updateViewportContent()
 			}
+		}
+
+	case CausalityLoadedMsg:
+		if msg.DataGeneration != m.semanticDataGeneration || msg.RequestGeneration != m.causalityRequestGen {
+			return m, nil
+		}
+		m.cancelCausalityLoad()
+		if msg.Error != nil || msg.Result == nil {
+			errText := "no causal history available"
+			if msg.Error != nil {
+				errText = msg.Error.Error()
+			}
+			m.statusMsg = fmt.Sprintf("⚠ Causality unavailable for %s: %s", msg.BeadID, errText)
+			m.statusIsError = true
+		} else {
+			m.historyView.SetCausality(msg.BeadID, msg.Result)
+			m.historyView.SetShowCausality(true)
+			cov := "unknown"
+			if msg.Result.Insights != nil && strings.TrimSpace(msg.Result.Insights.Coverage) != "" {
+				cov = msg.Result.Insights.Coverage
+			}
+			m.statusMsg = fmt.Sprintf("⏱ Causality for %s [%s] — press W to hide", msg.BeadID, cov)
+			m.statusIsError = false
 		}
 
 	case CassHealthMsg:
@@ -10150,6 +10325,9 @@ func (m *Model) handleHistoryKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 			m.historyView.PrevCommit()
 		}
 	case "tab":
+		if m.historyView.IsOrphansMode() {
+			break
+		}
 		// Cycle focus: list -> [timeline ->] [middle ->] detail -> file tree (if rendered) -> list (bv-190l)
 		if m.historyView.FileTreeRendered() {
 			if m.historyView.FileTreeHasFocus() {
@@ -10232,6 +10410,44 @@ func (m *Model) handleHistoryKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 			m.statusMsg = "◈ Returned to History mode"
 		}
 		m.statusIsError = false
+	case "W":
+		// Toggle Temporal Causality & Wait-Time Analysis panel (W30-2)
+		if m.historyView.IsOrphansMode() {
+			m.statusMsg = "⏱ Causality requires Bead or Git history mode (press O to switch)"
+			m.statusIsError = false
+			break
+		}
+		var targetBeadID string
+		if m.historyView.IsGitMode() {
+			targetBeadID = m.historyView.SelectedRelatedBeadID()
+		} else {
+			targetBeadID = m.historyView.SelectedBeadID()
+		}
+		if targetBeadID == "" {
+			m.statusMsg = "❌ No bead selected for causality analysis"
+			m.statusIsError = true
+			break
+		}
+		if m.historyView.ShowCausality() && m.historyView.GetCausality(targetBeadID) != nil {
+			m.historyView.SetShowCausality(false)
+			m.statusMsg = "⏱ Causality panel hidden (press W to inspect)"
+			m.statusIsError = false
+			break
+		}
+		if cached := m.historyView.GetCausality(targetBeadID); cached != nil {
+			m.historyView.SetShowCausality(true)
+			cov := "unknown"
+			if cached.Insights != nil && strings.TrimSpace(cached.Insights.Coverage) != "" {
+				cov = cached.Insights.Coverage
+			}
+			m.statusMsg = fmt.Sprintf("⏱ Causality for %s [%s] — press W to hide", targetBeadID, cov)
+			m.statusIsError = false
+			break
+		}
+		m.historyView.SetShowCausality(true)
+		m.statusMsg = fmt.Sprintf("⏳ Computing causal wait timeline for %s…", targetBeadID)
+		m.statusIsError = false
+		cmd = m.loadCausalityForBeadCmd(targetBeadID)
 	case "+":
 		cmd = m.recordCorrelationFeedback("confirm")
 	case "-":
@@ -10239,6 +10455,11 @@ func (m *Model) handleHistoryKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 	case "x":
 		cmd = m.recordCorrelationFeedback("ignore")
 	case "c":
+		if m.historyView.IsOrphansMode() {
+			m.statusMsg = "◎ Confidence filter applies to Bead/Git history modes (press O to switch)"
+			m.statusIsError = false
+			break
+		}
 		// Cycle confidence threshold (applies to both Bead Mode and Git Mode)
 		m.historyView.CycleConfidence()
 		conf := m.historyView.GetMinConfidence()
@@ -10383,6 +10604,164 @@ func (m *Model) handleHistoryKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 		m.focused = focusList
 	}
 	return m, cmd
+}
+
+func (m *Model) cancelCausalityLoad() {
+	if m.causalityCancel != nil {
+		m.causalityCancel()
+		m.causalityCancel = nil
+	}
+	m.causalityLoadingBead = ""
+}
+
+func (m *Model) loadCausalityForBeadCmd(beadID string) tea.Cmd {
+	m.cancelCausalityLoad()
+	m.causalityRequestGen++
+	reqGen := m.causalityRequestGen
+	dataGen := m.semanticDataGeneration
+	m.causalityLoadingBead = beadID
+
+	ctx, cancel := context.WithCancel(context.Background())
+	m.causalityCancel = cancel
+
+	refNow := m.analysisReferenceTime().UTC()
+	asOfRev := strings.TrimSpace(m.asOfRevision)
+	blockerTitles := make(map[string]string, len(m.issues))
+	for _, iss := range m.issues {
+		blockerTitles[iss.ID] = iss.Title
+	}
+
+	// Capture repo root, beads path, local ID, and aliases synchronously before leaving the UI goroutine.
+	repoDir := strings.TrimSpace(m.workDir)
+	beadsPath := strings.TrimSpace(m.beadsPath)
+	localID := beadID
+	var aliases []string
+	var targetSourceRepo string
+	if iss := m.issueMap[beadID]; iss != nil {
+		targetSourceRepo = normalizeRepoKey(iss.SourceRepo)
+		if iss.Origin != nil {
+			if lid := strings.TrimSpace(iss.Origin.LocalID); lid != "" {
+				localID = lid
+			}
+			if wd := strings.TrimSpace(iss.Origin.WorkingDirectory); wd != "" {
+				repoDir = wd
+			} else if canDeriveWorkspaceFromTrackerOrigin(iss.Origin) {
+				repoDir = filepath.Dir(strings.TrimSpace(iss.Origin.TrackerDirectory))
+			}
+			if td := strings.TrimSpace(iss.Origin.TrackerDirectory); td != "" {
+				candIssues := filepath.Join(td, "issues.jsonl")
+				candBeads := filepath.Join(td, "beads.jsonl")
+				if _, err := os.Stat(candIssues); err == nil {
+					beadsPath = candIssues
+				} else if _, err := os.Stat(candBeads); err == nil {
+					beadsPath = candBeads
+				} else {
+					beadsPath = candIssues
+				}
+			}
+		}
+	}
+	if repoDir == "" {
+		if m.historyFullReport != nil {
+			if hist, ok := m.historyFullReport.Histories[beadID]; ok {
+				for _, c := range hist.Commits {
+					if d := m.resolveCommitRepoDir(c.SHA); d != "" {
+						repoDir = d
+						break
+					}
+				}
+			}
+		}
+		if repoDir == "" {
+			repoDir, _ = os.Getwd()
+		}
+	}
+	if isHistoricalGitBeadsPath(beadsPath) {
+		if _, relPath, ok := splitHistoricalGitBeadsPath(beadsPath); ok && relPath != "" && repoDir != "" {
+			beadsPath = filepath.Join(repoDir, filepath.FromSlash(relPath))
+		} else {
+			beadsPath = ""
+		}
+	}
+	if localID != "" && !strings.EqualFold(localID, beadID) {
+		aliases = []string{beadID}
+	}
+
+	localBeads := make([]correlation.BeadInfo, 0, len(m.issues))
+	for _, iss := range m.issues {
+		if m.workspaceMode && targetSourceRepo != "" && normalizeRepoKey(iss.SourceRepo) != targetSourceRepo {
+			continue
+		}
+		id := iss.ID
+		if iss.Origin != nil && strings.TrimSpace(iss.Origin.LocalID) != "" {
+			id = strings.TrimSpace(iss.Origin.LocalID)
+		}
+		localBeads = append(localBeads, correlation.BeadInfo{
+			ID:     id,
+			Title:  iss.Title,
+			Status: string(iss.Status),
+		})
+	}
+
+	// Capture fallback BeadHistory snapshot so causality still degrades gracefully
+	// in non-git or synthetic-history environments (honoring Coverage/Limitations).
+	var fallbackHist *correlation.BeadHistory
+	if m.historyFullReport != nil {
+		if h, ok := m.historyFullReport.Histories[beadID]; ok {
+			hCopy := h
+			fallbackHist = &hCopy
+		}
+	}
+
+	return func() tea.Msg {
+		if ctx.Err() != nil {
+			return CausalityLoadedMsg{DataGeneration: dataGen, RequestGeneration: reqGen, BeadID: beadID, Error: ctx.Err()}
+		}
+		opts := correlation.CausalityOptions{
+			IncludeCommits: true,
+			BlockerTitles:  blockerTitles,
+		}
+		var res *correlation.CausalityResult
+		var lastErr error
+		if repoDir != "" {
+			var corr *correlation.Correlator
+			if beadsPath != "" {
+				corr = correlation.NewCorrelator(repoDir, beadsPath)
+			} else {
+				corr = correlation.NewCorrelator(repoDir)
+			}
+			rep, err := corr.WithContext(ctx).GenerateReport(localBeads, correlation.CorrelatorOptions{
+				Limit:             500,
+				CausalityBeadID:   localID,
+				TargetBeadAliases: aliases,
+				Revision:          asOfRev,
+			})
+			if err != nil {
+				lastErr = err
+			} else if rep != nil {
+				res = rep.BuildCausalityChainAt(localID, opts, refNow)
+				if res != nil && res.Chain != nil && beadID != "" {
+					res.Chain.BeadID = beadID
+				}
+			}
+		}
+		if res == nil && fallbackHist != nil && ctx.Err() == nil {
+			fbReport := &correlation.HistoryReport{
+				Histories: map[string]correlation.BeadHistory{beadID: *fallbackHist},
+			}
+			res = fbReport.BuildCausalityChainAt(beadID, opts, refNow)
+			if res != nil {
+				lastErr = nil
+			}
+		}
+		return CausalityLoadedMsg{
+			DataGeneration:    dataGen,
+			RequestGeneration: reqGen,
+			BeadID:            beadID,
+			Result:            res,
+			Error:             lastErr,
+		}
+	}
 }
 
 func (m *Model) resolveCommitRepoDir(sha string) string {
@@ -10785,7 +11164,8 @@ func (m *Model) syncSecondaryViewsForRepoScope(targetFocus focus) {
 	}
 	if m.historyFullReport != nil && m.historyReportDataGeneration == m.semanticDataGeneration {
 		m.historyView.SetReport(m.scopeHistoryReportForActiveRepos(m.historyFullReport))
-		m.historyView.SetOrphans(m.scopeHistoryOrphansForActiveRepos(m.historyFullOrphans), m.historyOrphanRatio)
+		scopedOrphans, scopedRatio := m.scopeHistoryOrphansForActiveRepos(m.historyFullOrphans)
+		m.historyView.SetOrphans(scopedOrphans, scopedRatio)
 		m.syncHistoryCassSessions()
 		if m.isSplitView || m.showDetails {
 			m.updateViewportContent()
@@ -10855,6 +11235,7 @@ func (m *Model) handleRepoPickerKeys(msg tea.KeyMsg) *Model {
 			m.activeRepos = selected
 			m.statusMsg = fmt.Sprintf("Repo filter: %s", formatRepoList(sortedRepoKeys(selected), 3))
 		}
+		repoStatus := m.statusMsg
 		m.etaCtx = nil
 		m.suggestionsCacheLoaded = false
 		m.suggestionsCache = nil
@@ -10868,18 +11249,28 @@ func (m *Model) handleRepoPickerKeys(msg tea.KeyMsg) *Model {
 		if m.savedViewFocus == focusVelocityComparison {
 			m.savedViewFocus = focusLabelDashboard
 		}
-		if m.activeRecipe != nil {
+		if m.timeTravelMode {
+			// P16A-10 / P17-3: Keep time-travel diff/modMap scoped to the newly active repo selection,
+			// exiting time-travel cleanly if the new repo scope has no beads history at timeTravelSince.
+			if strings.TrimSpace(m.timeTravelSince) != "" {
+				if m.enterTimeTravelMode(m.timeTravelSince) {
+					m.statusMsg = repoStatus + " • " + m.statusMsg
+					m.statusIsError = false
+				} else {
+					errMsg := m.statusMsg
+					m.exitTimeTravelMode()
+					m.statusMsg = errMsg
+					m.statusIsError = true
+				}
+			} else {
+				m.exitTimeTravelMode()
+				m.statusMsg = repoStatus + " • " + m.statusMsg
+				m.statusIsError = false
+			}
+		} else if m.activeRecipe != nil {
 			m.applyRecipe(m.activeRecipe)
 		} else {
 			m.applyFilter()
-		}
-		if m.timeTravelMode {
-			// P16A-10: Keep time-travel diff/modMap scoped to the newly active repo selection.
-			if strings.TrimSpace(m.timeTravelSince) != "" {
-				m.enterTimeTravelMode(m.timeTravelSince)
-			} else {
-				m.exitTimeTravelMode()
-			}
 		}
 		m.updateListDelegate()
 
@@ -12624,6 +13015,28 @@ func (m *Model) renderLabelHealthDetail(lh analysis.LabelHealth) string {
 			sb.WriteString("\n")
 		}
 	}
+	if len(m.labelHealthDetailTopUnblocks) > 0 {
+		limit := min(3, len(m.labelHealthDetailTopUnblocks))
+		parts := make([]string, 0, limit)
+		for i := 0; i < limit; i++ {
+			ub := m.labelHealthDetailTopUnblocks[i]
+			parts = append(parts, fmt.Sprintf("%s (+%d)", ub.IssueID, ub.UnblocksCount))
+		}
+		sb.WriteString(labelStyle.Render("Unblock first: "))
+		sb.WriteString(valStyle.Render(ansi.Truncate(strings.Join(parts, ", "), max(10, innerWidth-15), "…")))
+		sb.WriteString("\n\n")
+	}
+	if len(m.labelHealthDetailCooccurrence) > 0 {
+		limit := min(5, len(m.labelHealthDetailCooccurrence))
+		parts := make([]string, 0, limit)
+		for i := 0; i < limit; i++ {
+			co := m.labelHealthDetailCooccurrence[i]
+			parts = append(parts, fmt.Sprintf("%s (%d)", co.Label, co.Count))
+		}
+		sb.WriteString(labelStyle.Render("Co-occurs with: "))
+		sb.WriteString(valStyle.Render(ansi.Truncate(strings.Join(parts, ", "), max(10, innerWidth-16), "…")))
+		sb.WriteString("\n\n")
+	}
 
 	// Cross-Label Flow Table (incoming/outgoing dependencies)
 	if len(m.labelHealthDetailFlow.Incoming) > 0 || len(m.labelHealthDetailFlow.Outgoing) > 0 {
@@ -14059,6 +14472,38 @@ func (m *Model) refreshRecipeMetrics() {
 					values[id] = float64(value)
 				}
 				m.recipeMetricValues[name] = values
+			case "risk":
+				now := m.analysisReferenceTime().UTC()
+				readiness := m.exportReadiness()
+				issueValMap := make(map[string]model.Issue, len(m.issues))
+				for _, iss := range m.issues {
+					issueValMap[iss.ID] = iss
+				}
+				weights := analysis.DefaultRiskWeights()
+				values := make(map[string]float64, len(m.issues))
+				for _, iss := range m.issues {
+					if isGraphSortIneligible(iss) {
+						continue
+					}
+					issCopy := iss
+					sig := analysis.ComputeRiskSignalsWithReadiness(&issCopy, m.analysis, issueValMap, readiness, now, weights)
+					values[iss.ID] = sig.CompositeRisk
+				}
+				m.recipeMetricValues[name] = values
+			case "eta":
+				if etaCtx := m.etaContext(); etaCtx != nil {
+					values := make(map[string]float64, len(m.issues))
+					for _, iss := range m.issues {
+						if isGraphSortIneligible(iss) {
+							continue
+						}
+						est := etaCtx.EstimateForIssue(iss, 1)
+						if est.EstimatedDays > 0 && !est.ETADate.IsZero() {
+							values[iss.ID] = est.EstimatedDays
+						}
+					}
+					m.recipeMetricValues[name] = values
+				}
 			}
 		}
 	}
@@ -14321,6 +14766,22 @@ func (m *Model) refreshListItemsPhase2() {
 		}
 		items[i] = m.itemWithTriage(item)
 	}
+	if m.sortMode == SortTriage || m.sortMode == SortUnblocks || m.sortMode == SortRisk || m.sortMode == SortETA {
+		// Re-sort flat lists when Phase 2 updates triage/unblocks/risk/ETA scores.
+		allIssueItems := true
+		issuesForSort := make([]model.Issue, 0, len(items))
+		for _, it := range items {
+			if ii, ok := it.(IssueItem); ok {
+				issuesForSort = append(issuesForSort, ii.Issue)
+			} else {
+				allIssueItems = false
+				break
+			}
+		}
+		if allIssueItems && len(items) > 1 {
+			m.sortFilteredItems(items, issuesForSort)
+		}
+	}
 
 	m.replaceListPresentation(items, selectedID)
 	m.updateViewportContent()
@@ -14340,7 +14801,55 @@ func (m *Model) cycleSortMode() {
 	m.applyFilter() // Re-apply filter with new sort
 }
 
-func (m *Model) compareIssuesByCurrentSort(a, b model.Issue) bool {
+func isGraphSortIneligible(iss model.Issue) bool {
+	return isClosedLikeStatus(iss.Status) || iss.IsTemplate || iss.Pinned || iss.Status == model.StatusPinned
+}
+
+func (m *Model) buildSortDerivedMaps(issues []model.Issue) (riskScores map[string]float64, etaDays map[string]float64) {
+	if len(issues) == 0 {
+		return nil, nil
+	}
+	switch m.sortMode {
+	case SortRisk:
+		if m.analysis == nil {
+			return nil, nil
+		}
+		now := m.analysisReferenceTime().UTC()
+		readiness := m.exportReadiness()
+		issueValMap := make(map[string]model.Issue, len(m.issues))
+		for _, iss := range m.issues {
+			issueValMap[iss.ID] = iss
+		}
+		weights := analysis.DefaultRiskWeights()
+		riskScores = make(map[string]float64, len(issues))
+		for _, iss := range issues {
+			if isGraphSortIneligible(iss) {
+				continue
+			}
+			issCopy := iss
+			sig := analysis.ComputeRiskSignalsWithReadiness(&issCopy, m.analysis, issueValMap, readiness, now, weights)
+			riskScores[iss.ID] = sig.CompositeRisk
+		}
+	case SortETA:
+		etaCtx := m.etaContext()
+		if etaCtx == nil {
+			return nil, nil
+		}
+		etaDays = make(map[string]float64, len(issues))
+		for _, iss := range issues {
+			if isGraphSortIneligible(iss) {
+				continue
+			}
+			est := etaCtx.EstimateForIssue(iss, 1)
+			if est.EstimatedDays > 0 && !est.ETADate.IsZero() {
+				etaDays[iss.ID] = est.EstimatedDays
+			}
+		}
+	}
+	return riskScores, etaDays
+}
+
+func (m *Model) compareIssuesWithSortMaps(a, b model.Issue, riskScores, etaDays map[string]float64) bool {
 	if a.ID == b.ID {
 		return false
 	}
@@ -14361,6 +14870,75 @@ func (m *Model) compareIssuesByCurrentSort(a, b model.Issue) bool {
 		if !a.UpdatedAt.Equal(b.UpdatedAt) {
 			return a.UpdatedAt.After(b.UpdatedAt)
 		}
+	case SortTriage:
+		aInelig := isGraphSortIneligible(a)
+		bInelig := isGraphSortIneligible(b)
+		if aInelig != bInelig {
+			return !aInelig
+		}
+		if !aInelig {
+			aScore, aOK := m.triageScores[a.ID]
+			bScore, bOK := m.triageScores[b.ID]
+			if aOK != bOK {
+				return aOK
+			}
+			if aScore != bScore {
+				return aScore > bScore
+			}
+		}
+		if a.Priority != b.Priority {
+			return a.Priority < b.Priority
+		}
+	case SortUnblocks:
+		aClosed := isClosedLikeStatus(a.Status)
+		bClosed := isClosedLikeStatus(b.Status)
+		if aClosed != bClosed {
+			return !aClosed
+		}
+		if !aClosed {
+			aUb := len(m.unblocksMap[a.ID])
+			bUb := len(m.unblocksMap[b.ID])
+			if aUb != bUb {
+				return aUb > bUb
+			}
+		}
+		if a.Priority != b.Priority {
+			return a.Priority < b.Priority
+		}
+	case SortRisk:
+		aScore, aOK := riskScores[a.ID]
+		bScore, bOK := riskScores[b.ID]
+		if aOK != bOK {
+			return aOK
+		}
+		if aOK && aScore != bScore {
+			return aScore > bScore
+		}
+		aClosed := isClosedLikeStatus(a.Status)
+		bClosed := isClosedLikeStatus(b.Status)
+		if aClosed != bClosed {
+			return !aClosed
+		}
+		if a.Priority != b.Priority {
+			return a.Priority < b.Priority
+		}
+	case SortETA:
+		aDays, aOK := etaDays[a.ID]
+		bDays, bOK := etaDays[b.ID]
+		if aOK != bOK {
+			return aOK
+		}
+		if aOK && aDays != bDays {
+			return aDays < bDays
+		}
+		aClosed := isClosedLikeStatus(a.Status)
+		bClosed := isClosedLikeStatus(b.Status)
+		if aClosed != bClosed {
+			return !aClosed
+		}
+		if a.Priority != b.Priority {
+			return a.Priority < b.Priority
+		}
 	default:
 		aClosed := isClosedLikeStatus(a.Status)
 		bClosed := isClosedLikeStatus(b.Status)
@@ -14377,12 +14955,18 @@ func (m *Model) compareIssuesByCurrentSort(a, b model.Issue) bool {
 	return a.ID < b.ID
 }
 
+func (m *Model) compareIssuesByCurrentSort(a, b model.Issue) bool {
+	riskScores, etaDays := m.buildSortDerivedMaps([]model.Issue{a, b})
+	return m.compareIssuesWithSortMaps(a, b, riskScores, etaDays)
+}
+
 func (m *Model) sortIssuesByCurrentMode(issues []model.Issue) {
 	if len(issues) <= 1 {
 		return
 	}
+	riskScores, etaDays := m.buildSortDerivedMaps(issues)
 	sort.Slice(issues, func(i, j int) bool {
-		return m.compareIssuesByCurrentSort(issues[i], issues[j])
+		return m.compareIssuesWithSortMaps(issues[i], issues[j], riskScores, etaDays)
 	})
 }
 
@@ -14391,6 +14975,8 @@ func (m *Model) sortFilteredItems(items []list.Item, issues []model.Issue) {
 	if len(items) == 0 {
 		return
 	}
+
+	riskScores, etaDays := m.buildSortDerivedMaps(issues)
 
 	// Sort indices to keep items and issues in sync
 	indices := make([]int, len(items))
@@ -14401,7 +14987,7 @@ func (m *Model) sortFilteredItems(items []list.Item, issues []model.Issue) {
 	sort.Slice(indices, func(i, j int) bool {
 		iItem := items[indices[i]].(IssueItem)
 		jItem := items[indices[j]].(IssueItem)
-		return m.compareIssuesByCurrentSort(iItem.Issue, jItem.Issue)
+		return m.compareIssuesWithSortMaps(iItem.Issue, jItem.Issue, riskScores, etaDays)
 	})
 
 	// Reorder items and issues based on sorted indices
@@ -15959,7 +16545,7 @@ func (m *Model) evaluateTimeTravelCandidates(
 }
 
 // enterTimeTravelMode loads historical data and computes diff
-func (m *Model) enterTimeTravelMode(revision string) {
+func (m *Model) enterTimeTravelMode(revision string) bool {
 	workDir := strings.TrimSpace(m.workDir)
 	if workDir == "" && !m.workspaceMode {
 		var err error
@@ -15967,7 +16553,7 @@ func (m *Model) enterTimeTravelMode(revision string) {
 		if err != nil {
 			m.statusMsg = "❌ Time-travel failed: cannot get working directory"
 			m.statusIsError = true
-			return
+			return false
 		}
 	}
 
@@ -16188,7 +16774,7 @@ func (m *Model) enterTimeTravelMode(revision string) {
 				if inRepoScope {
 					m.statusMsg = fmt.Sprintf("❌ Time-travel failed: %v", err)
 					m.statusIsError = true
-					return
+					return false
 				}
 				continue
 			}
@@ -16252,12 +16838,12 @@ func (m *Model) enterTimeTravelMode(revision string) {
 		if gitRepos == 0 {
 			m.statusMsg = "❌ Time-travel requires a git repository"
 			m.statusIsError = true
-			return
+			return false
 		}
 		if reposWithBeads == 0 {
 			m.statusMsg = fmt.Sprintf("❌ No beads history at %s (try fewer commits back)", revision)
 			m.statusIsError = true
-			return
+			return false
 		}
 		if firstSHA != "" {
 			resolvedFromRev = firstSHA
@@ -16277,7 +16863,7 @@ func (m *Model) enterTimeTravelMode(revision string) {
 		if _, err := gitLoader.ResolveRevision("HEAD"); err != nil {
 			m.statusMsg = "❌ Time-travel requires a git repository"
 			m.statusIsError = true
-			return
+			return false
 		}
 
 		// Check if beads files exist at the revision
@@ -16285,7 +16871,7 @@ func (m *Model) enterTimeTravelMode(revision string) {
 		if err != nil || !hasBeads {
 			m.statusMsg = fmt.Sprintf("❌ No beads history at %s (try fewer commits back)", revision)
 			m.statusIsError = true
-			return
+			return false
 		}
 
 		// Load historical issues with commit timestamp and tombstones
@@ -16293,7 +16879,7 @@ func (m *Model) enterTimeTravelMode(revision string) {
 		if err != nil {
 			m.statusMsg = fmt.Sprintf("❌ Time-travel failed: %v", err)
 			m.statusIsError = true
-			return
+			return false
 		}
 		historicalIssues = report.Issues
 		histAuthIssues = make([]model.Issue, 0, len(report.Issues)+len(report.TombstoneIDs))
@@ -16431,6 +17017,7 @@ func (m *Model) enterTimeTravelMode(revision string) {
 
 	// Rebuild list items with diff info
 	m.rebuildListWithDiffInfo()
+	return true
 }
 
 // exitTimeTravelMode clears time-travel state
@@ -16473,6 +17060,46 @@ func (m Model) TimeTravelDiff() *analysis.SnapshotDiff {
 	return m.timeTravelDiff
 }
 
+func formatTimeTravelCodeSpan(raw string) string {
+	clean := strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(raw, "\r", " "), "\n", " "))
+	if clean == "" {
+		return "_(none)_"
+	}
+	maxRun, curRun := 0, 0
+	for i := 0; i < len(clean); i++ {
+		if clean[i] == '`' {
+			curRun++
+			if curRun > maxRun {
+				maxRun = curRun
+			}
+		} else {
+			curRun = 0
+		}
+	}
+	fence := strings.Repeat("`", maxRun+1)
+	if strings.HasPrefix(clean, "`") || strings.HasSuffix(clean, "`") {
+		return fence + " " + clean + " " + fence
+	}
+	return fence + clean + fence
+}
+
+func formatTimeTravelCycle(cyc []string) string {
+	if len(cyc) == 0 {
+		return ""
+	}
+	closed := cyc
+	if len(cyc) > 1 && cyc[0] != cyc[len(cyc)-1] {
+		closed = make([]string, len(cyc)+1)
+		copy(closed, cyc)
+		closed[len(cyc)] = cyc[0]
+	}
+	parts := make([]string, len(closed))
+	for i, id := range closed {
+		parts[i] = formatTimeTravelCodeSpan(id)
+	}
+	return strings.Join(parts, " → ")
+}
+
 // appendTimeTravelIssueDiffMarkdown renders field-level diffs, cycle deltas, and
 // snapshot-wide removed/cycle summaries inside the Detail Pane when Time-Travel is active (W29-1).
 func (m *Model) appendTimeTravelIssueDiffMarkdown(sb *strings.Builder, issueID string) {
@@ -16484,54 +17111,17 @@ func (m *Model) appendTimeTravelIssueDiffMarkdown(sb *strings.Builder, issueID s
 	if since == "" {
 		since = "baseline"
 	}
+	sinceSpan := formatTimeTravelCodeSpan(since)
 
 	var statusLines []string
 	if m.newIssueIDs[issueID] {
-		statusLines = append(statusLines, "- **Transition:** 🆕 **NEW** since `"+since+"`")
+		statusLines = append(statusLines, "- **Transition:** 🆕 **NEW** since "+sinceSpan)
 	}
 	if m.closedIssueIDs[issueID] {
-		statusLines = append(statusLines, "- **Transition:** ✅ **CLOSED** since `"+since+"`")
+		statusLines = append(statusLines, "- **Transition:** ✅ **CLOSED** since "+sinceSpan)
 	}
 	if m.reopenedIssueIDs[issueID] {
-		statusLines = append(statusLines, "- **Transition:** ↺ **REOPENED** since `"+since+"`")
-	}
-	formatTimeTravelCodeSpan := func(raw string) string {
-		clean := strings.TrimSpace(strings.ReplaceAll(strings.ReplaceAll(raw, "\r", " "), "\n", " "))
-		if clean == "" {
-			return "_(none)_"
-		}
-		maxRun, curRun := 0, 0
-		for i := 0; i < len(clean); i++ {
-			if clean[i] == '`' {
-				curRun++
-				if curRun > maxRun {
-					maxRun = curRun
-				}
-			} else {
-				curRun = 0
-			}
-		}
-		fence := strings.Repeat("`", maxRun+1)
-		if strings.HasPrefix(clean, "`") || strings.HasSuffix(clean, "`") {
-			return fence + " " + clean + " " + fence
-		}
-		return fence + clean + fence
-	}
-	formatTimeTravelCycle := func(cyc []string) string {
-		if len(cyc) == 0 {
-			return ""
-		}
-		closed := cyc
-		if len(cyc) > 1 && cyc[0] != cyc[len(cyc)-1] {
-			closed = make([]string, len(cyc)+1)
-			copy(closed, cyc)
-			closed[len(cyc)] = cyc[0]
-		}
-		parts := make([]string, len(closed))
-		for i, id := range closed {
-			parts[i] = formatTimeTravelCodeSpan(id)
-		}
-		return strings.Join(parts, " → ")
+		statusLines = append(statusLines, "- **Transition:** ↺ **REOPENED** since "+sinceSpan)
 	}
 	if mod := m.timeTravelModMap[issueID]; mod != nil && len(mod.Changes) > 0 {
 		statusLines = append(statusLines, fmt.Sprintf("- **Modified Fields (%d):**", len(mod.Changes)))
@@ -16567,7 +17157,7 @@ func (m *Model) appendTimeTravelIssueDiffMarkdown(sb *strings.Builder, issueID s
 	if len(statusLines) == 0 && !hasOverview {
 		return
 	}
-	sb.WriteString(fmt.Sprintf("### ⏱️ Changes Since `%s`\n", since))
+	sb.WriteString(fmt.Sprintf("### ⏱️ Changes Since %s\n", sinceSpan))
 	for _, ln := range statusLines {
 		sb.WriteString(ln + "\n")
 	}
@@ -16583,7 +17173,7 @@ func (m *Model) appendTimeTravelOverviewMarkdown(sb *strings.Builder) {
 	if since == "" {
 		since = "baseline"
 	}
-	sb.WriteString(fmt.Sprintf("### ⏱️ Time-Travel Summary Since `%s`\n", since))
+	sb.WriteString(fmt.Sprintf("### ⏱️ Time-Travel Summary Since %s\n", formatTimeTravelCodeSpan(since)))
 	if m.timeTravelDiff != nil {
 		s := m.timeTravelDiff.Summary
 		sb.WriteString(fmt.Sprintf("- **Delta:** +%d added • ✓%d closed • ~%d modified • ↺%d reopened • −%d removed\n",
@@ -16602,7 +17192,7 @@ func (m *Model) appendTimeTravelOverviewLines(sb *strings.Builder) {
 		limit := min(5, len(diff.RemovedIssues))
 		ids := make([]string, 0, limit)
 		for i := 0; i < limit; i++ {
-			ids = append(ids, "`"+diff.RemovedIssues[i].ID+"`")
+			ids = append(ids, formatTimeTravelCodeSpan(diff.RemovedIssues[i].ID))
 		}
 		extra := ""
 		if len(diff.RemovedIssues) > limit {
@@ -16610,20 +17200,11 @@ func (m *Model) appendTimeTravelOverviewLines(sb *strings.Builder) {
 		}
 		sb.WriteString(fmt.Sprintf("- **Removed Issues (%d):** %s%s\n", len(diff.RemovedIssues), strings.Join(ids, ", "), extra))
 	}
-	closeCycle := func(cyc []string) []string {
-		if len(cyc) > 1 && cyc[0] != cyc[len(cyc)-1] {
-			out := make([]string, len(cyc)+1)
-			copy(out, cyc)
-			out[len(cyc)] = cyc[0]
-			return out
-		}
-		return cyc
-	}
 	if len(diff.NewCycles) > 0 {
 		limit := min(3, len(diff.NewCycles))
 		parts := make([]string, 0, limit)
 		for i := 0; i < limit; i++ {
-			parts = append(parts, "`"+strings.Join(closeCycle(diff.NewCycles[i]), " → ")+"`")
+			parts = append(parts, formatTimeTravelCycle(diff.NewCycles[i]))
 		}
 		sb.WriteString(fmt.Sprintf("- **New Cycles (%d):** %s\n", len(diff.NewCycles), strings.Join(parts, "; ")))
 	}
@@ -16631,18 +17212,43 @@ func (m *Model) appendTimeTravelOverviewLines(sb *strings.Builder) {
 		limit := min(3, len(diff.ResolvedCycles))
 		parts := make([]string, 0, limit)
 		for i := 0; i < limit; i++ {
-			parts = append(parts, "`"+strings.Join(closeCycle(diff.ResolvedCycles[i]), " → ")+"`")
+			parts = append(parts, formatTimeTravelCycle(diff.ResolvedCycles[i]))
 		}
 		sb.WriteString(fmt.Sprintf("- **Resolved Cycles (%d):** %s\n", len(diff.ResolvedCycles), strings.Join(parts, "; ")))
 	}
 }
 
-func (m *Model) scopeHistoryOrphansForActiveRepos(orphans []correlation.OrphanCandidate) []correlation.OrphanCandidate {
-	if len(orphans) == 0 {
-		return nil
-	}
+func (m *Model) scopeHistoryOrphansForActiveRepos(orphans []correlation.OrphanCandidate) ([]correlation.OrphanCandidate, float64) {
 	if !m.workspaceMode || m.activeRepos == nil {
-		return orphans
+		if len(orphans) == 0 {
+			return nil, m.historyOrphanRatio
+		}
+		return orphans, m.historyOrphanRatio
+	}
+	scopedRatio := m.historyOrphanRatio
+	if len(m.historyOrphanRootStats) > 0 {
+		var orphanSum, totalSum int
+		for _, st := range m.historyOrphanRootStats {
+			include := len(st.RepoKeys) == 0
+			for _, rk := range st.RepoKeys {
+				if m.activeRepos[rk] {
+					include = true
+					break
+				}
+			}
+			if include {
+				orphanSum += st.OrphanCount
+				totalSum += st.TotalCommits
+			}
+		}
+		if totalSum > 0 {
+			scopedRatio = float64(orphanSum) / float64(totalSum)
+		} else {
+			scopedRatio = 0
+		}
+	}
+	if len(orphans) == 0 {
+		return nil, scopedRatio
 	}
 	out := make([]correlation.OrphanCandidate, 0, len(orphans))
 	for _, o := range orphans {
@@ -16663,7 +17269,7 @@ func (m *Model) scopeHistoryOrphansForActiveRepos(orphans []correlation.OrphanCa
 		cloned.ProbableBeads = kept
 		out = append(out, cloned)
 	}
-	return out
+	return out, scopedRatio
 }
 
 func (m *Model) baselineSaveBlockedReason() string {
@@ -18123,7 +18729,11 @@ func (m *Model) selectedIssueForActionWithReason() (*model.Issue, string) {
 		return m.resolveLiveIssue(sel.ID, sel), ""
 	case focusHistory:
 		var id string
-		if m.historyView.IsGitMode() {
+		if m.historyView.IsOrphansMode() {
+			if pb := m.historyView.SelectedOrphanProbableBead(); pb != nil {
+				id = pb.BeadID
+			}
+		} else if m.historyView.IsGitMode() {
 			id = m.historyView.SelectedRelatedBeadID()
 		} else {
 			id = m.historyView.SelectedBeadID()
@@ -18695,6 +19305,8 @@ func (m *Model) populateLabelHealthDetailExtras(label string) {
 	m.labelHealthDetailTrendSym = ""
 	m.labelHealthDetailAttention = nil
 	m.labelHealthDetailCascade = nil
+	m.labelHealthDetailCooccurrence = nil
+	m.labelHealthDetailTopUnblocks = nil
 
 	scopedIssues := m.repoScopedIssues()
 	refNow := m.analysisReferenceTime().UTC()
@@ -18743,12 +19355,40 @@ func (m *Model) populateLabelHealthDetailExtras(label string) {
 	}
 	flow := analysis.ComputeCrossLabelFlowWithScope(scopedIssues, cfg, m.candidateIDs)
 	cascades := analysis.ComputeBlockageCascadeAtWithScope(scopedIssues, flow, cfg, refNow, m.exportReadiness(), m.candidateIDs)
+	visibleScoped := make(map[string]bool, len(velIssues))
+	for _, iss := range velIssues {
+		visibleScoped[iss.ID] = true
+	}
 	for i := range cascades.Cascades {
 		if cascades.Cascades[i].SourceLabel == label {
 			c := cascades.Cascades[i]
 			m.labelHealthDetailCascade = &c
+			for _, rec := range c.Recommendations {
+				if len(visibleScoped) == 0 || visibleScoped[rec.IssueID] {
+					m.labelHealthDetailTopUnblocks = append(m.labelHealthDetailTopUnblocks, rec)
+				}
+			}
 			break
 		}
+	}
+	if cooc := analysis.GetLabelCooccurrence(velIssues); len(cooc[label]) > 0 {
+		items := make([]labelCount, 0, len(cooc[label]))
+		for peer, cnt := range cooc[label] {
+			if peer == label || cnt <= 0 {
+				continue
+			}
+			items = append(items, labelCount{Label: peer, Count: cnt})
+		}
+		sort.Slice(items, func(i, j int) bool {
+			if items[i].Count != items[j].Count {
+				return items[i].Count > items[j].Count
+			}
+			return items[i].Label < items[j].Label
+		})
+		if len(items) > 5 {
+			items = items[:5]
+		}
+		m.labelHealthDetailCooccurrence = items
 	}
 }
 
@@ -18956,10 +19596,7 @@ func (m *Model) alertOptions() alertComputeOptions {
 	}
 	label := strings.TrimSpace(m.scopeLabelFilter)
 	repo := strings.TrimSpace(m.scopeRepoFilter)
-	recipeName := ""
-	if m.activeRecipe != nil {
-		recipeName = strings.TrimSpace(m.activeRecipe.Name)
-	}
+	recipeName := strings.TrimSpace(m.scopeRecipeFilter)
 	var scope *baseline.BaselineScope
 	if label != "" || repo != "" || recipeName != "" || m.workspaceMode {
 		scope = &baseline.BaselineScope{
@@ -20140,7 +20777,11 @@ func (m *Model) focusedIssueForSessions() *model.Issue {
 		return nil
 	case focusHistory:
 		var id string
-		if m.historyView.IsGitMode() {
+		if m.historyView.IsOrphansMode() {
+			if pb := m.historyView.SelectedOrphanProbableBead(); pb != nil {
+				id = pb.BeadID
+			}
+		} else if m.historyView.IsGitMode() {
 			id = m.historyView.SelectedRelatedBeadID()
 		} else {
 			id = m.historyView.SelectedBeadID()

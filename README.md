@@ -4404,6 +4404,7 @@ bv has a comprehensive built-in help system:
 |  | `-` | Reject commit correlation |
 |  | `x` | Ignore commit correlation |
 |  | `O` | Toggle orphan commits audit |
+|  | `W` | Toggle causality & wait analysis |
 |  | `o` | Open in browser |
 |  | `h` | Close history view |
 | **flow** | `g` | Go to top |
