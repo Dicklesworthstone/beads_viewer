@@ -40,6 +40,24 @@ the latest tag, including installer changes usable with already released binarie
 
 ---
 
+## Unreleased
+
+### CLI, Robot Protocol, and Analysis
+- **Pre-flight dependency validation (`--robot-check-dep`):** add the 47th registered robot command (`--robot-check-dep fromID:toID[,from2:to2]`, intent alias `check-dep`) to validate proposed blocking edges against the full issue graph for cycles, readiness impact, cross-repo links, and writable same-origin command emission (`1b29841b`, `5bee30dc`, `eb4fab38`).
+- **Batch counterfactual simulation (`--robot-whatif <id1,id2>`):** add `ComputeWhatIfBatch` in `pkg/analysis` and batch support in `--robot-whatif` (emitting `batch_result` with `synergy_issue_ids` for jointly unblocked diamond dependents), while keeping single-ID `result` contracts intact and rejecting empty IDs (`86632206`, `518917b7`).
+- **Scoped plans and historical diffs:** honor `BV_ROBOT_NOT_READY_LABELS` / `--robot-not-ready-labels` in `--robot-plan` via `GetExecutionPlanWithOptions`, cap items inside tracks under `--robot-max-results` rather than dropping whole trailing tracks, scope workspace `--diff-since` across member repositories, and keep history orphan detection and label co-occurrence matrices strictly scoped (`5bee30dc`, `86632206`, `518917b7`).
+- **Recipe metrics:** accept `risk` and `eta` in `recipe.ViewMetrics` (`302f1b85`).
+
+### TUI and Static Exports
+- **Interactive graph dependency preflight & cut-vertex accuracy:** add `D` (check add dependency) and `c` (copy checked dep command) in Graph view with automatic stale-verdict invalidation on reload/scope/time-travel changes, and mark cut vertices only while active (`f2315d44`, `5abbc07e`).
+- **History causality, risk/ETA list sorts, and scoped time travel:** add `W` causality/wait analysis in History view, per-repo qualified history orphans, `SortRisk` (`Risk ↓`) and `SortETA` (`ETA ↑`) list sort modes, and scoped workspace time travel while aligning `O` keybindings across views (`33a8cbfc`, `2f375ac9`, `9c0cceb1`).
+- **Decision intelligence, batch what-if, diff summaries, and check-dep HUD in exports:** add decision-intel summaries, snapshot diff summaries, filtered what-if counts, computed requested metric columns, nil-issue guards in SQLite export, and interactive check-dep / batch what-if controls in HTML exports (`0177b16a`, `10ce5ebc`, `12851003`, `82b72c4a`, `f19e925a`, `7f955c6f`, `31ca0656`).
+
+### Documentation and Verification
+- **Registry-driven sort-mode docgen & post-`v0.28.0` docs parity:** derive `docgen.RenderSortModesTable()` from `ui.GetSortModeDocs()` covering all 9 `SortMode` values, update `README.md` (`nine distinct sort modes`, `risk`/`eta` recipe metrics, `--robot-check-dep` and batch `--robot-whatif` summary rows, `v0.28.0` archive examples), `SKILL.md`, and `docs/RELEASING.md` (`v0.27.0` and `v0.28.0` verification entries), add `c` to the Graph shortcuts sidebar, strip wall-clock compute durations from exported `data/triage.json` under `SOURCE_DATE_EPOCH` so `triage.json` and `coi-serviceworker.js` `OFFLINE_ASSETS` stay bit-identical under load, and isolate host `PATH` in `TestRobotAlertsSourceInconsistencyAndScopedLabelReadiness` so host-installed `bd` binaries do not affect synthetic Dolt workspace tests.
+
+---
+
 ## v0.28.0 — 2026-11-23
 
 Time-travel clusters, orphan-commit audit, one-pass static export companions,

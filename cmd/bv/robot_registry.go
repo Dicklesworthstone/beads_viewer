@@ -2480,7 +2480,7 @@ func registerPhaseThreeRobotHandlers(registry *RobotRegistry, cfg phaseThreeRobo
 	register("robot-blocker-chain", cfg.RobotBlockerChainFlag, "Output blocker chain analysis for an issue", func(ctx RobotContext) error {
 		return handleRobotBlockerChain(ctx, cfg)
 	})
-	register("robot-whatif", cfg.RobotWhatIfFlag, "Simulate completing an issue and output downstream unblock impact as JSON", func(ctx RobotContext) error {
+	register("robot-whatif", cfg.RobotWhatIfFlag, "Simulate completing one or more comma-separated issues and output downstream unblock impact as JSON", func(ctx RobotContext) error {
 		return handleRobotWhatIf(ctx, cfg)
 	})
 	register("robot-check-dep", cfg.RobotCheckDepFlag, "Validate proposed blocking dependency edge(s) for cycles and readiness impact before adding", func(ctx RobotContext) error {

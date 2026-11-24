@@ -494,16 +494,14 @@ func RenderKeysTable() string {
 	return strings.TrimSpace(sb.String())
 }
 
-// RenderSortModesTable generates the Markdown table of sort modes.
+// RenderSortModesTable generates the Markdown table of sort modes from pkg/ui.
 func RenderSortModesTable() string {
 	var sb strings.Builder
 	sb.WriteString("| Mode | Key Display | Ordering Logic | Use Case |\n")
 	sb.WriteString("|:---|:---:|:---|:---|\n")
-	sb.WriteString("| **Default** | `Default` | Priority (asc) → Created (desc) | Standard priority-driven workflow |\n")
-	sb.WriteString("| **Created ↑** | `Created ↑` | Creation date ascending (oldest first) | Audit: find long-standing issues |\n")
-	sb.WriteString("| **Created ↓** | `Created ↓` | Creation date descending (newest first) | Review: see recently created work |\n")
-	sb.WriteString("| **Priority** | `Priority` | Priority only (P0 → P4) | Pure priority triage |\n")
-	sb.WriteString("| **Updated** | `Updated` | Last update descending (newest first) | Activity tracking: see active issues |\n")
+	for _, mode := range ui.GetSortModeDocs() {
+		sb.WriteString(fmt.Sprintf("| **%s** | `%s` | %s | %s |\n", mode.Mode, mode.KeyDisplay, mode.OrderingLogic, mode.UseCase))
+	}
 	return strings.TrimSpace(sb.String())
 }
 

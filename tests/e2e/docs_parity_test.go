@@ -2,6 +2,7 @@ package main_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -2438,6 +2439,172 @@ func TestDocsParity_RC40CrossDocumentTruthAndNegativeControls(t *testing.T) {
 				Expected:  "gg jumps back to first node in Tree view",
 				Observed:  "tree view after gg did not match initial top view",
 			}))
+		}
+	})
+}
+
+// TestDocsParity_SortModesRecipeMetricsAndPostV028Examples verifies that the
+// README sort modes table, recipe presentation metrics list, Robot Protocol
+// Commands summary table, and post-v0.28.0 CLI examples (--robot-check-dep and
+// batch --robot-whatif) match live code with planted negative controls.
+func TestDocsParity_SortModesRecipeMetricsAndPostV028Examples(t *testing.T) {
+	readme := repoFile(t, "README.md")
+
+	t.Run("sort_modes_table_and_prose_match_ui", func(t *testing.T) {
+		checkSortModes := func(doc string) error {
+			if strings.Contains(doc, "five distinct sort modes") {
+				return fmt.Errorf("README.md still claims five distinct sort modes")
+			}
+			startMarker := "<!-- bv:generated:sort-modes -->"
+			startIdx := strings.Index(doc, startMarker)
+			if startIdx < 0 {
+				return fmt.Errorf("README.md missing %s marker", startMarker)
+			}
+			rest := doc[startIdx:]
+			endIdx := strings.Index(rest, "<!-- /bv:generated -->")
+			if endIdx < 0 {
+				return fmt.Errorf("README.md missing closing generated marker for sort-modes")
+			}
+			section := rest[:endIdx]
+			for _, mode := range ui.GetSortModeDocs() {
+				if !strings.Contains(section, "`"+mode.KeyDisplay+"`") {
+					return fmt.Errorf("README.md sort modes table missing %q", mode.KeyDisplay)
+				}
+			}
+			return nil
+		}
+		if err := checkSortModes(readme); err != nil {
+			t.Fatal(err)
+		}
+		stale := strings.ReplaceAll(readme, "nine distinct sort modes", "five distinct sort modes")
+		if err := checkSortModes(stale); err == nil {
+			t.Fatal("negative control failed: stale five-mode prose unexpectedly passed")
+		}
+		missingRisk := strings.ReplaceAll(readme, "`Risk ↓`", "`Removed`")
+		if err := checkSortModes(missingRisk); err == nil {
+			t.Fatal("negative control failed: missing Risk sort mode unexpectedly passed")
+		}
+	})
+
+	t.Run("recipe_view_metrics_documented_in_readme", func(t *testing.T) {
+		checkMetrics := func(doc string) error {
+			idx := strings.Index(doc, "| `metrics` |")
+			if idx < 0 {
+				return fmt.Errorf("README.md missing recipe `metrics` documentation row")
+			}
+			end := strings.Index(doc[idx:], "\n")
+			row := doc[idx:]
+			if end != -1 {
+				row = doc[idx : idx+end]
+			}
+			for _, metric := range recipe.ViewMetrics {
+				if !strings.Contains(row, "`"+metric+"`") {
+					return fmt.Errorf("README.md recipe metrics row missing ViewMetrics entry %q: %s", metric, row)
+				}
+			}
+			return nil
+		}
+		if err := checkMetrics(readme); err != nil {
+			t.Fatal(err)
+		}
+		stale := strings.Replace(readme, ", `risk`, `eta`.", ".", 1)
+		if err := checkMetrics(stale); err == nil {
+			t.Fatal("negative control failed: README recipe metrics row missing risk/eta unexpectedly passed")
+		}
+	})
+
+	t.Run("robot_summary_table_and_live_check_dep_and_batch_whatif", func(t *testing.T) {
+		start := strings.Index(readme, "### Robot Protocol Commands")
+		end := strings.Index(readme, "Issue-backed analysis commands support `--as-of <ref>`")
+		if start < 0 || end <= start {
+			t.Fatal("could not locate README Robot Protocol Commands summary table")
+		}
+		summaryTable := readme[start:end]
+		if !strings.Contains(summaryTable, "`--robot-check-dep") {
+			t.Fatalf("README Robot Protocol Commands summary table missing --robot-check-dep")
+		}
+		if !strings.Contains(summaryTable, "`--robot-whatif <id>[,id2,...]`") {
+			t.Fatalf("README Robot Protocol Commands summary table missing batch --robot-whatif syntax")
+		}
+
+		bv := buildBvBinary(t)
+		dir := t.TempDir()
+		beadsDir := filepath.Join(dir, ".beads")
+		if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		fixture := strings.Join([]string{
+			`{"id":"A","title":"Root A","status":"open","priority":1,"issue_type":"task","created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-25T00:00:00Z"}`,
+			`{"id":"B","title":"Root B","status":"open","priority":1,"issue_type":"task","created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-25T00:00:00Z"}`,
+			`{"id":"C","title":"Diamond child","status":"open","priority":1,"issue_type":"task","dependencies":[{"issue_id":"C","depends_on_id":"A","type":"blocks"},{"issue_id":"C","depends_on_id":"B","type":"blocks"}],"created_at":"2026-08-02T00:00:00Z","updated_at":"2026-08-25T00:00:00Z"}`,
+		}, "\n") + "\n"
+		if err := os.WriteFile(filepath.Join(beadsDir, "issues.jsonl"), []byte(fixture), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		checkCtx, checkCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer checkCancel()
+		checkCmd := exec.CommandContext(checkCtx, bv, "--robot-check-dep", "A:C,A:B")
+		checkCmd.Dir = dir
+		checkCmd.Env = append(os.Environ(), "BV_NO_BROWSER=1", "BV_TEST_MODE=1", "SOURCE_DATE_EPOCH=1788220800")
+		var checkErr bytes.Buffer
+		checkCmd.Stderr = &checkErr
+		checkOut, err := checkCmd.Output()
+		if err != nil {
+			t.Fatalf("--robot-check-dep A:C,A:B failed: %v\nstderr: %s", err, checkErr.String())
+		}
+		var checkPayload struct {
+			AllSafe      bool `json:"all_safe"`
+			CheckedCount int  `json:"checked_count"`
+			CycleCount   int  `json:"cycle_count"`
+			Results      []struct {
+				FromID     string `json:"from_id"`
+				ToID       string `json:"to_id"`
+				CanAdd     bool   `json:"can_add"`
+				WouldCycle bool   `json:"would_cycle"`
+			} `json:"results"`
+		}
+		if err := json.Unmarshal(checkOut, &checkPayload); err != nil {
+			t.Fatalf("decode --robot-check-dep output: %v\n%s", err, checkOut)
+		}
+		if checkPayload.CheckedCount != 2 || checkPayload.CycleCount != 1 || checkPayload.AllSafe {
+			t.Fatalf("unexpected --robot-check-dep summary: %+v", checkPayload)
+		}
+		if len(checkPayload.Results) != 2 || !checkPayload.Results[0].WouldCycle || checkPayload.Results[0].CanAdd || checkPayload.Results[1].WouldCycle || !checkPayload.Results[1].CanAdd {
+			t.Fatalf("unexpected --robot-check-dep results: %+v", checkPayload.Results)
+		}
+
+		whatIfCtx, whatIfCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer whatIfCancel()
+		whatIfCmd := exec.CommandContext(whatIfCtx, bv, "--robot-whatif", "A,B")
+		whatIfCmd.Dir = dir
+		whatIfCmd.Env = append(os.Environ(), "BV_NO_BROWSER=1", "BV_TEST_MODE=1", "SOURCE_DATE_EPOCH=1788220800")
+		var whatIfErr bytes.Buffer
+		whatIfCmd.Stderr = &whatIfErr
+		whatIfOut, err := whatIfCmd.Output()
+		if err != nil {
+			t.Fatalf("--robot-whatif A,B failed: %v\nstderr: %s", err, whatIfErr.String())
+		}
+		var batchPayload struct {
+			BatchResult struct {
+				SynergyUnblocks int      `json:"synergy_unblocks"`
+				SynergyIssueIDs []string `json:"synergy_issue_ids"`
+			} `json:"batch_result"`
+		}
+		if err := json.Unmarshal(whatIfOut, &batchPayload); err != nil {
+			t.Fatalf("decode --robot-whatif A,B output: %v\n%s", err, whatIfOut)
+		}
+		if batchPayload.BatchResult.SynergyUnblocks != 1 || len(batchPayload.BatchResult.SynergyIssueIDs) != 1 || batchPayload.BatchResult.SynergyIssueIDs[0] != "C" {
+			t.Fatalf("unexpected batch what-if synergy: %+v", batchPayload.BatchResult)
+		}
+
+		badCtx, badCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer badCancel()
+		badCmd := exec.CommandContext(badCtx, bv, "--robot-whatif", "A,MISSING-999")
+		badCmd.Dir = dir
+		badCmd.Env = append(os.Environ(), "BV_NO_BROWSER=1", "BV_TEST_MODE=1", "SOURCE_DATE_EPOCH=1788220800")
+		if badOut, err := badCmd.CombinedOutput(); err == nil {
+			t.Fatalf("negative control failed: --robot-whatif A,MISSING-999 exited 0:\n%s", badOut)
 		}
 	})
 }

@@ -996,6 +996,20 @@ func (e *SQLiteExporter) writeRobotOutputs(bundle *Bundle, dataDir string) error
 		if e.envelopeClaimsUnproven(&triageOut) {
 			suppressExportGroupedClaims(&triageOut)
 		}
+		if _, reproducible := sourceDateEpochTime(); reproducible {
+			// Strip non-deterministic wall-clock compute timings so data/triage.json
+			// and coi-serviceworker.js OFFLINE_ASSETS stay bit-identical under SOURCE_DATE_EPOCH.
+			triageOut.Meta.ComputeTimeMs = 0
+			triageOut.Status.PageRank.Elapsed = 0
+			triageOut.Status.Betweenness.Elapsed = 0
+			triageOut.Status.Eigenvector.Elapsed = 0
+			triageOut.Status.HITS.Elapsed = 0
+			triageOut.Status.Critical.Elapsed = 0
+			triageOut.Status.Cycles.Elapsed = 0
+			triageOut.Status.KCore.Elapsed = 0
+			triageOut.Status.Articulation.Elapsed = 0
+			triageOut.Status.Slack.Elapsed = 0
+		}
 		if err := e.writeRobotJSON(bundle, filepath.Join(dataDir, "triage.json"), &triageOut); err != nil {
 			return fmt.Errorf("write triage.json: %w", err)
 		}

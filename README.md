@@ -52,11 +52,11 @@ scoop install dicklesworthstone/bv
 ```
 
 Homebrew and Scoop select the version in their published manifests. To pin
-v0.26.0, use a verified release archive below. See the [distribution checks](docs/RELEASING.md#native-installation-and-package-stores) for version and checksum details.
+a specific release such as `v0.28.0`, use a verified release archive below. See the [distribution checks](docs/RELEASING.md#native-installation-and-package-stores) for version and checksum details.
 
 ### Alternative: Direct Download
 
-Pick the archive for your platform from the [latest release page](https://github.com/Dicklesworthstone/beads_viewer/releases/latest). Archives are named `bv_<version>_<os>_<arch>.tar.gz` (`.zip` on Windows), for example `bv_0.26.0_linux_amd64.tar.gz`, `bv_0.26.0_darwin_arm64.tar.gz`, `bv_0.26.0_windows_amd64.zip`, so a downloaded file always says which release it came from. Every release also ships `checksums.txt`; verify before extracting:
+Pick the archive for your platform from the [latest release page](https://github.com/Dicklesworthstone/beads_viewer/releases/latest). Archives are named `bv_<version>_<os>_<arch>.tar.gz` (`.zip` on Windows), for example `bv_0.28.0_linux_amd64.tar.gz`, `bv_0.28.0_darwin_arm64.tar.gz`, `bv_0.28.0_windows_amd64.zip`, so a downloaded file always says which release it came from. Every release also ships `checksums.txt`; verify before extracting:
 
 ```bash
 sha256sum -c --ignore-missing checksums.txt
@@ -81,12 +81,12 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/9f7
 # Pinned to a reviewed commit; read it first: https://github.com/Dicklesworthstone/beads_viewer/blob/9f7d0b703d845f2c050e6fdcd68887414e2b1a3f/install.ps1
 irm "https://raw.githubusercontent.com/Dicklesworthstone/beads_viewer/9f7d0b703d845f2c050e6fdcd68887414e2b1a3f/install.ps1" | iex
 ```
-> **Note:** The pinned installer above downloads the Windows release zip, verifies it against the release `checksums.txt` with `Get-FileHash`, and refuses anything that does not verify; no Go toolchain is needed. Pass `-Version v0.26.0` to pin a release or `-InstallDir` to choose the folder (default `%LOCALAPPDATA%\Programs\bv`). Scoop installs the archive selected by its manifest. For best display, use Windows Terminal with a [Nerd Font](https://www.nerdfonts.com/).
+> **Note:** The pinned installer above downloads the Windows release zip, verifies it against the release `checksums.txt` with `Get-FileHash`, and refuses anything that does not verify; no Go toolchain is needed. Pass `-Version v0.28.0` to pin a release or `-InstallDir` to choose the folder (default `%LOCALAPPDATA%\Programs\bv`). Scoop installs the archive selected by its manifest. For best display, use Windows Terminal with a [Nerd Font](https://www.nerdfonts.com/).
 
 For a source build, use `install.ps1` from this checkout (requires Git and Go 1.26.11+):
 
 ```powershell
-.\install.ps1 -FromSource -Version v0.26.0
+.\install.ps1 -FromSource -Version v0.28.0
 ```
 
 This source path builds a verified checkout of the requested tag with that tag's vendored dependencies, checks the executable's version and Git revision before installation, and retains diagnostics on failure. The pinned installer above uses the same verified source-build path. Selecting an older release tag does not include later, unreleased fixes from this checkout.
@@ -1182,7 +1182,7 @@ presentation fields configure the existing list, details, and graph:
 | `view.columns` | Ordered columns: `id`, `title`, `status`, `priority`, `assignee`, `repo` (`source_repo`), `created`, `updated`, `tags`, `blockers`. Empty uses the ordinary adaptive row. |
 | `view.show_graph` | Opens the dependency graph when selecting the recipe. Later keyboard navigation is preserved across refreshes. |
 | `view.show_metrics` | Shows PageRank, impact, and triage values in rows and issue details. Unavailable metrics display an em dash in rows and `unavailable` in details. |
-| `metrics` | Selects displayed metrics and enables metric display: `pagerank`, `betweenness`, `impact`, `triage`, `hub`, `authority`, `eigenvector`, `kcore`, `slack`. |
+| `metrics` | Selects displayed metrics and enables metric display: `pagerank`, `betweenness`, `impact`, `triage`, `hub`, `authority`, `eigenvector`, `kcore`, `slack`, `risk`, `eta`. |
 | `view.group_by` | Groups the list by `status`, `priority`, `assignee`, `repo` (`source_repo`), or `tag` (`label`/`labels`); `none` disables groups. Tag grouping uses the first alphabetically sorted label, or `untagged`. |
 | `view.collapsed` | Starts groups collapsed. Enter or Space on a group expands/collapses it; search still includes collapsed issues. |
 | `view.truncate_title` | Maximum title display cells, including ellipsis; respects wide Unicode characters. Zero uses available width. |
@@ -1656,18 +1656,22 @@ Press `Tab` to open a **side panel** with the full issue detail view (on wide te
 
 ## 🔄 List Sorting: Multi-Dimensional Organization
 
-Press `s` to cycle through **five distinct sort modes**, giving you instant control over how issues are organized. The current sort mode is displayed in the status bar.
+Press `s` to cycle through **nine distinct sort modes**, giving you instant control over how issues are organized. The current sort mode is displayed in the status bar.
 
 ### Sort Modes
 
 <!-- bv:generated:sort-modes -->
 | Mode | Key Display | Ordering Logic | Use Case |
 |:---|:---:|:---|:---|
-| **Default** | `Default` | Priority (asc) → Created (desc) | Standard priority-driven workflow |
+| **Default** | `Default` | Active before closed → Priority (asc) → Created (desc) | Standard priority-driven workflow |
 | **Created ↑** | `Created ↑` | Creation date ascending (oldest first) | Audit: find long-standing issues |
 | **Created ↓** | `Created ↓` | Creation date descending (newest first) | Review: see recently created work |
 | **Priority** | `Priority` | Priority only (P0 → P4) | Pure priority triage |
 | **Updated** | `Updated` | Last update descending (newest first) | Activity tracking: see active issues |
+| **Triage ↓** | `Triage ↓` | Active before closed/pinned/template → Triage impact score (desc) → Priority (asc) | Graph-weighted impact prioritization |
+| **Unblocks ↓** | `Unblocks ↓` | Active before closed → Direct unblock count (desc) → Priority (asc) | Bottleneck clearing: maximize unblocked work |
+| **Risk ↓** | `Risk ↓` | Operational risk score (desc) → Active before closed → Priority (asc) | Risk management: surface highest-risk items |
+| **ETA ↑** | `ETA ↑` | Estimated days to completion (asc) → Active before closed → Priority (asc) | Quick-win focus: soonest estimated completion |
 <!-- /bv:generated -->
 
 ### Design Philosophy
@@ -3263,7 +3267,8 @@ These commands output **structured JSON** designed for programmatic consumption:
 | `--robot-insights` | Graph metrics + top N lists | Project health assessment |
 | `--robot-plan` | Actionable tracks + dependencies | Work queue generation |
 | `--robot-priority` | Priority recommendations | Automated priority fixing |
-| `--robot-whatif <id>` | Counterfactual impact delta if an issue completes | Unblock & priority simulation |
+| `--robot-whatif <id>[,id2,...]` | Counterfactual unblock delta for one issue (`result`) or joint batch synergy (`batch_result`) | Unblock & priority simulation |
+| `--robot-check-dep <from:to>[,...]` | Pre-flight cycle, readiness, and cross-repo check for proposed blocking edges | Safe dependency validation |
 | `--robot-search` | Hashed keyword or graph-weighted hybrid search (with `--search <query>`) | Issue discovery |
 | `--robot-history` | Bead-to-commit correlations | Code change tracking |
 | `--bead-history <id>` | Single-bead commit correlation history | Scoped code provenance |
@@ -3457,7 +3462,7 @@ bv --robot-triage --format toon --stats           # Show JSON vs TOON token esti
 | `--robot-triage` | bool | `false` | Output unified triage as JSON (the mega-command for AI agents) | Robot & Planning Flags |
 | `--robot-triage-by-label` | bool | `false` | Group triage recommendations by label (bv-87) | Robot & Planning Flags |
 | `--robot-triage-by-track` | bool | `false` | Group triage recommendations by execution track (bv-87) | Robot & Planning Flags |
-| `--robot-whatif` | string | (empty) | Simulate completing issue ID and output downstream unblock impact as JSON | Robot & Planning Flags |
+| `--robot-whatif` | string | (empty) | Simulate completing issue ID(s) (comma-separated for batch) and output downstream unblock impact as JSON | Robot & Planning Flags |
 | `--schema-command` | string | (empty) | Output schema for specific command only (e.g., robot-triage) | Robot & Planning Flags |
 | `--suggest-bead` | string | (empty) | Filter suggestions for specific bead ID | Robot & Planning Flags |
 | `--suggest-confidence` | float64 | `0` | Minimum confidence for suggestions (0.0-1.0) | Robot & Planning Flags |

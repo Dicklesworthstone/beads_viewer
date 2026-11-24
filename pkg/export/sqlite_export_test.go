@@ -1285,7 +1285,10 @@ func TestSQLiteExporter_SourceDateEpochDeterminismAndChunkForwardSlashes(t *test
 	}
 
 	dir1 := filepath.Join(t.TempDir(), "bundle1")
-	if err := buildExporter().Export(dir1); err != nil {
+	exp1 := buildExporter()
+	exp1.Triage.Meta.ComputeTimeMs = 7
+	exp1.Triage.Status.PageRank.Elapsed = 3 * time.Millisecond
+	if err := exp1.Export(dir1); err != nil {
 		t.Fatalf("first Export failed: %v", err)
 	}
 	if err := EmbedAssetsWithSubtitle(dir1, "Deterministic Dashboard", ""); err != nil {
@@ -1296,7 +1299,10 @@ func TestSQLiteExporter_SourceDateEpochDeterminismAndChunkForwardSlashes(t *test
 	time.Sleep(1100 * time.Millisecond)
 
 	dir2 := filepath.Join(t.TempDir(), "bundle2")
-	if err := buildExporter().Export(dir2); err != nil {
+	exp2 := buildExporter()
+	exp2.Triage.Meta.ComputeTimeMs = 42
+	exp2.Triage.Status.PageRank.Elapsed = 19 * time.Millisecond
+	if err := exp2.Export(dir2); err != nil {
 		t.Fatalf("second Export failed: %v", err)
 	}
 	if err := EmbedAssetsWithSubtitle(dir2, "Deterministic Dashboard", ""); err != nil {
@@ -1315,6 +1321,7 @@ func TestSQLiteExporter_SourceDateEpochDeterminismAndChunkForwardSlashes(t *test
 		"beads.sqlite3",
 		"beads.sqlite3.config.json",
 		filepath.Join("data", "meta.json"),
+		filepath.Join("data", "triage.json"),
 		filepath.Join("data", "graph_layout.json"),
 		"index.html",
 		"coi-serviceworker.js",

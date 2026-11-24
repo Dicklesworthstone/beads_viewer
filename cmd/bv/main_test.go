@@ -6354,14 +6354,15 @@ func TestRobotAlertsSourceInconsistencyAndScopedLabelReadiness(t *testing.T) {
 		t.Fatalf("expected --check-drift exit code 2 for warning source_inconsistency, got err=%v\n%s", checkErr, string(checkOut))
 	}
 
-	// Dolt workspace (.beads/dolt + metadata.json backend=dolt) ignores retired beads.db
+	// Dolt workspace (.beads/dolt + metadata.json backend=dolt) ignores retired beads.db.
+	// Isolate PATH so a host-installed bd CLI is not invoked against the synthetic empty .beads/dolt directory.
 	if err := os.MkdirAll(filepath.Join(beadsDir, "dolt"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), []byte(`{"backend":"dolt"}`+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	doltAlertsOut, stderr, err := runCommandWithTimeout(t, driftDir, exe, "--robot-alerts", "--alert-type", "source_inconsistency")
+	doltAlertsOut, stderr, err := runCommandWithEnv(t, driftDir, []string{"PATH=" + t.TempDir()}, exe, "--robot-alerts", "--alert-type", "source_inconsistency")
 	if err != nil {
 		t.Fatalf("dolt --robot-alerts failed: %v\nstderr: %s", err, stderr)
 	}

@@ -14,6 +14,7 @@ import (
 	"github.com/Dicklesworthstone/beads_viewer/internal/docgen"
 	"github.com/Dicklesworthstone/beads_viewer/internal/env"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/drift"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/ui"
 )
 
 func TestDocgen_RenderEnvTable(t *testing.T) {
@@ -222,6 +223,18 @@ func TestDocgen_PreservesDollarLiterals(t *testing.T) {
 	for _, literal := range []string{"Open in $EDITOR", "$1", "${PATH}", "$$"} {
 		if !strings.Contains(got, literal) {
 			t.Errorf("expected output to preserve literal %q, got:\n%s", literal, got)
+		}
+	}
+}
+
+func TestDocgen_RenderSortModesTable(t *testing.T) {
+	table := docgen.RenderSortModesTable()
+	if !strings.Contains(table, "| Mode | Key Display | Ordering Logic | Use Case |") {
+		t.Fatalf("sort modes table missing header:\n%s", table)
+	}
+	for _, mode := range ui.GetSortModeDocs() {
+		if !strings.Contains(table, "`"+mode.KeyDisplay+"`") {
+			t.Errorf("sort modes table missing mode %q", mode.KeyDisplay)
 		}
 	}
 }

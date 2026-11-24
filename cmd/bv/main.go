@@ -1949,7 +1949,7 @@ func main() {
 	// Blocker chain analysis flag (bv-nlo0)
 	robotBlockerChain := flag.String("robot-blocker-chain", "", "Output full blocker chain analysis for issue ID as JSON")
 	// What-if impact simulation flag (bv-apal.36)
-	robotWhatIf := flag.String("robot-whatif", "", "Simulate completing issue ID and output downstream unblock impact as JSON")
+	robotWhatIf := flag.String("robot-whatif", "", "Simulate completing issue ID(s) (comma-separated for batch) and output downstream unblock impact as JSON")
 	// Pre-flight dependency cycle & readiness impact validator (W29-5)
 	robotCheckDep := flag.String("robot-check-dep", "", "Validate proposed blocking dependency edge(s) for cycles and readiness impact before adding (format: fromID:toID[,from2:to2])")
 	// Coding agent session search correlation flag (bv-apal.88)
@@ -10975,7 +10975,7 @@ func robotCommandDocs() map[string]robotCommandDoc {
 		},
 		"robot-whatif": {
 			Flag:        "--robot-whatif <id>",
-			Description: "Simulate completing an issue and report direct/transitive downstream unblocks.",
+			Description: "Simulate completing one or more comma-separated issues and report direct/transitive downstream unblocks (single result or batch_result with synergy).",
 			KeyFields:   []string{"result.issue_id", "result.delta.direct_unblocks", "result.delta.transitive_unblocks", "result.delta.blocked_reduction", "result.delta.parallelization_gain", "result.delta.unblocked_issue_ids"},
 			NeedsIssues: true,
 		},

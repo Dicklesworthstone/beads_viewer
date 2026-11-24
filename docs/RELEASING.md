@@ -242,6 +242,34 @@ or when that release is superseded; retention/deletion follows maintainer policy
 
 ## Native installation and package stores
 
+### v0.28.0 verification (2026-11-23)
+
+Published at 17:10 UTC from clean revision `88664e48` after all 11 release-gate
+stages (including Stage 11 `govulncheck` and Stage 7 pinned WASM source rebuild)
+passed with `eligible: true` on Go 1.26.11 (`CGO_ENABLED=0`). All 14 release
+assets (five platform archives, five per-archive `.sha256` files,
+`checksums.txt`, `SHA256SUMS`, `release-gate-receipt.json`, and the Linux amd64
+SPDX SBOM) were published. Homebrew (`Formula/bv.rb` at `4b2be87`, four
+macOS/Linux targets) and Scoop (`bv.json` at `63fc917`, Windows amd64) match
+all five archive SHA-256 digests in `checksums.txt`.
+
+Post-publication Linux amd64 verification checked:
+- `bv_0.28.0_linux_amd64.tar.gz` SHA-256 (`6b11b1c652e35b900465e30c59fa5dcd08d289e1bc0e5fee370660c893c34b4b`), extracted binary SHA-256 (`097808f3aa785e7da58c134e70e815de9d6a8947759c6bbe75f753e39d210212`), `go version -m` (`go1.26.11`, `CGO_ENABLED=0`, `vcs.revision=88664e48863ab1959463caadfc67b39689083485`, `vcs.modified=false`), `--version` (`bv v0.28.0`), and `--robot-capabilities` (46 registered commands at `v0.28.0`; `--robot-check-dep` was added post-`v0.28.0` on `main`).
+- `tests/scripts/install_sh_test.sh` against real `v0.28.0` and `v0.27.0` archives passed all six positive and failed-install preservation controls (`matching-release`, `wrong-version`, `corrupt-checksum`, `corrupt-archive`, `missing-checksum`, `missing-binary`).
+- Live `install.sh --version v0.27.0` into an isolated directory containing spaces, followed by `--check-update`, `--update --yes` (`v0.27.0` to `v0.28.0`), idempotent `--update --yes`, `--rollback` (`v0.28.0` to `v0.27.0`), and re-update to `v0.28.0`, produced the exact packaged binary SHA-256.
+- Dual-binary vision checks (six-issue readiness/label/search counterexample, partial and colliding-ID workspaces, `--as-of HEAD~1` action withholding, and copied README `sprint-review` recipe exports in Markdown/JSON/CSV/Mermaid) passed on both packaged `v0.28.0` and compiled `main`.
+
+Physical `darwin/amd64` and `linux/arm64` hardware execution (as well as native
+`v0.28.0` execution on Windows, macOS arm64, and Nix) remain outside this Linux
+amd64 verification and stay explicitly tracked under `bv-oonu.9` / `bv-oonu.10`.
+
+### v0.27.0 verification (2026-11-21)
+
+Published at 12:34 UTC from clean revision `2ccf44e0` after all 11 release-gate
+stages passed with `eligible: true` on Go 1.26.11 (`CGO_ENABLED=0`), shipping
+the 14-asset contract with Homebrew (`9db4921`) and Scoop (`6a63772`) manifest
+updates.
+
 ### v0.25.2 verification (2026-10-01)
 
 Published at 04:07 UTC from `721353e7` after all ten gate stages passed

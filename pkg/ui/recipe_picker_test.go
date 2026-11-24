@@ -541,3 +541,19 @@ func TestRecipeSelectionResetsManualSortAndSnapshotRepoScopedMaxItems(t *testing
 		t.Fatalf("SnapshotReadyMsg starved active repo 'api' under MaxItems=2: got %+v, want [api-2 api-1]", scopedGot)
 	}
 }
+
+func TestGetSortModeDocs_MatchesAllSortModes(t *testing.T) {
+	docs := GetSortModeDocs()
+	if len(docs) != int(numSortModes) {
+		t.Fatalf("GetSortModeDocs() returned %d modes, want %d (numSortModes)", len(docs), numSortModes)
+	}
+	for i := SortMode(0); i < numSortModes; i++ {
+		d := docs[i]
+		if d.KeyDisplay != i.String() {
+			t.Errorf("docs[%d].KeyDisplay = %q, want %q", i, d.KeyDisplay, i.String())
+		}
+		if d.Mode == "" || d.OrderingLogic == "" || d.UseCase == "" {
+			t.Errorf("docs[%d] has empty documentation field: %+v", i, d)
+		}
+	}
+}

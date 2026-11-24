@@ -151,6 +151,74 @@ func (s SortMode) String() string {
 	}
 }
 
+// SortModeDoc describes a single list sort mode for documentation and parity checks.
+type SortModeDoc struct {
+	Mode          string
+	KeyDisplay    string
+	OrderingLogic string
+	UseCase       string
+}
+
+// GetSortModeDocs returns documentation for every SortMode in exact cycle order.
+func GetSortModeDocs() []SortModeDoc {
+	return []SortModeDoc{
+		{
+			Mode:          "Default",
+			KeyDisplay:    SortDefault.String(),
+			OrderingLogic: "Active before closed → Priority (asc) → Created (desc)",
+			UseCase:       "Standard priority-driven workflow",
+		},
+		{
+			Mode:          "Created ↑",
+			KeyDisplay:    SortCreatedAsc.String(),
+			OrderingLogic: "Creation date ascending (oldest first)",
+			UseCase:       "Audit: find long-standing issues",
+		},
+		{
+			Mode:          "Created ↓",
+			KeyDisplay:    SortCreatedDesc.String(),
+			OrderingLogic: "Creation date descending (newest first)",
+			UseCase:       "Review: see recently created work",
+		},
+		{
+			Mode:          "Priority",
+			KeyDisplay:    SortPriority.String(),
+			OrderingLogic: "Priority only (P0 → P4)",
+			UseCase:       "Pure priority triage",
+		},
+		{
+			Mode:          "Updated",
+			KeyDisplay:    SortUpdated.String(),
+			OrderingLogic: "Last update descending (newest first)",
+			UseCase:       "Activity tracking: see active issues",
+		},
+		{
+			Mode:          "Triage ↓",
+			KeyDisplay:    SortTriage.String(),
+			OrderingLogic: "Active before closed/pinned/template → Triage impact score (desc) → Priority (asc)",
+			UseCase:       "Graph-weighted impact prioritization",
+		},
+		{
+			Mode:          "Unblocks ↓",
+			KeyDisplay:    SortUnblocks.String(),
+			OrderingLogic: "Active before closed → Direct unblock count (desc) → Priority (asc)",
+			UseCase:       "Bottleneck clearing: maximize unblocked work",
+		},
+		{
+			Mode:          "Risk ↓",
+			KeyDisplay:    SortRisk.String(),
+			OrderingLogic: "Operational risk score (desc) → Active before closed → Priority (asc)",
+			UseCase:       "Risk management: surface highest-risk items",
+		},
+		{
+			Mode:          "ETA ↑",
+			KeyDisplay:    SortETA.String(),
+			OrderingLogic: "Estimated days to completion (asc) → Active before closed → Priority (asc)",
+			UseCase:       "Quick-win focus: soonest estimated completion",
+		},
+	}
+}
+
 // LabelGraphAnalysisResult holds label-specific graph analysis results (bv-109)
 type LabelGraphAnalysisResult struct {
 	Label        string
