@@ -2506,7 +2506,11 @@ function checkStandaloneDep(fromId, toId) {
     }
     if (isActiveNodeStatus(fromNode.status) && isActiveNodeStatus(toNode.status)) {
         const model = buildStandaloneWhatIfModel();
-        const readySet = evaluateStandaloneReadySet(model, new Set());
+        const depsOk = createStandaloneDepsEvaluator(model, new Set());
+        const readySet = new Set();
+        model.activeNodes.forEach((n, id) => {
+            if (isWhatIfUnlockableNode(n) && depsOk(id)) readySet.add(id);
+        });
         const seen = new Set([fromId]);
         const descQ = [fromId];
         while (descQ.length > 0) {
