@@ -3780,7 +3780,8 @@ func TestWave30_W30_1_ExportDecisionIntelligenceAndMetrics(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GenerateReport(scoped markdown): %v", err)
 	}
-	if strings.Contains(string(scopedMD), "EX-CYC-B") || strings.Contains(string(scopedMD), "EX-CHILD") {
-		t.Fatalf("W30-1 regression: VisibleIDs filter leaked hidden IDs into Markdown:\n%s", string(scopedMD))
+	scopedStr := string(scopedMD)
+	if strings.Contains(scopedStr, "Cycle-Break Suggestions") || strings.Contains(scopedStr, "What-If Unblocks") || strings.Contains(scopedStr, "EX-CHILD") {
+		t.Fatalf("W30-1 regression: VisibleIDs filter leaked hidden cycle-break/what-if IDs into Markdown:\n%s", scopedStr)
 	}
 }
