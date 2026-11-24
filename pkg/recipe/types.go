@@ -74,7 +74,7 @@ type ViewConfig struct {
 
 // Presentation field names are shared by validation and the TUI renderer.
 var ViewColumns = []string{"id", "title", "status", "priority", "assignee", "created", "updated", "tags", "blockers", "repo"}
-var ViewMetrics = []string{"pagerank", "betweenness", "impact", "triage", "hub", "authority", "eigenvector", "kcore", "slack"}
+var ViewMetrics = []string{"pagerank", "betweenness", "impact", "triage", "hub", "authority", "eigenvector", "kcore", "slack", "risk", "eta"}
 
 var viewColumnAliases = map[string]string{
 	"label":       "tags",
