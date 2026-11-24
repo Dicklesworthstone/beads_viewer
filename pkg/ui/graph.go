@@ -1228,17 +1228,19 @@ func (g *GraphModel) renderMetricsPanel(id string, width int, t Theme) string {
 			rows = append(rows, detailStyle.Render("  "+strings.Join(compactBadges, " • ")))
 		}
 		isCutVertex := false
-		for _, ap := range g.insights.Articulation {
-			if ap == id {
-				isCutVertex = true
-				break
-			}
-		}
-		if !isCutVertex {
-			for _, ap := range stats.ArticulationPoints() {
+		if isActive {
+			for _, ap := range g.insights.Articulation {
 				if ap == id {
 					isCutVertex = true
 					break
+				}
+			}
+			if !isCutVertex {
+				for _, ap := range stats.ActiveArticulationPoints() {
+					if ap == id {
+						isCutVertex = true
+						break
+					}
 				}
 			}
 		}
