@@ -57,6 +57,63 @@ type GraphModel struct {
 	rankCriticalPath map[string]int
 	rankInDegree     map[string]int
 	rankOutDegree    map[string]int
+
+	// Interactive Pre-Flight Dependency Validator state (W31-4: D key)
+	checkDepFromID string
+	checkDepResult *graphCheckDepResult
+}
+
+// graphCheckDepResult holds the evaluated pre-flight check for adding blocking edge FromID -> ToID (W31-4).
+type graphCheckDepResult struct {
+	FromID               string
+	ToID                 string
+	CanAdd               bool
+	AlreadyExists        bool
+	WouldCycle           bool
+	CyclePath            []string
+	WouldBlockActionable bool
+	CrossRepo            bool
+	Warning              string
+	Command              string
+}
+
+func (g *GraphModel) StartCheckDep(fromID string) {
+	g.checkDepFromID = strings.TrimSpace(fromID)
+	g.checkDepResult = nil
+}
+
+func (g *GraphModel) SetCheckDepResult(res *graphCheckDepResult) {
+	g.checkDepResult = res
+	if res != nil {
+		g.checkDepFromID = res.FromID
+	}
+}
+
+func (g *GraphModel) ClearCheckDep() {
+	g.checkDepFromID = ""
+	g.checkDepResult = nil
+}
+
+func (g *GraphModel) CheckDepActive() bool {
+	return g.checkDepFromID != "" || g.checkDepResult != nil
+}
+
+func (g *GraphModel) CheckDepFromID() string {
+	return g.checkDepFromID
+}
+
+func (g *GraphModel) CheckDepResult() *graphCheckDepResult {
+	return g.checkDepResult
+}
+
+func (g *GraphModel) reconcileCheckDepScope() {
+	// P20A-2: Always discard any cached verdict on snapshot/issue reloads so an edge
+	// addition, status change, time-travel entry, or degraded source cannot preserve
+	// a stale CanAdd/Command result.
+	g.checkDepResult = nil
+	if g.checkDepFromID != "" && g.issueMap[g.checkDepFromID] == nil {
+		g.checkDepFromID = ""
+	}
 }
 
 // NewGraphModel creates a new graph view from issues
@@ -133,6 +190,7 @@ func (g *GraphModel) SetSnapshot(snapshot *DataSnapshot) {
 		g.selectedIdx = 0
 	}
 	g.restoreNavigation(selectedID)
+	g.reconcileCheckDepScope()
 }
 
 // SetAnalyzer injects the active scoped Analyzer so What-If impact in the
@@ -194,6 +252,7 @@ func (g *GraphModel) SetIssues(issues []model.Issue, insights *analysis.Insights
 		}
 	}
 	g.restoreNavigation(selectedID)
+	g.reconcileCheckDepScope()
 }
 
 func (g *GraphModel) restoreNavigation(selectedID string) {
@@ -1229,18 +1288,10 @@ func (g *GraphModel) renderMetricsPanel(id string, width int, t Theme) string {
 		}
 		isCutVertex := false
 		if isActive {
-			for _, ap := range g.insights.Articulation {
+			for _, ap := range stats.ActiveArticulationPoints() {
 				if ap == id {
 					isCutVertex = true
 					break
-				}
-			}
-			if !isCutVertex {
-				for _, ap := range stats.ActiveArticulationPoints() {
-					if ap == id {
-						isCutVertex = true
-						break
-					}
 				}
 			}
 		}
@@ -1400,6 +1451,50 @@ func (g *GraphModel) renderMetricsPanel(id string, width int, t Theme) string {
 				confPct := int(math.Round(eta.Confidence * 100))
 				etaLine := fmt.Sprintf("  ETA: %s (~%.1fd • %d%% conf)", eta.ETADate.Format("2006-01-02"), eta.EstimatedDays, confPct)
 				rows = append(rows, mutedStyle.Render(etaLine))
+			}
+		}
+	}
+
+	if g.CheckDepActive() {
+		rows = append(rows, "")
+		rows = append(rows, sectionStyle.Render("Check Add Dep (D / Esc)"))
+		detailStyle := t.Renderer.NewStyle().Foreground(ColorText)
+		warnStyle := t.Renderer.NewStyle().Foreground(t.Blocked).Bold(true)
+		okStyle := t.Renderer.NewStyle().Foreground(t.Open).Bold(true)
+		mutedStyle := t.Renderer.NewStyle().Foreground(ColorMuted)
+		maxW := max(20, width-4)
+		if g.checkDepResult == nil {
+			rows = append(rows, detailStyle.Render(truncateRunesHelper(
+				fmt.Sprintf("  From %s → move to target & press D", g.checkDepFromID), maxW, "…")))
+		} else {
+			res := g.checkDepResult
+			switch {
+			case res.WouldCycle:
+				pathText := strings.Join(res.CyclePath, " → ")
+				if pathText == "" {
+					pathText = res.FromID + " → " + res.ToID
+				}
+				rows = append(rows, warnStyle.Render(truncateRunesHelper("  ⛔ Cycle: "+pathText, maxW, "…")))
+			case !res.CanAdd:
+				rows = append(rows, warnStyle.Render(truncateRunesHelper("  ⚠ Invalid: "+res.Warning, maxW, "…")))
+			case res.AlreadyExists:
+				rows = append(rows, detailStyle.Render(truncateRunesHelper("  ℹ Exists: "+res.FromID+" → "+res.ToID, maxW, "…")))
+			default:
+				var tags []string
+				if res.WouldBlockActionable {
+					tags = append(tags, "blocks ready")
+				}
+				if res.CrossRepo {
+					tags = append(tags, "cross-repo")
+				}
+				verdict := fmt.Sprintf("  ✓ Safe: %s → %s", res.FromID, res.ToID)
+				if len(tags) > 0 {
+					verdict += " [" + strings.Join(tags, ", ") + "]"
+				}
+				rows = append(rows, okStyle.Render(truncateRunesHelper(verdict, maxW, "…")))
+			}
+			if res.Command != "" {
+				rows = append(rows, mutedStyle.Render(truncateRunesHelper("  Cmd (c to copy): "+res.Command, maxW, "…")))
 			}
 		}
 	}

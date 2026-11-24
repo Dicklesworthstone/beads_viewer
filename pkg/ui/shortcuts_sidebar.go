@@ -266,6 +266,7 @@ func (s *ShortcutsSidebar) hardcodedSections() []shortcutSection {
 				{"H/L", "Scroll ←/→"},
 				{"J/K", "Scroll ↓/↑"},
 				{"PgUp/Dn", "Jump 10 nodes"},
+				{"D", "Check add dep"},
 				{"y", "Copy ID"},
 				{"Enter", "Jump to issue"},
 			},

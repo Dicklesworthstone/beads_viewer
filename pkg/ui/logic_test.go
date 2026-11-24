@@ -11217,3 +11217,227 @@ func TestPass18_TrackARegressions(t *testing.T) {
 		}
 	})
 }
+
+func TestWave31_TUIRegressions(t *testing.T) {
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	oldTime := now.Add(-10 * 24 * time.Hour)
+	keyRune := func(s string) tea.KeyMsg {
+		return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)}
+	}
+
+	t.Run("W31-4_GraphCheckDepCycleOverHiddenFilteredNodeAndGuards", func(t *testing.T) {
+		// Chain: LEAF -> MID (hidden by filter in graphView) -> ROOT.
+		// Checking ROOT -> LEAF must detect the cycle over full m.issues even though MID is filtered out of g.issues!
+		issues := []model.Issue{
+			{ID: "ROOT", Title: "Root task", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, Labels: []string{"ui"}, CreatedAt: oldTime, UpdatedAt: oldTime},
+			{ID: "MID", Title: "Hidden intermediate", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, Labels: []string{"backend"}, CreatedAt: oldTime, UpdatedAt: oldTime,
+				Dependencies: []*model.Dependency{{IssueID: "MID", DependsOnID: "ROOT", Type: model.DepBlocks}}},
+			{ID: "LEAF", Title: "Leaf task", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, Labels: []string{"ui"}, CreatedAt: oldTime, UpdatedAt: oldTime,
+				Dependencies: []*model.Dependency{{IssueID: "LEAF", DependsOnID: "MID", Type: model.DepBlocks}}},
+			{ID: "OTHER", Title: "Independent task", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, Labels: []string{"ui"}, CreatedAt: oldTime, UpdatedAt: oldTime},
+		}
+		m := NewModel(copyIssues(issues), nil, "")
+		defer m.Stop()
+		m.Update(tea.WindowSizeMsg{Width: 140, Height: 40})
+		// Filter visible graph issues to label "ui" (hiding MID from graphView.issues while keeping it in m.issues).
+		m.currentFilter = "label:ui"
+		m.applyFilter()
+		m.Update(keyRune("g"))
+		if !m.isGraphView || m.focused != focusGraph {
+			t.Fatalf("expected to enter focusGraph")
+		}
+		m.graphView.SelectByID("ROOT")
+
+		// Press 'D' to start Check Add Dep from ROOT.
+		m.Update(keyRune("D"))
+		if !m.graphView.CheckDepActive() || m.graphView.CheckDepFromID() != "ROOT" {
+			t.Fatalf("W31-4: pressing D did not arm Check Add Dep from ROOT")
+		}
+		// Select LEAF and press 'D' -> must detect cycle [ROOT -> LEAF -> MID -> ROOT].
+		m.graphView.SelectByID("LEAF")
+		m.Update(keyRune("D"))
+		res := m.graphView.CheckDepResult()
+		if res == nil || !res.WouldCycle || res.CanAdd || res.Command != "" {
+			t.Fatalf("W31-4 regression: ROOT->LEAF did not detect cycle over hidden MID, got %+v", res)
+		}
+		if len(res.CyclePath) != 4 || res.CyclePath[0] != "ROOT" || res.CyclePath[2] != "MID" {
+			t.Fatalf("W31-4 regression: unexpected cycle path %v", res.CyclePath)
+		}
+		panel := ansi.Strip(m.graphView.renderMetricsPanel("LEAF", 72, m.theme))
+		if !strings.Contains(panel, "Check Add Dep") || !strings.Contains(panel, "Cycle: ROOT → LEAF → MID → ROOT") {
+			t.Fatalf("W31-4: graph metrics panel did not render cycle verdict:\n%s", panel)
+		}
+
+		// Esc dismisses Check Add Dep WITHOUT leaving Graph view.
+		m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+		if m.graphView.CheckDepActive() {
+			t.Fatalf("W31-4: Esc did not clear Check Add Dep state")
+		}
+		if !m.isGraphView || m.focused != focusGraph {
+			t.Fatalf("W31-4: Esc exited Graph view instead of only dismissing Check Add Dep")
+		}
+
+		// Safe acyclic check: OTHER -> ROOT emits br dep add command; read-only time-travel suppresses it.
+		m.graphView.SelectByID("OTHER")
+		m.Update(keyRune("D"))
+		m.graphView.SelectByID("ROOT")
+		m.Update(keyRune("D"))
+		safeRes := m.graphView.CheckDepResult()
+		if safeRes == nil || !safeRes.CanAdd || safeRes.WouldCycle || safeRes.Command != "br dep add OTHER ROOT" {
+			t.Fatalf("W31-4: safe OTHER->ROOT expected command 'br dep add OTHER ROOT', got %+v", safeRes)
+		}
+		// Time-travel guard must suppress mutation command.
+		m.timeTravelMode = true
+		guarded := m.evaluateGraphCheckDep("OTHER", "ROOT")
+		if guarded.Command != "" {
+			t.Fatalf("W31-4 guard violation: timeTravelMode emitted mutation command %q", guarded.Command)
+		}
+		m.timeTravelMode = false
+		// Workspace cross-repo guard must suppress mutation command and flag CrossRepo.
+		m.workspaceMode = true
+		for i := range m.issues {
+			switch m.issues[i].ID {
+			case "ROOT":
+				m.issues[i].SourceRepo = "repoA"
+				m.issueMap["ROOT"] = &m.issues[i]
+			case "OTHER":
+				m.issues[i].SourceRepo = "repoB"
+				m.issueMap["OTHER"] = &m.issues[i]
+			}
+		}
+		crossRepo := m.evaluateGraphCheckDep("OTHER", "ROOT")
+		if !crossRepo.CrossRepo || crossRepo.Command != "" {
+			t.Fatalf("W31-4 guard violation: cross-repo workspace edge emitted command or missed CrossRepo: %+v", crossRepo)
+		}
+
+		// P20A-2: SetIssues reload and exiting Graph view via 'g' must clear stale CheckDepResult;
+		// pressing 'c' must re-evaluate against live read-only/authorityIncomplete state.
+		m.workspaceMode = false
+		m.authorityIncomplete = false
+		m.graphView.SelectByID("OTHER")
+		m.Update(keyRune("D"))
+		m.graphView.SelectByID("ROOT")
+		m.Update(keyRune("D"))
+		if m.graphView.CheckDepResult() == nil || m.graphView.CheckDepResult().Command == "" {
+			t.Fatalf("P20A-2 setup expected populated command before authorityIncomplete check")
+		}
+		m.authorityIncomplete = true
+		m.Update(keyRune("c"))
+		if m.graphView.CheckDepResult().Command != "" {
+			t.Fatalf("P20A-2/P20A-3 regression: pressing 'c' under authorityIncomplete did not re-evaluate and clear command: %+v", m.graphView.CheckDepResult())
+		}
+		m.authorityIncomplete = false
+		m.graphView.SetIssues(m.issues, m.graphView.insights)
+		if m.graphView.CheckDepResult() != nil {
+			t.Fatalf("P20A-2 regression: SetIssues reload preserved stale checkDepResult: %+v", m.graphView.CheckDepResult())
+		}
+		m.graphView.StartCheckDep("OTHER")
+		m.Update(keyRune("g")) // toggle off Graph view
+		if m.graphView.CheckDepActive() {
+			t.Fatalf("P20A-2 regression: exiting Graph view via 'g' did not clear CheckDepActive")
+		}
+
+		// P20A-3: Workspace missing WorkingDirectory and leading-'-' / control-char IDs must suppress command.
+		m.workspaceMode = true
+		for i := range m.issues {
+			if m.issues[i].ID == "ROOT" || m.issues[i].ID == "OTHER" {
+				m.issues[i].SourceRepo = "same"
+				m.issues[i].Origin = &model.IssueOrigin{Tracker: "br", Database: "/tmp/a.db", TrackerDirectory: "/tmp/a/.beads", Executable: "/usr/bin/br", LocalID: m.issues[i].ID}
+			}
+		}
+		if wsNoDir := m.evaluateGraphCheckDep("OTHER", "ROOT"); wsNoDir.Command != "" {
+			t.Fatalf("P20A-3 regression: workspace with empty WorkingDirectory emitted bare command %q", wsNoDir.Command)
+		}
+		m.workspaceMode = false
+		m.issues = append(m.issues, model.Issue{ID: "--flag-inject", Title: "Evil", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask})
+		if injRes := m.evaluateGraphCheckDep("--flag-inject", "ROOT"); injRes.Command != "" {
+			t.Fatalf("P20A-3 regression: leading-dash ID emitted unguarded flag command %q", injRes.Command)
+		}
+	})
+
+	t.Run("W31-5_TUINotReadyLabelsExcludesFromTopPicks", func(t *testing.T) {
+		t.Setenv("BV_ROBOT_NOT_READY_LABELS", "needs-spec")
+		issues := []model.Issue{
+			{ID: "NR-1", Title: "Needs spec high priority", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask, Labels: []string{"needs-spec"}, CreatedAt: oldTime, UpdatedAt: oldTime},
+			{ID: "OK-1", Title: "Ready lower priority", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, CreatedAt: oldTime, UpdatedAt: oldTime},
+		}
+		m := NewModel(copyIssues(issues), nil, "")
+		defer m.Stop()
+		if m.analysis != nil {
+			m.analysis.WaitForPhase2()
+		}
+		m.Update(keyRune("i"))
+		for _, pick := range m.insightsPanel.topPicks {
+			if pick.ID == "NR-1" {
+				t.Fatalf("W31-5 regression: not-ready issue NR-1 leaked into TUI TopPicks: %+v", m.insightsPanel.topPicks)
+			}
+		}
+		if len(m.insightsPanel.topPicks) == 0 || m.insightsPanel.topPicks[0].ID != "OK-1" {
+			t.Fatalf("W31-5: expected OK-1 as TUI top pick when NR-1 is marked not-ready, got %+v", m.insightsPanel.topPicks)
+		}
+	})
+
+	t.Run("P19-6_LeavingHistoryCancelsCausalityAndGuardsStatus", func(t *testing.T) {
+		issues := []model.Issue{
+			{ID: "H-1", Title: "History bead", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: oldTime, UpdatedAt: oldTime},
+		}
+		m := NewModel(copyIssues(issues), nil, "")
+		defer m.Stop()
+		m.isHistoryView = true
+		m.focused = focusHistory
+		m.causalityRequestGen = 5
+		canceled := false
+		m.causalityCancel = func() { canceled = true }
+
+		// Pressing Esc leaves History view and cancels in-flight causality.
+		m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+		if !canceled || m.isHistoryView || m.causalityRequestGen != 6 {
+			t.Fatalf("P19-6 regression: leaving History via Esc did not cancel causality (canceled=%v isHist=%v gen=%d)", canceled, m.isHistoryView, m.causalityRequestGen)
+		}
+		// Even a matching-generation CausalityLoadedMsg arriving while outside History must NOT clobber statusMsg.
+		m.statusMsg = "keep-me"
+		m.Update(CausalityLoadedMsg{
+			DataGeneration:    m.semanticDataGeneration,
+			RequestGeneration: m.causalityRequestGen,
+			BeadID:            "H-1",
+			Result:            &correlation.CausalityResult{Insights: &correlation.CausalInsights{Coverage: "complete"}},
+		})
+		if m.statusMsg != "keep-me" {
+			t.Fatalf("P19-6 regression: CausalityLoadedMsg clobbered statusMsg=%q outside History view", m.statusMsg)
+		}
+
+		// P20A-4: Selecting a ShowGraph recipe while in History view must also cancel in-flight causality.
+		m.isHistoryView = true
+		m.focused = focusHistory
+		canceledOnRecipe := false
+		m.causalityCancel = func() { canceledOnRecipe = true }
+		genBefore := m.causalityRequestGen
+		m.setActiveRecipe(&recipe.Recipe{Name: "graph-view", View: recipe.ViewConfig{ShowGraph: true}})
+		if !canceledOnRecipe || m.isHistoryView || m.causalityRequestGen != genBefore+1 {
+			t.Fatalf("P20A-4 regression: setActiveRecipe(ShowGraph) did not cancel causality (canceled=%v isHist=%v gen=%d->%d)",
+				canceledOnRecipe, m.isHistoryView, genBefore, m.causalityRequestGen)
+		}
+	})
+
+	t.Run("P19-10_ActiveNodeBridgingClosedNotFlaggedCutVertex", func(t *testing.T) {
+		// CLOSED-1 <- OPEN-BRIDGE <- OPEN-LEAF: OPEN-BRIDGE is an articulation point in the FULL graph
+		// (disconnects CLOSED-1 from OPEN-LEAF), but NOT an active articulation point (only 2 active nodes).
+		issues := []model.Issue{
+			{ID: "CLOSED-1", Title: "Closed dep", Status: model.StatusClosed, Priority: 1, IssueType: model.TypeTask, CreatedAt: oldTime, UpdatedAt: oldTime},
+			{ID: "OPEN-BRIDGE", Title: "Open bridge", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: oldTime, UpdatedAt: oldTime,
+				Dependencies: []*model.Dependency{{IssueID: "OPEN-BRIDGE", DependsOnID: "CLOSED-1", Type: model.DepBlocks}}},
+			{ID: "OPEN-LEAF", Title: "Open leaf", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: oldTime, UpdatedAt: oldTime,
+				Dependencies: []*model.Dependency{{IssueID: "OPEN-LEAF", DependsOnID: "OPEN-BRIDGE", Type: model.DepBlocks}}},
+		}
+		an := analysis.NewAnalyzer(issues)
+		an.SetNow(now)
+		stats := an.Analyze()
+		ins := stats.GenerateInsights(10)
+		gm := NewGraphModel(issues, &ins, DefaultTheme(lipgloss.NewRenderer(&strings.Builder{})))
+		gm.SetAnalyzer(an, func() time.Time { return now })
+		panel := ansi.Strip(gm.renderMetricsPanel("OPEN-BRIDGE", 72, gm.theme))
+		if strings.Contains(panel, "Cut Vertex") {
+			t.Fatalf("P19-10 regression: OPEN-BRIDGE bridging only a closed issue must not be flagged as Cut Vertex:\n%s", panel)
+		}
+	})
+}

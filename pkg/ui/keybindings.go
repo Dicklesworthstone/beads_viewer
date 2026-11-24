@@ -294,6 +294,8 @@ func GetKeyBindingDocs() []KeyBindingDoc {
 		{"L", "Scroll right", "Graph", "graph"},
 		{"J/K", "Scroll graph vertically", "Graph", "graph"},
 		{"space", "Expand/collapse dependency paths", "Graph", "graph"},
+		{"D", "Check add dependency (A → B)", "Graph", "graph"},
+		{"c", "Copy checked dep command", "Graph", "graph"},
 		{"PgUp", "Page nodes (prev 10)", "Graph", "graph"},
 		{"PgDn", "Page nodes (next 10)", "Graph", "graph"},
 

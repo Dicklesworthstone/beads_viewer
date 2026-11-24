@@ -64,6 +64,8 @@
 |  | `L` | Scroll right |
 |  | `J/K` | Scroll graph vertically |
 |  | `space` | Expand/collapse dependency paths |
+|  | `D` | Check add dependency (A → B) |
+|  | `c` | Copy checked dep command |
 |  | `PgUp` | Page nodes (prev 10) |
 |  | `PgDn` | Page nodes (next 10) |
 | **board** | `h` | Previous column |

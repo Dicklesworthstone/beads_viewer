@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Dicklesworthstone/beads_viewer/internal/env"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/baseline"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/cass"
@@ -23,6 +24,29 @@ import (
 	"github.com/Dicklesworthstone/beads_viewer/pkg/search"
 	"github.com/charmbracelet/bubbles/list"
 )
+
+// tuiNotReadyLabels parses BV_ROBOT_NOT_READY_LABELS via internal/env so TUI
+// triage recommendations honor the same opt-in not-ready label gate as CLI/exports (W31-5).
+func tuiNotReadyLabels() []string {
+	raw := strings.TrimSpace(env.RobotNotReadyLabels.Get())
+	if raw == "" {
+		return nil
+	}
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
+}
+
+func tuiTriageOptions(weights *analysis.Weights) analysis.TriageOptions {
+	return analysis.TriageOptions{
+		Weights:        weights,
+		NotReadyLabels: tuiNotReadyLabels(),
+	}
+}
 
 type datasetTier int
 
@@ -713,10 +737,7 @@ func (b *SnapshotBuilder) Build() *DataSnapshot {
 	)
 	hasTriage := b.cfg.PrecomputeTriage || (b.recipe != nil && b.recipe.NeedsTriageScores())
 	if hasTriage {
-		opts := analysis.TriageOptions{}
-		if feedbackWeights != nil {
-			opts.Weights = feedbackWeights
-		}
+		opts := tuiTriageOptions(feedbackWeights)
 		triageResult = analysis.ComputeTriageFromAnalyzer(b.analyzer, graphStats, issues, opts, now)
 		triageScores, triageReasons, quickWinSet, blockerSet, unblocksMap = extractTriageMaps(triageResult)
 		recipeTriage = triageScores
@@ -1565,16 +1586,16 @@ func (s *DataSnapshot) WithPhase2(stats *analysis.GraphStats, insights analysis.
 	var completedTriage *analysis.TriageResult
 
 	if stats != nil && analyzer != nil && len(issues) > 0 {
-		opts := analysis.TriageOptions{}
+		var fw *analysis.Weights
 		if !s.explicitWeights && analyzer.Weights() == analysis.DefaultWeights() {
 			if beadsDir := s.resolvedBeadsDir(); beadsDir != "" {
-				if fw := feedbackWeightsForBeadsDir(beadsDir); fw != nil {
-					analyzer.SetWeights(*fw)
-					opts.Weights = fw
+				if loaded := feedbackWeightsForBeadsDir(beadsDir); loaded != nil {
+					analyzer.SetWeights(*loaded)
+					fw = loaded
 				}
 			}
 		}
-		triageResult := analysis.ComputeTriageFromAnalyzer(analyzer, stats, issues, opts, analyzer.Now())
+		triageResult := analysis.ComputeTriageFromAnalyzer(analyzer, stats, issues, tuiTriageOptions(fw), analyzer.Now())
 		completedTriage = &triageResult
 		triageScores, triageReasons, quickWinSet, blockerSet, unblocksMap = extractTriageMaps(triageResult)
 	}

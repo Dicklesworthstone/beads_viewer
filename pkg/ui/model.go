@@ -1340,7 +1340,7 @@ func LoadHistoryCmd(
 	beadsPath string,
 	dataGeneration, requestGeneration uint64,
 ) tea.Cmd {
-	return loadHistoryForWorkDirAtRevisionCmd(ctx, beads, beadsPath, "", "", dataGeneration, requestGeneration)
+	return loadHistoryForWorkDirAtRevisionCmd(ctx, beads, beadsPath, "", "", time.Time{}, dataGeneration, requestGeneration)
 }
 
 func loadHistoryForWorkDirCmd(
@@ -1350,7 +1350,7 @@ func loadHistoryForWorkDirCmd(
 	workDir string,
 	dataGeneration, requestGeneration uint64,
 ) tea.Cmd {
-	return loadHistoryForWorkDirAtRevisionCmd(ctx, beads, beadsPath, workDir, "", dataGeneration, requestGeneration)
+	return loadHistoryForWorkDirAtRevisionCmd(ctx, beads, beadsPath, workDir, "", time.Time{}, dataGeneration, requestGeneration)
 }
 
 func loadHistoryForWorkDirAtRevisionCmd(
@@ -1359,6 +1359,7 @@ func loadHistoryForWorkDirAtRevisionCmd(
 	beadsPath string,
 	workDir string,
 	revision string,
+	referenceNow time.Time,
 	dataGeneration, requestGeneration uint64,
 ) tea.Cmd {
 	if ctx == nil {
@@ -1482,7 +1483,11 @@ func loadHistoryForWorkDirAtRevisionCmd(
 					storeDirs = append(storeDirs, filepath.ToSlash(rel))
 				}
 			}
-			if orphRep, oErr := correlation.NewOrphanDetectorAt(report, orphanGitRoot, time.Now().UTC()).
+			orphanNow := referenceNow.UTC()
+			if orphanNow.IsZero() {
+				orphanNow = time.Now().UTC()
+			}
+			if orphRep, oErr := correlation.NewOrphanDetectorAt(report, orphanGitRoot, orphanNow).
 				WithStoreDirs(storeDirs...).
 				DetectOrphans(correlation.ExtractOptions{Limit: 500, Revision: resolvedRev}); oErr == nil && orphRep != nil {
 				orphanRatio = orphRep.Stats.OrphanRatio
@@ -1686,6 +1691,7 @@ func loadWorkspaceHistoryAtRevisionCmd(
 	revision string,
 	scopeRepoFilter string,
 	dataHash string,
+	referenceNow time.Time,
 	dataGeneration, requestGeneration uint64,
 ) tea.Cmd {
 	if ctx == nil {
@@ -2423,7 +2429,11 @@ func loadWorkspaceHistoryAtRevisionCmd(
 			for _, rs := range grp.rejectSources {
 				grpReport.MergeRejectedPairs(rs.report, rs.qualify)
 			}
-			detector := correlation.NewOrphanDetectorAt(grpReport, grp.gitRoot, time.Now().UTC()).
+			orphanNow := referenceNow.UTC()
+			if orphanNow.IsZero() {
+				orphanNow = time.Now().UTC()
+			}
+			detector := correlation.NewOrphanDetectorAt(grpReport, grp.gitRoot, orphanNow).
 				WithStoreDirs(grp.storeDirs...)
 			if normScopeRepo != "" && grp.totalRootTargets > 1 {
 				if grp.matchedRootStore && len(grp.unmatchedSubtree) > 0 {
@@ -3765,6 +3775,7 @@ func (m *Model) startHistoryLoadForce(force bool) tea.Cmd {
 				originBeadsDir: originBeadsDir,
 			}
 		}
+		refNow := m.analysisReferenceTime().UTC()
 		repos := append([]WorkspaceRepoTarget(nil), m.workspaceInfo.Repos...)
 		cmd = loadWorkspaceHistoryAtRevisionCmd(
 			ctx,
@@ -3774,6 +3785,7 @@ func (m *Model) startHistoryLoadForce(force bool) tea.Cmd {
 			m.asOfRevision,
 			m.scopeRepoFilter,
 			analysis.ComputeDataHash(m.issues),
+			refNow,
 			m.historyLoadDataGeneration,
 			m.historyLoadRequestGeneration,
 		)
@@ -3804,6 +3816,7 @@ func (m *Model) startHistoryLoadForce(force bool) tea.Cmd {
 				m.beadsPath,
 				m.workDir,
 				m.asOfRevision,
+				m.analysisReferenceTime().UTC(),
 				m.historyLoadDataGeneration,
 				m.historyLoadRequestGeneration,
 			)
@@ -4117,7 +4130,7 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 	priorityHints := make(map[string]*analysis.PriorityRecommendation)
 
 	// Compute triage insights (bv-151) - reuse existing analyzer/stats (bv-runn.12)
-	triageResult := analysis.ComputeTriageFromAnalyzer(analyzer, graphStats, issues, analysis.TriageOptions{}, analyzer.Now())
+	triageResult := analysis.ComputeTriageFromAnalyzer(analyzer, graphStats, issues, tuiTriageOptions(nil), analyzer.Now())
 	triageScores, triageReasons, quickWinSet, blockerSet, unblocksMap := extractTriageMaps(triageResult)
 
 	// Update items with triage data
@@ -4533,7 +4546,7 @@ func (m *Model) SetSearchConfig(cfg search.SearchConfig) {
 // selected IDs. Context nodes still contribute graph metrics, but cannot be
 // promoted to recommended work after a reload.
 func (m *Model) refreshScopedTriageData() {
-	triage := analysis.ComputeTriageFromAnalyzer(m.analyzer, m.analysis, m.issues, analysis.TriageOptions{}, m.analysisReferenceTime())
+	triage := analysis.ComputeTriageFromAnalyzer(m.analyzer, m.analysis, m.issues, tuiTriageOptions(nil), m.analysisReferenceTime())
 	m.triageScores, m.triageReasons, m.quickWinSet, m.blockerSet, m.unblocksMap = extractTriageMaps(triage)
 	if !m.workspaceMode || m.activeRepos == nil {
 		m.insightsPanel.SetTopPicks(triage.QuickRef.TopPicks)
@@ -5028,7 +5041,7 @@ func (m *Model) recordTriageFeedback(action string) {
 			m.graphView.SetAnalyzer(m.analyzer, m.analysisReferenceTime)
 		}
 		m.analyzer.SetWeights(fb.Weights())
-		triage := analysis.ComputeTriageFromAnalyzer(m.analyzer, m.analysis, m.issues, analysis.TriageOptions{}, m.analysisReferenceTime())
+		triage := analysis.ComputeTriageFromAnalyzer(m.analyzer, m.analysis, m.issues, tuiTriageOptions(nil), m.analysisReferenceTime())
 		m.triageScores, m.triageReasons, m.quickWinSet, m.blockerSet, m.unblocksMap = extractTriageMaps(triage)
 		recs := m.analyzer.GenerateRecommendationsFromStats(m.analysis, analysis.DefaultThresholds())
 		m.priorityHints = make(map[string]*analysis.PriorityRecommendation, len(recs))
@@ -5269,7 +5282,7 @@ func (m *Model) rebuildInsightsPanel() {
 
 	wantsAdvanced := m.effectiveUnderlyingFocus() == focusInsights
 	if scopedAnalyzer != nil && scopedStats != nil {
-		triage := analysis.ComputeTriageFromAnalyzer(scopedAnalyzer, scopedStats, scoped, analysis.TriageOptions{}, scopedAnalyzer.Now())
+		triage := analysis.ComputeTriageFromAnalyzer(scopedAnalyzer, scopedStats, scoped, tuiTriageOptions(nil), scopedAnalyzer.Now())
 		panel.SetTopPicks(triage.QuickRef.TopPicks)
 		dataHash := fmt.Sprintf("v%s@%s#%d", triage.Meta.Version, triage.Meta.GeneratedAt.Format("15:04:05"), triage.Meta.IssueCount)
 		panel.SetRecommendations(triage.Recommendations, dataHash)
@@ -5279,7 +5292,7 @@ func (m *Model) rebuildInsightsPanel() {
 			panel.SetAdvancedInsights(nil)
 		}
 	} else if m.analyzer != nil && m.analysis != nil {
-		triage := analysis.ComputeTriageFromAnalyzer(m.analyzer, m.analysis, m.issues, analysis.TriageOptions{}, m.analyzer.Now())
+		triage := analysis.ComputeTriageFromAnalyzer(m.analyzer, m.analysis, m.issues, tuiTriageOptions(nil), m.analyzer.Now())
 		panel.SetTopPicks(triage.QuickRef.TopPicks)
 		dataHash := fmt.Sprintf("v%s@%s#%d", triage.Meta.Version, triage.Meta.GeneratedAt.Format("15:04:05"), triage.Meta.IssueCount)
 		panel.SetRecommendations(triage.Recommendations, dataHash)
@@ -6058,7 +6071,7 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.isGraphView = true
 				m.isBoardView = false
 				m.isActionableView = false
-				m.isHistoryView = false
+				m.exitHistoryView()
 				m.focused = focusGraph
 				m.refreshBoardAndGraphForCurrentFilter()
 			}
@@ -6126,7 +6139,7 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.blockerSet = newSnap.BlockerSet
 			m.unblocksMap = newSnap.UnblocksMap
 		} else if m.analyzer != nil && m.analysis != nil {
-			triage := analysis.ComputeTriageFromAnalyzer(m.analyzer, m.analysis, m.issues, analysis.TriageOptions{}, m.analysisReferenceTime())
+			triage := analysis.ComputeTriageFromAnalyzer(m.analyzer, m.analysis, m.issues, tuiTriageOptions(nil), m.analysisReferenceTime())
 			m.triageScores, m.triageReasons, m.quickWinSet, m.blockerSet, m.unblocksMap = extractTriageMaps(triage)
 		}
 
@@ -6174,7 +6187,7 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if msg.prepared != nil && msg.prepared.phase2Triage != nil {
 				triage = *msg.prepared.phase2Triage
 			} else {
-				triage = analysis.ComputeTriageFromAnalyzer(m.analyzer, m.analysis, m.issues, analysis.TriageOptions{}, m.analyzer.Now())
+				triage = analysis.ComputeTriageFromAnalyzer(m.analyzer, m.analysis, m.issues, tuiTriageOptions(nil), m.analyzer.Now())
 			}
 			m.insightsPanel.SetTopPicks(triage.QuickRef.TopPicks)
 
@@ -6346,6 +6359,16 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.cancelCausalityLoad()
+		if !m.isHistoryView {
+			// P19-6: User left History view while causality was in flight; cache valid result
+			// or reset stuck showCausality on failure silently without clobbering statusMsg.
+			if msg.Error == nil && msg.Result != nil {
+				m.historyView.SetCausality(msg.BeadID, msg.Result)
+			} else if m.historyView.GetCausality(msg.BeadID) == nil {
+				m.historyView.SetShowCausality(false)
+			}
+			return m, nil
+		}
 		if msg.Error != nil || msg.Result == nil {
 			if m.historyView.GetCausality(msg.BeadID) == nil {
 				m.historyView.SetShowCausality(false)
@@ -8628,7 +8651,7 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 				if m.isGraphView {
-					m.isGraphView = false
+					m.exitGraphView()
 					m.focused = focusList
 					return m, nil
 				}
@@ -8647,7 +8670,7 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				if m.isHistoryView {
 					m.historyView.SetFileTreeFocus(false)
-					m.isHistoryView = false
+					m.exitHistoryView()
 					m.focused = focusList
 					return m, nil
 				}
@@ -8700,7 +8723,13 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 				if m.isGraphView {
-					m.isGraphView = false
+					if m.graphView.CheckDepActive() {
+						m.graphView.ClearCheckDep()
+						m.statusMsg = "Check Add Dep cleared"
+						m.statusIsError = false
+						return m, nil
+					}
+					m.exitGraphView()
 					m.focused = focusList
 					return m, nil
 				}
@@ -8741,7 +8770,7 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.statusIsError = false
 						return m, nil
 					}
-					m.isHistoryView = false
+					m.exitHistoryView()
 					m.focused = focusList
 					return m, nil
 				}
@@ -9015,6 +9044,36 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 					"J", "K", " ", "enter":
 					m = m.handleGraphKeys(msg)
 					viewToggleHandled = true
+				case "D":
+					m.handleGraphCheckDepKey()
+					viewToggleHandled = true
+				case "c":
+					if res := m.graphView.CheckDepResult(); res != nil {
+						// P20A-2: Re-evaluate against live graph/read-only state before copying
+						// so time-travel entry, background reloads, or authority degradation cannot copy stale commands.
+						liveRes := m.evaluateGraphCheckDep(res.FromID, res.ToID)
+						m.graphView.SetCheckDepResult(liveRes)
+						if liveRes.Command != "" {
+							cmds = append(cmds, m.copyTextToClipboardCmd(liveRes.Command, "📋 Copied: "+liveRes.Command))
+						} else {
+							m.statusMsg = "No writable br/bd dep add command available for this check"
+							m.statusIsError = false
+						}
+					} else if m.graphView.CheckDepActive() {
+						m.statusMsg = "No writable br/bd dep add command available for this check"
+						m.statusIsError = false
+					} else {
+						m.statusMsg = "Press D in Graph view to check adding a dependency (A → B)"
+						m.statusIsError = false
+					}
+					viewToggleHandled = true
+				case "esc":
+					if m.graphView.CheckDepActive() {
+						m.graphView.ClearCheckDep()
+						m.statusMsg = "Check Add Dep cleared"
+						m.statusIsError = false
+						viewToggleHandled = true
+					}
 				case "y":
 					var selectedID string
 					if selected := m.graphView.SelectedIssue(); selected != nil {
@@ -9251,9 +9310,9 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			case "b":
 				m.isBoardView = !m.isBoardView
-				m.isGraphView = false
+				m.exitGraphView()
 				m.isActionableView = false
-				m.isHistoryView = false
+				m.exitHistoryView()
 				m.isSprintView = false
 				m.showVelocityComparison = false
 				if m.isBoardView {
@@ -9266,10 +9325,14 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			case "g":
 				// Toggle graph view
-				m.isGraphView = !m.isGraphView
+				if m.isGraphView {
+					m.exitGraphView()
+				} else {
+					m.isGraphView = true
+				}
 				m.isBoardView = false
 				m.isActionableView = false
-				m.isHistoryView = false
+				m.exitHistoryView()
 				m.isSprintView = false
 				m.showVelocityComparison = false
 				if m.isGraphView {
@@ -9283,9 +9346,9 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "a":
 				// Toggle actionable view
 				m.isActionableView = !m.isActionableView
-				m.isGraphView = false
+				m.exitGraphView()
 				m.isBoardView = false
-				m.isHistoryView = false
+				m.exitHistoryView()
 				m.isSprintView = false
 				m.showVelocityComparison = false
 				if m.isActionableView {
@@ -9301,10 +9364,10 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.focused == focusTree {
 					m.focused = focusList
 				} else {
-					m.isGraphView = false
+					m.exitGraphView()
 					m.isBoardView = false
 					m.isActionableView = false
-					m.isHistoryView = false
+					m.exitHistoryView()
 					m.isSprintView = false
 					m.showVelocityComparison = false
 					m.refreshTreeView()
@@ -9316,10 +9379,10 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.focused == focusInsights {
 					m.focused = focusList
 				} else {
-					m.isGraphView = false
+					m.exitGraphView()
 					m.isBoardView = false
 					m.isActionableView = false
-					m.isHistoryView = false
+					m.exitHistoryView()
 					m.isSprintView = false
 					m.showVelocityComparison = false
 					m.focused = focusInsights
@@ -9347,7 +9410,7 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			case "h":
 				// Toggle history view
-				m.isGraphView = false
+				m.exitGraphView()
 				m.isBoardView = false
 				m.isActionableView = false
 				m.isSprintView = false
@@ -9356,7 +9419,7 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 					if m.historyLoadFailed && !m.historyLoading {
 						return m, m.enterHistoryView()
 					}
-					m.isHistoryView = false
+					m.exitHistoryView()
 					m.focused = focusList
 					return m, nil
 				}
@@ -9369,10 +9432,10 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.statusMsg = ""
 					return m, nil
 				}
-				m.isGraphView = false
+				m.exitGraphView()
 				m.isBoardView = false
 				m.isActionableView = false
-				m.isHistoryView = false
+				m.exitHistoryView()
 				m.isSprintView = false
 				m.showVelocityComparison = false
 				m.focused = focusLabelDashboard
@@ -9397,10 +9460,10 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			case "]", "f4":
 				// Attention view (bv-117): ranked labels with a cursor
-				m.isGraphView = false
+				m.exitGraphView()
 				m.isBoardView = false
 				m.isActionableView = false
-				m.isHistoryView = false
+				m.exitHistoryView()
 				m.isSprintView = false
 				m.showVelocityComparison = false
 				m.focused = focusAttention
@@ -9414,10 +9477,7 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 				scopedIssues := m.repoScopedIssues()
 				cfg := analysis.DefaultLabelHealthConfig()
 				flow := analysis.ComputeCrossLabelFlowWithScope(scopedIssues, cfg, m.candidateIDs)
-				m.isGraphView = false
-				m.isBoardView = false
-				m.isActionableView = false
-				m.isHistoryView = false
+				m.exitGraphView()
 				m.isSprintView = false
 				m.showVelocityComparison = false
 				m.focused = focusFlowMatrix
@@ -10149,6 +10209,7 @@ func (m *Model) handleGraphKeys(msg tea.KeyMsg) *Model {
 		m.graphView.ToggleExpand()
 	case "enter":
 		if selected := m.graphView.SelectedIssue(); selected != nil {
+			m.graphView.ClearCheckDep()
 			m.revealRecipeIssue(selected.ID)
 			// Find and select in list
 			m.selectListIssueByID(selected.ID)
@@ -10165,6 +10226,244 @@ func (m *Model) handleGraphKeys(msg tea.KeyMsg) *Model {
 		}
 	}
 	return m
+}
+
+func quoteTUIShellWord(word string) string {
+	if word == "" {
+		return "''"
+	}
+	safe := true
+	for _, r := range word {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') ||
+			r == '_' || r == '.' || r == '/' || r == ':' || r == '@' || r == '+' || r == '-') {
+			safe = false
+			break
+		}
+	}
+	if safe {
+		return word
+	}
+	return "'" + strings.ReplaceAll(word, "'", "'\"'\"'") + "'"
+}
+
+// handleGraphCheckDepKey implements interactive 2-step Pre-Flight Dependency Validation
+// ("Check Add Dep A → B") inside the TUI Graph View (W31-4).
+func (m *Model) handleGraphCheckDepKey() {
+	selected := m.graphView.SelectedIssue()
+	if selected == nil {
+		m.statusMsg = "❌ No issue selected in Graph view"
+		m.statusIsError = true
+		return
+	}
+	fromID := m.graphView.CheckDepFromID()
+	// Start (or restart after a previous verdict) picking from the currently selected issue.
+	if fromID == "" || m.graphView.CheckDepResult() != nil {
+		m.graphView.StartCheckDep(selected.ID)
+		m.statusMsg = fmt.Sprintf("🧪 Check Add Dep: %s → navigate to blocker target & press D (Esc to cancel)", selected.ID)
+		m.statusIsError = false
+		return
+	}
+	res := m.evaluateGraphCheckDep(fromID, selected.ID)
+	m.graphView.SetCheckDepResult(res)
+	switch {
+	case res.WouldCycle:
+		m.statusMsg = "⛔ " + res.Warning
+		m.statusIsError = true
+	case !res.CanAdd:
+		m.statusMsg = "⚠ " + res.Warning
+		m.statusIsError = true
+	case res.AlreadyExists:
+		m.statusMsg = "ℹ " + res.Warning
+		m.statusIsError = false
+	default:
+		msg := fmt.Sprintf("✓ Safe: %s → %s", res.FromID, res.ToID)
+		if res.WouldBlockActionable {
+			msg += " (blocks ready work)"
+		}
+		if res.CrossRepo {
+			msg += " (cross-repo)"
+		}
+		if res.Command != "" {
+			msg += " • press c to copy: " + res.Command
+		}
+		m.statusMsg = msg
+		m.statusIsError = false
+	}
+}
+
+// evaluateGraphCheckDep validates adding blocking edge fromID -> toID against the FULL
+// unfiltered issue graph (m.issues) so filtered-out intermediate nodes cannot hide multi-hop cycles.
+func (m *Model) evaluateGraphCheckDep(fromID, toID string) *graphCheckDepResult {
+	res := &graphCheckDepResult{FromID: fromID, ToID: toID}
+	fullIssues := m.issues
+	idxByID := make(map[string]int, len(fullIssues))
+	for i := range fullIssues {
+		idxByID[fullIssues[i].ID] = i
+	}
+	fromIdx, fromOK := idxByID[fromID]
+	toIdx, toOK := idxByID[toID]
+	if !fromOK || !toOK {
+		var missing []string
+		if !fromOK {
+			missing = append(missing, fromID)
+		}
+		if !toOK && toID != fromID {
+			missing = append(missing, toID)
+		}
+		res.Warning = fmt.Sprintf("Unknown issue ID(s): %s", strings.Join(missing, ", "))
+		return res
+	}
+	fromIss := &fullIssues[fromIdx]
+	toIss := &fullIssues[toIdx]
+	fromRepo := strings.TrimSpace(fromIss.SourceRepo)
+	toRepo := strings.TrimSpace(toIss.SourceRepo)
+	res.CrossRepo = fromRepo != "" && toRepo != "" && !strings.EqualFold(fromRepo, toRepo)
+
+	if fromID == toID {
+		res.WouldCycle = true
+		res.CyclePath = []string{fromID, toID}
+		res.Warning = fmt.Sprintf("Self-dependency %s → %s would create a 1-node cycle", fromID, toID)
+		return res
+	}
+	for _, dep := range fromIss.Dependencies {
+		if dep != nil && dep.Type.IsBlocking() && dep.DependsOnID == toID {
+			res.CanAdd = true
+			res.AlreadyExists = true
+			res.Warning = fmt.Sprintf("Blocking dependency %s → %s already exists", fromID, toID)
+			return res
+		}
+	}
+
+	readiness := model.NewReadinessIndex(fullIssues)
+	if m.analyzer != nil && m.analyzer.Readiness() != nil {
+		readiness = m.analyzer.Readiness()
+	}
+	refNow := m.analysisReferenceTime()
+	parentChildren := make(map[string][]string)
+	for i := range fullIssues {
+		for _, dep := range fullIssues[i].Dependencies {
+			if dep != nil && dep.Type == model.DepParentChild && dep.DependsOnID != "" {
+				parentChildren[dep.DependsOnID] = append(parentChildren[dep.DependsOnID], fullIssues[i].ID)
+			}
+		}
+	}
+	hasReadySelfOrDescendant := func(rootID string) bool {
+		if readiness.Ready(rootID, refNow) {
+			return true
+		}
+		visited := map[string]bool{rootID: true}
+		queue := append([]string(nil), parentChildren[rootID]...)
+		for len(queue) > 0 {
+			curr := queue[0]
+			queue = queue[1:]
+			if visited[curr] {
+				continue
+			}
+			visited[curr] = true
+			if idx, ok := idxByID[curr]; ok && (fullIssues[idx].Status.IsClosed() || fullIssues[idx].Status.IsTombstone()) {
+				continue
+			}
+			if readiness.Ready(curr, refNow) {
+				return true
+			}
+			queue = append(queue, parentChildren[curr]...)
+		}
+		return false
+	}
+	res.WouldBlockActionable = !fromIss.Status.IsClosed() &&
+		!fromIss.Status.IsTombstone() &&
+		!toIss.Status.IsClosed() &&
+		!toIss.Status.IsTombstone() &&
+		hasReadySelfOrDescendant(fromID)
+
+	canAdd, cyclePath, warning := analysis.CheckDependencyAddition(fullIssues, fromID, toID)
+	res.CanAdd = canAdd
+	res.WouldCycle = !canAdd
+	res.CyclePath = cyclePath
+	res.Warning = warning
+	if !canAdd {
+		return res
+	}
+
+	// Gate br/bd dep add identically to --robot-check-dep (P17-8 / P18A-6 / P20A-3):
+	// withhold in historical/time-travel/explicit-DB/provisional/incomplete-authority modes,
+	// cross-repo workspace edges, read-only origins, missing workspace working directory,
+	// mismatched tracker origins, or flag/control-char injection IDs.
+	canEmitCmd := !m.timeTravelMode &&
+		strings.TrimSpace(m.asOfRevision) == "" &&
+		!m.isExplicitDB &&
+		!m.sourceDegraded &&
+		!m.authorityIncomplete &&
+		!isHistoricalGitBeadsPath(m.beadsPath)
+	if canEmitCmd && res.CrossRepo && m.workspaceMode {
+		canEmitCmd = false
+	}
+	cmdFrom, cmdTo := fromID, toID
+	trackerCLI := "br"
+	if canEmitCmd && (fromIss.Origin != nil || toIss.Origin != nil) {
+		o, pOrig := fromIss.Origin, toIss.Origin
+		if o == nil || pOrig == nil ||
+			strings.TrimSpace(o.ReadOnlyReason) != "" ||
+			strings.TrimSpace(pOrig.ReadOnlyReason) != "" {
+			canEmitCmd = false
+		} else {
+			sameTracker := o.Tracker == pOrig.Tracker &&
+				o.Database == pOrig.Database &&
+				o.WorkingDirectory == pOrig.WorkingDirectory &&
+				o.TrackerDirectory == pOrig.TrackerDirectory &&
+				o.Executable == pOrig.Executable
+			if !sameTracker {
+				canEmitCmd = false
+			} else {
+				if lid := strings.TrimSpace(o.LocalID); lid != "" {
+					cmdFrom = lid
+				}
+				if lid := strings.TrimSpace(pOrig.LocalID); lid != "" {
+					cmdTo = lid
+				}
+				if cmdFrom == cmdTo {
+					canEmitCmd = false
+				}
+				if strings.EqualFold(strings.TrimSpace(o.Tracker), "bd") {
+					trackerCLI = "bd"
+				}
+			}
+		}
+	} else if canEmitCmd && m.workspaceMode {
+		// Workspace issues without verified Origin lack safe local ID + working directory.
+		canEmitCmd = false
+	}
+	isSafeDepArg := func(s string) bool {
+		if s == "" || strings.HasPrefix(s, "-") {
+			return false
+		}
+		for _, r := range s {
+			if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) {
+				return false
+			}
+		}
+		return true
+	}
+	if canEmitCmd && (!isSafeDepArg(cmdFrom) || !isSafeDepArg(cmdTo)) {
+		canEmitCmd = false
+	}
+	if canEmitCmd && m.workspaceMode {
+		if fromIss.Origin == nil || strings.TrimSpace(fromIss.Origin.WorkingDirectory) == "" {
+			canEmitCmd = false
+		}
+	}
+	if canEmitCmd {
+		if m.workspaceMode {
+			res.Command = fmt.Sprintf("cd -- %s && %s dep add %s %s",
+				quoteTUIShellWord(fromIss.Origin.WorkingDirectory),
+				trackerCLI,
+				quoteTUIShellWord(cmdFrom),
+				quoteTUIShellWord(cmdTo))
+		} else {
+			res.Command = fmt.Sprintf("%s dep add %s %s", trackerCLI, quoteTUIShellWord(cmdFrom), quoteTUIShellWord(cmdTo))
+		}
+	}
+	return res
 }
 
 // handleTreeKeys handles keyboard input when tree view is focused (bv-gllx)
@@ -10467,6 +10766,8 @@ func (m *Model) handleHistoryKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 			selectedID = m.historyView.SelectedBeadID()
 		}
 		if selectedID != "" {
+			m.cancelCausalityLoad()
+			m.causalityRequestGen++
 			m.revealRecipeIssue(selectedID)
 			m.selectListIssueByID(selectedID)
 			m.isHistoryView = false
@@ -10697,6 +10998,8 @@ func (m *Model) handleHistoryKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 			// Find and select the bead in the main list
 			m.selectListIssueByID(selectedID)
 			// Switch to graph view focused on this bead
+			m.cancelCausalityLoad()
+			m.causalityRequestGen++
 			m.isHistoryView = false
 			m.isGraphView = true
 			m.refreshBoardAndGraphForCurrentFilter()
@@ -10710,6 +11013,8 @@ func (m *Model) handleHistoryKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 		}
 	case "h", "esc":
 		// Exit history view
+		m.cancelCausalityLoad()
+		m.causalityRequestGen++
 		m.isHistoryView = false
 		m.focused = focusList
 	}
@@ -10839,6 +11144,24 @@ func (m *Model) loadCausalityForBeadCmd(beadID string) tea.Cmd {
 		var res *correlation.CausalityResult
 		var lastErr error
 		if repoDir != "" {
+			// P19-5: Resolve human/date --as-of revisions (e.g. "2026-10-01", "3 days ago")
+			// against repoDir before forwarding to git log in Correlator.
+			resolvedRev := asOfRev
+			if resolvedRev != "" {
+				beadsDirForRev := ""
+				if beadsPath != "" {
+					beadsDirForRev = filepath.Dir(beadsPath)
+				}
+				if beadsDirForRev != "" {
+					if r, rErr := loader.NewGitLoaderWithBeadsDir(repoDir, beadsDirForRev).ResolveRevision(resolvedRev); rErr == nil && strings.TrimSpace(r) != "" {
+						resolvedRev = strings.TrimSpace(r)
+					} else if r, rErr := loader.NewGitLoader(repoDir).ResolveRevision(resolvedRev); rErr == nil && strings.TrimSpace(r) != "" {
+						resolvedRev = strings.TrimSpace(r)
+					}
+				} else if r, rErr := loader.NewGitLoader(repoDir).ResolveRevision(resolvedRev); rErr == nil && strings.TrimSpace(r) != "" {
+					resolvedRev = strings.TrimSpace(r)
+				}
+			}
 			var corr *correlation.Correlator
 			if beadsPath != "" {
 				corr = correlation.NewCorrelator(repoDir, beadsPath)
@@ -10849,7 +11172,7 @@ func (m *Model) loadCausalityForBeadCmd(beadID string) tea.Cmd {
 				Limit:             500,
 				CausalityBeadID:   localID,
 				TargetBeadAliases: aliases,
-				Revision:          asOfRev,
+				Revision:          resolvedRev,
 			})
 			if err != nil {
 				lastErr = err
@@ -11207,7 +11530,7 @@ func (m *Model) handleRecipePickerKeys(msg tea.KeyMsg) *Model {
 			m.applyRecipe(selected)
 			if !m.isBoardView && !m.isGraphView {
 				m.isActionableView = false
-				m.isHistoryView = false
+				m.exitHistoryView()
 				m.isSprintView = false
 				m.savedViewFocus = focusList
 			}
@@ -11351,6 +11674,8 @@ func (m *Model) handleRepoPickerKeys(msg tea.KeyMsg) *Model {
 			m.statusMsg = fmt.Sprintf("Repo filter: %s", formatRepoList(sortedRepoKeys(selected), 3))
 		}
 		repoStatus := m.statusMsg
+		m.cancelCausalityLoad()
+		m.causalityRequestGen++
 		m.etaCtx = nil
 		m.suggestionsCacheLoaded = false
 		m.suggestionsCache = nil
@@ -11424,7 +11749,7 @@ func (m *Model) handleLabelPickerKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 			m.statusIsError = false
 			if !m.isBoardView && !m.isGraphView {
 				m.isActionableView = false
-				m.isHistoryView = false
+				m.exitHistoryView()
 				m.isSprintView = false
 				m.savedViewFocus = focusList
 			}
@@ -11651,7 +11976,7 @@ func (m *Model) handleTimeTravelInputKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 		m.enterTimeTravelMode(revision)
 		if m.timeTravelMode && !m.isBoardView && !m.isGraphView && m.savedViewFocus != focusTree {
 			m.isActionableView = false
-			m.isHistoryView = false
+			m.exitHistoryView()
 			m.isSprintView = false
 			m.showVelocityComparison = false
 			m.savedViewFocus = focusList
@@ -11697,13 +12022,28 @@ func (m *Model) recordSavedViewFocus() {
 	}
 }
 
+func (m *Model) exitGraphView() {
+	if m.isGraphView {
+		m.graphView.ClearCheckDep()
+	}
+	m.isGraphView = false
+}
+
+func (m *Model) exitHistoryView() {
+	if m.isHistoryView {
+		m.cancelCausalityLoad()
+		m.causalityRequestGen++
+	}
+	m.isHistoryView = false
+}
+
 func (m *Model) resetUnderlyingViewToMainList() {
 	hadFlowDetail := m.flowDetailID != ""
 	m.flowDetailID = ""
 	m.isBoardView = false
-	m.isGraphView = false
+	m.exitGraphView()
 	m.isActionableView = false
-	m.isHistoryView = false
+	m.exitHistoryView()
 	m.isSprintView = false
 	m.showVelocityComparison = false
 	if !m.isSplitView {
@@ -14384,7 +14724,7 @@ func (m *Model) setActiveRecipe(r *recipe.Recipe) {
 		}
 	}
 	if m.recipeGraphOwned && m.isGraphView {
-		m.isGraphView = false
+		m.exitGraphView()
 		if m.focused == focusGraph {
 			m.focused = focusList
 		}
@@ -14404,7 +14744,8 @@ func (m *Model) setActiveRecipe(r *recipe.Recipe) {
 	m.recipeCollapsed = make(map[string]bool)
 	if r != nil && r.View.ShowGraph {
 		m.recipeGraphOwned = true
-		m.isGraphView, m.isBoardView, m.isActionableView, m.isHistoryView = true, false, false, false
+		m.exitHistoryView()
+		m.isGraphView, m.isBoardView, m.isActionableView = true, false, false
 		m.isSprintView = false
 		m.showVelocityComparison = false
 		m.savedViewFocus = focusGraph
@@ -16636,7 +16977,7 @@ func (m *Model) evaluateTimeTravelCandidates(
 		az.SetWeights(*w)
 	}
 	stats := az.Analyze()
-	triageRes := analysis.ComputeTriageFromAnalyzer(az, &stats, issues, analysis.TriageOptions{}, az.Now())
+	triageRes := analysis.ComputeTriageFromAnalyzer(az, &stats, issues, tuiTriageOptions(nil), az.Now())
 	triageScores, _, _, _, _ := extractTriageMaps(triageRes)
 	applied, err := applyRecipeToIssues(scopedCandidates, az, &stats, triageScores, m.activeRecipe, az.Now())
 	if err != nil {
@@ -17128,6 +17469,7 @@ func (m *Model) enterTimeTravelMode(revision string) bool {
 	m.timeTravelSince = revision
 	m.timeTravelDensityDelta = densityDelta
 	m.tree.SetReadOnly(true)
+	m.graphView.ClearCheckDep()
 
 	// Success feedback with full summary counts and graph/health deltas
 	healthTrend := diff.Summary.HealthTrend
@@ -17156,6 +17498,7 @@ func (m *Model) exitTimeTravelMode() {
 	m.reopenedIssueIDs = nil
 	m.modifiedIssueIDs = nil
 	m.tree.SetReadOnly(m.beadsPath == "" || isHistoricalGitBeadsPath(m.beadsPath))
+	m.graphView.ClearCheckDep()
 
 	// Feedback
 	m.statusMsg = "⏱️ Time-travel mode disabled"
@@ -20645,8 +20988,8 @@ func (m *Model) RenderDebugView(viewName string, width, height int) string {
 	m.ready = true
 	m.snapshotInitPending = false
 	m.isBoardView = false
-	m.isGraphView = false
-	m.isHistoryView = false
+	m.exitGraphView()
+	m.exitHistoryView()
 	m.isActionableView = false
 	m.isSprintView = false
 	m.showVelocityComparison = false
@@ -20661,7 +21004,7 @@ func (m *Model) RenderDebugView(viewName string, width, height int) string {
 	if m.analysis != nil {
 		m.analysis.WaitForPhase2()
 		if m.analyzer != nil {
-			triage := analysis.ComputeTriageFromAnalyzer(m.analyzer, m.analysis, m.issues, analysis.TriageOptions{}, m.analysisReferenceTime())
+			triage := analysis.ComputeTriageFromAnalyzer(m.analyzer, m.analysis, m.issues, tuiTriageOptions(nil), m.analysisReferenceTime())
 			m.triageScores, m.triageReasons, m.quickWinSet, m.blockerSet, m.unblocksMap = extractTriageMaps(triage)
 			if len(m.priorityHints) == 0 {
 				recs := m.analyzer.GenerateRecommendationsFromStats(m.analysis, analysis.DefaultThresholds())
