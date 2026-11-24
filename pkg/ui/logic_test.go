@@ -10990,3 +10990,230 @@ func TestWave30_Pass17AndTUIPowerUpgrades(t *testing.T) {
 		}
 	})
 }
+
+func TestPass18_TrackARegressions(t *testing.T) {
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	oldTime := now.Add(-10 * 24 * time.Hour)
+
+	t.Run("P18A-1_FocusHistoryRealUpdateDispatch", func(t *testing.T) {
+		issues := []model.Issue{
+			{ID: "H-1", Title: "History issue", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: oldTime, UpdatedAt: oldTime},
+		}
+		m := NewModel(issues, nil, "")
+		defer m.Stop()
+		m.width = 140
+		m.height = 40
+		m.isHistoryView = true
+		m.focused = focusHistory
+		m.historyView.SetSize(140, 39)
+		report := &correlation.HistoryReport{
+			Histories: map[string]correlation.BeadHistory{
+				"H-1": {
+					BeadID: "H-1",
+					Title:  "History issue",
+					Status: "open",
+					Commits: []correlation.CorrelatedCommit{
+						{SHA: "abc1234567890", ShortSHA: "abc1234", Message: "feat: H-1", Author: "alice", Timestamp: oldTime, Confidence: 0.9},
+					},
+				},
+			},
+			CommitIndex: map[string][]string{"abc1234567890": {"H-1"}},
+		}
+		m.historyFullReport = report
+		m.historyLoading = false
+		m.historyReportDataGeneration = m.semanticDataGeneration
+		m.historyView.SetReport(report)
+		m.historyView.SetOrphans([]correlation.OrphanCandidate{
+			{SHA: "def5678901234", ShortSHA: "def5678", Message: "unlinked fix", Author: "bob", Timestamp: oldTime, SuspicionScore: 60},
+		}, 0.5)
+
+		// Press O via real m.Update -> must toggle Orphans mode (NOT launch $EDITOR).
+		um, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'O'}})
+		m = um.(*Model)
+		if !m.historyView.IsOrphansMode() {
+			t.Fatalf("P18A-1 regression: pressing O via m.Update in focusHistory did not toggle Orphans mode (status=%q)", m.statusMsg)
+		}
+		if cmd != nil {
+			t.Fatalf("P18A-1 regression: pressing O in focusHistory returned unexpected command (likely $EDITOR hijacked O)")
+		}
+		// Exit orphans mode with O again.
+		um, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'O'}})
+		m = um.(*Model)
+		if m.historyView.IsOrphansMode() {
+			t.Fatalf("P18A-1 regression: second O did not exit Orphans mode")
+		}
+
+		// Press W via real m.Update -> must enter causality loading and return an async tea.Cmd.
+		um, wCmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'W'}})
+		m = um.(*Model)
+		if !m.historyView.ShowCausality() || wCmd == nil {
+			t.Fatalf("P18A-1 regression: pressing W via m.Update in focusHistory did not trigger causality load (show=%v cmdNil=%v)", m.historyView.ShowCausality(), wCmd == nil)
+		}
+		m.cancelCausalityLoad()
+
+		// Press x via real m.Update -> must route to history correlation ignore, NOT open Markdown export modal.
+		um, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
+		m = um.(*Model)
+		if m.focused != focusHistory {
+			t.Fatalf("P18A-1 regression: pressing x via m.Update in focusHistory hijacked focus=%v", m.focused)
+		}
+
+		// Verify keybindings registry does not advertise O -> Open in $EDITOR for history view.
+		for _, kb := range GetKeyBindingDocs() {
+			if kb.Key == "O" && strings.Contains(kb.Desc, "$EDITOR") && strings.Contains(kb.Context, "history") {
+				t.Fatalf("P18A-1 regression: keybindings registry still lists O ($EDITOR) in history view: %+v", kb)
+			}
+		}
+	})
+
+	t.Run("P18A-2_GitModeDetailPanelRendersCausality", func(t *testing.T) {
+		h := NewHistoryModel(&correlation.HistoryReport{
+			Histories: map[string]correlation.BeadHistory{
+				"G-1": {
+					BeadID: "G-1",
+					Title:  "Git mode bead",
+					Status: "open",
+					Commits: []correlation.CorrelatedCommit{
+						{SHA: "aaa1111222233", ShortSHA: "aaa1111", Message: "feat: G-1", Author: "alice", Timestamp: oldTime, Confidence: 0.9},
+					},
+				},
+			},
+			CommitIndex: map[string][]string{"aaa1111222233": {"G-1"}},
+		}, DefaultTheme(lipgloss.NewRenderer(&strings.Builder{})))
+		h.SetSize(120, 36)
+		h.ToggleViewMode()
+		if !h.IsGitMode() {
+			t.Fatalf("expected git mode active")
+		}
+		h.SetCausality("G-1", &correlation.CausalityResult{
+			Insights: &correlation.CausalInsights{
+				Coverage:             "complete",
+				DurationKnown:        true,
+				TotalDuration:        48 * time.Hour,
+				BlockedDurationKnown: true,
+				BlockedDuration:      12 * time.Hour,
+				BlockedPercentage:    25,
+			},
+		})
+		h.SetShowCausality(true)
+		panel := ansi.Strip(h.renderGitDetailPanel(72, 34))
+		if !strings.Contains(panel, "CAUSALITY & WAIT") || !strings.Contains(panel, "Blocked: 12.0h") {
+			t.Fatalf("P18A-2 regression: Git mode detail panel did not render causality section:\n%s", panel)
+		}
+		if !strings.Contains(panel, "COMMIT DETAILS") {
+			t.Fatalf("P18A-2 regression: Git mode detail panel dropped COMMIT DETAILS:\n%s", panel)
+		}
+	})
+
+	t.Run("P18A-7_ScopeRecipeFilterBypassesPreparedGlobalAlerts", func(t *testing.T) {
+		issues := []model.Issue{
+			{ID: "A-1", Title: "Alpha", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: oldTime, UpdatedAt: oldTime},
+		}
+		m := NewModel(issues, nil, "")
+		defer m.Stop()
+		m.scopeRecipeFilter = "actionable"
+		m.activeRecipe = nil
+		sentinel := []drift.Alert{{Type: drift.AlertStaleIssue, Severity: drift.SeverityWarning, Message: "UNSCOPED_SENTINEL"}}
+		um, _ := m.Update(Phase2ReadyMsg{
+			Stats:    m.analysis,
+			prepared: &DataSnapshot{alerts: sentinel, alertsWarning: 1},
+		})
+		m = um.(*Model)
+		for _, a := range m.alerts {
+			if a.Message == "UNSCOPED_SENTINEL" {
+				t.Fatalf("P18A-7 regression: Phase2ReadyMsg installed unscoped prepared alerts while scopeRecipeFilter=%q", m.scopeRecipeFilter)
+			}
+		}
+	})
+
+	t.Run("P18A-8_CausalityErrorResetsShowFlagAndRefTimeClearsCache", func(t *testing.T) {
+		issues := []model.Issue{
+			{ID: "C-1", Title: "Causality bead", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: oldTime, UpdatedAt: oldTime},
+		}
+		m := NewModel(issues, nil, "")
+		defer m.Stop()
+		m.historyView.SetShowCausality(true)
+		m.causalityRequestGen = 7
+		um, _ := m.Update(CausalityLoadedMsg{
+			DataGeneration:    m.semanticDataGeneration,
+			RequestGeneration: 7,
+			BeadID:            "C-1",
+			Error:             fmt.Errorf("git unavailable"),
+		})
+		m = um.(*Model)
+		if m.historyView.ShowCausality() {
+			t.Fatalf("P18A-8 regression: CausalityLoadedMsg error left showCausality stuck true")
+		}
+		// Verify SetReferenceTime invalidates causalityCache.
+		m.historyView.SetCausality("C-1", &correlation.CausalityResult{Insights: &correlation.CausalInsights{Coverage: "complete"}})
+		m.historyView.SetReferenceTime(now.Add(24 * time.Hour))
+		if m.historyView.GetCausality("C-1") != nil {
+			t.Fatalf("P18A-8 regression: HistoryModel.SetReferenceTime did not invalidate causalityCache")
+		}
+	})
+
+	t.Run("P18A-9_Phase2ResortKeepsSelectionAndRecipeItemsSynced", func(t *testing.T) {
+		issues := []model.Issue{
+			{ID: "P-A", Title: "Alpha", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, CreatedAt: oldTime, UpdatedAt: oldTime},
+			{ID: "P-B", Title: "Beta", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, CreatedAt: oldTime, UpdatedAt: oldTime},
+		}
+		m := NewModel(issues, nil, "")
+		defer m.Stop()
+		m.sortMode = SortTriage
+		m.triageScores = map[string]float64{"P-A": 0.9, "P-B": 0.1}
+		m.applyFilter()
+		// Select P-A (currently index 0).
+		m.selectVisibleListItemByID("P-A")
+		// Now Phase 2 flips scores so P-B ranks first.
+		m.triageScores = map[string]float64{"P-A": 0.1, "P-B": 0.95}
+		m.refreshListItemsPhase2()
+		items := m.list.Items()
+		if len(items) != 2 || items[0].(IssueItem).Issue.ID != "P-B" {
+			t.Fatalf("P18A-9 regression: refreshListItemsPhase2 did not re-sort items, got %v", items)
+		}
+		if sel, ok := m.list.SelectedItem().(IssueItem); !ok || sel.Issue.ID != "P-A" {
+			t.Fatalf("P18A-9 regression: selection jumped away from P-A after Phase 2 resort, got %+v", m.list.SelectedItem())
+		}
+		if len(m.recipeListItems) != 2 || m.recipeListItems[0].(IssueItem).Issue.ID != "P-B" {
+			t.Fatalf("P18A-9 regression: recipeListItems out of sync with re-sorted list: %v", m.recipeListItems)
+		}
+	})
+
+	t.Run("P18A-10_ClosedNodeNotFlaggedAsCutVertex", func(t *testing.T) {
+		issues := []model.Issue{
+			{ID: "CV-A", Title: "Open A", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: oldTime, UpdatedAt: oldTime,
+				Dependencies: []*model.Dependency{{IssueID: "CV-A", DependsOnID: "CV-MID", Type: model.DepBlocks}}},
+			{ID: "CV-MID", Title: "Closed bridge", Status: model.StatusClosed, Priority: 1, IssueType: model.TypeTask, CreatedAt: oldTime, UpdatedAt: oldTime,
+				Dependencies: []*model.Dependency{{IssueID: "CV-MID", DependsOnID: "CV-C", Type: model.DepBlocks}}},
+			{ID: "CV-C", Title: "Open C", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: oldTime, UpdatedAt: oldTime},
+		}
+		an := analysis.NewAnalyzer(issues)
+		an.SetNow(now)
+		stats := an.Analyze()
+		ins := stats.GenerateInsights(10)
+		gm := NewGraphModel(issues, &ins, DefaultTheme(lipgloss.NewRenderer(&strings.Builder{})))
+		gm.SetAnalyzer(an, func() time.Time { return now })
+		panel := ansi.Strip(gm.renderMetricsPanel("CV-MID", 72, gm.theme))
+		if strings.Contains(panel, "Cut Vertex") {
+			t.Fatalf("P18A-10 regression: closed node CV-MID must not be flagged as Cut Vertex:\n%s", panel)
+		}
+	})
+
+	t.Run("P18A-12_EmptyCandidateScopeDoesNotLeakLabelExtras", func(t *testing.T) {
+		issues := []model.Issue{
+			{ID: "L-1", Title: "Root", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, Labels: []string{"core", "backend"}, CreatedAt: oldTime, UpdatedAt: oldTime},
+			{ID: "L-2", Title: "Child", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, Labels: []string{"frontend"}, CreatedAt: oldTime, UpdatedAt: oldTime,
+				Dependencies: []*model.Dependency{{IssueID: "L-2", DependsOnID: "L-1", Type: model.DepBlocks}}},
+		}
+		m := NewModel(issues, nil, "")
+		defer m.Stop()
+		m.candidateIDs = map[string]bool{} // Explicit empty scope!
+		m.populateLabelHealthDetailExtras("core")
+		if len(m.labelHealthDetailCooccurrence) != 0 {
+			t.Fatalf("P18A-12 regression: empty candidateIDs leaked cooccurrence: %+v", m.labelHealthDetailCooccurrence)
+		}
+		if len(m.labelHealthDetailTopUnblocks) != 0 {
+			t.Fatalf("P18A-12 regression: empty candidateIDs leaked top unblocks: %+v", m.labelHealthDetailTopUnblocks)
+		}
+	})
+}

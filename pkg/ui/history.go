@@ -202,6 +202,7 @@ func (h *HistoryModel) SetReferenceTime(now time.Time) {
 	if !h.referenceNow.Equal(now) {
 		h.referenceNow = now
 		h.relatedCache = nil
+		h.causalityCache = nil
 	}
 }
 
@@ -4773,9 +4774,13 @@ func (h *HistoryModel) renderGitDetailPanel(width, height int) string {
 	}
 
 	// Window related beads around h.selectedRelatedBead so J/K reveals later beads
-	// while keeping COMMIT DETAILS visible below.
+	// while keeping COMMIT DETAILS (and optional CAUSALITY & WAIT) visible below.
 	totalBeads := len(commit.BeadIDs)
-	maxBeadBudget := contentHeight - 12
+	reservedDetailLines := 12
+	if h.showCausality {
+		reservedDetailLines = 18
+	}
+	maxBeadBudget := contentHeight - reservedDetailLines
 	if maxBeadBudget < 3 {
 		maxBeadBudget = 3
 	}
@@ -4868,6 +4873,15 @@ func (h *HistoryModel) renderGitDetailPanel(width, height int) string {
 		lines = append(lines, scrollIndicatorStyle.Render(fmt.Sprintf("↓ %d more bead(s)", rem)))
 	}
 
+	// Render Causality & Wait section in Git mode when toggled (W30-2 / P18A-2)
+	if h.showCausality {
+		if selBeadID := h.SelectedRelatedBeadID(); selBeadID != "" {
+			lines = append(lines, "")
+			lines = append(lines, strings.Repeat("─", detailSepWidth))
+			lines = append(lines, h.renderCausalitySection(selBeadID, detailSepWidth)...)
+		}
+	}
+
 	// Add separator before commit details
 	lines = append(lines, "")
 	lines = append(lines, strings.Repeat("─", detailSepWidth))
@@ -4909,10 +4923,10 @@ func (h *HistoryModel) renderGitDetailPanel(width, height int) string {
 		lines = lines[:contentHeight]
 	}
 
-	// Add footer hint (bv-xf4p, W28-1)
+	// Add footer hint (bv-xf4p, W28-1, W30-2)
 	lines = append(lines, strings.Repeat("─", detailSepWidth))
 	hintStyle := t.Renderer.NewStyle().Foreground(ColorFooterHint).Italic(true)
-	lines = append(lines, hintStyle.Render("J/K:bead  +/-:confirm/reject  x:ignore  O:orphans  y:copy  o:open  g:graph"))
+	lines = append(lines, hintStyle.Render("J/K:bead  +/-:confirm/reject  x:ignore  W:causality  O:orphans  y:copy  o:open  g:graph"))
 
 	content := clampHistoryPanelContent(lines, width-2, height-2)
 	return panelStyle.Render(content)

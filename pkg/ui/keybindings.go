@@ -279,7 +279,7 @@ func GetKeyBindingDocs() []KeyBindingDoc {
 		{"+", "Accept triage recommendation (tune weights)", "Actions", "list,detail,insights"},
 		{"-", "Ignore triage recommendation (tune weights)", "Actions", "list,detail,insights"},
 		{"C", "Copy full issue", "Actions", "list,detail,board,graph,insights,tree,actionable,flow,history"},
-		{"O", "Open in $EDITOR", "Actions", "list,detail,board,graph,tree,actionable,insights,flow,history"},
+		{"O", "Open in $EDITOR", "Actions", "list,detail,board,graph,tree,actionable,insights,flow"},
 		{"'", "Recipe picker", "Actions", "list"},
 		{"U", "Self-update check", "Actions", "list"},
 		{"V", "Cass sessions", "Actions", "list,detail,board,graph,insights,tree,actionable,flow,history"},

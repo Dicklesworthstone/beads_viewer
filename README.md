@@ -4326,7 +4326,7 @@ bv has a comprehensive built-in help system:
 | **list,detail,insights** | `+` | Accept triage recommendation (tune weights) |
 |  | `-` | Ignore triage recommendation (tune weights) |
 | **list,detail,board,graph,insights,tree,actionable,flow,history** | `C` | Copy full issue |
-| **list,detail,board,graph,tree,actionable,insights,flow,history** | `O` | Open in $EDITOR |
+| **list,detail,board,graph,tree,actionable,insights,flow** | `O` | Open in $EDITOR |
 | **list** | `'` | Recipe picker |
 |  | `U` | Self-update check |
 | **list,detail,board,graph,insights,tree,actionable,flow,history** | `V` | Cass sessions |

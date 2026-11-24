@@ -2053,32 +2053,55 @@ func loadWorkspaceHistoryAtRevisionCmd(
 			gitRoot string
 			rev     string
 		}
-		type wsOrphanGroup struct {
-			gitRoot        string
-			rev            string
-			histories      map[string]correlation.BeadHistory
-			storeDirs      []string
-			seenStoreDir   map[string]bool
-			repoKeys       []string
-			seenRepoKey    map[string]bool
-			subtreesByRepo map[string]string
+		type wsOrphanRejectSource struct {
+			report  *correlation.HistoryReport
+			qualify func(string) string
 		}
-		canonOrphanPath := func(p string) string {
-			p = strings.TrimSpace(p)
-			if p == "" {
-				return ""
-			}
-			if abs, aErr := filepath.Abs(p); aErr == nil {
-				p = abs
-			}
-			if eval, eErr := filepath.EvalSymlinks(p); eErr == nil && eval != "" {
-				p = eval
-			}
-			return filepath.Clean(p)
+		type wsOrphanGroup struct {
+			gitRoot          string
+			rev              string
+			allRootHistories map[string]correlation.BeadHistory
+			scopedHistories  map[string]correlation.BeadHistory
+			rejectSources    []wsOrphanRejectSource
+			feedbackApplied  *correlation.FeedbackApplied
+			storeDirs        []string
+			seenStoreDir     map[string]bool
+			repoKeys         []string
+			seenRepoKey      map[string]bool
+			subtreesByRepo   map[string]string
+			rootRepoKey      string
+			matchedSubtrees  []string
+			unmatchedSubtree []string
+			matchedRootStore bool
+			totalRootTargets int
 		}
 
 		effectiveRev := strings.TrimSpace(revision)
 		normScopeRepo := normalizeRepoKey(scopeRepoFilter)
+		matchesScopeRepo := func(target wsCorrTarget) bool {
+			if normScopeRepo == "" {
+				return true
+			}
+			return target.sourceRepo == normScopeRepo ||
+				normalizeRepoKey(target.label) == normScopeRepo ||
+				normalizeRepoKey(target.prefix) == normScopeRepo
+		}
+		var scopedGitRoots map[string]bool
+		if normScopeRepo != "" {
+			scopedGitRoots = make(map[string]bool)
+			for _, target := range targets {
+				if !matchesScopeRepo(target) {
+					continue
+				}
+				gr := target.gitRoot
+				if gr == "" {
+					gr = target.repoPath
+				}
+				if cg := canonDir(gr); cg != "" {
+					scopedGitRoots[cg] = true
+				}
+			}
+		}
 		prefixFiles := len(distinctRoots) > 1
 		mergedHistories := make(map[string]correlation.BeadHistory, len(captured))
 		commitRepoDirs := make(map[string]string)
@@ -2110,12 +2133,6 @@ func loadWorkspaceHistoryAtRevisionCmd(
 					Error:             ctx.Err(),
 				}
 			}
-			if normScopeRepo != "" &&
-				target.sourceRepo != normScopeRepo &&
-				normalizeRepoKey(target.label) != normScopeRepo &&
-				normalizeRepoKey(target.prefix) != normScopeRepo {
-				continue
-			}
 			repoPath := target.repoPath
 			if repoPath == "" {
 				continue
@@ -2123,6 +2140,14 @@ func loadWorkspaceHistoryAtRevisionCmd(
 			gitRoot := target.gitRoot
 			if gitRoot == "" {
 				gitRoot = repoPath
+			}
+			inScope := matchesScopeRepo(target)
+			if !inScope {
+				// P18A-3: Keep sibling targets on a shared-.git monorepo root so their
+				// storeDirs, correlated commits, and subtrees prevent false-positive orphans.
+				if scopedGitRoots == nil || !scopedGitRoots[canonDir(gitRoot)] {
+					continue
+				}
 			}
 			targetRepoKey := target.sourceRepo
 			if targetRepoKey == "" {
@@ -2181,61 +2206,102 @@ func loadWorkspaceHistoryAtRevisionCmd(
 			entry := getSharedIncrementalCorrelator(gitRoot, correlationPath)
 			part, err := entry.generateReport(ctx, feedbackStore, localBeads, opts)
 			if err != nil {
-				lastErr = err
+				if inScope {
+					lastErr = err
+				}
 				continue
 			}
-			successCount++
 
-			if gitRange == "" && part.GitRange != "" {
-				gitRange = part.GitRange
-			}
-			if part.Window != nil && !countedRoots[gitRoot] {
-				countedRoots[gitRoot] = true
-				totalWalkedCommits += part.Window.Commits
-			}
-			allStrategies = append(allStrategies, part.Stats.Strategies...)
-			if part.Stats.FeedbackApplied != nil {
-				if mergedFeedback == nil {
-					mergedFeedback = &correlation.FeedbackApplied{}
+			if inScope {
+				successCount++
+				if gitRange == "" && part.GitRange != "" {
+					gitRange = part.GitRange
 				}
-				mergedFeedback.Confirmed += part.Stats.FeedbackApplied.Confirmed
-				mergedFeedback.Rejected += part.Stats.FeedbackApplied.Rejected
-				mergedFeedback.Ignored += part.Stats.FeedbackApplied.Ignored
-			}
-			for sha := range part.CommitIndex {
-				if low := strings.ToLower(strings.TrimSpace(sha)); low != "" {
-					commitRepoDirs[low] = gitRoot
+				if part.Window != nil && !countedRoots[gitRoot] {
+					countedRoots[gitRoot] = true
+					totalWalkedCommits += part.Window.Commits
+				}
+				allStrategies = append(allStrategies, part.Stats.Strategies...)
+				if part.Stats.FeedbackApplied != nil {
+					if mergedFeedback == nil {
+						mergedFeedback = &correlation.FeedbackApplied{}
+					}
+					mergedFeedback.Confirmed += part.Stats.FeedbackApplied.Confirmed
+					mergedFeedback.Rejected += part.Stats.FeedbackApplied.Rejected
+					mergedFeedback.Ignored += part.Stats.FeedbackApplied.Ignored
+				}
+				for sha := range part.CommitIndex {
+					if low := strings.ToLower(strings.TrimSpace(sha)); low != "" {
+						commitRepoDirs[low] = gitRoot
+					}
 				}
 			}
 
 			// Register per-(gitRoot, targetRev) orphan group so shared-.git monorepos
-			// run OrphanDetector once across merged histories and all sibling storeDirs (P17-1).
+			// run OrphanDetector once across merged histories and all sibling storeDirs (P17-1, P18A-3).
 			var orphanGroup *wsOrphanGroup
 			if gitRoot != "" {
-				gKey := wsOrphanGroupKey{gitRoot: canonOrphanPath(gitRoot), rev: targetRev}
+				canonRoot := canonDir(gitRoot)
+				gKey := wsOrphanGroupKey{gitRoot: canonRoot, rev: targetRev}
 				orphanGroup = orphanGroups[gKey]
 				if orphanGroup == nil {
 					orphanGroup = &wsOrphanGroup{
-						gitRoot:        gitRoot,
-						rev:            targetRev,
-						histories:      make(map[string]correlation.BeadHistory),
-						seenStoreDir:   make(map[string]bool),
-						seenRepoKey:    make(map[string]bool),
-						subtreesByRepo: make(map[string]string),
+						gitRoot:          gitRoot,
+						rev:              targetRev,
+						allRootHistories: make(map[string]correlation.BeadHistory),
+						scopedHistories:  make(map[string]correlation.BeadHistory),
+						seenStoreDir:     make(map[string]bool),
+						seenRepoKey:      make(map[string]bool),
+						subtreesByRepo:   make(map[string]string),
 					}
 					orphanGroups[gKey] = orphanGroup
 					orphanGroupOrder = append(orphanGroupOrder, gKey)
 				}
-				if targetRepoKey != "" && !orphanGroup.seenRepoKey[targetRepoKey] {
-					orphanGroup.seenRepoKey[targetRepoKey] = true
-					orphanGroup.repoKeys = append(orphanGroup.repoKeys, targetRepoKey)
+				orphanGroup.totalRootTargets++
+				if part.Stats.FeedbackApplied != nil {
+					if orphanGroup.feedbackApplied == nil {
+						orphanGroup.feedbackApplied = &correlation.FeedbackApplied{}
+					}
+					orphanGroup.feedbackApplied.Confirmed += part.Stats.FeedbackApplied.Confirmed
+					orphanGroup.feedbackApplied.Rejected += part.Stats.FeedbackApplied.Rejected
+					orphanGroup.feedbackApplied.Ignored += part.Stats.FeedbackApplied.Ignored
 				}
-				if targetRepoKey != "" && target.subtreePrefix != "" {
-					orphanGroup.subtreesByRepo[targetRepoKey] = strings.Trim(filepath.ToSlash(target.subtreePrefix), "/")
+				tLocalToQualified := localToQualified
+				tPrefix := target.prefix
+				orphanGroup.rejectSources = append(orphanGroup.rejectSources, wsOrphanRejectSource{
+					report: part,
+					qualify: func(localID string) string {
+						if q := tLocalToQualified[localID]; q != "" {
+							return q
+						}
+						if tPrefix != "" {
+							return workspace.QualifyID(localID, tPrefix)
+						}
+						return localID
+					},
+				})
+				cleanSub := strings.Trim(filepath.ToSlash(target.subtreePrefix), "/")
+				if inScope {
+					if targetRepoKey != "" && !orphanGroup.seenRepoKey[targetRepoKey] {
+						orphanGroup.seenRepoKey[targetRepoKey] = true
+						orphanGroup.repoKeys = append(orphanGroup.repoKeys, targetRepoKey)
+					}
+					if cleanSub != "" {
+						if targetRepoKey != "" {
+							orphanGroup.subtreesByRepo[targetRepoKey] = cleanSub
+						}
+						orphanGroup.matchedSubtrees = append(orphanGroup.matchedSubtrees, cleanSub)
+					} else {
+						orphanGroup.matchedRootStore = true
+						if targetRepoKey != "" && orphanGroup.rootRepoKey == "" {
+							orphanGroup.rootRepoKey = targetRepoKey
+						}
+					}
+				} else if cleanSub != "" {
+					orphanGroup.unmatchedSubtree = append(orphanGroup.unmatchedSubtree, cleanSub)
 				}
 				if correlationPath != "" {
-					canonRoot := canonOrphanPath(gitRoot)
-					canonStore := canonOrphanPath(filepath.Dir(correlationPath))
+					canonStore := canonDir(filepath.Dir(correlationPath))
 					if rel, rErr := filepath.Rel(canonRoot, canonStore); rErr == nil && rel != "." && rel != "" && !strings.HasPrefix(rel, "..") {
 						relSlash := filepath.ToSlash(rel)
 						if !orphanGroup.seenStoreDir[relSlash] {
@@ -2254,7 +2320,7 @@ func loadWorkspaceHistoryAtRevisionCmd(
 				if qualID == "" {
 					qualID = localID
 				}
-				if targetRepoKey != "" {
+				if inScope && targetRepoKey != "" {
 					beadRepoKeys[qualID] = targetRepoKey
 				}
 				hist.BeadID = qualID
@@ -2262,53 +2328,72 @@ func loadWorkspaceHistoryAtRevisionCmd(
 				for i, ev := range hist.Events {
 					ev.BeadID = qualID
 					events[i] = ev
-					if ev.Timestamp.After(latestTime) {
-						latestTime = ev.Timestamp
-						latestSHA = ev.CommitSHA
-					}
-					if low := strings.ToLower(strings.TrimSpace(ev.CommitSHA)); low != "" {
-						commitRepoDirs[low] = gitRoot
+					if inScope {
+						if ev.Timestamp.After(latestTime) {
+							latestTime = ev.Timestamp
+							latestSHA = ev.CommitSHA
+						}
+						if low := strings.ToLower(strings.TrimSpace(ev.CommitSHA)); low != "" {
+							commitRepoDirs[low] = gitRoot
+						}
 					}
 				}
 				hist.Events = events
 				hist.Milestones = correlation.GetBeadMilestones(hist.Events)
 
+				// P18A-3: Preserve git-root-relative unprefixed commit file paths for OrphanDetector
+				// before optional multi-root display prefixing mutates cc.Files.
+				orphanCommits := make([]correlation.CorrelatedCommit, len(hist.Commits))
 				commits := make([]correlation.CorrelatedCommit, len(hist.Commits))
 				for i, cc := range hist.Commits {
 					cc.BeadID = qualID
-					if low := strings.ToLower(strings.TrimSpace(cc.SHA)); low != "" {
-						commitRepoDirs[low] = gitRoot
+					orphanCC := cc
+					if len(cc.Files) > 0 {
+						orphanCC.Files = append([]correlation.FileChange(nil), cc.Files...)
 					}
-					if lowShort := strings.ToLower(strings.TrimSpace(cc.ShortSHA)); lowShort != "" {
-						commitRepoDirs[lowShort] = gitRoot
-					}
-					if prefixFiles && target.label != "" && len(cc.Files) > 0 {
-						files := make([]correlation.FileChange, len(cc.Files))
-						repoPrefix := target.label + "/"
-						for j, f := range cc.Files {
-							cleanRel := strings.TrimPrefix(filepath.ToSlash(f.Path), "./")
-							if !strings.HasPrefix(cleanRel, repoPrefix) {
-								f.Path = repoPrefix + strings.TrimLeft(cleanRel, "/")
-							} else {
-								f.Path = cleanRel
-							}
-							files[j] = f
+					orphanCommits[i] = orphanCC
+					if inScope {
+						if low := strings.ToLower(strings.TrimSpace(cc.SHA)); low != "" {
+							commitRepoDirs[low] = gitRoot
 						}
-						cc.Files = files
-					}
-					if cc.Timestamp.After(latestTime) {
-						latestTime = cc.Timestamp
-						latestSHA = cc.SHA
+						if lowShort := strings.ToLower(strings.TrimSpace(cc.ShortSHA)); lowShort != "" {
+							commitRepoDirs[lowShort] = gitRoot
+						}
+						if prefixFiles && target.label != "" && len(cc.Files) > 0 {
+							files := make([]correlation.FileChange, len(cc.Files))
+							repoPrefix := target.label + "/"
+							for j, f := range cc.Files {
+								cleanRel := strings.TrimPrefix(filepath.ToSlash(f.Path), "./")
+								if !strings.HasPrefix(cleanRel, repoPrefix) {
+									f.Path = repoPrefix + strings.TrimLeft(cleanRel, "/")
+								} else {
+									f.Path = cleanRel
+								}
+								files[j] = f
+							}
+							cc.Files = files
+						}
+						if cc.Timestamp.After(latestTime) {
+							latestTime = cc.Timestamp
+							latestSHA = cc.SHA
+						}
 					}
 					commits[i] = cc
 				}
-				hist.Commits = commits
-				mergedHistories[qualID] = hist
 				if orphanGroup != nil {
-					orphanGroup.histories[qualID] = hist
+					orphanHist := hist
+					orphanHist.Commits = orphanCommits
+					orphanGroup.allRootHistories[qualID] = orphanHist
+					if inScope {
+						orphanGroup.scopedHistories[qualID] = orphanHist
+					}
+				}
+				if inScope {
+					hist.Commits = commits
+					mergedHistories[qualID] = hist
 				}
 			}
-			if latestSHA == "" && part.LatestCommitSHA != "" {
+			if inScope && latestSHA == "" && part.LatestCommitSHA != "" {
 				latestSHA = part.LatestCommitSHA
 			}
 		}
@@ -2321,22 +2406,33 @@ func loadWorkspaceHistoryAtRevisionCmd(
 			}
 		}
 
-		// Run OrphanDetector once per distinct (gitRoot, targetRev) over merged histories and union storeDirs (P17-1, P17-9).
+		// Run OrphanDetector once per distinct (gitRoot, targetRev) over merged histories and union storeDirs (P17-1, P17-9, P18A-3, P18A-15).
 		for _, gKey := range orphanGroupOrder {
 			if ctx.Err() != nil {
 				break
 			}
 			grp := orphanGroups[gKey]
-			if grp == nil || grp.gitRoot == "" {
+			if grp == nil || grp.gitRoot == "" || (len(grp.repoKeys) == 0 && len(grp.scopedHistories) == 0) {
 				continue
 			}
 			grpReport := &correlation.HistoryReport{
-				Histories:   grp.histories,
-				CommitIndex: correlation.BuildCommitIndex(grp.histories),
+				Stats:       correlation.HistoryStats{FeedbackApplied: grp.feedbackApplied},
+				Histories:   grp.scopedHistories,
+				CommitIndex: correlation.BuildCommitIndex(grp.allRootHistories),
 			}
-			oRep, oErr := correlation.NewOrphanDetectorAt(grpReport, grp.gitRoot, time.Now().UTC()).
-				WithStoreDirs(grp.storeDirs...).
-				DetectOrphans(correlation.ExtractOptions{Limit: 500, Revision: grp.rev})
+			for _, rs := range grp.rejectSources {
+				grpReport.MergeRejectedPairs(rs.report, rs.qualify)
+			}
+			detector := correlation.NewOrphanDetectorAt(grpReport, grp.gitRoot, time.Now().UTC()).
+				WithStoreDirs(grp.storeDirs...)
+			if normScopeRepo != "" && grp.totalRootTargets > 1 {
+				if grp.matchedRootStore && len(grp.unmatchedSubtree) > 0 {
+					detector.WithSubtreeScope(nil, grp.unmatchedSubtree)
+				} else if !grp.matchedRootStore && len(grp.matchedSubtrees) > 0 {
+					detector.WithSubtreeScope(grp.matchedSubtrees, nil)
+				}
+			}
+			oRep, oErr := detector.DetectOrphans(correlation.ExtractOptions{Limit: 500, Revision: grp.rev})
 			if oErr != nil || oRep == nil {
 				continue
 			}
@@ -2367,16 +2463,25 @@ func loadWorkspaceHistoryAtRevisionCmd(
 					ambiguous := false
 					for _, f := range cand.Files {
 						cleanPath := strings.TrimPrefix(filepath.ToSlash(strings.TrimSpace(f)), "./")
+						fileRepo := ""
+						bestLen := -1
 						for rk, sub := range grp.subtreesByRepo {
 							if sub == "" {
 								continue
 							}
-							if cleanPath == sub || strings.HasPrefix(cleanPath, sub+"/") {
-								if matchedRepo == "" {
-									matchedRepo = rk
-								} else if matchedRepo != rk {
-									ambiguous = true
-								}
+							if (cleanPath == sub || strings.HasPrefix(cleanPath, sub+"/")) && len(sub) > bestLen {
+								bestLen = len(sub)
+								fileRepo = rk
+							}
+						}
+						if fileRepo == "" && grp.rootRepoKey != "" {
+							fileRepo = grp.rootRepoKey
+						}
+						if fileRepo != "" {
+							if matchedRepo == "" {
+								matchedRepo = fileRepo
+							} else if matchedRepo != fileRepo {
+								ambiguous = true
 							}
 						}
 					}
@@ -3762,6 +3867,7 @@ func (m *Model) quitCommand() tea.Cmd {
 	m.quitting = true
 	m.cancelOwnedAnalysis()
 	m.cancelHistoryLoad()
+	m.cancelCausalityLoad()
 	m.cancelPhase2Preparation()
 	m.cancelCassLookup()
 	if m.editorCancel != nil {
@@ -6094,7 +6200,7 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Refresh alerts now that full Phase 2 metrics (cycles, etc.) are available
 		if msg.prepared != nil && m.candidateIDs == nil && !m.workspaceMode &&
 			m.scopeLabelFilter == "" && m.scopeRepoFilter == "" &&
-			m.activeRecipe == nil && !m.isExplicitDB && m.asOfRevision == "" && m.referenceNow.IsZero() {
+			m.scopeRecipeFilter == "" && m.activeRecipe == nil && !m.isExplicitDB && m.asOfRevision == "" && m.referenceNow.IsZero() {
 			m.alerts = msg.prepared.alerts
 			m.alertsCritical, m.alertsWarning, m.alertsInfo = msg.prepared.alertsCritical, msg.prepared.alertsWarning, msg.prepared.alertsInfo
 		} else {
@@ -6241,6 +6347,9 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.cancelCausalityLoad()
 		if msg.Error != nil || msg.Result == nil {
+			if m.historyView.GetCausality(msg.BeadID) == nil {
+				m.historyView.SetShowCausality(false)
+			}
 			errText := "no causal history available"
 			if msg.Error != nil {
 				errText = msg.Error.Error()
@@ -6617,7 +6726,7 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.candidateIDs != nil || !m.referenceNow.IsZero() || m.workspaceMode ||
 			m.scopeLabelFilter != "" || m.scopeRepoFilter != "" ||
-			m.activeRecipe != nil || m.isExplicitDB || m.asOfRevision != "" {
+			m.scopeRecipeFilter != "" || m.activeRecipe != nil || m.isExplicitDB || m.asOfRevision != "" {
 			m.alerts, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlertsWithOptions(m.issues, m.analysis, m.analyzer, m.alertOptions())
 		} else {
 			m.alerts = msg.Snapshot.alerts
@@ -9005,7 +9114,8 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 						"ctrl+d", "ctrl+u", "pgdown", "pgup",
 						"home", "G", "end",
 						"J", "K", "v", "tab", "enter",
-						"y", "c", "F", "o", "/", "A":
+						"y", "c", "F", "o", "/", "A",
+						"O", "W", "+", "-", "x":
 						m, cmd = m.handleHistoryKeys(msg)
 						cmds = append(cmds, cmd)
 						viewToggleHandled = true
@@ -10626,10 +10736,6 @@ func (m *Model) loadCausalityForBeadCmd(beadID string) tea.Cmd {
 
 	refNow := m.analysisReferenceTime().UTC()
 	asOfRev := strings.TrimSpace(m.asOfRevision)
-	blockerTitles := make(map[string]string, len(m.issues))
-	for _, iss := range m.issues {
-		blockerTitles[iss.ID] = iss.Title
-	}
 
 	// Capture repo root, beads path, local ID, and aliases synchronously before leaving the UI goroutine.
 	repoDir := strings.TrimSpace(m.workDir)
@@ -10658,6 +10764,15 @@ func (m *Model) loadCausalityForBeadCmd(beadID string) tea.Cmd {
 				} else {
 					beadsPath = candIssues
 				}
+			}
+		}
+	}
+	blockerTitles := make(map[string]string, len(m.issues)*2)
+	for _, iss := range m.issues {
+		blockerTitles[iss.ID] = iss.Title
+		if iss.Origin != nil && (!m.workspaceMode || targetSourceRepo == "" || normalizeRepoKey(iss.SourceRepo) == targetSourceRepo) {
+			if lid := strings.TrimSpace(iss.Origin.LocalID); lid != "" {
+				blockerTitles[lid] = iss.Title
 			}
 		}
 	}
@@ -14738,7 +14853,7 @@ func (m *Model) refreshListItemsPhase2() {
 	if len(current) == 0 {
 		return
 	}
-	if m.snapshot != nil && m.snapshot.IsPhase2Ready() &&
+	if m.snapshot != nil && m.snapshot.IsPhase2Ready() && m.sortMode == SortDefault &&
 		m.snapshotListGeneration != 0 && m.snapshotListGeneration == m.listDataGeneration &&
 		m.list.FilterState() == list.Unfiltered && len(m.snapshot.listModelItems) == len(current) {
 		// Every presentation mutation advances listDataGeneration. Only pristine
@@ -14766,6 +14881,7 @@ func (m *Model) refreshListItemsPhase2() {
 		}
 		items[i] = m.itemWithTriage(item)
 	}
+	resorted := false
 	if m.sortMode == SortTriage || m.sortMode == SortUnblocks || m.sortMode == SortRisk || m.sortMode == SortETA {
 		// Re-sort flat lists when Phase 2 updates triage/unblocks/risk/ETA scores.
 		allIssueItems := true
@@ -14780,10 +14896,18 @@ func (m *Model) refreshListItemsPhase2() {
 		}
 		if allIssueItems && len(items) > 1 {
 			m.sortFilteredItems(items, issuesForSort)
+			resorted = true
 		}
 	}
 
-	m.replaceListPresentation(items, selectedID)
+	if resorted {
+		m.setListItems(items)
+		if m.list.FilterState() == list.Unfiltered {
+			m.selectVisibleListItemByID(selectedID)
+		}
+	} else {
+		m.replaceListPresentation(items, selectedID)
+	}
 	m.updateViewportContent()
 }
 
@@ -19102,6 +19226,7 @@ func (m *Model) Stop() {
 		ownedAnalysis.WaitForPhase2()
 	}
 	m.cancelHistoryLoad()
+	m.cancelCausalityLoad()
 	m.cancelPhase2Preparation()
 	m.cancelCassLookup()
 	if m.editorCancel != nil {
@@ -19258,9 +19383,6 @@ func (m *Model) buildLabelDashboardExtras(scopedIssues []model.Issue, refNow tim
 		trendByLabel[lh.Label] = lh.Velocity.TrendDirection
 	}
 	velIssues := m.candidateScopedIssues()
-	if len(velIssues) == 0 {
-		velIssues = scopedIssues
-	}
 	histVel := analysis.ComputeAllHistoricalVelocity(velIssues, 4, refNow)
 	for _, lv := range histVel {
 		var counts []int
@@ -19312,9 +19434,6 @@ func (m *Model) populateLabelHealthDetailExtras(label string) {
 	refNow := m.analysisReferenceTime().UTC()
 	cfg := analysis.DefaultLabelHealthConfig()
 	velIssues := m.candidateScopedIssues()
-	if len(velIssues) == 0 {
-		velIssues = scopedIssues
-	}
 	trendDir := ""
 	if m.labelHealthDetail != nil && m.labelHealthDetail.Label == label {
 		trendDir = m.labelHealthDetail.Velocity.TrendDirection
@@ -19364,7 +19483,7 @@ func (m *Model) populateLabelHealthDetailExtras(label string) {
 			c := cascades.Cascades[i]
 			m.labelHealthDetailCascade = &c
 			for _, rec := range c.Recommendations {
-				if len(visibleScoped) == 0 || visibleScoped[rec.IssueID] {
+				if m.candidateIDs == nil || visibleScoped[rec.IssueID] {
 					m.labelHealthDetailTopUnblocks = append(m.labelHealthDetailTopUnblocks, rec)
 				}
 			}
