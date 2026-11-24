@@ -1023,3 +1023,39 @@ func TestWave29_W29_4_InteractiveGraphRiskAndCollateralCycleBreaks(t *testing.T)
 		t.Fatalf("W29-4 regression: expected collateral(A->B) > collateral(B->A), got %+v", colByEdge)
 	}
 }
+
+func TestWave30_W30_4_StandaloneGraphCheckAddDep(t *testing.T) {
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	issues := []model.Issue{
+		{ID: "A", Title: "Root", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
+		{ID: "B", Title: "Blocked by A", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "B", DependsOnID: "A", Type: model.DepBlocks}}},
+	}
+	an := analysis.NewAnalyzer(issues)
+	an.SetNow(now)
+	stats := an.Analyze()
+	written, err := GenerateInteractiveGraphHTML(InteractiveGraphOptions{
+		Issues:     issues,
+		Stats:      &stats,
+		Readiness:  an.Readiness(),
+		ExportedAt: now,
+		Title:      "Wave 30 Check Dep",
+		Path:       filepath.Join(t.TempDir(), "w30_checkdep_graph.html"),
+	})
+	if err != nil {
+		t.Fatalf("GenerateInteractiveGraphHTML: %v", err)
+	}
+	raw, err := os.ReadFile(written)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	html := string(raw)
+	if strings.Contains(html, "%!(") {
+		t.Fatalf("W30-4 regression: unescaped fmt.Sprintf artifact found in standalone graph HTML")
+	}
+	for _, want := range []string{`id="ctx-checkdep"`, `id="checkdep-banner"`, `id="btn-checkdep-copy"`, `function checkStandaloneDep(`, `window.bvCheckStandaloneDep = checkStandaloneDep`} {
+		if !strings.Contains(html, want) {
+			t.Fatalf("W30-4 regression: standalone graph HTML missing %q", want)
+		}
+	}
+}

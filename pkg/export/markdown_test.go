@@ -3654,3 +3654,133 @@ func TestWave29_W29_4_HTMLReportParity_And_PriorityBriefRisk(t *testing.T) {
 		t.Fatalf("W29-4 regression: Low-risk issue RISK-LO should not appear in High-Risk Watchlist:\n%s", brief)
 	}
 }
+
+func TestWave30_W30_1_ExportDecisionIntelligenceAndMetrics(t *testing.T) {
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-60 * 24 * time.Hour)
+	closedAt := now.Add(-48 * time.Hour)
+	est := 120
+	issues := []model.Issue{
+		{ID: "EX-ROOT", Title: "High-leverage root", Status: model.StatusOpen, Priority: 4, IssueType: model.TypeTask, SourceRepo: "api", CreatedAt: old, UpdatedAt: old, EstimatedMinutes: &est},
+		{ID: "EX-CHILD", Title: "Cross-repo dependent", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeBug, SourceRepo: "web", CreatedAt: old, UpdatedAt: old, EstimatedMinutes: &est,
+			Dependencies: []*model.Dependency{{IssueID: "EX-CHILD", DependsOnID: "EX-ROOT", Type: model.DepBlocks}}},
+		{ID: "EX-CYC-A", Title: "Cycle node A", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: old, UpdatedAt: old,
+			Dependencies: []*model.Dependency{{IssueID: "EX-CYC-A", DependsOnID: "EX-CYC-B", Type: model.DepBlocks}}},
+		{ID: "EX-CYC-B", Title: "Cycle node B", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: old, UpdatedAt: old,
+			Dependencies: []*model.Dependency{{IssueID: "EX-CYC-B", DependsOnID: "EX-CYC-A", Type: model.DepBlocks}}},
+		{ID: "EX-TMPL", Title: "Template issue", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, IsTemplate: true, CreatedAt: old, UpdatedAt: old, EstimatedMinutes: &est},
+		{ID: "EX-CLOSED", Title: "Closed history", Status: model.StatusClosed, Priority: 1, IssueType: model.TypeTask, CreatedAt: old, UpdatedAt: closedAt, ClosedAt: &closedAt},
+	}
+
+	an := analysis.NewAnalyzer(issues)
+	an.SetNow(now)
+	stats := an.Analyze()
+	etaCtx := analysis.NewETAContext(issues, &stats, now)
+	vis := map[string]bool{"EX-ROOT": true, "EX-CHILD": true, "EX-CYC-A": true, "EX-CYC-B": true, "EX-TMPL": true, "EX-CLOSED": true}
+
+	baseOpts := ReportOptions{
+		Title:        "Wave 30 Decision Intel",
+		GeneratedAt:  now,
+		IncludeGraph: false,
+		Metrics:      []string{"triage", "risk", "eta"},
+		GraphStats:   &stats,
+		Analyzer:     an,
+		ETAContext:   etaCtx,
+		Readiness:    an.Readiness(),
+		GraphIssues:  issues,
+		VisibleIDs:   vis,
+	}
+
+	// 1. Markdown report: triage/risk/eta columns + Decision Intelligence + per-issue What-If & Cycle-Break.
+	mdOpts := baseOpts
+	mdOpts.Format = "markdown"
+	mdBytes, err := GenerateReport(issues, issues, mdOpts)
+	if err != nil {
+		t.Fatalf("GenerateReport(markdown): %v", err)
+	}
+	md := string(mdBytes)
+	for _, want := range []string{"| Triage Score |", "| Risk |", "| ETA (d) |", "## Decision Intelligence", "### Cycle-Break Suggestions", "| **What-If Unblocks** |", "EX-CHILD"} {
+		if !strings.Contains(md, want) {
+			t.Fatalf("W30-1 markdown missing %q:\n%s", want, md)
+		}
+	}
+
+	// 2. HTML report parity.
+	htmlOpts := baseOpts
+	htmlOpts.Format = "html"
+	htmlBytes, err := GenerateReport(issues, issues, htmlOpts)
+	if err != nil {
+		t.Fatalf("GenerateReport(html): %v", err)
+	}
+	htmlOut := string(htmlBytes)
+	for _, want := range []string{"<th>Triage Score</th>", "<th>Risk</th>", "<th>ETA (d)</th>", "Decision Intelligence", "Cycle-Break Suggestions", "<th>What-If Unblocks</th>"} {
+		if !strings.Contains(htmlOut, want) {
+			t.Fatalf("W30-1 html missing %q:\n%s", want, htmlOut)
+		}
+	}
+
+	// 3. CSV report: triage/risk/eta columns present & suppressed ("N/A") on closed/template.
+	csvOpts := baseOpts
+	csvOpts.Format = "csv"
+	csvBytes, err := GenerateReport(issues, issues, csvOpts)
+	if err != nil {
+		t.Fatalf("GenerateReport(csv): %v", err)
+	}
+	csvLines := strings.Split(strings.TrimSpace(string(csvBytes)), "\n")
+	if len(csvLines) < 2 || !strings.Contains(csvLines[0], "triage,risk,eta") {
+		t.Fatalf("W30-1 csv header missing triage,risk,eta: %q", csvLines[0])
+	}
+	for _, line := range csvLines[1:] {
+		if strings.HasPrefix(line, "EX-CLOSED,") || strings.HasPrefix(line, "EX-TMPL,") {
+			if !strings.HasSuffix(line, ",N/A,N/A,N/A") {
+				t.Fatalf("W30-1 csv leaked triage/risk/eta on ineligible issue: %q", line)
+			}
+		}
+		if strings.HasPrefix(line, "EX-ROOT,") && strings.HasSuffix(line, ",N/A,N/A,N/A") {
+			t.Fatalf("W30-1 csv missing triage/risk/eta values on active EX-ROOT: %q", line)
+		}
+	}
+
+	// 4. JSON report: metrics map contains numeric triage/risk/eta on active issues and omits them on closed/template.
+	jsonOpts := baseOpts
+	jsonOpts.Format = "json"
+	jsonBytes, err := GenerateReport(issues, issues, jsonOpts)
+	if err != nil {
+		t.Fatalf("GenerateReport(json): %v", err)
+	}
+	var parsed struct {
+		Issues []struct {
+			ID      string             `json:"id"`
+			Metrics map[string]float64 `json:"metrics"`
+		} `json:"issues"`
+	}
+	if err := json.Unmarshal(jsonBytes, &parsed); err != nil {
+		t.Fatalf("json.Unmarshal report: %v", err)
+	}
+	for _, iss := range parsed.Issues {
+		if iss.ID == "EX-ROOT" {
+			if _, ok := iss.Metrics["triage"]; !ok {
+				t.Fatalf("W30-1 json missing triage metric on EX-ROOT: %+v", iss.Metrics)
+			}
+			if _, ok := iss.Metrics["eta"]; !ok {
+				t.Fatalf("W30-1 json missing eta metric on EX-ROOT: %+v", iss.Metrics)
+			}
+		}
+		if iss.ID == "EX-CLOSED" || iss.ID == "EX-TMPL" {
+			if len(iss.Metrics) != 0 {
+				t.Fatalf("W30-1 json leaked triage/risk/eta on %s: %+v", iss.ID, iss.Metrics)
+			}
+		}
+	}
+
+	// 5. VisibleIDs filtering: hiding EX-CYC-B and EX-CHILD must suppress cycle-break and What-If leakage.
+	scopedOpts := mdOpts
+	scopedOpts.VisibleIDs = map[string]bool{"EX-ROOT": true, "EX-CYC-A": true}
+	scopedMD, err := GenerateReport([]model.Issue{issues[0], issues[2]}, issues, scopedOpts)
+	if err != nil {
+		t.Fatalf("GenerateReport(scoped markdown): %v", err)
+	}
+	if strings.Contains(string(scopedMD), "EX-CYC-B") || strings.Contains(string(scopedMD), "EX-CHILD") {
+		t.Fatalf("W30-1 regression: VisibleIDs filter leaked hidden IDs into Markdown:\n%s", string(scopedMD))
+	}
+}

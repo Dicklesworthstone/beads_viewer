@@ -1938,3 +1938,14 @@ func TestWave29_A15_4_And_W29_4_SQLiteRiskAndETASuppression(t *testing.T) {
 		t.Fatalf("P16B-7 regression: GetExportedIssues() leaked risk/ETA on template/closed: tmpl=%+v closed=%+v", expByID["tmpl-1"], expByID["closed-1"])
 	}
 }
+
+func TestWave30_P17_5_GetExportedIssuesSkipsNilElements(t *testing.T) {
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	ext := "GH-99"
+	iss := &model.Issue{ID: "OK-1", Title: "Valid issue", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, ExternalRef: &ext, CreatedAt: now, UpdatedAt: now}
+	exp := NewSQLiteExporter([]*model.Issue{nil, iss, nil}, nil, nil, nil)
+	got := exp.GetExportedIssues()
+	if len(got) != 1 || got[0].ID != "OK-1" || got[0].ExternalRef != "GH-99" {
+		t.Fatalf("P17-5 regression: GetExportedIssues() with nil slice elements returned %+v, want [OK-1]", got)
+	}
+}
