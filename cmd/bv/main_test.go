@@ -11124,10 +11124,65 @@ func TestWave29_Pass15AndGapClosures_CLI(t *testing.T) {
 	runGit("add", ".")
 	runGit("commit", "-m", "feat(W29-A): initialize auth service")
 
-	// 1. W29-5: --robot-check-dep safe edge, direct cycle, sequential compound cycle, self-loop, missing ID, already_exists, cross_repo, and --as-of command suppression.
+	// 1. W29-5 & P17-8: --robot-check-dep safe edge, direct cycle, sequential compound cycle, self-loop, missing ID, already_exists, cross_repo, Origin writability, and --as-of command suppression.
 	t.Run("W29-5_RobotCheckDep", func(t *testing.T) {
-		// Safe edge: W29-C -> W29-B (blocks actionable W29-C, cross-repo api->web, safe no cycle)
-		out, stderr, err := runCommandWithTimeout(t, proj, exe, "--robot-check-dep", "W29-C:W29-B")
+		// On a bare JSONL-only directory (no metadata.json / live tracker DB), P17-8 withholds br dep add.
+		roOut, stderr, err := runCommandWithTimeout(t, proj, exe, "--robot-check-dep", "W29-C:W29-B")
+		if err != nil {
+			t.Fatalf("--robot-check-dep (JSONL-only) failed: %v\nstderr=%s", err, stderr)
+		}
+		var roResp struct {
+			Results []struct {
+				CanAdd  bool   `json:"can_add"`
+				Command string `json:"command"`
+			} `json:"results"`
+		}
+		if err := json.Unmarshal([]byte(roOut), &roResp); err != nil {
+			t.Fatalf("unmarshal roResp: %v\n%s", err, roOut)
+		}
+		if len(roResp.Results) != 1 || !roResp.Results[0].CanAdd || roResp.Results[0].Command != "" {
+			t.Fatalf("P17-8 regression: expected JSONL-only read-only dir to withhold command, got %+v", roResp.Results)
+		}
+
+		// With a live tracker metadata.json + beads.db + br executable, safe edge emits br dep add.
+		liveProj := t.TempDir()
+		liveBeads := filepath.Join(liveProj, ".beads")
+		if err := os.MkdirAll(liveBeads, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(liveBeads, "metadata.json"), []byte(`{"database":"beads.db","jsonl_export":"issues.jsonl"}`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(liveBeads, "issues.jsonl"), []byte(buf.String()), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		liveDB, err := sql.Open("sqlite", filepath.Join(liveBeads, "beads.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := liveDB.Exec(`
+			CREATE TABLE issues (id TEXT PRIMARY KEY, title TEXT NOT NULL, description TEXT, status TEXT NOT NULL, priority INTEGER DEFAULT 3, issue_type TEXT DEFAULT 'task', source_repo TEXT, tombstone INTEGER DEFAULT 0);
+			CREATE TABLE dependencies (issue_id TEXT NOT NULL, depends_on_id TEXT NOT NULL, type TEXT NOT NULL);
+			INSERT INTO issues (id, title, status, priority, issue_type, source_repo) VALUES
+				('W29-A', 'Core Auth Service', 'open', 0, 'task', 'api'),
+				('W29-B', 'Web Login Handler', 'open', 1, 'feature', 'web'),
+				('W29-C', 'Audit Log Sink', 'open', 2, 'task', 'api'),
+				('W29-DUP', 'Core Auth Service', 'open', 1, 'task', 'api'),
+				('W29-DONE', 'Bootstrap Repo', 'closed', 1, 'chore', 'api');
+			INSERT INTO dependencies (issue_id, depends_on_id, type) VALUES ('W29-B', 'W29-A', 'blocks');
+		`); err != nil {
+			_ = liveDB.Close()
+			t.Fatal(err)
+		}
+		_ = liveDB.Close()
+		fakeBin := t.TempDir()
+		if err := os.WriteFile(filepath.Join(fakeBin, "br"), []byte("#!/usr/bin/env bash\necho \"--db --json --no-auto-import --no-auto-flush --claim\"\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+		// Safe edge: W29-C -> W29-B (blocks actionable W29-C, cross-repo metadata within single live tracker, safe no cycle)
+		out, stderr, err := runCommandWithTimeout(t, liveProj, exe, "--robot-check-dep", "W29-C:W29-B")
 		if err != nil {
 			t.Fatalf("--robot-check-dep safe edge failed: %v\nstderr=%s", err, stderr)
 		}
@@ -11343,6 +11398,207 @@ func TestWave29_Pass15AndGapClosures_CLI(t *testing.T) {
 		_, stderr, err := runCommandWithTimeout(t, linkProj, exe, "--robot-orphans")
 		if err != nil {
 			t.Fatalf("A15-8 regression: --robot-orphans in symlinked git root failed: %v\nstderr=%s", err, stderr)
+		}
+	})
+}
+
+func TestWave30_Pass17AndLabelAndExportIntelligence(t *testing.T) {
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+
+	// 1. P17-4 & P17-8: --robot-check-dep parent-child descendant readiness + Origin writability/tracker/LocalID gating.
+	t.Run("P17-4_And_P17-8_CheckDepDescendantsAndOriginAuthority", func(t *testing.T) {
+		future := now.Add(7 * 24 * time.Hour)
+		issues := []model.Issue{
+			// Deferred parent (NOT itself ready) with an open ready child via DepParentChild.
+			{ID: "api-EPIC", Title: "Deferred container", Status: model.StatusDeferred, DeferUntil: &future, Priority: 1, IssueType: model.TypeEpic, SourceRepo: "api",
+				Origin: &model.IssueOrigin{LocalID: "EPIC", Tracker: "br", WorkingDirectory: "/ws/api", TrackerDirectory: "/ws/api/.beads", Database: "/ws/api/.beads/beads.db"}},
+			{ID: "api-CHILD", Title: "Ready child task", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, SourceRepo: "api",
+				Dependencies: []*model.Dependency{{IssueID: "api-CHILD", DependsOnID: "api-EPIC", Type: model.DepParentChild}},
+				Origin:       &model.IssueOrigin{LocalID: "CHILD", Tracker: "br", WorkingDirectory: "/ws/api", TrackerDirectory: "/ws/api/.beads", Database: "/ws/api/.beads/beads.db"}},
+			{ID: "api-BLK", Title: "Open blocker", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, SourceRepo: "api",
+				Origin: &model.IssueOrigin{LocalID: "BLK", Tracker: "br", WorkingDirectory: "/ws/api", TrackerDirectory: "/ws/api/.beads", Database: "/ws/api/.beads/beads.db"}},
+			{ID: "api-RO", Title: "Read-only issue", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, SourceRepo: "api",
+				Origin: &model.IssueOrigin{LocalID: "RO", Tracker: "br", WorkingDirectory: "/ws/api", TrackerDirectory: "/ws/api/.beads", Database: "/ws/api/.beads/beads.db", ReadOnlyReason: "stale snapshot"}},
+			{ID: "web-OTHER", Title: "Other repo issue", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, SourceRepo: "web",
+				Origin: &model.IssueOrigin{LocalID: "OTHER", Tracker: "br", WorkingDirectory: "/ws/web", TrackerDirectory: "/ws/web/.beads", Database: "/ws/web/.beads/beads.db"}},
+		}
+
+		runCheck := func(spec string) struct {
+			Results []robotCheckDepEdgeResult `json:"results"`
+		} {
+			var buf bytes.Buffer
+			ctx := RobotContext{
+				Issues:          issues,
+				FullIssues:      issues,
+				SourceKind:      "workspace",
+				SourceAuthority: &RobotSourceAuthority{ClaimSafe: true},
+				Readiness:       model.NewReadinessIndex(issues),
+				Stdout:          &buf,
+				AsOfCommitTime:  now,
+			}
+			flagVal := spec
+			if err := handleRobotCheckDep(ctx, phaseThreeRobotHandlerConfig{RobotCheckDepFlag: &flagVal}); err != nil {
+				t.Fatalf("handleRobotCheckDep(%q): %v", spec, err)
+			}
+			var out struct {
+				Results []robotCheckDepEdgeResult `json:"results"`
+			}
+			if err := json.Unmarshal(buf.Bytes(), &out); err != nil {
+				t.Fatalf("unmarshal check-dep(%q): %v", spec, err)
+			}
+			return out
+		}
+
+		// P17-4 + P17-8: api-EPIC -> api-BLK must mark would_block_actionable=true (via ready child api-CHILD)
+		// and emit workspace-scoped local-ID command (NOT qualified api-EPIC/api-BLK).
+		r1 := runCheck("api-EPIC:api-BLK")
+		if len(r1.Results) != 1 || !r1.Results[0].CanAdd || !r1.Results[0].WouldBlockActionable {
+			t.Fatalf("P17-4 regression: expected would_block_actionable=true for container with ready child, got %+v", r1.Results)
+		}
+		if !strings.Contains(r1.Results[0].Command, "cd -- /ws/api && br dep add EPIC BLK") {
+			t.Fatalf("P17-8 regression: expected local-ID workspace command, got %q", r1.Results[0].Command)
+		}
+
+		// P17-8: ReadOnlyReason suppresses command.
+		rRO := runCheck("api-RO:api-BLK")
+		if len(rRO.Results) != 1 || rRO.Results[0].Command != "" {
+			t.Fatalf("P17-8 regression: read-only endpoint emitted command %q", rRO.Results[0].Command)
+		}
+
+		// P17-8: Cross-repo / different tracker suppresses command.
+		rCross := runCheck("api-CHILD:web-OTHER")
+		if len(rCross.Results) != 1 || !rCross.Results[0].CrossRepo || rCross.Results[0].Command != "" {
+			t.Fatalf("P17-8 regression: cross-repo endpoints emitted command=%q cross=%v", rCross.Results[0].Command, rCross.Results[0].CrossRepo)
+		}
+	})
+
+	// 2. P17-6: Empty scoped export (0 visible issues while FullIssues non-empty) never leaks probable_bead_id.
+	t.Run("P17-6_EmptyScopedHistoryExportNoLeak", func(t *testing.T) {
+		proj := t.TempDir()
+		runGit := func(args ...string) {
+			t.Helper()
+			cmd := exec.Command("git", args...)
+			cmd.Dir = proj
+			cmd.Env = append(os.Environ(),
+				"GIT_AUTHOR_NAME=Dev", "GIT_AUTHOR_EMAIL=dev@example.com",
+				"GIT_COMMITTER_NAME=Dev", "GIT_COMMITTER_EMAIL=dev@example.com",
+			)
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("git %v: %v\n%s", args, err, out)
+			}
+		}
+		runGit("init")
+		beadsDir := filepath.Join(proj, ".beads")
+		if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		beadsFile := filepath.Join(beadsDir, "issues.jsonl")
+		if err := os.WriteFile(beadsFile, []byte(`{"id":"LEAK-1","title":"Secret auth token fix","status":"open","priority":1,"issue_type":"bug","labels":["secret"],"created_at":"2026-11-18T10:00:00Z","updated_at":"2026-11-18T10:00:00Z"}`+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		runGit("add", ".beads/issues.jsonl")
+		runGit("commit", "-m", "init beads")
+		if err := os.WriteFile(filepath.Join(proj, "auth.go"), []byte("package main\n// token fix\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		runGit("add", "auth.go")
+		runGit("commit", "-m", "fix secret auth token handling")
+
+		full := []model.Issue{{ID: "LEAK-1", Title: "Secret auth token fix", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeBug, Labels: []string{"secret"}, CreatedAt: now, UpdatedAt: now}}
+		hist, err := generateHistoryForExportContext(RobotContext{
+			Issues:          nil, // Empty filtered result!
+			FullIssues:      full,
+			LabelScope:      "nonexistent-label",
+			ProjectDir:      proj,
+			WorkDir:         proj,
+			SourcePath:      beadsFile,
+			SourceAuthority: &RobotSourceAuthority{ClaimSafe: true},
+			AsOfCommitTime:  now,
+		})
+		if err != nil {
+			t.Fatalf("generateHistoryForExportContext: %v", err)
+		}
+		for _, o := range hist.Orphans {
+			if o.ProbableBeadID != "" || o.ConfirmCommand != "" {
+				t.Fatalf("P17-6 regression: empty-scope history.json leaked out-of-scope probable_bead_id/confirm_command: %+v", o)
+			}
+		}
+		if len(hist.Histories) != 0 {
+			t.Fatalf("P17-6 regression: empty-scope history.json leaked histories: %+v", hist.Histories)
+		}
+	})
+
+	// 3. W30-5: --robot-label-health co-occurrence & --label subgraph keystones + data/labels.json TopUnblocks & CooccurringLabels.
+	t.Run("W30-5_LabelCooccurrenceSubgraphAndTopUnblocks", func(t *testing.T) {
+		issues := []model.Issue{
+			{ID: "L-1", Title: "DB schema lock", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, Labels: []string{"db", "backend"}, CreatedAt: now.Add(-48 * time.Hour), UpdatedAt: now},
+			{ID: "L-2", Title: "API endpoint", Status: model.StatusBlocked, Priority: 1, IssueType: model.TypeTask, Labels: []string{"backend", "api"}, CreatedAt: now.Add(-48 * time.Hour), UpdatedAt: now,
+				Dependencies: []*model.Dependency{{IssueID: "L-2", DependsOnID: "L-1", Type: model.DepBlocks}}},
+			{ID: "L-3", Title: "UI screen", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeFeature, Labels: []string{"frontend", "api"}, CreatedAt: now.Add(-48 * time.Hour), UpdatedAt: now,
+				Dependencies: []*model.Dependency{{IssueID: "L-3", DependsOnID: "L-2", Type: model.DepBlocks}}},
+		}
+
+		// (a) --robot-label-health --label backend emits cooccurrence + subgraph_pagerank + subgraph_critical_path.
+		var buf bytes.Buffer
+		ctx := RobotContext{
+			Issues:         issues,
+			FullIssues:     issues,
+			LabelScope:     "backend",
+			Readiness:      model.NewReadinessIndex(issues),
+			Stdout:         &buf,
+			AsOfCommitTime: now,
+		}
+		if err := handleRobotLabelHealth(ctx, phaseThreeRobotHandlerConfig{}); err != nil {
+			t.Fatalf("handleRobotLabelHealth: %v", err)
+		}
+		var lhResp struct {
+			Cooccurrence         map[string]map[string]int         `json:"cooccurrence"`
+			SubgraphPageRank     *analysis.LabelPageRankResult     `json:"subgraph_pagerank"`
+			SubgraphCriticalPath *analysis.LabelCriticalPathResult `json:"subgraph_critical_path"`
+		}
+		if err := json.Unmarshal(buf.Bytes(), &lhResp); err != nil {
+			t.Fatalf("unmarshal label-health: %v", err)
+		}
+		if lhResp.Cooccurrence["backend"]["db"] != 1 || lhResp.Cooccurrence["backend"]["api"] != 1 {
+			t.Fatalf("W30-5 regression: unexpected backend cooccurrence: %+v", lhResp.Cooccurrence)
+		}
+		if lhResp.SubgraphPageRank == nil || lhResp.SubgraphPageRank.Label != "backend" || len(lhResp.SubgraphPageRank.TopIssues) == 0 {
+			t.Fatalf("W30-5 regression: missing subgraph_pagerank for --label backend: %+v", lhResp.SubgraphPageRank)
+		}
+		if lhResp.SubgraphCriticalPath == nil || lhResp.SubgraphCriticalPath.PathLength < 2 {
+			t.Fatalf("W30-5 regression: missing subgraph_critical_path for --label backend: %+v", lhResp.SubgraphCriticalPath)
+		}
+
+		// (b) data/labels.json exposes scoped top_unblocks, cooccurring_labels, and top_core_issue_id.
+		raw, _, err := buildExportLabelsPayload(RobotContext{
+			Issues:         issues,
+			FullIssues:     issues,
+			Readiness:      model.NewReadinessIndex(issues),
+			AsOfCommitTime: now,
+		}, issues, nil, "", now)
+		if err != nil {
+			t.Fatalf("buildExportLabelsPayload: %v", err)
+		}
+		var doc exportLabelsDocument
+		if err := json.Unmarshal(raw, &doc); err != nil {
+			t.Fatalf("unmarshal labels.json: %v", err)
+		}
+		if len(doc.TopUnblocks) == 0 {
+			t.Fatalf("W30-5 regression: labels.json missing top_unblocks: %+v", doc)
+		}
+		foundCooc, foundCore := false, false
+		for _, lbl := range doc.Labels {
+			if lbl.Label == "backend" {
+				if len(lbl.CooccurringLabels) > 0 {
+					foundCooc = true
+				}
+				if lbl.TopCoreIssueID != "" {
+					foundCore = true
+				}
+			}
+		}
+		if !foundCooc || !foundCore {
+			t.Fatalf("W30-5 regression: labels.json backend entry missing cooccurring_labels=%v or top_core_issue_id=%v", foundCooc, foundCore)
 		}
 	})
 }
