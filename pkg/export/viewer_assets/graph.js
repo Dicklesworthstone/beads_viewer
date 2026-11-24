@@ -2257,11 +2257,13 @@ function getNodeOpacity(node) {
 }
 
 function drawNode(node, ctx, globalScale) {
+    if (!Number.isFinite(node?.x) || !Number.isFinite(node?.y)) return;
     const transition = timeTravelState.active ? timeTravelState.nodeStates.get(node.id) : null;
     const fade = transition ? timelineOpacity(transition) : 1;
     if (fade <= 0) return;
     const pulse = transition?.visible && fade < 1 ? 0.35 * Math.sin(Math.PI * fade) : 0;
     const size = getNodeSize(node) * (0.2 + 0.8 * fade + pulse);
+    if (!Number.isFinite(size) || size <= 0) return;
     const color = getNodeColor(node);
     const opacity = getNodeOpacity(node) * fade;
     const isHovered = store.hoveredNode?.id === node.id;
@@ -3553,6 +3555,9 @@ export function selectNode(node) {
     if (cycleNavigatorState.active) {
         resetCycleNavigator();
     }
+    if (store.checkDepPicking) {
+        store.checkDepPicking = false;
+    }
     resetDependencyCone({ refresh: false });
     store.selectedNode = node;
     store.highlightedNodes.clear();
@@ -3563,6 +3568,7 @@ export function selectNode(node) {
     }
 
     refreshGraph();
+    dispatchEvent('checkDepReset', {});
     dispatchEvent('selectionChange', { node });
 }
 
@@ -4335,6 +4341,7 @@ export function zoomToFit(padding = 50) {
 
 export function resetView() {
     store.checkDepPicking = false;
+    dispatchEvent('checkDepReset', {});
     resetWhatIf({ force: true });
     resetCriticalPath();
     resetCycleNavigator();

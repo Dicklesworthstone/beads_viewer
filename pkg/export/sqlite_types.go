@@ -89,6 +89,7 @@ type ExportMeta struct {
 	HasHistory     bool      `json:"has_history,omitempty"`
 	HasLabels      bool      `json:"has_labels,omitempty"`
 	HasForecast    bool      `json:"has_forecast,omitempty"`
+	HasDiff        bool      `json:"has_diff,omitempty"`
 }
 
 // SQLiteExportConfig configures the SQLite export process.
@@ -131,6 +132,8 @@ type SQLiteExportConfig struct {
 	HasLabels bool
 	// HasForecast records whether data/forecast.json will be published alongside this bundle.
 	HasForecast bool
+	// HasDiff records whether data/diff.json will be published alongside this bundle.
+	HasDiff bool
 	// ETAContext optionally supplies a velocity-calibrated ETA context computed over
 	// full-graph velocity issues + matching stats (preserving identical-units scaling
 	// when --pages-include-closed=false or scoped recipes omit closed issues).

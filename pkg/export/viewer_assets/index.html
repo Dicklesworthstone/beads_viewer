@@ -742,6 +742,100 @@
           </div>
         </div>
 
+        <!-- Snapshot Changelog Card (Dashboard, shown when data/diff.json is present via --diff-since) -->
+        <div x-show="hasDiff && diffData?.diff"
+             x-cloak
+             id="dashboard-diff-card"
+             class="mb-4 bg-white dark:bg-gray-800 rounded-2xl border border-sky-200 dark:border-sky-800/60 overflow-hidden shadow-sm">
+          <div class="px-4 py-3 bg-gradient-to-r from-sky-50 to-indigo-50/70 dark:from-sky-950/40 dark:to-indigo-950/30 border-b border-sky-100 dark:border-sky-800/50 flex flex-wrap items-center justify-between gap-2">
+            <div class="flex items-center gap-2 min-w-0">
+              <span class="text-base">Δ</span>
+              <div class="min-w-0">
+                <h3 class="text-sm font-bold text-sky-950 dark:text-sky-100 truncate">
+                  Changes Since <code class="font-mono text-xs px-1.5 py-0.5 rounded bg-sky-100 dark:bg-sky-900/60 text-sky-800 dark:text-sky-200" x-text="diffData?.diff_since || diffData?.from_revision || diffData?.diff?.from_revision || 'baseline'"></code>
+                </h3>
+                <p class="text-[11px] text-sky-700/90 dark:text-sky-300/90"
+                   x-text="((diffData?.diff?.summary?.total_changes || 0) === 0 ? 'No issue changes detected' : ((diffData?.diff?.summary?.total_changes || 0) + ' total change(s) · trend: ' + (diffData?.diff?.summary?.health_trend || 'stable')))"></p>
+              </div>
+            </div>
+            <div class="flex flex-wrap items-center gap-1.5 text-[11px] font-mono">
+              <span class="px-2 py-0.5 rounded-full bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300 font-semibold"
+                    x-text="'+' + (diffData?.diff?.summary?.issues_added || 0) + ' new'"></span>
+              <span class="px-2 py-0.5 rounded-full bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-200 font-semibold"
+                    x-text="'✓' + (diffData?.diff?.summary?.issues_closed || 0) + ' closed'"></span>
+              <span x-show="(diffData?.diff?.summary?.issues_reopened || 0) > 0"
+                    class="px-2 py-0.5 rounded-full bg-amber-100 dark:bg-amber-900/40 text-amber-800 dark:text-amber-200 font-semibold"
+                    x-text="'↺' + (diffData?.diff?.summary?.issues_reopened || 0) + ' reopened'"></span>
+              <span x-show="(diffData?.diff?.summary?.issues_removed || 0) > 0"
+                    class="px-2 py-0.5 rounded-full bg-rose-100 dark:bg-rose-900/40 text-rose-700 dark:text-rose-300 font-semibold"
+                    x-text="'-' + (diffData?.diff?.summary?.issues_removed || 0) + ' removed'"></span>
+              <span class="px-2 py-0.5 rounded-full bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-300 font-semibold"
+                    x-text="'~' + (diffData?.diff?.summary?.issues_modified || 0) + ' modified'"></span>
+              <span x-show="(diffData?.diff?.metric_deltas?.cycle_count || 0) !== 0"
+                    class="px-2 py-0.5 rounded-full font-semibold"
+                    :class="(diffData?.diff?.metric_deltas?.cycle_count || 0) > 0 ? 'bg-rose-100 dark:bg-rose-900/40 text-rose-700 dark:text-rose-300' : 'bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300'"
+                    x-text="((diffData?.diff?.metric_deltas?.cycle_count || 0) > 0 ? '+' : '') + (diffData?.diff?.metric_deltas?.cycle_count || 0) + ' cycles'"></span>
+            </div>
+          </div>
+          <div x-show="((diffData?.diff?.new_issues?.length || 0) + (diffData?.diff?.closed_issues?.length || 0) + (diffData?.diff?.reopened_issues?.length || 0) + (diffData?.diff?.removed_issues?.length || 0) + (diffData?.diff?.modified_issues?.length || 0)) > 0"
+               class="px-4 py-3 space-y-2 text-xs">
+            <div x-show="(diffData?.diff?.new_issues?.length || 0) > 0" class="flex flex-wrap items-center gap-1.5">
+              <span class="text-[11px] font-semibold text-emerald-700 dark:text-emerald-300 shrink-0">Added:</span>
+              <template x-for="ni in (diffData?.diff?.new_issues || []).slice(0, 6)" :key="'diff-new-' + ni.id">
+                <button type="button" @click="showIssue(ni.id)"
+                        class="px-2 py-0.5 rounded bg-emerald-50 dark:bg-emerald-900/30 border border-emerald-200 dark:border-emerald-800/50 text-emerald-800 dark:text-emerald-200 hover:bg-emerald-100 dark:hover:bg-emerald-800/50 font-mono text-[11px] max-w-full truncate"
+                        :title="ni.title"
+                        x-text="ni.id"></button>
+              </template>
+              <span x-show="(diffData?.diff?.new_issues?.length || 0) > 6" class="text-[11px] text-gray-500 dark:text-gray-400 font-mono"
+                    x-text="'+' + ((diffData?.diff?.new_issues?.length || 0) - 6) + ' more'"></span>
+            </div>
+            <div x-show="(diffData?.diff?.closed_issues?.length || 0) > 0" class="flex flex-wrap items-center gap-1.5">
+              <span class="text-[11px] font-semibold text-slate-600 dark:text-slate-300 shrink-0">Closed:</span>
+              <template x-for="ci in (diffData?.diff?.closed_issues || []).slice(0, 6)" :key="'diff-closed-' + ci.id">
+                <button type="button" @click="showIssue(ci.id)"
+                        class="px-2 py-0.5 rounded bg-slate-100 dark:bg-slate-700/60 border border-slate-200 dark:border-slate-600 text-slate-700 dark:text-slate-200 hover:bg-slate-200 dark:hover:bg-slate-700 font-mono text-[11px] max-w-full truncate"
+                        :title="ci.title"
+                        x-text="ci.id"></button>
+              </template>
+              <span x-show="(diffData?.diff?.closed_issues?.length || 0) > 6" class="text-[11px] text-gray-500 dark:text-gray-400 font-mono"
+                    x-text="'+' + ((diffData?.diff?.closed_issues?.length || 0) - 6) + ' more'"></span>
+            </div>
+            <div x-show="(diffData?.diff?.reopened_issues?.length || 0) > 0" class="flex flex-wrap items-center gap-1.5">
+              <span class="text-[11px] font-semibold text-amber-700 dark:text-amber-300 shrink-0">Reopened:</span>
+              <template x-for="ri in (diffData?.diff?.reopened_issues || []).slice(0, 6)" :key="'diff-reopen-' + ri.id">
+                <button type="button" @click="showIssue(ri.id)"
+                        class="px-2 py-0.5 rounded bg-amber-50 dark:bg-amber-900/30 border border-amber-200 dark:border-amber-800/50 text-amber-800 dark:text-amber-200 hover:bg-amber-100 dark:hover:bg-amber-800/50 font-mono text-[11px] max-w-full truncate"
+                        :title="ri.title"
+                        x-text="ri.id"></button>
+              </template>
+              <span x-show="(diffData?.diff?.reopened_issues?.length || 0) > 6" class="text-[11px] text-gray-500 dark:text-gray-400 font-mono"
+                    x-text="'+' + ((diffData?.diff?.reopened_issues?.length || 0) - 6) + ' more'"></span>
+            </div>
+            <div x-show="(diffData?.diff?.removed_issues?.length || 0) > 0" class="flex flex-wrap items-center gap-1.5">
+              <span class="text-[11px] font-semibold text-rose-700 dark:text-rose-300 shrink-0">Removed:</span>
+              <template x-for="rm in (diffData?.diff?.removed_issues || []).slice(0, 6)" :key="'diff-removed-' + rm.id">
+                <span class="px-2 py-0.5 rounded bg-rose-50 dark:bg-rose-900/30 border border-rose-200 dark:border-rose-800/50 text-rose-700 dark:text-rose-200 font-mono text-[11px] line-through max-w-full truncate"
+                      :title="rm.title"
+                      x-text="rm.id"></span>
+              </template>
+              <span x-show="(diffData?.diff?.removed_issues?.length || 0) > 6" class="text-[11px] text-gray-500 dark:text-gray-400 font-mono"
+                    x-text="'+' + ((diffData?.diff?.removed_issues?.length || 0) - 6) + ' more'"></span>
+            </div>
+            <div x-show="(diffData?.diff?.modified_issues?.length || 0) > 0" class="flex flex-wrap items-center gap-1.5">
+              <span class="text-[11px] font-semibold text-blue-700 dark:text-blue-300 shrink-0">Modified:</span>
+              <template x-for="mi in (diffData?.diff?.modified_issues || []).slice(0, 6)" :key="'diff-mod-' + mi.issue_id">
+                <button type="button" @click="showIssue(mi.issue_id)"
+                        class="px-2 py-0.5 rounded bg-blue-50 dark:bg-blue-900/30 border border-blue-200 dark:border-blue-800/50 text-blue-800 dark:text-blue-200 hover:bg-blue-100 dark:hover:bg-blue-800/50 font-mono text-[11px] max-w-full truncate"
+                        :title="mi.title"
+                        x-text="mi.issue_id"></button>
+              </template>
+              <span x-show="(diffData?.diff?.modified_issues?.length || 0) > 6" class="text-[11px] text-gray-500 dark:text-gray-400 font-mono"
+                    x-text="'+' + ((diffData?.diff?.modified_issues?.length || 0) - 6) + ' more'"></span>
+            </div>
+          </div>
+        </div>
+
         <!-- Active Sprint Summary Banner (Dashboard, shown when sprints.json is present) -->
         <div x-show="hasSprints && activeSprint"
              x-cloak
@@ -4554,7 +4648,7 @@
       <!-- Floating Control Panel -->
       <div class="absolute top-4 left-4 right-4 flex items-start justify-between gap-2 pointer-events-none">
         <!-- Left controls -->
-        <div class="pointer-events-auto flex flex-col items-start gap-2 md:gap-3">
+        <div class="pointer-events-auto flex flex-col items-start gap-2 md:gap-3 min-w-0">
           <!-- Back button - larger touch target on mobile -->
           <button @click="window.location.hash = '#/'"
                   class="flex items-center gap-2 px-3 py-2.5 md:px-4 md:py-2 bg-white dark:bg-gray-800 rounded-lg shadow-lg border border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700 active:bg-gray-100 dark:active:bg-gray-600 transition-colors min-h-[44px]">
@@ -4722,21 +4816,21 @@
           <div x-show="graphCheckDepMode || graphCheckDepResult"
                id="graph-checkdep-hud"
                x-cloak
-               class="bg-white/95 dark:bg-gray-800/95 backdrop-blur-sm rounded-lg shadow-lg border px-2.5 py-2 flex flex-wrap items-center gap-2 max-w-[380px]"
+               class="bg-white/95 dark:bg-gray-800/95 backdrop-blur-sm rounded-lg shadow-lg border px-2.5 py-2 flex flex-wrap items-center gap-2 max-w-full sm:max-w-[380px] min-w-0"
                :class="graphCheckDepResult ? (graphCheckDepResult.wouldCycle ? 'border-red-400 dark:border-red-600' : (!graphCheckDepResult.canAdd ? 'border-amber-400 dark:border-amber-600' : 'border-emerald-400 dark:border-emerald-600')) : 'border-indigo-300 dark:border-indigo-700'">
             <template x-if="graphCheckDepMode && !graphCheckDepResult">
-              <div class="flex items-center gap-2 text-xs">
+              <div class="flex flex-wrap items-center gap-2 text-xs min-w-0">
                 <span class="font-semibold text-indigo-700 dark:text-indigo-300">🧪 Check Dep:</span>
-                <span class="font-mono font-bold text-indigo-800 dark:text-indigo-200" x-text="graphCheckDepFromId"></span>
+                <span class="font-mono font-bold text-indigo-800 dark:text-indigo-200 break-all" x-text="graphCheckDepFromId"></span>
                 <span class="text-gray-500 dark:text-gray-400">→ click target node</span>
               </div>
             </template>
             <template x-if="graphCheckDepResult">
-              <div class="flex flex-wrap items-center gap-1.5 text-xs">
+              <div class="flex flex-wrap items-center gap-1.5 text-xs min-w-0">
                 <span class="font-semibold"
                       :class="graphCheckDepResult.wouldCycle ? 'text-red-700 dark:text-red-300' : (!graphCheckDepResult.canAdd ? 'text-amber-700 dark:text-amber-300' : (graphCheckDepResult.alreadyExists ? 'text-blue-700 dark:text-blue-300' : 'text-emerald-700 dark:text-emerald-300'))"
                       x-text="graphCheckDepResult.wouldCycle ? '⛔ Cycle' : (!graphCheckDepResult.canAdd ? '⚠ Invalid' : (graphCheckDepResult.alreadyExists ? 'ℹ Exists' : '✓ Safe'))"></span>
-                <span class="font-mono text-gray-800 dark:text-gray-200"
+                <span class="font-mono text-gray-800 dark:text-gray-200 min-w-0 break-all max-w-full"
                       x-text="graphCheckDepResult.wouldCycle && graphCheckDepResult.cyclePath?.length ? graphCheckDepResult.cyclePath.join(' → ') : (!graphCheckDepResult.canAdd && graphCheckDepResult.warning ? graphCheckDepResult.warning : (graphCheckDepResult.fromId + ' → ' + graphCheckDepResult.toId))"></span>
                 <span x-show="graphCheckDepResult.wouldBlockActionable"
                       class="px-1.5 py-0.5 rounded bg-amber-100 dark:bg-amber-900/50 text-amber-800 dark:text-amber-200 text-[10px] font-semibold">Blocks ready work</span>

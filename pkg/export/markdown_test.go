@@ -3815,33 +3815,61 @@ func TestPass18_ExportRegressions(t *testing.T) {
 			},
 		}
 
-		// CSV must emit real numeric values on M-ROOT (not N/A,N/A,N/A).
+		// CSV must emit real non-N/A values individually for triage, risk, and eta on M-ROOT.
 		csvOpts := baseOpts
 		csvOpts.Format = "csv"
 		csvBytes, err := GenerateReport(issues, issues, csvOpts)
 		if err != nil {
 			t.Fatalf("GenerateReport(csv): %v", err)
 		}
+		foundCSVRoot := false
 		for _, line := range strings.Split(strings.TrimSpace(string(csvBytes)), "\n")[1:] {
-			if strings.HasPrefix(line, "M-ROOT,") && strings.HasSuffix(line, ",N/A,N/A,N/A") {
-				t.Fatalf("P18A-4 regression: CSV rendered N/A for triage/risk/eta when ShowMetrics=true & Metrics=nil: %q", line)
+			if strings.HasPrefix(line, "M-ROOT,") {
+				foundCSVRoot = true
+				cols := strings.Split(line, ",")
+				if len(cols) < 5 {
+					t.Fatalf("P19-12 CSV M-ROOT row too short: %q", line)
+				}
+				for idx, name := range []string{"triage", "risk", "eta"} {
+					cell := strings.TrimSpace(cols[len(cols)-3+idx])
+					if cell == "" || cell == "N/A" {
+						t.Fatalf("P18A-4/P19-12 regression: CSV %s cell was %q on M-ROOT row: %q", name, cell, line)
+					}
+				}
 			}
 		}
+		if !foundCSVRoot {
+			t.Fatalf("P19-12 CSV output missing M-ROOT row:\n%s", csvBytes)
+		}
 
-		// Markdown summary table must not show "| N/A | N/A | N/A |" for M-ROOT.
+		// Markdown summary table must emit real non-N/A values individually for triage, risk, and eta on M-ROOT.
 		mdOpts := baseOpts
 		mdOpts.Format = "markdown"
 		mdBytes, err := GenerateReport(issues, issues, mdOpts)
 		if err != nil {
 			t.Fatalf("GenerateReport(markdown): %v", err)
 		}
+		foundMDRoot := false
 		for _, line := range strings.Split(string(mdBytes), "\n") {
-			if strings.Contains(line, "M-ROOT") && strings.Contains(line, "| N/A | N/A | N/A |") {
-				t.Fatalf("P18A-4 regression: Markdown summary table rendered N/A for triage/risk/eta: %q", line)
+			if strings.HasPrefix(line, "| M-ROOT |") {
+				foundMDRoot = true
+				rawParts := strings.Split(strings.Trim(line, "|"), "|")
+				if len(rawParts) < 5 {
+					t.Fatalf("P19-12 Markdown M-ROOT row too short: %q", line)
+				}
+				for idx, name := range []string{"triage", "risk", "eta"} {
+					cell := strings.TrimSpace(rawParts[len(rawParts)-3+idx])
+					if cell == "" || cell == "N/A" {
+						t.Fatalf("P18A-4/P19-12 regression: Markdown %s cell was %q on M-ROOT row: %q", name, cell, line)
+					}
+				}
 			}
 		}
+		if !foundMDRoot {
+			t.Fatalf("P19-12 Markdown output missing M-ROOT summary row:\n%s", mdBytes)
+		}
 
-		// HTML summary table must not show three N/A cells for M-ROOT.
+		// HTML summary table must emit real non-N/A values individually for triage, risk, and eta on M-ROOT.
 		htmlOpts := baseOpts
 		htmlOpts.Format = "html"
 		htmlBytes, err := GenerateReport(issues, issues, htmlOpts)
@@ -3849,8 +3877,25 @@ func TestPass18_ExportRegressions(t *testing.T) {
 			t.Fatalf("GenerateReport(html): %v", err)
 		}
 		htmlStr := string(htmlBytes)
-		if strings.Contains(htmlStr, "<td>M-ROOT</td><td>Root task</td><td>N/A</td><td>N/A</td><td>N/A</td>") {
-			t.Fatalf("P18A-4 regression: HTML table rendered N/A for triage/risk/eta when ShowMetrics=true & Metrics=nil")
+		rowStart := strings.Index(htmlStr, "<td>M-ROOT</td>")
+		if rowStart < 0 {
+			t.Fatalf("P19-12 HTML output missing M-ROOT table row")
+		}
+		rowEnd := strings.Index(htmlStr[rowStart:], "</tr>")
+		if rowEnd < 0 {
+			t.Fatalf("P19-12 HTML output missing closing </tr> for M-ROOT")
+		}
+		rowHTML := htmlStr[rowStart : rowStart+rowEnd]
+		cells := strings.Split(rowHTML, "<td>")
+		// cells[0] == "", cells[1] == "M-ROOT</td>", ..., last 3 are triage, risk, eta
+		if len(cells) < 6 {
+			t.Fatalf("P19-12 HTML M-ROOT row has too few cells: %q", rowHTML)
+		}
+		for idx, name := range []string{"triage", "risk", "eta"} {
+			cell := strings.TrimSpace(strings.TrimSuffix(cells[len(cells)-3+idx], "</td>"))
+			if cell == "" || cell == "N/A" {
+				t.Fatalf("P18A-4/P19-12 regression: HTML %s cell was %q in row: %q", name, cell, rowHTML)
+			}
 		}
 	})
 
@@ -3892,6 +3937,173 @@ func TestPass18_ExportRegressions(t *testing.T) {
 		if wi.Delta.DirectUnblocks != 1 || wi.Delta.TransitiveUnblocks != 1 {
 			t.Fatalf("P18A-11 regression: expected clamped Direct=1 Transitive=1 when out-of-scope unblocks stripped, got direct=%d transitive=%d ids=%v",
 				wi.Delta.DirectUnblocks, wi.Delta.TransitiveUnblocks, wi.Delta.UnblockedIssueIDs)
+		}
+	})
+}
+
+func TestWave31_ExportRegressions(t *testing.T) {
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-15 * 24 * time.Hour)
+
+	t.Run("P19-1_UnscopedNoTruncationScopedZeroLeakAndParentChildCascade", func(t *testing.T) {
+		// 1. Unscoped report with 12 direct unblocks must NOT truncate DirectUnblocks to 10.
+		unscopedIssues := []model.Issue{
+			{ID: "U-ROOT", Title: "Root", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: old, UpdatedAt: old},
+		}
+		for i := 0; i < 12; i++ {
+			id := fmt.Sprintf("U-DEP-%02d", i)
+			unscopedIssues = append(unscopedIssues, model.Issue{
+				ID: id, Title: id, Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, CreatedAt: old, UpdatedAt: old,
+				Dependencies: []*model.Dependency{{IssueID: id, DependsOnID: "U-ROOT", Type: model.DepBlocks}},
+			})
+		}
+		anU := analysis.NewAnalyzer(unscopedIssues)
+		anU.SetNow(now)
+		statsU := anU.Analyze()
+		diU := buildReportDecisionIntel(unscopedIssues, ReportOptions{
+			GeneratedAt: now,
+			GraphStats:  &statsU,
+			GraphIssues: unscopedIssues,
+			Analyzer:    anU,
+			Readiness:   model.NewReadinessIndex(unscopedIssues),
+		})
+		wiU := diU.whatIfByID["U-ROOT"]
+		if wiU == nil || wiU.Delta.DirectUnblocks != 12 {
+			t.Fatalf("P19-1 regression: unscoped U-ROOT expected DirectUnblocks=12 (not truncated to 10), got %+v", wiU)
+		}
+
+		// 2. Scoped report with pure DepParentChild cascade preserves parent->child cascade while excluding out-of-scope.
+		scopedAll := []model.Issue{
+			{ID: "PC-ROOT", Title: "Root", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: old, UpdatedAt: old},
+			{ID: "PC-EPIC", Title: "Epic blocked by root", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeEpic, CreatedAt: old, UpdatedAt: old,
+				Dependencies: []*model.Dependency{{IssueID: "PC-EPIC", DependsOnID: "PC-ROOT", Type: model.DepBlocks}}},
+			{ID: "PC-CHILD", Title: "In-scope child of epic", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: old, UpdatedAt: old,
+				Dependencies: []*model.Dependency{{IssueID: "PC-CHILD", DependsOnID: "PC-EPIC", Type: model.DepParentChild}}},
+			{ID: "PC-OUT", Title: "Out-of-scope child", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: old, UpdatedAt: old,
+				Dependencies: []*model.Dependency{{IssueID: "PC-OUT", DependsOnID: "PC-EPIC", Type: model.DepBlocks}}},
+		}
+		anS := analysis.NewAnalyzer(scopedAll)
+		anS.SetNow(now)
+		statsS := anS.Analyze()
+		vis := map[string]bool{"PC-ROOT": true, "PC-EPIC": true, "PC-CHILD": true}
+		diS := buildReportDecisionIntel(scopedAll[:3], ReportOptions{
+			GeneratedAt: now,
+			GraphStats:  &statsS,
+			GraphIssues: scopedAll,
+			Analyzer:    anS,
+			Readiness:   model.NewReadinessIndex(scopedAll),
+			VisibleIDs:  vis,
+		})
+		wiS := diS.whatIfByID["PC-ROOT"]
+		if wiS == nil || wiS.Delta.DirectUnblocks != 1 || wiS.Delta.TransitiveUnblocks != 2 {
+			t.Fatalf("P19-1 regression: scoped DepParentChild cascade expected Direct=1 Transitive=2 (PC-EPIC direct + PC-CHILD transitive, excluding PC-OUT), got %+v", wiS)
+		}
+		for _, id := range wiS.Delta.UnblockedIssueIDs {
+			if id == "PC-OUT" {
+				t.Fatalf("P19-1 regression: out-of-scope PC-OUT leaked into scoped What-If: %v", wiS.Delta.UnblockedIssueIDs)
+			}
+		}
+
+		// P20A-1: IncludeGraph=false with explicit false entry in VisibleIDs must still build scoped analyzer and never leak PC-OUT.
+		mdOptsNoGraph := DefaultReportOptions()
+		mdOptsNoGraph.Format = "markdown"
+		mdOptsNoGraph.IncludeGraph = false
+		mdOptsNoGraph.GeneratedAt = now
+		mdOptsNoGraph.GraphStats = &statsS
+		mdOptsNoGraph.Analyzer = anS
+		mdOptsNoGraph.Readiness = model.NewReadinessIndex(scopedAll)
+		mdOptsNoGraph.VisibleIDs = map[string]bool{"PC-ROOT": true, "PC-EPIC": true, "PC-CHILD": true, "PC-OUT": false}
+		noGraphBytes, err := GenerateReport(scopedAll[:3], scopedAll, mdOptsNoGraph)
+		if err != nil {
+			t.Fatalf("P20A-1 GenerateReport(IncludeGraph=false): %v", err)
+		}
+		if strings.Contains(string(noGraphBytes), "PC-OUT") {
+			t.Fatalf("P20A-1 regression: hidden PC-OUT leaked into Markdown What-If when IncludeGraph=false / VisibleIDs has false entry:\n%s", noGraphBytes)
+		}
+	})
+
+	t.Run("W31-6_ComposableDiffChangelogInMarkdownHTMLJSONAndPriorityBrief", func(t *testing.T) {
+		before := []model.Issue{
+			{ID: "CHG-1", Title: "Old task", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, CreatedAt: old, UpdatedAt: old},
+			{ID: "CHG-2", Title: "Will close", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeBug, CreatedAt: old, UpdatedAt: old},
+		}
+		after := []model.Issue{
+			{ID: "CHG-1", Title: "Old task", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask, CreatedAt: old, UpdatedAt: now},
+			{ID: "CHG-2", Title: "Will close", Status: model.StatusClosed, Priority: 1, IssueType: model.TypeBug, CreatedAt: old, UpdatedAt: now},
+			{ID: "CHG-3", Title: "Brand new <feature>", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeFeature, CreatedAt: now, UpdatedAt: now},
+		}
+		snapFrom := analysis.NewSnapshotAt(before, old, "abc1234")
+		snapTo := analysis.NewSnapshotAt(after, now, "HEAD")
+		diff := analysis.CompareSnapshots(snapFrom, snapTo)
+
+		opts := DefaultReportOptions()
+		opts.GeneratedAt = now
+		opts.Readiness = model.NewReadinessIndex(after)
+		opts.Diff = diff
+		opts.DiffSince = "HEAD~1"
+
+		// Markdown
+		opts.Format = "markdown"
+		mdBytes, err := GenerateReport(after, after, opts)
+		if err != nil {
+			t.Fatalf("GenerateReport(markdown): %v", err)
+		}
+		mdStr := string(mdBytes)
+		if !strings.Contains(mdStr, "## Changes Since `HEAD~1`") || !strings.Contains(mdStr, "`CHG-3`") || !strings.Contains(mdStr, "`CHG-2`") || !strings.Contains(mdStr, "`CHG-1`") {
+			t.Fatalf("W31-6 Markdown report missing diff changelog content:\n%s", mdStr)
+		}
+
+		// HTML (also verifies <feature> is escaped)
+		opts.Format = "html"
+		htmlBytes, err := GenerateReport(after, after, opts)
+		if err != nil {
+			t.Fatalf("GenerateReport(html): %v", err)
+		}
+		htmlStr := string(htmlBytes)
+		if !strings.Contains(htmlStr, "class=\"diff-summary\"") || !strings.Contains(htmlStr, "Changes Since <code>HEAD~1</code>") || strings.Contains(htmlStr, "<feature>") {
+			t.Fatalf("W31-6 HTML report missing escaped diff changelog:\n%s", htmlStr)
+		}
+
+		// JSON
+		opts.Format = "json"
+		jsonBytes, err := GenerateReport(after, after, opts)
+		if err != nil {
+			t.Fatalf("GenerateReport(json): %v", err)
+		}
+		var jsonReport struct {
+			DiffSince string                 `json:"diff_since"`
+			Diff      *analysis.SnapshotDiff `json:"diff"`
+		}
+		if err := json.Unmarshal(jsonBytes, &jsonReport); err != nil {
+			t.Fatalf("unmarshal JSON report: %v", err)
+		}
+		if jsonReport.DiffSince != "HEAD~1" || jsonReport.Diff == nil || jsonReport.Diff.Summary.IssuesAdded != 1 || jsonReport.Diff.Summary.IssuesClosed != 1 {
+			t.Fatalf("W31-6 JSON report missing diff payload: %+v", jsonReport)
+		}
+
+		// Priority Brief
+		triage := analysis.ComputeTriageWithOptionsAndTime(after, analysis.TriageOptions{WaitForPhase2: true}, now)
+		triageJSON, err := json.Marshal(triage)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg := DefaultPriorityBriefConfig()
+		cfg.Diff = diff
+		cfg.DiffSince = "v0.28.0"
+		brief, err := GeneratePriorityBriefFromTriageJSON(triageJSON, cfg)
+		if err != nil {
+			t.Fatalf("GeneratePriorityBriefFromTriageJSON: %v", err)
+		}
+		if !strings.Contains(brief, "## Changes Since `v0.28.0`") || !strings.Contains(brief, "`CHG-3`") || !strings.Contains(brief, "`CHG-2`") {
+			t.Fatalf("W31-6 priority brief missing diff changelog:\n%s", brief)
+		}
+
+		// P20A-8: Inline code spans outside tables must not escape '|' as '\|' and must strip control runes (\x1b).
+		var diffBuf strings.Builder
+		writeMarkdownDiffSummary(&diffBuf, diff, "feat|a\x1b[31m")
+		diffMD := diffBuf.String()
+		if !strings.Contains(diffMD, "## Changes Since `feat|a[31m`") || strings.Contains(diffMD, `\|`) || strings.Contains(diffMD, "\x1b") {
+			t.Fatalf("P20A-8 regression: writeMarkdownDiffSummary mangled pipe or kept control rune:\n%q", diffMD)
 		}
 	})
 }

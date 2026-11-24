@@ -1878,6 +1878,24 @@ document.getElementById('hover-close').onclick = () => document.getElementById('
 let selectedNode = null;
 function selectNode(node) {
     if (!node) return;
+    // P20B-3: Clear any active What-If, Check Add Dep, Cycle, or Path overlay on normal selection
+    // so stale banners and dimmed 0.15-opacity states do not remain stuck over the newly selected node.
+    if (activeWhatIfIds.length > 0 || activeWhatIfId) {
+        clearWhatIfSimulation();
+    }
+    if (checkDepMode || checkDepFromId) {
+        cancelCheckDep();
+    }
+    if (typeof closeCycleInspector === 'function') {
+        closeCycleInspector();
+    }
+    if (activePathNodes || highlightedNodes.size > 0) {
+        activePathNodes = null;
+        highlightedNodes = new Set();
+        Graph.nodeColor(Graph.nodeColor());
+        Graph.linkColor(Graph.linkColor());
+        Graph.linkWidth(Graph.linkWidth());
+    }
     selectedNode = node;
     addToRecent(node);
     showHoverPanel(node);
@@ -2238,10 +2256,18 @@ function createStandaloneDepsEvaluator(model, simClosed) {
     }
     return id => check(id).ok;
 }
-function simulateWhatIfClose(targetId) {
+function simulateWhatIfClose(targetOrIds) {
     const model = buildStandaloneWhatIfModel();
-    if (!model.activeNodes.has(targetId)) {
-        return { direct: [], transitive: [], cascade: [] };
+    const rawList = Array.isArray(targetOrIds) ? targetOrIds : [targetOrIds];
+    const activeIds = [];
+    const seenInput = new Set();
+    for (const id of rawList) {
+        if (!id || seenInput.has(id) || !model.activeNodes.has(id)) continue;
+        seenInput.add(id);
+        activeIds.push(id);
+    }
+    if (activeIds.length === 0) {
+        return { direct: [], transitive: [], cascade: [], synergy: [] };
     }
     const baseClosed = new Set();
     const beforeDepsOk = createStandaloneDepsEvaluator(model, baseClosed);
@@ -2249,7 +2275,7 @@ function simulateWhatIfClose(targetId) {
     model.activeNodes.forEach((n, id) => {
         if (isWhatIfUnlockableNode(n) && beforeDepsOk(id)) beforeReady.add(id);
     });
-    const simClosed = new Set([targetId]);
+    const simClosed = new Set(activeIds);
     const afterDepsOk = createStandaloneDepsEvaluator(model, simClosed);
     const direct = [];
     model.activeNodes.forEach((n, id) => {
@@ -2258,6 +2284,20 @@ function simulateWhatIfClose(targetId) {
         }
     });
     direct.sort();
+    // W31-2: Identify joint diamond-dependency unlocks that only appear when the full batch closes.
+    const synergy = [];
+    if (activeIds.length > 1 && direct.length > 0) {
+        const singleUnion = new Set();
+        for (const singleId of activeIds) {
+            const singleDepsOk = createStandaloneDepsEvaluator(model, new Set([singleId]));
+            for (const dId of direct) {
+                if (singleId !== dId && singleDepsOk(dId)) singleUnion.add(dId);
+            }
+        }
+        for (const dId of direct) {
+            if (!singleUnion.has(dId)) synergy.push(dId);
+        }
+    }
     const visited = new Set(direct);
     const cascade = [...direct];
     const queue = [...direct];
@@ -2290,7 +2330,7 @@ function simulateWhatIfClose(targetId) {
             }
         }
     }
-    return { direct, transitive: cascade, cascade };
+    return { direct, transitive: cascade, cascade, synergy };
 }
 function computeStandaloneRootBlockers(targetId) {
     const model = buildStandaloneWhatIfModel();
@@ -2384,36 +2424,64 @@ function computeStandaloneRootBlockers(targetId) {
     );
     return { isBlocked: true, chainLength: minDepth.size, maxDepth, roots, hasCycle };
 }
+let activeWhatIfIds = [];
 function clearWhatIfSimulation() {
     activeWhatIfId = null;
+    activeWhatIfIds = [];
     const banner = document.getElementById('whatif-banner');
     if (banner) { banner.style.display = 'none'; banner.classList.remove('visible'); }
 }
-function runWhatIfSimulation(nodeId) {
-    if (!nodeId) return;
-    const targetNode = lookupStandaloneNode(nodeId);
-    if (!targetNode || !isActiveNodeStatus(targetNode.status)) return;
+function runWhatIfBatchSimulation(nodeIds) {
+    const validIds = [];
+    const seen = new Set();
+    for (const rawId of (Array.isArray(nodeIds) ? nodeIds : [nodeIds])) {
+        if (!rawId || seen.has(rawId)) continue;
+        const targetNode = lookupStandaloneNode(rawId);
+        if (!targetNode || !isActiveNodeStatus(targetNode.status)) continue;
+        seen.add(rawId);
+        validIds.push(rawId);
+    }
+    if (validIds.length === 0) {
+        clearWhatIfSimulation();
+        activePathNodes = null;
+        highlightedNodes = new Set();
+        Graph.nodeColor(Graph.nodeColor());
+        Graph.linkColor(Graph.linkColor());
+        Graph.linkWidth(Graph.linkWidth());
+        return null;
+    }
     cancelPathFinder();
     cancelCheckDep();
     closeCycleInspector();
-    const res = simulateWhatIfClose(nodeId);
-    activeWhatIfId = nodeId;
-    const ids = new Set([nodeId, ...res.cascade]);
+    const res = simulateWhatIfClose(validIds);
+    activeWhatIfIds = validIds;
+    activeWhatIfId = validIds[0];
+    const ids = new Set([...validIds, ...res.cascade]);
     activePathNodes = ids;
     highlightedNodes = ids;
     Graph.nodeColor(Graph.nodeColor());
     Graph.linkColor(Graph.linkColor());
     Graph.linkWidth(Graph.linkWidth());
+    const label = validIds.length === 1
+        ? validIds[0]
+        : '[' + validIds.slice(0, 3).join(' + ') + (validIds.length > 3 ? ' +' + (validIds.length - 3) : '') + ']';
+    const synergyTag = res.synergy && res.synergy.length > 0 ? ' (+' + res.synergy.length + ' synergy)' : '';
     const banner = document.getElementById('whatif-banner');
     const textEl = document.getElementById('whatif-banner-text');
     if (banner && textEl) {
-        textEl.textContent = '⚡ What-If ' + nodeId + ': +' + res.direct.length + ' direct / +' + res.transitive.length + ' total unblocked' +
+        textEl.textContent = '⚡ What-If ' + label + ': +' + res.direct.length + ' direct' + synergyTag + ' / +' + res.transitive.length + ' total unblocked' +
             (res.cascade.length ? ' (' + res.cascade.slice(0, 5).join(', ') + (res.cascade.length > 5 ? ' +' + (res.cascade.length - 5) : '') + ')' : '');
         banner.style.display = 'flex';
         banner.classList.add('visible');
     }
-    showToast('What-If ' + nodeId + ': +' + res.direct.length + ' direct, +' + res.transitive.length + ' total unblocked');
+    showToast('What-If ' + label + ': +' + res.direct.length + ' direct' + synergyTag + ', +' + res.transitive.length + ' total unblocked');
+    return res;
 }
+function runWhatIfSimulation(nodeId) {
+    return runWhatIfBatchSimulation(nodeId ? [nodeId] : []);
+}
+window.bvRunStandaloneWhatIfBatch = runWhatIfBatchSimulation;
+window.bvSimulateWhatIfClose = simulateWhatIfClose;
 document.getElementById('btn-whatif-close').onclick = () => {
     clearWhatIfSimulation();
     closeCycleInspector();
@@ -2531,6 +2599,7 @@ function checkStandaloneDep(fromId, toId) {
     }
     res.canAdd = true;
     const allowCmd = !(DATA.source_authority && DATA.source_authority.claim_safe === false) &&
+        DATA.source_kind !== 'workspace' &&
         !DATA.as_of && !DATA.as_of_commit;
     if (allowCmd && !res.crossRepo) {
         res.command = 'br dep add ' + quoteStandaloneWord(fromId) + ' ' + quoteStandaloneWord(toId);
@@ -2780,10 +2849,22 @@ function highlightPath(path) {
     showToast('Path (' + path.length + ' nodes): ' + path.join(' → '));
 }
 
-function handleNodeClick(d) {
+function handleNodeClick(d, event) {
     if (!d) return;
     if (checkDepMode && checkDepFromId) {
         runStandaloneCheckDep(checkDepFromId, d.id);
+        return;
+    }
+    if (event && event.shiftKey) {
+        if (!isActiveNodeStatus(d.status)) {
+            showToast('What-If only simulates closing active issues');
+            return;
+        }
+        const idx = activeWhatIfIds.indexOf(d.id);
+        const nextIds = idx >= 0
+            ? activeWhatIfIds.filter(id => id !== d.id)
+            : [...activeWhatIfIds, d.id];
+        runWhatIfBatchSimulation(nextIds);
         return;
     }
     if (pathFinderMode) {

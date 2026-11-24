@@ -910,6 +910,7 @@ func (e *SQLiteExporter) insertMeta(db *sql.DB) error {
 		"has_history":      strconv.FormatBool(e.Config.HasHistory),
 		"has_labels":       strconv.FormatBool(e.Config.HasLabels),
 		"has_forecast":     strconv.FormatBool(e.Config.HasForecast),
+		"has_diff":         strconv.FormatBool(e.Config.HasDiff),
 	}
 
 	if e.gitHash != "" {
@@ -917,6 +918,19 @@ func (e *SQLiteExporter) insertMeta(db *sql.DB) error {
 	}
 	if e.Config.Title != "" {
 		meta["title"] = e.Config.Title
+	}
+	// P20B-1: Persist RobotEnvelope source authority & scope metadata directly in export_meta
+	// so viewer.js getMeta() holds authoritative values synchronously before triage.json loads.
+	for _, key := range []string{"source_kind", "as_of", "as_of_commit"} {
+		if raw, ok := e.Config.RobotEnvelope[key]; ok && len(raw) > 0 {
+			var strVal string
+			if err := json.Unmarshal(raw, &strVal); err == nil && strVal != "" {
+				meta[key] = strVal
+			}
+		}
+	}
+	if raw, ok := e.Config.RobotEnvelope["source_authority"]; ok && len(raw) > 0 && string(raw) != "null" {
+		meta["source_authority"] = string(raw)
 	}
 	if resolvedIDs := e.readiness.ResolvedIDs(); len(resolvedIDs) > 0 {
 		resolved, err := json.Marshal(resolvedIDs)
@@ -1006,6 +1020,7 @@ func (e *SQLiteExporter) writeRobotOutputs(bundle *Bundle, dataDir string) error
 		HasHistory:     e.Config.HasHistory,
 		HasLabels:      e.Config.HasLabels,
 		HasForecast:    e.Config.HasForecast,
+		HasDiff:        e.Config.HasDiff,
 	}
 	if err := e.writeRobotJSON(bundle, filepath.Join(dataDir, "meta.json"), meta); err != nil {
 		return fmt.Errorf("write meta.json: %w", err)

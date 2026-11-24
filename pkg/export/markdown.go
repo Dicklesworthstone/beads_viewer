@@ -59,6 +59,8 @@ type ReportOptions struct {
 	AsOfCommit        string
 	NotReadyLabels    []string
 	IncludeInactive   bool
+	Diff              *analysis.SnapshotDiff
+	DiffSince         string
 }
 
 // DefaultReportOptions returns initialized report defaults with actionPlanSet
@@ -371,7 +373,12 @@ func newReportMetricsAccessor(opts ReportOptions, issueSlices ...[]model.Issue) 
 			}
 		}
 		if an != nil {
-			scores := an.ComputeImpactScores()
+			var scores []analysis.ImpactScore
+			if opts.GraphStats != nil {
+				scores = an.ComputeImpactScoresFromStats(opts.GraphStats, now)
+			} else {
+				scores = an.ComputeImpactScoresAt(now)
+			}
 			acc.triageScore = make(map[string]float64, len(scores))
 			for _, sc := range scores {
 				if !decisionExcluded[sc.IssueID] {
@@ -621,10 +628,10 @@ func GenerateReport(selected, context []model.Issue, opts ReportOptions) ([]byte
 		opts.GeneratedAt = time.Now().UTC()
 	}
 	hadCallerReadiness := opts.Readiness != nil
-	if opts.IncludeGraph {
-		if opts.Readiness == nil {
-			opts.Readiness = model.NewReadinessIndex(combineReportIssues(selected, context))
-		}
+	if opts.IncludeGraph && opts.Readiness == nil {
+		opts.Readiness = model.NewReadinessIndex(combineReportIssues(selected, context))
+	}
+	if opts.IncludeGraph || len(context) > 0 {
 		opts.GraphIssues = reportGraphContext(selected, context)
 	}
 	reportOpts := opts
@@ -675,18 +682,20 @@ func GenerateReport(selected, context []model.Issue, opts ReportOptions) ([]byte
 			}
 		}
 		return json.MarshalIndent(struct {
-			Title           string             `json:"title"`
-			GeneratedAt     time.Time          `json:"generated_at"`
-			SourceAuthority any                `json:"source_authority"`
-			AuthorityHash   string             `json:"authority_hash,omitempty"`
-			DataHash        string             `json:"data_hash,omitempty"`
-			SourcePath      string             `json:"source_path,omitempty"`
-			SourceKind      string             `json:"source_kind,omitempty"`
-			AsOf            string             `json:"as_of,omitempty"`
-			AsOfCommit      string             `json:"as_of_commit,omitempty"`
-			Issues          []row              `json:"issues"`
-			Graph           *GraphExportResult `json:"graph,omitempty"`
-		}{opts.Title, opts.GeneratedAt, opts.SourceAuthority, opts.AuthorityHash, opts.DataHash, opts.SourcePath, opts.SourceKind, opts.AsOf, opts.AsOfCommit, rows, graph}, "", "  ")
+			Title           string                 `json:"title"`
+			GeneratedAt     time.Time              `json:"generated_at"`
+			SourceAuthority any                    `json:"source_authority"`
+			AuthorityHash   string                 `json:"authority_hash,omitempty"`
+			DataHash        string                 `json:"data_hash,omitempty"`
+			SourcePath      string                 `json:"source_path,omitempty"`
+			SourceKind      string                 `json:"source_kind,omitempty"`
+			AsOf            string                 `json:"as_of,omitempty"`
+			AsOfCommit      string                 `json:"as_of_commit,omitempty"`
+			DiffSince       string                 `json:"diff_since,omitempty"`
+			Diff            *analysis.SnapshotDiff `json:"diff,omitempty"`
+			Issues          []row                  `json:"issues"`
+			Graph           *GraphExportResult     `json:"graph,omitempty"`
+		}{opts.Title, opts.GeneratedAt, opts.SourceAuthority, opts.AuthorityHash, opts.DataHash, opts.SourcePath, opts.SourceKind, opts.AsOf, opts.AsOfCommit, opts.DiffSince, opts.Diff, rows, graph}, "", "  ")
 	case "csv":
 		return writeCSVReport(selected, context, opts, metricsAcc)
 	case "mermaid":
@@ -1062,9 +1071,43 @@ func sanitizeInlineMarkdown(value string) string {
 }
 
 func escapeTableText(value string) string {
-	clean := strings.ReplaceAll(value, "\r", "")
-	clean = strings.ReplaceAll(clean, "\n", " ")
-	return strings.ReplaceAll(clean, "|", "\\|")
+	var sb strings.Builder
+	sb.Grow(len(value))
+	for _, r := range value {
+		switch {
+		case r == '\r':
+			continue
+		case r == '\n' || r == '\t':
+			sb.WriteByte(' ')
+		case unicode.IsControl(r):
+			continue
+		case r == '|':
+			sb.WriteString("\\|")
+		default:
+			sb.WriteRune(r)
+		}
+	}
+	return sb.String()
+}
+
+func sanitizeInlineCodeSpan(value string) string {
+	var sb strings.Builder
+	sb.Grow(len(value))
+	for _, r := range value {
+		switch {
+		case r == '\r':
+			continue
+		case r == '\n' || r == '\t':
+			sb.WriteByte(' ')
+		case unicode.IsControl(r):
+			continue
+		case r == '`':
+			sb.WriteByte('\'')
+		default:
+			sb.WriteRune(r)
+		}
+	}
+	return strings.TrimSpace(sb.String())
 }
 
 // sanitizeMermaidID ensures an ID is valid for Mermaid diagrams.
@@ -1236,34 +1279,43 @@ func buildReportDecisionIntel(issues []model.Issue, opts ReportOptions) *reportD
 		}
 
 		if opts.GraphStats != nil {
+			// P19-1 + P20A-1: Normalize visibleSet to strictly true IDs and build a native scoped
+			// Analyzer (SetReadinessScope + SetUnblockScope) whenever opts.VisibleIDs was supplied
+			// or cleanVisible is a strict subset of issueMap. This preserves unscoped DirectUnblocks > 10
+			// and pure DepParentChild cascades while never leaking hidden IDs when IncludeGraph=false
+			// or VisibleIDs contains explicit false entries.
+			cleanVisible := make(map[string]bool, len(visibleSet))
+			for id, ok := range visibleSet {
+				if ok {
+					cleanVisible[id] = true
+				}
+			}
+			needsScopedAnalyzer := opts.VisibleIDs != nil || len(cleanVisible) < len(issueMap)
+			whatIfAnalyzer := opts.Analyzer
+			if needsScopedAnalyzer {
+				allGraph := make([]model.Issue, 0, len(issueMap))
+				for _, iss := range issueMap {
+					allGraph = append(allGraph, iss)
+				}
+				scopedAn := analysis.NewAnalyzer(allGraph)
+				scopedAn.SetNow(now)
+				scopedReadiness := opts.Readiness
+				if scopedReadiness == nil {
+					scopedReadiness = model.NewReadinessIndex(allGraph)
+				}
+				scopedAn.SetReadinessScope(scopedReadiness, cleanVisible)
+				scopedAn.SetUnblockScope(cleanVisible)
+				whatIfAnalyzer = scopedAn
+			}
 			for _, iss := range issues {
-				if !visibleSet[iss.ID] || isDecisionIneligibleIssue(iss) {
+				if !cleanVisible[iss.ID] || isDecisionIneligibleIssue(iss) {
 					continue
 				}
-				wi := opts.Analyzer.ComputeWhatIf(iss.ID, opts.GraphStats)
+				wi := whatIfAnalyzer.ComputeWhatIf(iss.ID, opts.GraphStats)
 				if wi == nil || (wi.Delta.DirectUnblocks <= 0 && wi.Delta.TransitiveUnblocks <= 0) {
 					continue
 				}
-				filteredIDs := make([]string, 0, len(wi.Delta.UnblockedIssueIDs))
-				for _, uid := range wi.Delta.UnblockedIssueIDs {
-					if visibleSet[uid] {
-						filteredIDs = append(filteredIDs, uid)
-					}
-				}
-				wiCopy := *wi
-				wiCopy.Delta.UnblockedIssueIDs = filteredIDs
-				if opts.VisibleIDs != nil || len(filteredIDs) != len(wi.Delta.UnblockedIssueIDs) {
-					if len(filteredIDs) == 0 {
-						continue
-					}
-					if wiCopy.Delta.DirectUnblocks > len(filteredIDs) {
-						wiCopy.Delta.DirectUnblocks = len(filteredIDs)
-					}
-					if len(filteredIDs) < len(wi.Delta.UnblockedIssueIDs) {
-						wiCopy.Delta.TransitiveUnblocks = wiCopy.Delta.DirectUnblocks
-					}
-				}
-				di.whatIfByID[iss.ID] = &wiCopy
+				di.whatIfByID[iss.ID] = wi
 			}
 
 			adv := opts.Analyzer.GenerateAdvancedInsightsFromStats(opts.GraphStats, analysis.DefaultAdvancedInsightsConfig())
@@ -1370,6 +1422,140 @@ func writeHTMLDecisionIntel(sb *strings.Builder, di *reportDecisionIntel) {
 	sb.WriteString("</section>\n")
 }
 
+func writeMarkdownDiffSummary(sb *strings.Builder, diff *analysis.SnapshotDiff, diffSince string) {
+	if diff == nil {
+		return
+	}
+	ref := strings.TrimSpace(diffSince)
+	if ref == "" {
+		ref = strings.TrimSpace(diff.FromRevision)
+	}
+	if ref == "" {
+		ref = "baseline"
+	}
+	sb.WriteString(fmt.Sprintf("## Changes Since `%s`\n\n", sanitizeInlineCodeSpan(ref)))
+	sb.WriteString("| New | Closed | Reopened | Removed | Modified | Δ Cycles | Trend |\n")
+	sb.WriteString("|:---:|:------:|:--------:|:-------:|:--------:|:--------:|:-----:|\n")
+	trend := strings.TrimSpace(diff.Summary.HealthTrend)
+	if trend == "" {
+		trend = "stable"
+	}
+	sb.WriteString(fmt.Sprintf("| +%d | %d | %d | %d | %d | %+d | %s |\n\n",
+		diff.Summary.IssuesAdded,
+		diff.Summary.IssuesClosed,
+		diff.Summary.IssuesReopened,
+		diff.Summary.IssuesRemoved,
+		diff.Summary.IssuesModified,
+		diff.MetricDeltas.CycleCount,
+		escapeTableText(trend),
+	))
+	writeIssueList := func(heading string, items []model.Issue) {
+		if len(items) == 0 {
+			return
+		}
+		sb.WriteString(fmt.Sprintf("**%s (%d):** ", heading, len(items)))
+		limit := min(len(items), 8)
+		parts := make([]string, 0, limit)
+		for i := 0; i < limit; i++ {
+			parts = append(parts, fmt.Sprintf("`%s` %s", sanitizeInlineCodeSpan(items[i].ID), sanitizeInlineMarkdown(truncateString(items[i].Title, 40))))
+		}
+		sb.WriteString(strings.Join(parts, ", "))
+		if len(items) > limit {
+			sb.WriteString(fmt.Sprintf(" (+%d more)", len(items)-limit))
+		}
+		sb.WriteString("\n\n")
+	}
+	writeIssueList("Added", diff.NewIssues)
+	writeIssueList("Closed", diff.ClosedIssues)
+	writeIssueList("Reopened", diff.ReopenedIssues)
+	writeIssueList("Removed", diff.RemovedIssues)
+	if len(diff.ModifiedIssues) > 0 {
+		sb.WriteString(fmt.Sprintf("**Modified (%d):** ", len(diff.ModifiedIssues)))
+		limit := min(len(diff.ModifiedIssues), 8)
+		parts := make([]string, 0, limit)
+		for i := 0; i < limit; i++ {
+			mi := diff.ModifiedIssues[i]
+			fields := make([]string, 0, len(mi.Changes))
+			for _, ch := range mi.Changes {
+				fields = append(fields, sanitizeInlineMarkdown(ch.Field))
+			}
+			if len(fields) > 0 {
+				parts = append(parts, fmt.Sprintf("`%s` (%s)", sanitizeInlineCodeSpan(mi.IssueID), strings.Join(fields, ", ")))
+			} else {
+				parts = append(parts, fmt.Sprintf("`%s`", sanitizeInlineCodeSpan(mi.IssueID)))
+			}
+		}
+		sb.WriteString(strings.Join(parts, ", "))
+		if len(diff.ModifiedIssues) > limit {
+			sb.WriteString(fmt.Sprintf(" (+%d more)", len(diff.ModifiedIssues)-limit))
+		}
+		sb.WriteString("\n\n")
+	}
+}
+
+func writeHTMLDiffSummary(sb *strings.Builder, diff *analysis.SnapshotDiff, diffSince string) {
+	if diff == nil {
+		return
+	}
+	ref := strings.TrimSpace(diffSince)
+	if ref == "" {
+		ref = strings.TrimSpace(diff.FromRevision)
+	}
+	if ref == "" {
+		ref = "baseline"
+	}
+	trend := strings.TrimSpace(diff.Summary.HealthTrend)
+	if trend == "" {
+		trend = "stable"
+	}
+	sb.WriteString("<section class=\"diff-summary\">\n")
+	sb.WriteString(fmt.Sprintf("<h2>Changes Since <code>%s</code></h2>\n", html.EscapeString(ref)))
+	sb.WriteString("<table><thead><tr><th>New</th><th>Closed</th><th>Reopened</th><th>Removed</th><th>Modified</th><th>Δ Cycles</th><th>Trend</th></tr></thead><tbody>\n")
+	sb.WriteString(fmt.Sprintf("<tr><td>+%d</td><td>%d</td><td>%d</td><td>%d</td><td>%d</td><td>%+d</td><td>%s</td></tr>\n",
+		diff.Summary.IssuesAdded,
+		diff.Summary.IssuesClosed,
+		diff.Summary.IssuesReopened,
+		diff.Summary.IssuesRemoved,
+		diff.Summary.IssuesModified,
+		diff.MetricDeltas.CycleCount,
+		html.EscapeString(trend),
+	))
+	sb.WriteString("</tbody></table>\n")
+	writeList := func(label string, items []model.Issue) {
+		if len(items) == 0 {
+			return
+		}
+		limit := min(len(items), 8)
+		parts := make([]string, 0, limit)
+		for i := 0; i < limit; i++ {
+			parts = append(parts, fmt.Sprintf("<code>%s</code> %s", html.EscapeString(items[i].ID), html.EscapeString(truncateString(items[i].Title, 40))))
+		}
+		more := ""
+		if len(items) > limit {
+			more = fmt.Sprintf(" (+%d more)", len(items)-limit)
+		}
+		sb.WriteString(fmt.Sprintf("<p><strong>%s (%d):</strong> %s%s</p>\n", html.EscapeString(label), len(items), strings.Join(parts, ", "), more))
+	}
+	writeList("Added", diff.NewIssues)
+	writeList("Closed", diff.ClosedIssues)
+	writeList("Reopened", diff.ReopenedIssues)
+	writeList("Removed", diff.RemovedIssues)
+	if len(diff.ModifiedIssues) > 0 {
+		limit := min(len(diff.ModifiedIssues), 8)
+		parts := make([]string, 0, limit)
+		for i := 0; i < limit; i++ {
+			mi := diff.ModifiedIssues[i]
+			parts = append(parts, fmt.Sprintf("<code>%s</code>", html.EscapeString(mi.IssueID)))
+		}
+		more := ""
+		if len(diff.ModifiedIssues) > limit {
+			more = fmt.Sprintf(" (+%d more)", len(diff.ModifiedIssues)-limit)
+		}
+		sb.WriteString(fmt.Sprintf("<p><strong>Modified (%d):</strong> %s%s</p>\n", len(diff.ModifiedIssues), strings.Join(parts, ", "), more))
+	}
+	sb.WriteString("</section>\n")
+}
+
 // GenerateMarkdown creates a comprehensive markdown report of all issues
 func GenerateMarkdown(issues []model.Issue, title string, options ...ReportOptions) (string, error) {
 	opts := ReportOptions{IncludeGraph: true, GeneratedAt: time.Now(), GraphIssues: issues}
@@ -1421,6 +1607,7 @@ func GenerateMarkdown(issues []model.Issue, title string, options ...ReportOptio
 	metricsAcc := newReportMetricsAccessor(opts, issues)
 	decisionIntel := buildReportDecisionIntel(issues, opts)
 	writeSummaryTable(&sb, issues, opts, metricsAcc)
+	writeMarkdownDiffSummary(&sb, opts.Diff, opts.DiffSince)
 	writeMarkdownDecisionIntel(&sb, decisionIntel)
 
 	// Quick Actions Section
@@ -2236,6 +2423,7 @@ func GenerateHTMLReport(issues []model.Issue, title string, opts ReportOptions) 
 		sb.WriteString("</tr>\n")
 	}
 	sb.WriteString("</tbody>\n</table>\n")
+	writeHTMLDiffSummary(&sb, opts.Diff, opts.DiffSince)
 	writeHTMLDecisionIntel(&sb, decisionIntel)
 
 	if opts.includeActions() {
@@ -2751,6 +2939,8 @@ type PriorityBriefConfig struct {
 	GlobalCapacity          *PriorityBriefCapacity            // Optional global Graham-bound capacity summary
 	PriorityRecommendations []analysis.PriorityRecommendation // Optional priority misalignment alerts
 	CycleBreaks             []analysis.CycleBreakItem         // Optional cycle-break edge suggestions
+	Diff                    *analysis.SnapshotDiff            // Optional historical snapshot diff (--diff-since)
+	DiffSince               string                            // Optional ref label passed to --diff-since
 }
 
 func escapeTableCodeSpan(s string) string {
@@ -2855,6 +3045,10 @@ func GeneratePriorityBriefFromTriageJSON(triageJSON []byte, config PriorityBrief
 		triage.QuickRef.InProgressCount,
 		triage.QuickRef.BlockedCount,
 		triage.QuickRef.ActionableCount))
+
+	if config.Diff != nil {
+		writeMarkdownDiffSummary(&sb, config.Diff, config.DiffSince)
+	}
 
 	if len(triage.Alerts) > 0 {
 		sb.WriteString("## ⚠️ Alerts\n\n")
