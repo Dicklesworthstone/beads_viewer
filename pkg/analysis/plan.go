@@ -2,17 +2,22 @@ package analysis
 
 import (
 	"sort"
+	"strings"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
 
 // PlanItem represents a single actionable item in the execution plan
 type PlanItem struct {
-	ID          string   `json:"id"`
-	Title       string   `json:"title"`
-	Priority    int      `json:"priority"`
-	Status      string   `json:"status"`
-	UnblocksIDs []string `json:"unblocks"` // Issues that become actionable when this is done
+	ID          string              `json:"id"`
+	Title       string              `json:"title"`
+	Priority    int                 `json:"priority"`
+	Status      string              `json:"status"`
+	Assignee    string              `json:"assignee,omitempty"`
+	Claimable   bool                `json:"claimable"`
+	NotReady    bool                `json:"not_ready,omitempty"`
+	UnblocksIDs []string            `json:"unblocks"` // Issues that become actionable when this is done
+	Actions     *model.IssueActions `json:"actions,omitempty"`
 }
 
 // ExecutionTrack represents a group of related actionable items
@@ -178,6 +183,13 @@ type PlanSummary struct {
 // GetExecutionPlan generates a dependency-respecting execution plan
 // with parallel tracks identified for concurrent work.
 func (a *Analyzer) GetExecutionPlan() ExecutionPlan {
+	return a.GetExecutionPlanWithOptions(nil)
+}
+
+// GetExecutionPlanWithOptions builds the dependency-respecting execution plan
+// and annotates each actionable track item with claimability and opt-in
+// NotReadyLabels status without dropping track topology (W31-5).
+func (a *Analyzer) GetExecutionPlanWithOptions(notReadyLabels []string) ExecutionPlan {
 	actionable := a.getActionableIssuesAfterCompletions(nil)
 
 	// Build set of actionable IDs for quick lookup
@@ -196,7 +208,7 @@ func (a *Analyzer) GetExecutionPlan() ExecutionPlan {
 	components := a.findConnectedComponents()
 
 	// Build tracks from components, filtering to actionable issues only
-	tracks := a.buildTracks(components, actionableSet, unblocksMap)
+	tracks := a.buildTracks(components, actionableSet, unblocksMap, notReadyLabels)
 
 	// Partition candidate issues into actionable, blocked, and deferred/parked
 	partition := a.CountStatusPartition()
@@ -341,9 +353,12 @@ func (a *Analyzer) findConnectedComponents() map[string][]string {
 }
 
 // buildTracks creates execution tracks from connected components
-func (a *Analyzer) buildTracks(components map[string][]string, actionableSet map[string]bool, unblocksMap map[string][]string) []ExecutionTrack {
+func (a *Analyzer) buildTracks(components map[string][]string, actionableSet map[string]bool, unblocksMap map[string][]string, notReadyLabels []string) []ExecutionTrack {
 	tracks := make([]ExecutionTrack, 0)
 	trackNum := 1
+	readiness := a.Readiness()
+	now := a.Now()
+	parentsWithOpenChildren := a.ParentsWithOpenChildren()
 
 	// Sort component roots for deterministic output
 	var roots []string
@@ -378,11 +393,22 @@ func (a *Analyzer) buildTracks(components map[string][]string, actionableSet map
 		// Build plan items
 		items := make([]PlanItem, len(actionableMembers))
 		for i, issue := range actionableMembers {
+			isNotReady := hasAnyLabel(issue.Labels, notReadyLabels)
+			_, safeID := quoteBeadsCommandID(issue.ID)
+			isClaimable := safeID &&
+				readiness.Claimable(issue.ID, now) &&
+				!isNotReady &&
+				!parentsWithOpenChildren[issue.ID] &&
+				issue.IssueType != model.TypeEpic &&
+				strings.TrimSpace(issue.Assignee) == ""
 			items[i] = PlanItem{
 				ID:          issue.ID,
 				Title:       issue.Title,
 				Priority:    issue.Priority,
 				Status:      string(issue.Status),
+				Assignee:    issue.Assignee,
+				Claimable:   isClaimable,
+				NotReady:    isNotReady,
 				UnblocksIDs: append([]string{}, unblocksMap[issue.ID]...),
 			}
 		}

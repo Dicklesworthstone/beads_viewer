@@ -774,3 +774,38 @@ func TestGetExecutionPlan_ScopedCandidatesDoNotMergeTracksThroughOutOfScopeBridg
 			scopedPlan.TotalActionable, scopedPlan.Tracks)
 	}
 }
+
+func TestGetExecutionPlanWithOptions_ClaimableAndNotReadyLabels(t *testing.T) {
+	issues := []model.Issue{
+		{ID: "READY-1", Title: "Ready unassigned task", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 1},
+		{ID: "DRAFT-1", Title: "Needs spec task", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 1, Labels: []string{"needs-spec"}},
+		{ID: "OWNED-1", Title: "Assigned task", Status: model.StatusOpen, IssueType: model.TypeTask, Priority: 1, Assignee: "alice"},
+		{ID: "EPIC-1", Title: "Open epic", Status: model.StatusOpen, IssueType: model.TypeEpic, Priority: 1},
+	}
+
+	an := analysis.NewAnalyzer(issues)
+	plan := an.GetExecutionPlanWithOptions([]string{"needs-spec"})
+	if plan.TotalActionable != 4 {
+		t.Fatalf("expected all 4 unblocked issues preserved in plan topology, got %d", plan.TotalActionable)
+	}
+
+	itemsByID := make(map[string]analysis.PlanItem)
+	for _, track := range plan.Tracks {
+		for _, item := range track.Items {
+			itemsByID[item.ID] = item
+		}
+	}
+
+	if it := itemsByID["READY-1"]; !it.Claimable || it.NotReady {
+		t.Fatalf("READY-1 expected Claimable=true NotReady=false, got %+v", it)
+	}
+	if it := itemsByID["DRAFT-1"]; it.Claimable || !it.NotReady {
+		t.Fatalf("DRAFT-1 expected Claimable=false NotReady=true, got %+v", it)
+	}
+	if it := itemsByID["OWNED-1"]; it.Claimable || it.NotReady || it.Assignee != "alice" {
+		t.Fatalf("OWNED-1 expected Claimable=false NotReady=false Assignee=alice, got %+v", it)
+	}
+	if it := itemsByID["EPIC-1"]; it.Claimable || it.NotReady {
+		t.Fatalf("EPIC-1 expected Claimable=false NotReady=false, got %+v", it)
+	}
+}

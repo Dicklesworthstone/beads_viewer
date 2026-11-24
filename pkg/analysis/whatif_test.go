@@ -938,3 +938,69 @@ func TestGenerateEnhancedRecommendationsFromStats_WhatIfReuseAndInactiveExclusio
 		}
 	}
 }
+
+func TestComputeWhatIfBatch_DiamondSynergyAndEdgeCases(t *testing.T) {
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	issues := []model.Issue{
+		{ID: "A", Title: "Root A", Status: model.StatusOpen, Priority: 1, CreatedAt: now, UpdatedAt: now},
+		{ID: "B", Title: "Root B", Status: model.StatusOpen, Priority: 1, CreatedAt: now, UpdatedAt: now},
+		{
+			ID: "D", Title: "Diamond join", Status: model.StatusOpen, Priority: 1, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{
+				{IssueID: "D", DependsOnID: "A", Type: model.DepBlocks},
+				{IssueID: "D", DependsOnID: "B", Type: model.DepBlocks},
+			},
+		},
+		{
+			ID: "E", Title: "Cascade downstream", Status: model.StatusOpen, Priority: 2, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{
+				{IssueID: "E", DependsOnID: "D", Type: model.DepBlocks},
+			},
+		},
+		{ID: "DONE", Title: "Already closed", Status: model.StatusClosed, Priority: 3, CreatedAt: now, UpdatedAt: now},
+	}
+
+	an := NewAnalyzer(issues)
+	an.SetNow(now)
+	stats := an.Analyze()
+
+	// Control: closing A or B alone unlocks 0 issues because D requires both.
+	wiA := an.ComputeWhatIf("A", &stats)
+	wiB := an.ComputeWhatIf("B", &stats)
+	if wiA == nil || wiB == nil || wiA.Delta.DirectUnblocks != 0 || wiB.Delta.DirectUnblocks != 0 {
+		t.Fatalf("diamond single-close control failed: wiA=%+v wiB=%+v", wiA, wiB)
+	}
+
+	// Positive observable: batch closing [A, B] unlocks D directly via synergy (+1) and cascades to E (+2 transitive).
+	batch := an.ComputeWhatIfBatch([]string{"A", "B", "A"}, &stats)
+	if batch == nil {
+		t.Fatal("ComputeWhatIfBatch returned nil")
+	}
+	if !reflect.DeepEqual(batch.IssueIDs, []string{"A", "B"}) {
+		t.Fatalf("expected deduplicated IssueIDs=[A B], got %v", batch.IssueIDs)
+	}
+	if batch.Delta.DirectUnblocks != 1 || !reflect.DeepEqual(batch.Delta.UnblockedIssueIDs, []string{"D"}) {
+		t.Fatalf("expected DirectUnblocks=1 [D], got %+v", batch.Delta)
+	}
+	if batch.Delta.TransitiveUnblocks != 2 {
+		t.Fatalf("expected TransitiveUnblocks=2 (D, E), got %d", batch.Delta.TransitiveUnblocks)
+	}
+	if batch.SynergyUnblocks != 1 || !reflect.DeepEqual(batch.SynergyIssueIDs, []string{"D"}) {
+		t.Fatalf("expected SynergyUnblocks=1 [D], got synergy=%d ids=%v", batch.SynergyUnblocks, batch.SynergyIssueIDs)
+	}
+	if batch.Delta.ParallelizationGain == nil || *batch.Delta.ParallelizationGain != -1 {
+		t.Fatalf("expected ParallelizationGain=-1 (1 direct - 2 active targets), got %v", batch.Delta.ParallelizationGain)
+	}
+
+	// Already-closed input in batch must not inflate active-close denominator.
+	batchWithClosed := an.ComputeWhatIfBatch([]string{"A", "B", "DONE"}, &stats)
+	if batchWithClosed.Delta.ParallelizationGain == nil || *batchWithClosed.Delta.ParallelizationGain != -1 {
+		t.Fatalf("already-closed target DONE distorted ParallelizationGain: got %v, want -1", batchWithClosed.Delta.ParallelizationGain)
+	}
+
+	// Missing / out-of-scope ID is reported in MissingIDs.
+	missingRes := an.ComputeWhatIfBatch([]string{"A", "GHOST"}, &stats)
+	if !reflect.DeepEqual(missingRes.MissingIDs, []string{"GHOST"}) {
+		t.Fatalf("expected MissingIDs=[GHOST], got %v", missingRes.MissingIDs)
+	}
+}

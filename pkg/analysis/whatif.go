@@ -1,8 +1,12 @@
 package analysis
 
 import (
+	"fmt"
 	"sort"
+	"strings"
 	"time"
+
+	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 )
 
 // PriorityExplanation provides detailed reasoning for a priority recommendation
@@ -270,6 +274,26 @@ type WhatIfResult struct {
 	Delta    WhatIfDelta `json:"delta"`
 }
 
+// WhatIfBatchItem summarizes one input issue in a multi-issue batch what-if simulation (W31-2).
+type WhatIfBatchItem struct {
+	IssueID       string `json:"issue_id"`
+	Title         string `json:"title"`
+	Status        string `json:"status"`
+	Priority      int    `json:"priority"`
+	AlreadyClosed bool   `json:"already_closed,omitempty"`
+}
+
+// WhatIfBatchResult represents the joint completion simulation result for multiple issues (W31-2).
+type WhatIfBatchResult struct {
+	IssueIDs        []string          `json:"issue_ids"`
+	Issues          []WhatIfBatchItem `json:"issues"`
+	MissingIDs      []string          `json:"missing_ids,omitempty"`
+	ActiveCount     int               `json:"active_count"`
+	SynergyUnblocks int               `json:"synergy_unblocks"`
+	SynergyIssueIDs []string          `json:"synergy_issue_ids,omitempty"`
+	Delta           WhatIfDelta       `json:"delta"`
+}
+
 // ComputeWhatIf simulates completing issueID and returns its downstream impact
 // summary, or nil when issueID does not exist in the active candidate scope.
 func (a *Analyzer) ComputeWhatIf(issueID string, stats *GraphStats) *WhatIfResult {
@@ -294,6 +318,179 @@ func (a *Analyzer) ComputeWhatIf(issueID string, stats *GraphStats) *WhatIfResul
 		Status:   string(issue.Status),
 		Priority: issue.Priority,
 		Delta:    *delta,
+	}
+}
+
+// ComputeWhatIfBatch simulates completing multiple issues simultaneously, exposing
+// joint diamond-dependency unlocks (SynergyUnblocks), transitive cascades, and net
+// parallelization gain across all active input issues (W31-2).
+func (a *Analyzer) ComputeWhatIfBatch(issueIDs []string, stats *GraphStats) *WhatIfBatchResult {
+	if a == nil || len(issueIDs) == 0 {
+		return nil
+	}
+	deduped := make([]string, 0, len(issueIDs))
+	seenInput := make(map[string]bool, len(issueIDs))
+	for _, raw := range issueIDs {
+		id := strings.TrimSpace(raw)
+		if id == "" || seenInput[id] {
+			continue
+		}
+		seenInput[id] = true
+		deduped = append(deduped, id)
+	}
+	if len(deduped) == 0 {
+		return nil
+	}
+
+	items := make([]WhatIfBatchItem, 0, len(deduped))
+	var missing []string
+	batchClosed := make(map[string]bool, len(deduped))
+	activeIDs := make([]string, 0, len(deduped))
+	for _, id := range deduped {
+		iss, ok := a.issueMap[id]
+		if !ok || !a.IsCandidate(id) {
+			missing = append(missing, id)
+			continue
+		}
+		closed := isClosedLikeStatus(iss.Status)
+		items = append(items, WhatIfBatchItem{
+			IssueID:       iss.ID,
+			Title:         iss.Title,
+			Status:        string(iss.Status),
+			Priority:      iss.Priority,
+			AlreadyClosed: closed,
+		})
+		if !closed {
+			batchClosed[iss.ID] = true
+			activeIDs = append(activeIDs, iss.ID)
+		}
+	}
+	if len(missing) > 0 {
+		return &WhatIfBatchResult{
+			IssueIDs:   deduped,
+			Issues:     items,
+			MissingIDs: missing,
+		}
+	}
+	if stats == nil {
+		analyzed := a.Analyze()
+		stats = &analyzed
+	}
+
+	readiness := a.Readiness()
+	directSeen := make(map[string]bool)
+	var directUnblocks []string
+	checkDirectCandidate := func(candID string) {
+		if candID == "" || batchClosed[candID] || directSeen[candID] {
+			return
+		}
+		directSeen[candID] = true
+		if !readiness.Ready(candID, a.now) && a.isActionableAfterCompletions(candID, batchClosed) {
+			directUnblocks = append(directUnblocks, candID)
+		}
+	}
+	singleDirectUnion := make(map[string]bool)
+	maxDepth := 0.0
+	for _, id := range activeIDs {
+		if nodeID, ok := a.idToNode[id]; ok {
+			dependents := a.g.To(nodeID)
+			for dependents.Next() {
+				checkDirectCandidate(a.nodeToID[dependents.Node().ID()])
+			}
+		}
+		for _, childID := range a.childrenByParent[id] {
+			checkDirectCandidate(childID)
+		}
+		for _, singleID := range a.computeDirectBlockingUnblocks(id) {
+			singleDirectUnion[singleID] = true
+		}
+		if d, _ := stats.CriticalPathValue(id); d > maxDepth {
+			maxDepth = d
+		}
+	}
+	sort.Strings(directUnblocks)
+
+	var synergyIDs []string
+	for _, id := range directUnblocks {
+		if !singleDirectUnion[id] {
+			synergyIDs = append(synergyIDs, id)
+		}
+	}
+	synergyCount := len(synergyIDs)
+
+	// Transitive cascade seeded with all active batch inputs completed simultaneously.
+	simulatedClosed := make(map[string]bool, len(batchClosed))
+	queue := make([]string, 0, len(activeIDs))
+	for _, id := range activeIDs {
+		simulatedClosed[id] = true
+		queue = append(queue, id)
+	}
+	transitiveCount := 0
+	for len(queue) > 0 {
+		curr := queue[0]
+		queue = queue[1:]
+		for _, candID := range a.directUnlockFrontier(curr) {
+			if simulatedClosed[candID] {
+				continue
+			}
+			if _, exists := a.issueMap[candID]; !exists {
+				continue
+			}
+			if readiness.Ready(candID, a.now) {
+				continue
+			}
+			if a.isActionableAfterCompletions(candID, simulatedClosed) {
+				transitiveCount++
+				simulatedClosed[candID] = true
+				queue = append(queue, candID)
+			}
+		}
+	}
+
+	blockedReduction := 0
+	for _, uid := range directUnblocks {
+		if readiness.DependencyState(uid) != model.DependenciesSatisfied {
+			blockedReduction++
+		}
+	}
+	depthReduction := 0.0
+	if maxDepth > 0 {
+		depthReduction = maxDepth / MaxCriticalPathDepth
+		if depthReduction > 1.0 {
+			depthReduction = 1.0
+		}
+	}
+	estimatedDaysSaved := estimateDaysSaved(directUnblocks, a.issueMap)
+	unblockedShown := directUnblocks
+	if len(unblockedShown) > MaxUnblockedIDsShown {
+		unblockedShown = unblockedShown[:MaxUnblockedIDsShown]
+	}
+	synergyShown := synergyIDs
+	if len(synergyShown) > MaxUnblockedIDsShown {
+		synergyShown = synergyShown[:MaxUnblockedIDsShown]
+	}
+	parallelGain := len(directUnblocks) - len(activeIDs)
+	explanation := generateWhatIfExplanation(len(directUnblocks), transitiveCount, blockedReduction, estimatedDaysSaved)
+	if synergyCount > 0 {
+		explanation = fmt.Sprintf("%s (%d unlocked only jointly by completing this batch together)", explanation, synergyCount)
+	}
+
+	return &WhatIfBatchResult{
+		IssueIDs:        deduped,
+		Issues:          items,
+		ActiveCount:     len(activeIDs),
+		SynergyUnblocks: synergyCount,
+		SynergyIssueIDs: synergyShown,
+		Delta: WhatIfDelta{
+			DirectUnblocks:      len(directUnblocks),
+			TransitiveUnblocks:  transitiveCount,
+			BlockedReduction:    blockedReduction,
+			DepthReduction:      depthReduction,
+			EstimatedDaysSaved:  estimatedDaysSaved,
+			UnblockedIssueIDs:   unblockedShown,
+			ParallelizationGain: &parallelGain,
+			Explanation:         explanation,
+		},
 	}
 }
 
