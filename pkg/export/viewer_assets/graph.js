@@ -286,6 +286,7 @@ class GraphStore {
         this.highlightedLinks = new Set();
         this.connectedNodes = new Set(); // Gold glow connected subgraph
         this.focusedPath = null;
+        this.checkDepPicking = false;
 
         // Heatmap & metrics mode
         this.heatmapMode = false;
@@ -350,6 +351,7 @@ class GraphStore {
         this.highlightedLinks.clear();
         this.connectedNodes.clear();
         this.focusedPath = null;
+        this.checkDepPicking = false;
         this.heatmapMode = false;
         this.filters = {
             status: null,
@@ -2664,6 +2666,13 @@ function drawLink(link, ctx, globalScale) {
 function handleNodeClick(node, event) {
     if (!node) return;
 
+    // W30-4 / P18B-2: While picking a target node for Check Add Dep, dispatch
+    // nodeClick without opening the detail drawer or running modifier actions.
+    if (store.checkDepPicking) {
+        dispatchEvent('nodeClick', { node, event });
+        return;
+    }
+
     // Shift+click: what-if simulation
     // Ctrl+click: show dependencies
     // Regular click: select
@@ -3093,12 +3102,31 @@ export function isWhatIfActive() {
 }
 
 /**
- * Highlight a proposed-dependency path (or cycle path) on the force-graph canvas (W30-4).
+ * Enable or disable interactive target-node picking mode for Check Add Dep (W30-4 / P18B-2).
+ * @param {boolean} active
+ */
+export function setCheckDepPicking(active) {
+    store.checkDepPicking = Boolean(active);
+}
+
+/**
+ * Inspect current canvas highlight sets (string node IDs and edgeKey strings).
+ */
+export function getHighlightState() {
+    return {
+        nodes: [...store.highlightedNodes],
+        links: [...store.highlightedLinks],
+        checkDepPicking: Boolean(store.checkDepPicking)
+    };
+}
+
+/**
+ * Highlight a proposed-dependency path (or cycle path) on the force-graph canvas (W30-4 / P18B-1).
  * Clears competing visual overlays so the cycle/proposed edge stands out cleanly.
  * @param {string[]} nodeIds
  */
 export function highlightCheckDepPath(nodeIds = []) {
-    resetWhatIf();
+    resetWhatIf({ force: true });
     resetCycleNavigator();
     resetCriticalPath();
     resetDependencyCone({ refresh: false });
@@ -3112,19 +3140,21 @@ export function highlightCheckDepPath(nodeIds = []) {
     const idSet = new Set(nodeIds);
     for (const n of graphData.nodes || []) {
         if (idSet.has(n.id)) {
-            store.highlightedNodes.add(n);
+            store.highlightedNodes.add(n.id);
         }
     }
     const pairSet = new Set();
     for (let i = 0; i + 1 < nodeIds.length; i++) {
-        pairSet.add(`${nodeIds[i]}\0${nodeIds[i + 1]}`);
-        pairSet.add(`${nodeIds[i + 1]}\0${nodeIds[i]}`);
+        pairSet.add(edgeKey(nodeIds[i], nodeIds[i + 1]));
+        pairSet.add(edgeKey(nodeIds[i + 1], nodeIds[i]));
     }
     for (const l of graphData.links || []) {
+        if (l.blocking === false) continue;
         const s = typeof l.source === 'object' ? l.source.id : l.source;
         const t = typeof l.target === 'object' ? l.target.id : l.target;
-        if (pairSet.has(`${s}\0${t}`)) {
-            store.highlightedLinks.add(l);
+        const k = edgeKey(s, t);
+        if (pairSet.has(k)) {
+            store.highlightedLinks.add(k);
         }
     }
     refreshGraph();
@@ -3134,6 +3164,7 @@ export function highlightCheckDepPath(nodeIds = []) {
  * Clear proposed-dependency path highlight from the force-graph canvas (W30-4).
  */
 export function clearCheckDepHighlight() {
+    store.checkDepPicking = false;
     store.highlightedNodes.clear();
     store.highlightedLinks.clear();
     refreshGraph();
@@ -4303,6 +4334,7 @@ export function zoomToFit(padding = 50) {
 }
 
 export function resetView() {
+    store.checkDepPicking = false;
     resetWhatIf({ force: true });
     resetCriticalPath();
     resetCycleNavigator();

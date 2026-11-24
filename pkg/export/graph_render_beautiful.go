@@ -2430,6 +2430,7 @@ document.getElementById('btn-detail-whatif').onclick = () => {
 // Pre-flight Dependency Validator ("Check Add Dep A → B", W30-4)
 let checkDepMode = false;
 let checkDepFromId = null;
+let checkDepToId = null;
 let checkDepCommand = '';
 function quoteStandaloneWord(word) {
     const s = String(word || '');
@@ -2439,6 +2440,7 @@ function quoteStandaloneWord(word) {
 function cancelCheckDep() {
     checkDepMode = false;
     checkDepFromId = null;
+    checkDepToId = null;
     checkDepCommand = '';
     const banner = document.getElementById('checkdep-banner');
     if (banner) { banner.style.display = 'none'; banner.classList.remove('visible'); }
@@ -2528,7 +2530,9 @@ function checkStandaloneDep(fromId, toId) {
         }
     }
     res.canAdd = true;
-    if (!res.crossRepo) {
+    const allowCmd = !(DATA.source_authority && DATA.source_authority.claim_safe === false) &&
+        !DATA.as_of && !DATA.as_of_commit;
+    if (allowCmd && !res.crossRepo) {
         res.command = 'br dep add ' + quoteStandaloneWord(fromId) + ' ' + quoteStandaloneWord(toId);
     }
     return res;
@@ -2540,6 +2544,7 @@ function startStandaloneCheckDep(fromId) {
     clearWhatIfSimulation();
     checkDepMode = true;
     checkDepFromId = fromId;
+    checkDepToId = null;
     checkDepCommand = '';
     activePathNodes = new Set([fromId]);
     highlightedNodes = new Set([fromId]);
@@ -2559,13 +2564,26 @@ function startStandaloneCheckDep(fromId) {
     showToast('Check Add Dep: click target node for ' + fromId);
 }
 function runStandaloneCheckDep(fromId, toId) {
+    cancelPathFinder();
+    closeCycleInspector();
+    clearWhatIfSimulation();
     const res = checkStandaloneDep(fromId, toId);
     checkDepMode = false;
     checkDepFromId = fromId;
+    checkDepToId = toId;
     checkDepCommand = res.command || '';
-    const ids = new Set(res.wouldCycle && res.cyclePath.length ? res.cyclePath : [fromId, toId]);
-    activePathNodes = ids;
-    highlightedNodes = ids;
+    if (res.wouldCycle && res.cyclePath.length) {
+        const ids = new Set(res.cyclePath);
+        activePathNodes = ids;
+        highlightedNodes = ids;
+    } else if (res.canAdd) {
+        const ids = new Set([fromId, toId]);
+        activePathNodes = ids;
+        highlightedNodes = ids;
+    } else {
+        activePathNodes = null;
+        highlightedNodes = new Set();
+    }
     Graph.nodeColor(Graph.nodeColor());
     Graph.linkColor(Graph.linkColor());
     Graph.linkWidth(Graph.linkWidth());
@@ -2576,6 +2594,9 @@ function runStandaloneCheckDep(fromId, toId) {
         if (res.wouldCycle) {
             banner.style.borderColor = '#ef4444';
             textEl.textContent = '⛔ Cycle: ' + res.cyclePath.join(' → ');
+        } else if (!res.canAdd) {
+            banner.style.borderColor = '#f59e0b';
+            textEl.textContent = '⚠ Invalid: ' + (res.warning || (fromId + ' → ' + toId));
         } else if (res.alreadyExists) {
             banner.style.borderColor = '#3b82f6';
             textEl.textContent = 'ℹ Already exists: ' + fromId + ' → ' + toId;
@@ -2914,8 +2935,12 @@ function applyFilters() {
     if (pathStart && !visibleIds.has(pathStart)) {
         cancelPathFinder();
     }
-    if ((checkDepMode || checkDepFromId) && !visibleIds.has(checkDepFromId)) {
+    if ((checkDepMode || checkDepFromId || checkDepToId) &&
+        ((checkDepFromId && !visibleIds.has(checkDepFromId)) || (checkDepToId && !visibleIds.has(checkDepToId)))) {
         cancelCheckDep();
+        activePathNodes = null;
+        highlightedNodes = new Set();
+        needsHighlightRefresh = true;
     }
     if (highlightedNodes.size > 0 && ![...highlightedNodes].some(id => visibleIds.has(id))) {
         cancelPathFinder();

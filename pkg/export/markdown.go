@@ -245,6 +245,11 @@ type reportMetricsAccessor struct {
 	triageScore    map[string]float64
 	riskScore      map[string]float64
 	etaDays        map[string]float64
+	computedKeys   map[string]bool
+}
+
+func (m *reportMetricsAccessor) hasKey(key string) bool {
+	return m != nil && m.computedKeys[key]
 }
 
 func isDecisionIneligibleIssue(iss model.Issue) bool {
@@ -283,6 +288,11 @@ func newReportMetricsAccessor(opts ReportOptions, issueSlices ...[]model.Issue) 
 	if len(keys) == 0 {
 		return nil
 	}
+	computedKeys := make(map[string]bool, len(keys))
+	for _, k := range keys {
+		computedKeys[k] = true
+		seen[k] = true
+	}
 	resolvedIDs := make(map[string]bool)
 	decisionExcluded := make(map[string]bool)
 	issueByID := make(map[string]model.Issue)
@@ -315,8 +325,9 @@ func newReportMetricsAccessor(opts ReportOptions, issueSlices ...[]model.Issue) 
 	}
 
 	acc := &reportMetricsAccessor{
-		keys:        keys,
-		resolvedIDs: resolvedIDs,
+		keys:         keys,
+		resolvedIDs:  resolvedIDs,
+		computedKeys: computedKeys,
 	}
 	if opts.GraphStats != nil {
 		betweenness := opts.GraphStats.ActiveBetweenness()
@@ -815,7 +826,7 @@ func writeCSVReport(selected, context []model.Issue, opts ReportOptions, metrics
 			if opts.GraphStats != nil || opts.Analyzer != nil || opts.ETAContext != nil {
 				if mKey, ok := normalizeReportMetricKey(norm); ok {
 					acc := metricsAcc
-					if acc == nil {
+					if !acc.hasKey(mKey) {
 						colOpts := opts
 						colOpts.Metrics = []string{mKey}
 						acc = newReportMetricsAccessor(colOpts, selected, context)
@@ -1149,16 +1160,17 @@ func buildReportDecisionIntel(issues []model.Issue, opts ReportOptions) *reportD
 		priorityByID: make(map[string]analysis.PriorityRecommendation),
 	}
 
-	if opts.GraphStats != nil {
-		issueMap := make(map[string]model.Issue, len(opts.GraphIssues)+len(issues))
-		for _, iss := range opts.GraphIssues {
+	issueMap := make(map[string]model.Issue, len(opts.GraphIssues)+len(issues))
+	for _, iss := range opts.GraphIssues {
+		issueMap[iss.ID] = iss
+	}
+	for _, iss := range issues {
+		if _, ok := issueMap[iss.ID]; !ok {
 			issueMap[iss.ID] = iss
 		}
-		for _, iss := range issues {
-			if _, ok := issueMap[iss.ID]; !ok {
-				issueMap[iss.ID] = iss
-			}
-		}
+	}
+
+	if opts.GraphStats != nil {
 		readiness := opts.Readiness
 		if readiness == nil {
 			all := make([]model.Issue, 0, len(issueMap))
@@ -1197,8 +1209,17 @@ func buildReportDecisionIntel(issues []model.Issue, opts ReportOptions) *reportD
 	}
 
 	if opts.Analyzer != nil {
-		for _, rec := range opts.Analyzer.GenerateRecommendations() {
+		var recs []analysis.PriorityRecommendation
+		if opts.GraphStats != nil {
+			recs = opts.Analyzer.GenerateRecommendationsFromStats(opts.GraphStats, analysis.DefaultThresholds())
+		} else {
+			recs = opts.Analyzer.GenerateRecommendations()
+		}
+		for _, rec := range recs {
 			if !visibleSet[rec.IssueID] || rec.SuggestedPriority == rec.CurrentPriority {
+				continue
+			}
+			if iss, ok := issueMap[rec.IssueID]; ok && isDecisionIneligibleIssue(iss) {
 				continue
 			}
 			di.priorityByID[rec.IssueID] = rec
@@ -1216,7 +1237,7 @@ func buildReportDecisionIntel(issues []model.Issue, opts ReportOptions) *reportD
 
 		if opts.GraphStats != nil {
 			for _, iss := range issues {
-				if !visibleSet[iss.ID] || isClosedLikeStatus(iss.Status) {
+				if !visibleSet[iss.ID] || isDecisionIneligibleIssue(iss) {
 					continue
 				}
 				wi := opts.Analyzer.ComputeWhatIf(iss.ID, opts.GraphStats)
@@ -1231,12 +1252,15 @@ func buildReportDecisionIntel(issues []model.Issue, opts ReportOptions) *reportD
 				}
 				wiCopy := *wi
 				wiCopy.Delta.UnblockedIssueIDs = filteredIDs
-				if opts.VisibleIDs != nil {
+				if opts.VisibleIDs != nil || len(filteredIDs) != len(wi.Delta.UnblockedIssueIDs) {
 					if len(filteredIDs) == 0 {
 						continue
 					}
 					if wiCopy.Delta.DirectUnblocks > len(filteredIDs) {
 						wiCopy.Delta.DirectUnblocks = len(filteredIDs)
+					}
+					if len(filteredIDs) < len(wi.Delta.UnblockedIssueIDs) {
+						wiCopy.Delta.TransitiveUnblocks = wiCopy.Delta.DirectUnblocks
 					}
 				}
 				di.whatIfByID[iss.ID] = &wiCopy
@@ -1744,7 +1768,7 @@ func writeSummaryTable(sb *strings.Builder, issues []model.Issue, opts ReportOpt
 			if opts.GraphStats != nil || opts.Analyzer != nil || opts.ETAContext != nil {
 				if mKey, ok := normalizeReportMetricKey(norm); ok {
 					acc := metricsAcc
-					if acc == nil {
+					if !acc.hasKey(mKey) {
 						colOpts := opts
 						colOpts.Metrics = []string{mKey}
 						acc = newReportMetricsAccessor(colOpts, issues)
@@ -2151,7 +2175,7 @@ func GenerateHTMLReport(issues []model.Issue, title string, opts ReportOptions) 
 			if opts.GraphStats != nil || opts.Analyzer != nil || opts.ETAContext != nil {
 				if mKey, ok := normalizeReportMetricKey(norm); ok {
 					acc := metricsAcc
-					if acc == nil {
+					if !acc.hasKey(mKey) {
 						colOpts := opts
 						colOpts.Metrics = []string{mKey}
 						acc = newReportMetricsAccessor(colOpts, issues)

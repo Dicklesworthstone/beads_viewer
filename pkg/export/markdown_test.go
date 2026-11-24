@@ -3785,3 +3785,113 @@ func TestWave30_W30_1_ExportDecisionIntelligenceAndMetrics(t *testing.T) {
 		t.Fatalf("W30-1 regression: VisibleIDs filter leaked hidden cycle-break/what-if IDs into Markdown:\n%s", scopedStr)
 	}
 }
+
+func TestPass18_ExportRegressions(t *testing.T) {
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-20 * 24 * time.Hour)
+	est := 120
+
+	t.Run("P18A-4_ShowMetricsWithCustomColumnsComputesTriageRiskETA", func(t *testing.T) {
+		issues := []model.Issue{
+			{ID: "M-ROOT", Title: "Root task", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeFeature, EstimatedMinutes: &est, CreatedAt: old, UpdatedAt: old},
+			{ID: "M-CHILD", Title: "Blocked child", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: old, UpdatedAt: old,
+				Dependencies: []*model.Dependency{{IssueID: "M-CHILD", DependsOnID: "M-ROOT", Type: model.DepBlocks}}},
+		}
+		an := analysis.NewAnalyzer(issues)
+		an.SetNow(now)
+		stats := an.Analyze()
+		baseOpts := ReportOptions{
+			Title:       "P18A-4 Metrics",
+			GeneratedAt: now,
+			GraphStats:  &stats,
+			GraphIssues: issues,
+			Analyzer:    an,
+			ETAContext:  analysis.NewETAContext(issues, &stats, now),
+			Readiness:   model.NewReadinessIndex(issues),
+			// Metrics is intentionally empty while ShowMetrics=true and View.Columns asks for triage/risk/eta!
+			View: recipe.ViewConfig{
+				ShowMetrics: true,
+				Columns:     []string{"id", "title", "triage", "risk", "eta"},
+			},
+		}
+
+		// CSV must emit real numeric values on M-ROOT (not N/A,N/A,N/A).
+		csvOpts := baseOpts
+		csvOpts.Format = "csv"
+		csvBytes, err := GenerateReport(issues, issues, csvOpts)
+		if err != nil {
+			t.Fatalf("GenerateReport(csv): %v", err)
+		}
+		for _, line := range strings.Split(strings.TrimSpace(string(csvBytes)), "\n")[1:] {
+			if strings.HasPrefix(line, "M-ROOT,") && strings.HasSuffix(line, ",N/A,N/A,N/A") {
+				t.Fatalf("P18A-4 regression: CSV rendered N/A for triage/risk/eta when ShowMetrics=true & Metrics=nil: %q", line)
+			}
+		}
+
+		// Markdown summary table must not show "| N/A | N/A | N/A |" for M-ROOT.
+		mdOpts := baseOpts
+		mdOpts.Format = "markdown"
+		mdBytes, err := GenerateReport(issues, issues, mdOpts)
+		if err != nil {
+			t.Fatalf("GenerateReport(markdown): %v", err)
+		}
+		for _, line := range strings.Split(string(mdBytes), "\n") {
+			if strings.Contains(line, "M-ROOT") && strings.Contains(line, "| N/A | N/A | N/A |") {
+				t.Fatalf("P18A-4 regression: Markdown summary table rendered N/A for triage/risk/eta: %q", line)
+			}
+		}
+
+		// HTML summary table must not show three N/A cells for M-ROOT.
+		htmlOpts := baseOpts
+		htmlOpts.Format = "html"
+		htmlBytes, err := GenerateReport(issues, issues, htmlOpts)
+		if err != nil {
+			t.Fatalf("GenerateReport(html): %v", err)
+		}
+		htmlStr := string(htmlBytes)
+		if strings.Contains(htmlStr, "<td>M-ROOT</td><td>Root task</td><td>N/A</td><td>N/A</td><td>N/A</td>") {
+			t.Fatalf("P18A-4 regression: HTML table rendered N/A for triage/risk/eta when ShowMetrics=true & Metrics=nil")
+		}
+	})
+
+	t.Run("P18A-11_DecisionIntelIneligibleSuppressionAndTransitiveClamp", func(t *testing.T) {
+		issues := []model.Issue{
+			{ID: "D-ROOT", Title: "Root", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, CreatedAt: old, UpdatedAt: old},
+			{ID: "D-IN", Title: "In-scope child", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: old, UpdatedAt: old,
+				Dependencies: []*model.Dependency{{IssueID: "D-IN", DependsOnID: "D-ROOT", Type: model.DepBlocks}}},
+			{ID: "D-OUT1", Title: "Out-of-scope child", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: old, UpdatedAt: old,
+				Dependencies: []*model.Dependency{{IssueID: "D-OUT1", DependsOnID: "D-ROOT", Type: model.DepBlocks}}},
+			{ID: "D-OUT2", Title: "Out-of-scope grandchild", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: old, UpdatedAt: old,
+				Dependencies: []*model.Dependency{{IssueID: "D-OUT2", DependsOnID: "D-OUT1", Type: model.DepBlocks}}},
+			{ID: "D-PIN", Title: "Pinned blocker", Status: model.StatusOpen, Pinned: true, Priority: 3, IssueType: model.TypeTask, CreatedAt: old, UpdatedAt: old},
+			{ID: "D-PIN-CHILD", Title: "Child of pinned", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: old, UpdatedAt: old,
+				Dependencies: []*model.Dependency{{IssueID: "D-PIN-CHILD", DependsOnID: "D-PIN", Type: model.DepBlocks}}},
+		}
+		an := analysis.NewAnalyzer(issues)
+		an.SetNow(now)
+		stats := an.Analyze()
+		visible := map[string]bool{"D-ROOT": true, "D-IN": true, "D-PIN": true, "D-PIN-CHILD": true}
+		di := buildReportDecisionIntel([]model.Issue{issues[0], issues[1], issues[4], issues[5]}, ReportOptions{
+			GeneratedAt: now,
+			GraphStats:  &stats,
+			GraphIssues: issues,
+			Analyzer:    an,
+			Readiness:   model.NewReadinessIndex(issues),
+			VisibleIDs:  visible,
+		})
+		if _, leaked := di.whatIfByID["D-PIN"]; leaked {
+			t.Fatalf("P18A-11 regression: pinned issue D-PIN leaked into whatIfByID")
+		}
+		if _, leaked := di.priorityByID["D-PIN"]; leaked {
+			t.Fatalf("P18A-11 regression: pinned issue D-PIN leaked into priorityByID")
+		}
+		wi := di.whatIfByID["D-ROOT"]
+		if wi == nil {
+			t.Fatalf("expected What-If entry for D-ROOT")
+		}
+		if wi.Delta.DirectUnblocks != 1 || wi.Delta.TransitiveUnblocks != 1 {
+			t.Fatalf("P18A-11 regression: expected clamped Direct=1 Transitive=1 when out-of-scope unblocks stripped, got direct=%d transitive=%d ids=%v",
+				wi.Delta.DirectUnblocks, wi.Delta.TransitiveUnblocks, wi.Delta.UnblockedIssueIDs)
+		}
+	})
+}
