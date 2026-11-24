@@ -5732,7 +5732,8 @@ func main() {
 						"hubs", "hub", "authorities", "authority", "auth",
 						"critical_path", "critical_path_score", "criticalpath", "critical",
 						"in_degree", "indegree", "out_degree", "outdegree",
-						"slack", "kcore", "core_number", "k_core", "impact", "triage", "triage_score":
+						"slack", "kcore", "core_number", "k_core", "impact", "triage", "triage_score",
+						"risk", "risk_score", "eta", "eta_days":
 						needsReportStats = true
 					}
 				}
@@ -5761,33 +5762,34 @@ func main() {
 						options.GraphStats = stats
 					}
 				}
-				if options.Format == "markdown" || options.Format == "html" {
-					options.Analyzer = reportAnalyzer
-					visIDs := make(map[string]bool, len(reportIssues))
-					for _, iss := range reportIssues {
-						visIDs[iss.ID] = true
-					}
-					options.VisibleIDs = visIDs
-					velIssues := robotDispatchContext.VelocityIssues()
-					if len(velIssues) == 0 {
-						velIssues = graphIssuesForReport
-					}
-					etaStats := options.GraphStats
-					if etaStats == nil || len(graphIssuesForReport) < len(velIssues) {
-						_, fullStats := resolveExportFullGraphStats(robotDispatchContext, graphIssuesForReport, reportAnalyzer, options.GraphStats, *forceFullAnalysis)
-						if fullStats != nil {
-							etaStats = fullStats
-						} else if etaStats == nil {
-							if *forceFullAnalysis {
-								fullCfg := analysis.FullAnalysisConfig()
-								reportAnalyzer.SetConfig(&fullCfg)
-							}
-							s := reportAnalyzer.Analyze()
-							etaStats = &s
-						}
-					}
-					options.ETAContext = analysis.NewETAContext(velIssues, etaStats, options.GeneratedAt.UTC())
+				options.Analyzer = reportAnalyzer
+				visIDs := make(map[string]bool, len(reportIssues))
+				for _, iss := range reportIssues {
+					visIDs[iss.ID] = true
 				}
+				options.VisibleIDs = visIDs
+				velIssues := robotDispatchContext.VelocityIssues()
+				if len(velIssues) == 0 {
+					velIssues = graphIssuesForReport
+				}
+				etaStats := options.GraphStats
+				if etaStats == nil || len(graphIssuesForReport) < len(velIssues) {
+					_, fullStats := resolveExportFullGraphStats(robotDispatchContext, graphIssuesForReport, reportAnalyzer, options.GraphStats, *forceFullAnalysis)
+					if fullStats != nil {
+						etaStats = fullStats
+					} else if etaStats == nil {
+						if *forceFullAnalysis {
+							fullCfg := analysis.FullAnalysisConfig()
+							reportAnalyzer.SetConfig(&fullCfg)
+						}
+						s := reportAnalyzer.Analyze()
+						etaStats = &s
+					}
+				}
+				if options.GraphStats == nil && (options.Format == "markdown" || options.Format == "html") {
+					options.GraphStats = etaStats
+				}
+				options.ETAContext = analysis.NewETAContext(velIssues, etaStats, options.GeneratedAt.UTC())
 			}
 			envelope := robotDispatchContext.Envelope()
 			options.SourceAuthority = envelope.SourceAuthority
@@ -9883,10 +9885,17 @@ func generateHistoryForExportContext(ctx RobotContext) (*TimeTravelHistory, erro
 	for _, iss := range issues {
 		exportedIDSet[iss.ID] = true
 	}
+	// P17-6: Enforce exported scope even when a filter/recipe matches 0 issues.
+	enforceScope := len(exportedIDSet) > 0 ||
+		ctx.CandidateIDs != nil ||
+		strings.TrimSpace(ctx.LabelScope) != "" ||
+		strings.TrimSpace(ctx.Repo) != "" ||
+		ctx.ActiveRecipe != nil ||
+		len(ctx.FullIssues) > len(issues)
 
 	scopedHistories := make(map[string]correlation.BeadHistory, len(report.Histories))
 	for beadID, history := range report.Histories {
-		if len(exportedIDSet) > 0 && !exportedIDSet[beadID] {
+		if enforceScope && !exportedIDSet[beadID] {
 			continue
 		}
 		scopedHistories[beadID] = history
@@ -9914,7 +9923,7 @@ func generateHistoryForExportContext(ctx RobotContext) (*TimeTravelHistory, erro
 		var openIDs []string
 		if lookup := fileLookup.LookupByFile(hs.FilePath); lookup != nil {
 			for _, ref := range lookup.OpenBeads {
-				if len(exportedIDSet) > 0 && !exportedIDSet[ref.BeadID] {
+				if enforceScope && !exportedIDSet[ref.BeadID] {
 					continue
 				}
 				openIDs = append(openIDs, ref.BeadID)
@@ -9954,7 +9963,7 @@ func generateHistoryForExportContext(ctx RobotContext) (*TimeTravelHistory, erro
 			for _, cl := range net.Clusters {
 				var scopedIDs []string
 				for _, bid := range cl.BeadIDs {
-					if len(exportedIDSet) == 0 || exportedIDSet[bid] {
+					if !enforceScope || exportedIDSet[bid] {
 						scopedIDs = append(scopedIDs, bid)
 					}
 				}
@@ -9963,7 +9972,7 @@ func generateHistoryForExportContext(ctx RobotContext) (*TimeTravelHistory, erro
 				}
 				sort.Strings(scopedIDs)
 				central := cl.CentralBead
-				if len(exportedIDSet) > 0 && !exportedIDSet[central] {
+				if enforceScope && !exportedIDSet[central] {
 					central = scopedIDs[0]
 				}
 				sharedFiles := append([]string(nil), cl.SharedFiles...)
@@ -10098,7 +10107,7 @@ func generateHistoryForExportContext(ctx RobotContext) (*TimeTravelHistory, erro
 				item.Timestamp = cand.Timestamp.UTC().Format(time.RFC3339)
 			}
 			for _, pb := range cand.ProbableBeads {
-				if len(exportedIDSet) > 0 && !exportedIDSet[pb.BeadID] {
+				if enforceScope && !exportedIDSet[pb.BeadID] {
 					continue
 				}
 				item.ProbableBeadID = pb.BeadID
@@ -12028,7 +12037,7 @@ func generateRobotSchemas() RobotSchemas {
 		"robot-label-health": {
 			"$schema":     "https://json-schema.org/draft/2020-12/schema",
 			"title":       "Robot Label Health Output",
-			"description": "Per-label health metrics with analysis config and usage hints",
+			"description": "Per-label health metrics with analysis config, co-occurrence, optional label subgraph keystones, and usage hints",
 			"type":        "object",
 			"properties": map[string]interface{}{
 				"generated_at":    map[string]interface{}{"type": "string", "format": "date-time"},
@@ -12037,7 +12046,16 @@ func generateRobotSchemas() RobotSchemas {
 				"version":         map[string]interface{}{"type": "string"},
 				"analysis_config": labelHealthConfigSchema(),
 				"results":         labelAnalysisResultSchema(),
-				"usage_hints":     map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+				"cooccurrence": map[string]interface{}{
+					"type": "object",
+					"additionalProperties": map[string]interface{}{
+						"type":                 "object",
+						"additionalProperties": map[string]interface{}{"type": "integer"},
+					},
+				},
+				"subgraph_pagerank":      map[string]interface{}{"type": "object"},
+				"subgraph_critical_path": map[string]interface{}{"type": "object"},
+				"usage_hints":            map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
 			},
 			"required": []string{"generated_at", "data_hash", "output_format", "version", "analysis_config", "results", "usage_hints"},
 		},
@@ -14039,6 +14057,20 @@ func buildExportSuggestionsPayload(ctx RobotContext, exportIssues []model.Issue,
 	return raw, len(set.Suggestions), nil
 }
 
+type exportLabelCooccurrence struct {
+	Label string `json:"label"`
+	Count int    `json:"count"`
+}
+
+type exportLabelUnblock struct {
+	IssueID       string `json:"issue_id"`
+	IssueTitle    string `json:"issue_title,omitempty"`
+	Label         string `json:"label"`
+	UnblocksCount int    `json:"unblocks_count"`
+	CascadeDepth  int    `json:"cascade_depth"`
+	Reason        string `json:"reason,omitempty"`
+}
+
 type exportLabelIntelEntry struct {
 	Label             string                      `json:"label"`
 	IssueCount        int                         `json:"issue_count"`
@@ -14059,6 +14091,8 @@ type exportLabelIntelEntry struct {
 	OutgoingDeps      int                         `json:"outgoing_deps"`
 	IncomingLabels    []string                    `json:"incoming_labels,omitempty"`
 	OutgoingLabels    []string                    `json:"outgoing_labels,omitempty"`
+	CooccurringLabels []exportLabelCooccurrence   `json:"cooccurring_labels,omitempty"`
+	TopCoreIssueID    string                      `json:"top_core_issue_id,omitempty"`
 	CriticalPathCount int                         `json:"critical_path_count"`
 	Velocity          analysis.VelocityMetrics    `json:"velocity"`
 	Freshness         analysis.FreshnessMetrics   `json:"freshness"`
@@ -14067,11 +14101,12 @@ type exportLabelIntelEntry struct {
 }
 
 type exportLabelCascade struct {
-	SourceLabel    string   `json:"source_label"`
-	BlockedCount   int      `json:"blocked_count"`
-	TotalImpact    int      `json:"total_impact"`
-	MaxDepth       int      `json:"max_depth"`
-	AffectedLabels []string `json:"affected_labels,omitempty"`
+	SourceLabel     string               `json:"source_label"`
+	BlockedCount    int                  `json:"blocked_count"`
+	TotalImpact     int                  `json:"total_impact"`
+	MaxDepth        int                  `json:"max_depth"`
+	AffectedLabels  []string             `json:"affected_labels,omitempty"`
+	Recommendations []exportLabelUnblock `json:"recommendations,omitempty"`
 }
 
 type exportLabelsDocument struct {
@@ -14083,6 +14118,7 @@ type exportLabelsDocument struct {
 	Labels        []exportLabelIntelEntry `json:"labels"`
 	Flow          analysis.CrossLabelFlow `json:"flow"`
 	Cascades      []exportLabelCascade    `json:"cascades,omitempty"`
+	TopUnblocks   []exportLabelUnblock    `json:"top_unblocks,omitempty"`
 }
 
 func countUniqueIssueIDs(issues []model.Issue) int {
@@ -14402,6 +14438,11 @@ func buildExportLabelsPayload(ctx RobotContext, exportIssues []model.Issue, stat
 		TotalCrossLabelDeps: totalCross,
 	}
 
+	exportedIDSet := make(map[string]bool, len(exportIssues))
+	for _, iss := range exportIssues {
+		exportedIDSet[iss.ID] = true
+	}
+
 	cascadeRes := analysis.ComputeBlockageCascadeAtWithScope(graphIssues, flowOut, cfg, now.UTC(), readiness, ctx.CandidateIDs)
 	var exportCascades []exportLabelCascade
 	for _, c := range cascadeRes.Cascades {
@@ -14424,17 +14465,56 @@ func buildExportLabelsPayload(ctx RobotContext, exportIssues []model.Issue, stat
 			affected = append(affected, lbl)
 		}
 		sort.Strings(affected)
+		var recs []exportLabelUnblock
+		for _, rec := range c.Recommendations {
+			if !exportedIDSet[rec.IssueID] || (rec.Label != "" && !exportedLabels[rec.Label]) {
+				continue
+			}
+			recs = append(recs, exportLabelUnblock{
+				IssueID:       rec.IssueID,
+				IssueTitle:    rec.IssueTitle,
+				Label:         rec.Label,
+				UnblocksCount: rec.UnblocksCount,
+				CascadeDepth:  rec.CascadeDepth,
+				Reason:        rec.Reason,
+			})
+			if len(recs) >= 3 {
+				break
+			}
+		}
 		exportCascades = append(exportCascades, exportLabelCascade{
-			SourceLabel:    c.SourceLabel,
-			BlockedCount:   c.BlockedCount,
-			TotalImpact:    c.TotalImpact,
-			MaxDepth:       len(c.CascadeLevels),
-			AffectedLabels: affected,
+			SourceLabel:     c.SourceLabel,
+			BlockedCount:    c.BlockedCount,
+			TotalImpact:     c.TotalImpact,
+			MaxDepth:        len(c.CascadeLevels),
+			AffectedLabels:  affected,
+			Recommendations: recs,
 		})
 		if len(exportCascades) >= 6 {
 			break
 		}
 	}
+	var exportTopUnblocks []exportLabelUnblock
+	seenTopUnblock := make(map[string]bool)
+	for _, rec := range cascadeRes.TopUnblocks {
+		if !exportedIDSet[rec.IssueID] || (rec.Label != "" && !exportedLabels[rec.Label]) || seenTopUnblock[rec.IssueID] {
+			continue
+		}
+		seenTopUnblock[rec.IssueID] = true
+		exportTopUnblocks = append(exportTopUnblocks, exportLabelUnblock{
+			IssueID:       rec.IssueID,
+			IssueTitle:    rec.IssueTitle,
+			Label:         rec.Label,
+			UnblocksCount: rec.UnblocksCount,
+			CascadeDepth:  rec.CascadeDepth,
+			Reason:        rec.Reason,
+		})
+		if len(exportTopUnblocks) >= 6 {
+			break
+		}
+	}
+
+	cooccurrence := analysis.GetLabelCooccurrence(exportIssues)
 
 	sortedKeys := func(m map[string]bool) []string {
 		if len(m) == 0 {
@@ -14491,6 +14571,34 @@ func buildExportLabelsPayload(ctx RobotContext, exportIssues []model.Issue, stat
 				weeklyClosed[len(hv.WeeklyVelocity)-1-idx] = hv.WeeklyVelocity[idx].Closed
 			}
 		}
+		var coocList []exportLabelCooccurrence
+		if peers := cooccurrence[lh.Label]; len(peers) > 0 {
+			for peerLbl, cnt := range peers {
+				if peerLbl == lh.Label || cnt <= 0 || !exportedLabels[peerLbl] {
+					continue
+				}
+				coocList = append(coocList, exportLabelCooccurrence{Label: peerLbl, Count: cnt})
+			}
+			sort.Slice(coocList, func(i, j int) bool {
+				if coocList[i].Count != coocList[j].Count {
+					return coocList[i].Count > coocList[j].Count
+				}
+				return coocList[i].Label < coocList[j].Label
+			})
+			if len(coocList) > 5 {
+				coocList = coocList[:5]
+			}
+		}
+		topCoreID := ""
+		if sg := analysis.ComputeLabelSubgraph(exportIssues, lh.Label); !sg.IsEmpty() {
+			pr := analysis.ComputeLabelPageRank(sg)
+			for _, ri := range pr.TopIssues {
+				if ri.IsCore && exportedIDSet[ri.ID] {
+					topCoreID = ri.ID
+					break
+				}
+			}
+		}
 		entries = append(entries, exportLabelIntelEntry{
 			Label:             lh.Label,
 			IssueCount:        lh.IssueCount,
@@ -14511,6 +14619,8 @@ func buildExportLabelsPayload(ctx RobotContext, exportIssues []model.Issue, stat
 			OutgoingDeps:      outDeps,
 			IncomingLabels:    inLabels,
 			OutgoingLabels:    outLabels,
+			CooccurringLabels: coocList,
+			TopCoreIssueID:    topCoreID,
 			CriticalPathCount: lh.Criticality.CriticalPathCount,
 			Velocity:          lh.Velocity,
 			Freshness:         lh.Freshness,
@@ -14548,6 +14658,7 @@ func buildExportLabelsPayload(ctx RobotContext, exportIssues []model.Issue, stat
 		Labels:        entries,
 		Flow:          flowOut,
 		Cascades:      exportCascades,
+		TopUnblocks:   exportTopUnblocks,
 	}
 	envCtx := ctx
 	envCtx.Command = "robot-label-health"

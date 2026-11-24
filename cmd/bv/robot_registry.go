@@ -2769,15 +2769,52 @@ func handleRobotLabelHealth(ctx RobotContext, hcfg phaseThreeRobotHandlerConfig)
 		}
 	}
 
+	// W30-5: Compute scoped label co-occurrence matrix and optional --label subgraph keystones.
+	scopedIssues := baseIssues
+	if ctx.CandidateIDs != nil {
+		scopedIssues = make([]model.Issue, 0, len(ctx.CandidateIDs))
+		for _, iss := range baseIssues {
+			if ctx.CandidateIDs[iss.ID] {
+				scopedIssues = append(scopedIssues, iss)
+			}
+		}
+	}
+	var cooc map[string]map[string]int
+	if rawCooc := analysis.GetLabelCooccurrence(scopedIssues); len(rawCooc) > 0 {
+		if targetLabel := strings.TrimSpace(ctx.LabelScope); targetLabel != "" {
+			if peers := rawCooc[targetLabel]; len(peers) > 0 {
+				cooc = map[string]map[string]int{targetLabel: peers}
+			}
+		} else {
+			cooc = rawCooc
+		}
+	}
+	var subgraphPR *analysis.LabelPageRankResult
+	var subgraphCP *analysis.LabelCriticalPathResult
+	if targetLabel := strings.TrimSpace(ctx.LabelScope); targetLabel != "" {
+		if sg := analysis.ComputeLabelSubgraph(scopedIssues, targetLabel); !sg.IsEmpty() {
+			pr := analysis.ComputeLabelPageRank(sg)
+			cp := analysis.ComputeLabelCriticalPath(sg)
+			subgraphPR = &pr
+			subgraphCP = &cp
+		}
+	}
+
 	output := struct {
 		RobotEnvelope
-		AnalysisConfig analysis.LabelHealthConfig   `json:"analysis_config"`
-		Results        analysis.LabelAnalysisResult `json:"results"`
-		UsageHints     []string                     `json:"usage_hints"`
+		AnalysisConfig       analysis.LabelHealthConfig        `json:"analysis_config"`
+		Results              analysis.LabelAnalysisResult      `json:"results"`
+		Cooccurrence         map[string]map[string]int         `json:"cooccurrence,omitempty"`
+		SubgraphPageRank     *analysis.LabelPageRankResult     `json:"subgraph_pagerank,omitempty"`
+		SubgraphCriticalPath *analysis.LabelCriticalPathResult `json:"subgraph_critical_path,omitempty"`
+		UsageHints           []string                          `json:"usage_hints"`
 	}{
-		RobotEnvelope:  ctx.Envelope(),
-		AnalysisConfig: cfg,
-		Results:        results,
+		RobotEnvelope:        ctx.Envelope(),
+		AnalysisConfig:       cfg,
+		Results:              results,
+		Cooccurrence:         cooc,
+		SubgraphPageRank:     subgraphPR,
+		SubgraphCriticalPath: subgraphCP,
 		UsageHints: []string{
 			"jq '.results.summaries | sort_by(.health) | .[:3]' - Critical labels",
 			"jq '.results.labels[] | select(.health_level == \"critical\")' - Critical details",
@@ -6880,6 +6917,36 @@ func handleRobotCheckDep(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 	refNow := ctx.ReferenceNow()
 	canEmitCommand := ctx.AsOf == "" && ctx.AsOfCommit == "" && ctx.claimsProven()
 
+	// Build parent -> children map for DepParentChild readiness propagation checks (P17-4).
+	parentChildren := make(map[string][]string)
+	for _, iss := range workingIssues {
+		for _, dep := range iss.Dependencies {
+			if dep != nil && dep.Type == model.DepParentChild && dep.DependsOnID != "" {
+				parentChildren[dep.DependsOnID] = append(parentChildren[dep.DependsOnID], iss.ID)
+			}
+		}
+	}
+	hasReadySelfOrDescendant := func(rootID string) bool {
+		if readiness.Ready(rootID, refNow) {
+			return true
+		}
+		visited := map[string]bool{rootID: true}
+		queue := append([]string(nil), parentChildren[rootID]...)
+		for len(queue) > 0 {
+			curr := queue[0]
+			queue = queue[1:]
+			if visited[curr] {
+				continue
+			}
+			visited[curr] = true
+			if readiness.Ready(curr, refNow) {
+				return true
+			}
+			queue = append(queue, parentChildren[curr]...)
+		}
+		return false
+	}
+
 	results := make([]robotCheckDepEdgeResult, 0, len(pairs))
 	allSafe := true
 	cycleCount := 0
@@ -6932,7 +6999,11 @@ func handleRobotCheckDep(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 			results = append(results, res)
 			continue
 		}
-		res.WouldBlockActionable = readiness.Ready(p.from, refNow) && !toIss.Status.IsClosed() && !toIss.Status.IsTombstone()
+		res.WouldBlockActionable = !fromIss.Status.IsClosed() &&
+			!fromIss.Status.IsTombstone() &&
+			!toIss.Status.IsClosed() &&
+			!toIss.Status.IsTombstone() &&
+			hasReadySelfOrDescendant(p.from)
 
 		canAdd, cyclePath, warning := analysis.CheckDependencyAddition(workingIssues, p.from, p.to)
 		res.CanAdd = canAdd
@@ -6940,8 +7011,51 @@ func handleRobotCheckDep(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 		res.CyclePath = cyclePath
 		res.Warning = warning
 		if canAdd {
-			if canEmitCommand {
-				res.Command = fmt.Sprintf("br dep add %s %s", shellQuoteWord(p.from), shellQuoteWord(p.to))
+			// P17-8: Gate br/bd dep add on endpoint writability & shared tracker origin,
+			// using Origin.LocalID when both endpoints live in the same writable tracker.
+			canEmitEdgeCmd := canEmitCommand
+			cmdFrom, cmdTo := p.from, p.to
+			trackerCLI := "br"
+			if canEmitEdgeCmd {
+				if fromIss.Origin != nil || toIss.Origin != nil {
+					o, pOrig := fromIss.Origin, toIss.Origin
+					if o == nil || pOrig == nil ||
+						strings.TrimSpace(o.ReadOnlyReason) != "" ||
+						strings.TrimSpace(pOrig.ReadOnlyReason) != "" {
+						canEmitEdgeCmd = false
+					} else {
+						sameTracker := (o.Tracker == "" || pOrig.Tracker == "" || o.Tracker == pOrig.Tracker) &&
+							(o.Database == "" || pOrig.Database == "" || o.Database == pOrig.Database) &&
+							(o.WorkingDirectory == "" || pOrig.WorkingDirectory == "" || o.WorkingDirectory == pOrig.WorkingDirectory) &&
+							(o.TrackerDirectory == "" || pOrig.TrackerDirectory == "" || o.TrackerDirectory == pOrig.TrackerDirectory)
+						if !sameTracker {
+							canEmitEdgeCmd = false
+						} else {
+							if lid := strings.TrimSpace(o.LocalID); lid != "" {
+								cmdFrom = lid
+							}
+							if lid := strings.TrimSpace(pOrig.LocalID); lid != "" {
+								cmdTo = lid
+							}
+							if strings.EqualFold(strings.TrimSpace(o.Tracker), "bd") {
+								trackerCLI = "bd"
+							}
+						}
+					}
+				} else if res.CrossRepo && ctx.SourceKind == "workspace" {
+					canEmitEdgeCmd = false
+				}
+			}
+			if canEmitEdgeCmd {
+				if ctx.SourceKind == "workspace" && fromIss.Origin != nil && strings.TrimSpace(fromIss.Origin.WorkingDirectory) != "" {
+					res.Command = fmt.Sprintf("cd -- %s && %s dep add %s %s",
+						shellQuoteWord(fromIss.Origin.WorkingDirectory),
+						trackerCLI,
+						shellQuoteWord(cmdFrom),
+						shellQuoteWord(cmdTo))
+				} else {
+					res.Command = fmt.Sprintf("%s dep add %s %s", trackerCLI, shellQuoteWord(cmdFrom), shellQuoteWord(cmdTo))
+				}
 			}
 			// Accumulate safe edges so multi-edge batch requests detect compound cycles (e.g. A:B,B:C,C:A)
 			// and keep sequential readiness accurate (P16A-3).
