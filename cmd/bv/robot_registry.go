@@ -233,6 +233,7 @@ type phaseTwoRobotHandlerConfig struct {
 	ForecastLabel       *string
 	ForecastSprint      *string
 	ForecastAgents      *int
+	NotReadyLabels      *string
 }
 
 type phaseThreeRobotHandlerConfig struct {
@@ -1280,6 +1281,59 @@ func registerPhaseOneRobotHandlers(registry *RobotRegistry, cfg phaseOneRobotHan
 	})
 }
 
+func annotatePlanItemsWithActions(plan *analysis.ExecutionPlan, graphIssues []model.Issue, claimsProven bool) {
+	if plan == nil {
+		return
+	}
+	issueByID := make(map[string]model.Issue, len(graphIssues))
+	for _, iss := range graphIssues {
+		issueByID[iss.ID] = iss
+	}
+	for ti := range plan.Tracks {
+		for ii := range plan.Tracks[ti].Items {
+			item := &plan.Tracks[ti].Items[ii]
+			iss, ok := issueByID[item.ID]
+			if !ok {
+				continue
+			}
+			if !claimsProven {
+				item.Claimable = false
+				act := iss.Actions(false)
+				act.Claim = nil
+				act.UnavailableReason = "source authority is incomplete or stale"
+				item.Actions = &act
+			} else {
+				act := iss.Actions(item.Claimable)
+				if item.NotReady && (act.UnavailableReason == "" || act.UnavailableReason == "snapshot does not establish claim readiness") {
+					act.UnavailableReason = "marked not-ready by label"
+				}
+				item.Actions = &act
+			}
+		}
+	}
+}
+
+func capExecutionPlanTracks(plan *analysis.ExecutionPlan, maxResults int) {
+	if plan == nil || maxResults <= 0 {
+		return
+	}
+	remaining := maxResults
+	cappedTracks := make([]analysis.ExecutionTrack, 0, len(plan.Tracks))
+	for _, track := range plan.Tracks {
+		if remaining <= 0 {
+			break
+		}
+		if len(track.Items) > remaining {
+			track.Items = track.Items[:remaining]
+		}
+		if len(track.Items) > 0 {
+			cappedTracks = append(cappedTracks, track)
+			remaining -= len(track.Items)
+		}
+	}
+	plan.Tracks = cappedTracks
+}
+
 func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHandlerConfig) {
 	if registry == nil {
 		panic("robot registry must not be nil")
@@ -1314,23 +1368,11 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 				config.CyclesSkipReason = skipReason
 			}
 
-			plan := analyzer.GetExecutionPlan()
+			notReadyLabels := resolveNotReadyLabels(phaseThreeRobotHandlerConfig{NotReadyLabels: cfg.NotReadyLabels})
+			plan := analyzer.GetExecutionPlanWithOptions(notReadyLabels)
+			annotatePlanItemsWithActions(&plan, graphIssues, ctx.claimsProven())
 			if cfg.RobotMaxResults != nil && *cfg.RobotMaxResults > 0 {
-				remaining := *cfg.RobotMaxResults
-				cappedTracks := make([]analysis.ExecutionTrack, 0, len(plan.Tracks))
-				for _, track := range plan.Tracks {
-					if remaining <= 0 {
-						break
-					}
-					if len(track.Items) > remaining {
-						track.Items = track.Items[:remaining]
-					}
-					if len(track.Items) > 0 {
-						cappedTracks = append(cappedTracks, track)
-						remaining -= len(track.Items)
-					}
-				}
-				plan.Tracks = cappedTracks
+				capExecutionPlanTracks(&plan, *cfg.RobotMaxResults)
 			}
 			stats := analyzer.AnalyzeAsyncWithConfig(context.Background(), config)
 			stats.WaitForPhase2()
@@ -1353,6 +1395,7 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 				UsageHints: []string{
 					"jq '.plan.tracks | length' - Number of parallel execution tracks",
 					"jq '.plan.tracks[0].items | map(.id)' - First track item IDs",
+					"jq '.plan.tracks[].items[] | select(.claimable) | {id, title, claim: .actions.claim}' - Claimable track items",
 					"jq '.plan.tracks[].items[] | select(.unblocks | length > 0)' - Items that unblock others",
 					"jq '.plan.summary' - High-level execution summary",
 					"jq '[.plan.tracks[].items[]] | length' - Total items across all tracks",
@@ -2823,8 +2866,30 @@ func handleRobotLabelHealth(ctx RobotContext, hcfg phaseThreeRobotHandlerConfig)
 	}
 	var subgraphPR *analysis.LabelPageRankResult
 	var subgraphCP *analysis.LabelCriticalPathResult
-	if targetLabel := strings.TrimSpace(ctx.LabelScope); targetLabel != "" {
-		if sg := analysis.ComputeLabelSubgraph(scopedIssues, targetLabel); !sg.IsEmpty() {
+	if targetLabel := strings.TrimSpace(ctx.LabelScope); targetLabel != "" && len(scopedIssues) > 0 {
+		// P19-2: Keep 1-hop cross-label dependency context neighbors when building the label subgraph
+		// (while excluding any non-candidate issues that carry targetLabel so recipe/scope filtering holds).
+		subgraphInput := baseIssues
+		if ctx.CandidateIDs != nil {
+			subgraphInput = make([]model.Issue, 0, len(baseIssues))
+			for _, iss := range baseIssues {
+				if ctx.CandidateIDs[iss.ID] {
+					subgraphInput = append(subgraphInput, iss)
+					continue
+				}
+				hasTarget := false
+				for _, l := range iss.Labels {
+					if l == targetLabel {
+						hasTarget = true
+						break
+					}
+				}
+				if !hasTarget {
+					subgraphInput = append(subgraphInput, iss)
+				}
+			}
+		}
+		if sg := analysis.ComputeLabelSubgraph(subgraphInput, targetLabel); !sg.IsEmpty() {
 			pr := analysis.ComputeLabelPageRank(sg)
 			if maxN > 0 && len(pr.TopIssues) > maxN {
 				pr.TopIssues = pr.TopIssues[:maxN]
@@ -3160,6 +3225,55 @@ func buildRobotInsightsPayload(ctx RobotContext, includeInactive, forceFull bool
 		slackMap = stats.Slack()
 	}
 
+	// W31-3: Compute scoped operational risk signals for active eligible candidates.
+	riskIssueMap := make(map[string]model.Issue, len(graphIssues))
+	for _, iss := range graphIssues {
+		riskIssueMap[iss.ID] = iss
+	}
+	rawRisk := analysis.ComputeAllRiskSignalsWithReadiness(riskIssueMap, &stats, analyzer.Readiness(), ctx.ReferenceNow())
+	type robotInsightsRiskItem struct {
+		IssueID string `json:"issue_id"`
+		Title   string `json:"title"`
+		Status  string `json:"status"`
+		analysis.RiskSignals
+	}
+	riskScoreMap := make(map[string]float64, len(rawRisk))
+	highRisk := make([]robotInsightsRiskItem, 0, len(rawRisk))
+	for _, iss := range graphIssues {
+		if ctx.CandidateIDs != nil && !ctx.CandidateIDs[iss.ID] {
+			continue
+		}
+		if iss.Status.IsClosed() || iss.Status.IsTombstone() || iss.IsTemplate || iss.Pinned || iss.Status == model.StatusPinned || iss.Ephemeral {
+			continue
+		}
+		sig, ok := rawRisk[iss.ID]
+		if !ok {
+			continue
+		}
+		riskScoreMap[iss.ID] = sig.CompositeRisk
+		if sig.CompositeRisk > 0 {
+			highRisk = append(highRisk, robotInsightsRiskItem{
+				IssueID:     iss.ID,
+				Title:       iss.Title,
+				Status:      string(iss.Status),
+				RiskSignals: sig,
+			})
+		}
+	}
+	sort.Slice(highRisk, func(i, j int) bool {
+		if highRisk[i].CompositeRisk != highRisk[j].CompositeRisk {
+			return highRisk[i].CompositeRisk > highRisk[j].CompositeRisk
+		}
+		return highRisk[i].IssueID < highRisk[j].IssueID
+	})
+	riskLimit := 10
+	if maxResults > 0 && maxResults < riskLimit {
+		riskLimit = maxResults
+	}
+	if len(highRisk) > riskLimit {
+		highRisk = highRisk[:riskLimit]
+	}
+
 	fullStats := struct {
 		PageRank          map[string]float64 `json:"pagerank"`
 		Betweenness       map[string]float64 `json:"betweenness"`
@@ -3170,6 +3284,7 @@ func buildRobotInsightsPayload(ctx RobotContext, includeInactive, forceFull bool
 		CoreNumber        map[string]int     `json:"core_number"`
 		Slack             map[string]float64 `json:"slack"`
 		Articulation      []string           `json:"articulation_points"`
+		RiskScore         map[string]float64 `json:"risk_score,omitempty"`
 	}{
 		PageRank:          limitMaps(filterFloatMap(stats.PageRank()), mapLimit),
 		Betweenness:       limitMaps(filterFloatMap(betweennessMap), mapLimit),
@@ -3180,6 +3295,7 @@ func buildRobotInsightsPayload(ctx RobotContext, includeInactive, forceFull bool
 		CoreNumber:        limitMapInt(filterIntMap(coreNumberMap), mapLimit),
 		Slack:             limitMaps(filterFloatMap(slackMap), mapLimit),
 		Articulation:      limitSlice(filterStringSlice(articulationSlice), mapLimit),
+		RiskScore:         limitMaps(riskScoreMap, mapLimit),
 	}
 
 	whatIfLimit := 10
@@ -3196,6 +3312,7 @@ func buildRobotInsightsPayload(ctx RobotContext, includeInactive, forceFull bool
 		analysis.Insights
 		FullStats        interface{}                `json:"full_stats"`
 		TopWhatIfs       []analysis.WhatIfEntry     `json:"top_what_ifs,omitempty"`
+		HighRisk         []robotInsightsRiskItem    `json:"high_risk,omitempty"`
 		AdvancedInsights *analysis.AdvancedInsights `json:"advanced_insights,omitempty"`
 		UsageHints       []string                   `json:"usage_hints"`
 	}{
@@ -3207,11 +3324,13 @@ func buildRobotInsightsPayload(ctx RobotContext, includeInactive, forceFull bool
 		Insights:         insights,
 		FullStats:        fullStats,
 		TopWhatIfs:       analyzer.TopWhatIfDeltasFromStats(&stats, whatIfLimit),
+		HighRisk:         highRisk,
 		AdvancedInsights: analyzer.GenerateAdvancedInsightsFromStats(&stats, analysis.DefaultAdvancedInsightsConfig()),
 		UsageHints: []string{
 			"jq '.Bottlenecks[:5] | map(.ID)' - Top 5 bottleneck IDs",
 			"jq '.Keystones[:3]' - Top 3 critical path scores",
 			"jq '.top_what_ifs[] | select(.delta.direct_unblocks > 2)' - High-impact items",
+			"jq '.high_risk[:5] | map({issue_id, composite_risk, explanation})' - Top operational risk issues",
 			"jq '.full_stats.pagerank | to_entries | sort_by(-.value)[:5]' - Top PageRank",
 			"jq '.full_stats.core_number | to_entries | sort_by(-.value)[:5]' - Strongly embedded nodes (k-core)",
 			"jq '.full_stats.articulation_points' - Structural cut points",
@@ -6828,12 +6947,25 @@ func handleRobotBlockerChain(ctx RobotContext, cfg phaseThreeRobotHandlerConfig)
 }
 
 func handleRobotWhatIf(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
-	targetID := ""
+	rawSpec := ""
 	if cfg.RobotWhatIfFlag != nil {
-		targetID = strings.TrimSpace(*cfg.RobotWhatIfFlag)
+		rawSpec = strings.TrimSpace(*cfg.RobotWhatIfFlag)
 	}
-	if targetID == "" {
-		return fmt.Errorf("--robot-whatif requires an issue ID")
+	if rawSpec == "" {
+		return fmt.Errorf("--robot-whatif requires an issue ID (or comma-separated IDs)")
+	}
+	var targetIDs []string
+	seenID := make(map[string]bool)
+	for _, part := range strings.Split(rawSpec, ",") {
+		id := strings.TrimSpace(part)
+		if id == "" || seenID[id] {
+			continue
+		}
+		seenID[id] = true
+		targetIDs = append(targetIDs, id)
+	}
+	if len(targetIDs) == 0 {
+		return fmt.Errorf("--robot-whatif requires an issue ID (or comma-separated IDs)")
 	}
 	analyzer := ctx.GraphAnalyzer()
 	analyzer.SetNow(ctx.ReferenceNow())
@@ -6843,21 +6975,50 @@ func handleRobotWhatIf(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error
 	}
 	stats := analyzer.Analyze()
 
-	result := analyzer.ComputeWhatIf(targetID, &stats)
-	if result == nil {
-		fmt.Fprintf(ctx.StderrOrDefault(), "Issue not found: %s\n", targetID)
-		return newReportedRobotHandlerExit(1)
+	// Preserve the exact single-ID JSON contract; emit batch_result when simulating multiple IDs (W31-2).
+	if len(targetIDs) == 1 {
+		targetID := targetIDs[0]
+		result := analyzer.ComputeWhatIf(targetID, &stats)
+		if result == nil {
+			fmt.Fprintf(ctx.StderrOrDefault(), "Issue not found: %s\n", targetID)
+			return newReportedRobotHandlerExit(1)
+		}
+		output := struct {
+			RobotEnvelope
+			Result *analysis.WhatIfResult `json:"result"`
+		}{
+			RobotEnvelope: ctx.Envelope(),
+			Result:        result,
+		}
+		if err := ctx.EncoderOrDefault().Encode(output); err != nil {
+			return fmt.Errorf("encoding what-if impact: %w", err)
+		}
+		return nil
 	}
 
+	batch := analyzer.ComputeWhatIfBatch(targetIDs, &stats)
+	if batch == nil {
+		fmt.Fprintf(ctx.StderrOrDefault(), "Issues not found: %s\n", strings.Join(targetIDs, ", "))
+		return newReportedRobotHandlerExit(1)
+	}
+	if len(batch.MissingIDs) > 0 {
+		fmt.Fprintf(ctx.StderrOrDefault(), "Issue(s) not found: %s\n", strings.Join(batch.MissingIDs, ", "))
+		return newReportedRobotHandlerExit(1)
+	}
 	output := struct {
 		RobotEnvelope
-		Result *analysis.WhatIfResult `json:"result"`
+		BatchResult *analysis.WhatIfBatchResult `json:"batch_result"`
+		UsageHints  []string                    `json:"usage_hints"`
 	}{
 		RobotEnvelope: ctx.Envelope(),
-		Result:        result,
+		BatchResult:   batch,
+		UsageHints: []string{
+			"jq '.batch_result.delta' - Joint direct/transitive unblock impact",
+			"jq '.batch_result.synergy_issue_ids' - Issues unlocked only jointly by completing the full batch",
+		},
 	}
 	if err := ctx.EncoderOrDefault().Encode(output); err != nil {
-		return fmt.Errorf("encoding what-if impact: %w", err)
+		return fmt.Errorf("encoding batch what-if impact: %w", err)
 	}
 	return nil
 }

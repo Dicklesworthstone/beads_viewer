@@ -232,7 +232,7 @@ var (
 
 	RobotNotReadyLabels = register(Var{
 		Name:        "BV_ROBOT_NOT_READY_LABELS",
-		Description: "Comma-separated labels marking a bead not-ready; excluded from claimable `--robot-next`/`--robot-triage` top picks (`--robot-not-ready-labels` overrides).",
+		Description: "Comma-separated labels marking a bead not-ready; excluded from claimable `--robot-next`/`--robot-triage`/`--robot-plan`/TUI top picks (`--robot-not-ready-labels` overrides).",
 		Default:     "(none)",
 	})
 

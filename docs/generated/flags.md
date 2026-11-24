@@ -55,7 +55,7 @@
 | `--baseline-info` | bool | `false` | Show information about the current baseline | History & Drift |
 | `--bead-history` | string | (empty) | Show history for specific bead ID | History & Drift |
 | `--check-drift` | bool | `false` | Check for drift from baseline (exit codes: 0=OK, 1=critical, 2=warning) | History & Drift |
-| `--diff-since` | string | (empty) | Show changes since historical point (commit SHA, branch, tag, or date) | History & Drift |
+| `--diff-since` | string | (empty) | Show changes since historical point (commit SHA, branch, tag, or date; composable with --export, --export-md, --export-pages, --priority-brief, --agent-brief) | History & Drift |
 | `--history-limit` | int | `500` | Max commits to analyze (0 = unlimited) | History & Drift |
 | `--history-since` | string | (empty) | Limit history to commits after this date/ref (e.g., '30 days ago', '2024-01-01') | History & Drift |
 | `--id-pattern` | stringArray | `[]` | Custom bead ID regex for commit-message matching, e.g. 'bh-[a-z0-9]{5}' (repeatable; capture group 1 is the ID, else the whole match) (#188) | History & Drift |

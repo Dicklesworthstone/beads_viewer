@@ -31,7 +31,7 @@
 | `BV_PRETTY_JSON` | Set to `1` for indented JSON output. | (compact) |
 | `BV_ROBOT` | Set to `1` to force robot mode (clean stdout, JSON logs, disk cache on). Every `--robot-*` flag sets it. | (unset) |
 | `BV_ROBOT_HISTORY_TIMEOUT_MS` | Bound on the git-history prologue of `--robot-triage` in milliseconds; `0` = unbounded. | `10000` |
-| `BV_ROBOT_NOT_READY_LABELS` | Comma-separated labels marking a bead not-ready; excluded from claimable `--robot-next`/`--robot-triage` top picks (`--robot-not-ready-labels` overrides). | (none) |
+| `BV_ROBOT_NOT_READY_LABELS` | Comma-separated labels marking a bead not-ready; excluded from claimable `--robot-next`/`--robot-triage`/`--robot-plan`/TUI top picks (`--robot-not-ready-labels` overrides). | (none) |
 | `BV_SEARCH_MODE` | Default search mode: `text` or `hybrid` (`--search-mode` overrides). | `text` |
 | `BV_SEARCH_PRESET` | Default hybrid preset: `default`, `bug-hunting`, `sprint-planning`, `impact-first`, `text-only`; setting one implies hybrid mode. | `default` |
 | `BV_SEARCH_WEIGHTS` | JSON weight map for hybrid search; overrides the preset. | (preset) |

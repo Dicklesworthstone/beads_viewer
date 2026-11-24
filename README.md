@@ -3377,7 +3377,7 @@ bv --robot-triage --format toon --stats           # Show JSON vs TOON token esti
 | `--baseline-info` | bool | `false` | Show information about the current baseline | History & Drift |
 | `--bead-history` | string | (empty) | Show history for specific bead ID | History & Drift |
 | `--check-drift` | bool | `false` | Check for drift from baseline (exit codes: 0=OK, 1=critical, 2=warning) | History & Drift |
-| `--diff-since` | string | (empty) | Show changes since historical point (commit SHA, branch, tag, or date) | History & Drift |
+| `--diff-since` | string | (empty) | Show changes since historical point (commit SHA, branch, tag, or date; composable with --export, --export-md, --export-pages, --priority-brief, --agent-brief) | History & Drift |
 | `--history-limit` | int | `500` | Max commits to analyze (0 = unlimited) | History & Drift |
 | `--history-since` | string | (empty) | Limit history to commits after this date/ref (e.g., '30 days ago', '2024-01-01') | History & Drift |
 | `--id-pattern` | stringArray | `[]` | Custom bead ID regex for commit-message matching, e.g. 'bh-[a-z0-9]{5}' (repeatable; capture group 1 is the ID, else the whole match) (#188) | History & Drift |
@@ -4339,6 +4339,8 @@ bv has a comprehensive built-in help system:
 |  | `L` | Scroll right |
 |  | `J/K` | Scroll graph vertically |
 |  | `space` | Expand/collapse dependency paths |
+|  | `D` | Check add dependency (A → B) |
+|  | `c` | Copy checked dep command |
 |  | `PgUp` | Page nodes (prev 10) |
 |  | `PgDn` | Page nodes (next 10) |
 | **board** | `h` | Previous column |
@@ -4476,7 +4478,7 @@ bv has a comprehensive built-in help system:
 | `BV_PRETTY_JSON` | Set to `1` for indented JSON output. | (compact) |
 | `BV_ROBOT` | Set to `1` to force robot mode (clean stdout, JSON logs, disk cache on). Every `--robot-*` flag sets it. | (unset) |
 | `BV_ROBOT_HISTORY_TIMEOUT_MS` | Bound on the git-history prologue of `--robot-triage` in milliseconds; `0` = unbounded. | `10000` |
-| `BV_ROBOT_NOT_READY_LABELS` | Comma-separated labels marking a bead not-ready; excluded from claimable `--robot-next`/`--robot-triage` top picks (`--robot-not-ready-labels` overrides). | (none) |
+| `BV_ROBOT_NOT_READY_LABELS` | Comma-separated labels marking a bead not-ready; excluded from claimable `--robot-next`/`--robot-triage`/`--robot-plan`/TUI top picks (`--robot-not-ready-labels` overrides). | (none) |
 | `BV_SEARCH_MODE` | Default search mode: `text` or `hybrid` (`--search-mode` overrides). | `text` |
 | `BV_SEARCH_PRESET` | Default hybrid preset: `default`, `bug-hunting`, `sprint-planning`, `impact-first`, `text-only`; setting one implies hybrid mode. | `default` |
 | `BV_SEARCH_WEIGHTS` | JSON weight map for hybrid search; overrides the preset. | (preset) |

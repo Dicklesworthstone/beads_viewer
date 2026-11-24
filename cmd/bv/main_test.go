@@ -11654,17 +11654,22 @@ func TestPass18_CLIRegressions(t *testing.T) {
 				ID: "ws-b-1", Title: "B1 cross repo", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, SourceRepo: "repoB",
 				Origin: &model.IssueOrigin{Tracker: "br", Database: "/tmp/a.db", WorkingDirectory: "/tmp/a", TrackerDirectory: "/tmp/a/.beads", Executable: "/usr/bin/br", LocalID: "b-1"},
 			},
+			{
+				ID: "ws-a-3", Title: "A3 same tracker positive control", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, SourceRepo: "repoA",
+				Origin: &model.IssueOrigin{Tracker: "br", Database: "/tmp/a.db", WorkingDirectory: "/tmp/a", TrackerDirectory: "/tmp/a/.beads", Executable: "/usr/bin/br", LocalID: "a-3"},
+			},
 		}
 		var buf bytes.Buffer
 		ctx := RobotContext{
-			SourceKind:     "workspace",
-			Issues:         issues,
-			FullIssues:     issues,
-			Readiness:      model.NewReadinessIndex(issues),
-			Stdout:         &buf,
-			AsOfCommitTime: now,
+			SourceKind:      "workspace",
+			SourceAuthority: &RobotSourceAuthority{ClaimSafe: true},
+			Issues:          issues,
+			FullIssues:      issues,
+			Readiness:       model.NewReadinessIndex(issues),
+			Stdout:          &buf,
+			AsOfCommitTime:  now,
 		}
-		spec := "ws-a-1:ws-a-2,ws-a-1:ws-b-1"
+		spec := "ws-a-1:ws-a-2,ws-a-1:ws-b-1,ws-a-1:ws-a-3"
 		if err := handleRobotCheckDep(ctx, phaseThreeRobotHandlerConfig{RobotCheckDepFlag: &spec}); err != nil {
 			t.Fatalf("handleRobotCheckDep: %v", err)
 		}
@@ -11674,14 +11679,18 @@ func TestPass18_CLIRegressions(t *testing.T) {
 		if err := json.Unmarshal(buf.Bytes(), &resp); err != nil {
 			t.Fatalf("unmarshal check-dep: %v", err)
 		}
-		if len(resp.Results) != 2 {
-			t.Fatalf("expected 2 results, got %d", len(resp.Results))
+		if len(resp.Results) != 3 {
+			t.Fatalf("expected 3 results, got %d", len(resp.Results))
 		}
 		if resp.Results[0].Command != "" {
 			t.Fatalf("P18A-6 regression: mismatched Origin.Executable emitted command %q", resp.Results[0].Command)
 		}
 		if resp.Results[1].Command != "" || !resp.Results[1].CrossRepo {
 			t.Fatalf("P18A-6 regression: cross-repo workspace edge emitted command or missed cross_repo: %+v", resp.Results[1])
+		}
+		wantPosCmd := "cd -- /tmp/a && br dep add a-1 a-3"
+		if resp.Results[2].Command != wantPosCmd {
+			t.Fatalf("P19-8 positive control failed: expected %q, got %q", wantPosCmd, resp.Results[2].Command)
 		}
 	})
 
@@ -11734,6 +11743,403 @@ func TestPass18_CLIRegressions(t *testing.T) {
 		}
 		if scoped.SubgraphPageRank == nil || len(scoped.SubgraphPageRank.TopIssues) > 1 {
 			t.Fatalf("P18A-14 regression: subgraph_pagerank.top_issues exceeded --robot-max-results=1: %+v", scoped.SubgraphPageRank)
+		}
+	})
+}
+
+func TestWave31_CLIRegressions(t *testing.T) {
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	old := now.Add(-20 * 24 * time.Hour)
+
+	t.Run("P19-2_LabelHealthSubgraphRetains1HopCrossLabelNeighborUnderCandidateScope", func(t *testing.T) {
+		issues := []model.Issue{
+			{ID: "BE-CORE", Title: "Backend core", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, Labels: []string{"backend"}, CreatedAt: old, UpdatedAt: old,
+				Dependencies: []*model.Dependency{{IssueID: "BE-CORE", DependsOnID: "DB-EXT", Type: model.DepBlocks}}},
+			{ID: "BE-OUT", Title: "Backend out-of-candidate", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, Labels: []string{"backend"}, CreatedAt: old, UpdatedAt: old},
+			{ID: "DB-EXT", Title: "External DB dependency", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, Labels: []string{"database"}, CreatedAt: old, UpdatedAt: old},
+		}
+		var buf bytes.Buffer
+		ctx := RobotContext{
+			Issues:         issues,
+			FullIssues:     issues,
+			CandidateIDs:   map[string]bool{"BE-CORE": true},
+			LabelScope:     "backend",
+			Readiness:      model.NewReadinessIndex(issues),
+			Stdout:         &buf,
+			AsOfCommitTime: now,
+		}
+		if err := handleRobotLabelHealth(ctx, phaseThreeRobotHandlerConfig{}); err != nil {
+			t.Fatalf("handleRobotLabelHealth: %v", err)
+		}
+		var resp struct {
+			SubgraphPageRank *analysis.LabelPageRankResult `json:"subgraph_pagerank"`
+		}
+		if err := json.Unmarshal(buf.Bytes(), &resp); err != nil {
+			t.Fatalf("unmarshal label-health: %v", err)
+		}
+		if resp.SubgraphPageRank == nil || resp.SubgraphPageRank.IssueCount != 2 {
+			t.Fatalf("P19-2 regression: expected 2 subgraph nodes (BE-CORE + 1-hop context DB-EXT, excluding BE-OUT), got %+v", resp.SubgraphPageRank)
+		}
+		if _, leaked := resp.SubgraphPageRank.Scores["BE-OUT"]; leaked {
+			t.Fatalf("P19-2 regression: non-candidate backend issue BE-OUT leaked into subgraph scores: %+v", resp.SubgraphPageRank.Scores)
+		}
+		if _, hasNeighbor := resp.SubgraphPageRank.Scores["DB-EXT"]; !hasNeighbor {
+			t.Fatalf("P19-2 regression: 1-hop cross-label neighbor DB-EXT dropped from subgraph: %+v", resp.SubgraphPageRank.Scores)
+		}
+	})
+
+	t.Run("W31-2_RobotWhatIfBatchAndSingleParity", func(t *testing.T) {
+		issues := []model.Issue{
+			{ID: "W-A", Title: "Root A", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: old, UpdatedAt: old},
+			{ID: "W-B", Title: "Root B", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: old, UpdatedAt: old},
+			{ID: "W-D", Title: "Diamond", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: old, UpdatedAt: old,
+				Dependencies: []*model.Dependency{
+					{IssueID: "W-D", DependsOnID: "W-A", Type: model.DepBlocks},
+					{IssueID: "W-D", DependsOnID: "W-B", Type: model.DepBlocks},
+				}},
+			{ID: "W-E", Title: "Cascade", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, CreatedAt: old, UpdatedAt: old,
+				Dependencies: []*model.Dependency{{IssueID: "W-E", DependsOnID: "W-D", Type: model.DepBlocks}}},
+		}
+
+		// Multi-ID batch returns batch_result with synergy_unblocks=1.
+		var buf bytes.Buffer
+		spec := "W-A,W-B"
+		ctx := RobotContext{
+			Issues:         issues,
+			FullIssues:     issues,
+			Readiness:      model.NewReadinessIndex(issues),
+			Stdout:         &buf,
+			AsOfCommitTime: now,
+		}
+		if err := handleRobotWhatIf(ctx, phaseThreeRobotHandlerConfig{RobotWhatIfFlag: &spec}); err != nil {
+			t.Fatalf("handleRobotWhatIf(batch): %v", err)
+		}
+		var batchResp struct {
+			BatchResult *analysis.WhatIfBatchResult `json:"batch_result"`
+			Result      *analysis.WhatIfResult      `json:"result"`
+		}
+		if err := json.Unmarshal(buf.Bytes(), &batchResp); err != nil {
+			t.Fatalf("unmarshal batch what-if: %v", err)
+		}
+		if batchResp.BatchResult == nil || batchResp.Result != nil {
+			t.Fatalf("W31-2: expected batch_result (and nil single result), got %+v", batchResp)
+		}
+		if batchResp.BatchResult.SynergyUnblocks != 1 || batchResp.BatchResult.Delta.DirectUnblocks != 1 || batchResp.BatchResult.Delta.TransitiveUnblocks != 2 {
+			t.Fatalf("W31-2: unexpected diamond batch_result: %+v", batchResp.BatchResult)
+		}
+
+		// Single-ID still emits legacy result field unchanged.
+		buf.Reset()
+		singleSpec := "W-A"
+		if err := handleRobotWhatIf(ctx, phaseThreeRobotHandlerConfig{RobotWhatIfFlag: &singleSpec}); err != nil {
+			t.Fatalf("handleRobotWhatIf(single): %v", err)
+		}
+		var singleResp struct {
+			BatchResult *analysis.WhatIfBatchResult `json:"batch_result"`
+			Result      *analysis.WhatIfResult      `json:"result"`
+		}
+		if err := json.Unmarshal(buf.Bytes(), &singleResp); err != nil {
+			t.Fatalf("unmarshal single what-if: %v", err)
+		}
+		if singleResp.Result == nil || singleResp.BatchResult != nil || singleResp.Result.IssueID != "W-A" {
+			t.Fatalf("W31-2: single-ID payload regression: %+v", singleResp)
+		}
+
+		// Missing ID in batch returns error.
+		buf.Reset()
+		badSpec := "W-A,DOES-NOT-EXIST"
+		if err := handleRobotWhatIf(ctx, phaseThreeRobotHandlerConfig{RobotWhatIfFlag: &badSpec}); err == nil {
+			t.Fatalf("W31-2: expected error for missing ID in batch what-if")
+		}
+	})
+
+	t.Run("W31-3_RobotInsightsHighRiskScopedAndCapped", func(t *testing.T) {
+		issues := []model.Issue{
+			{ID: "RK-1", Title: "Stale blocked hub", Status: model.StatusBlocked, Priority: 1, IssueType: model.TypeTask, SourceRepo: "api", CreatedAt: old, UpdatedAt: old,
+				Dependencies: []*model.Dependency{{IssueID: "RK-1", DependsOnID: "RK-DEP", Type: model.DepBlocks}}},
+			{ID: "RK-2", Title: "Secondary active", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, SourceRepo: "web", CreatedAt: old, UpdatedAt: old,
+				Dependencies: []*model.Dependency{{IssueID: "RK-2", DependsOnID: "RK-1", Type: model.DepBlocks}}},
+			{ID: "RK-DEP", Title: "Cross-repo dep", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, SourceRepo: "db", CreatedAt: old, UpdatedAt: old},
+			{ID: "RK-CLOSED", Title: "Closed issue", Status: model.StatusClosed, Priority: 1, IssueType: model.TypeTask, CreatedAt: old, UpdatedAt: old},
+		}
+		ctx := RobotContext{
+			Issues:         issues,
+			FullIssues:     issues,
+			CandidateIDs:   map[string]bool{"RK-1": true, "RK-2": true, "RK-CLOSED": true},
+			Readiness:      model.NewReadinessIndex(issues),
+			AsOfCommitTime: now,
+		}
+		payload, err := buildRobotInsightsPayload(ctx, false, true, 1)
+		if err != nil {
+			t.Fatalf("buildRobotInsightsPayload: %v", err)
+		}
+		raw, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var resp struct {
+			HighRisk []struct {
+				IssueID       string  `json:"issue_id"`
+				CompositeRisk float64 `json:"composite_risk"`
+			} `json:"high_risk"`
+			FullStats struct {
+				RiskScore map[string]float64 `json:"risk_score"`
+			} `json:"full_stats"`
+		}
+		if err := json.Unmarshal(raw, &resp); err != nil {
+			t.Fatalf("unmarshal insights: %v", err)
+		}
+		if len(resp.HighRisk) != 1 {
+			t.Fatalf("W31-3: expected high_risk capped to maxResults=1, got %+v", resp.HighRisk)
+		}
+		if resp.HighRisk[0].CompositeRisk <= 0 {
+			t.Fatalf("W31-3: expected positive composite_risk, got %+v", resp.HighRisk[0])
+		}
+		if _, leakedClosed := resp.FullStats.RiskScore["RK-CLOSED"]; leakedClosed {
+			t.Fatalf("W31-3: closed issue RK-CLOSED leaked into full_stats.risk_score: %+v", resp.FullStats.RiskScore)
+		}
+		if _, leakedOut := resp.FullStats.RiskScore["RK-DEP"]; leakedOut {
+			t.Fatalf("W31-3: out-of-candidate RK-DEP leaked into full_stats.risk_score: %+v", resp.FullStats.RiskScore)
+		}
+	})
+
+	t.Run("W31-5_RobotPlanClaimableNotReadyAndProvenActions", func(t *testing.T) {
+		issues := []model.Issue{
+			{ID: "PL-READY", Title: "Ready", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: old, UpdatedAt: old,
+				Origin: &model.IssueOrigin{Tracker: "br", Database: "/tmp/repo/.beads/beads.db", Executable: "/usr/bin/br", WorkingDirectory: "/tmp/repo", TrackerDirectory: "/tmp/repo/.beads", LocalID: "PL-READY", SupportsClaim: true}},
+			{ID: "PL-SPEC", Title: "Needs spec", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, Labels: []string{"needs-spec"}, CreatedAt: old, UpdatedAt: old,
+				Origin: &model.IssueOrigin{Tracker: "br", Database: "/tmp/repo/.beads/beads.db", Executable: "/usr/bin/br", WorkingDirectory: "/tmp/repo", TrackerDirectory: "/tmp/repo/.beads", LocalID: "PL-SPEC", SupportsClaim: true}},
+		}
+		notReady := "needs-spec"
+		planFlag := true
+		reg := &RobotRegistry{}
+		registerPhaseTwoRobotHandlers(reg, phaseTwoRobotHandlerConfig{
+			RobotPlanFlag:  &planFlag,
+			NotReadyLabels: &notReady,
+		})
+
+		// 1. Proven source: PL-READY has Claim action, PL-SPEC is not_ready with no Claim action.
+		var buf bytes.Buffer
+		ctx := RobotContext{
+			Issues:          issues,
+			FullIssues:      issues,
+			Readiness:       model.NewReadinessIndex(issues),
+			SourceAuthority: &RobotSourceAuthority{ClaimSafe: true},
+			Stdout:          &buf,
+			AsOfCommitTime:  now,
+		}
+		if handled, err := reg.DispatchFlag("robot-plan", ctx); !handled || err != nil {
+			t.Fatalf("dispatch robot-plan (proven): handled=%v err=%v", handled, err)
+		}
+		var resp struct {
+			Plan analysis.ExecutionPlan `json:"plan"`
+		}
+		if err := json.Unmarshal(buf.Bytes(), &resp); err != nil {
+			t.Fatalf("unmarshal robot-plan: %v", err)
+		}
+		byID := make(map[string]analysis.PlanItem)
+		for _, tr := range resp.Plan.Tracks {
+			for _, it := range tr.Items {
+				byID[it.ID] = it
+			}
+		}
+		if it := byID["PL-READY"]; !it.Claimable || it.Actions == nil || it.Actions.Claim == nil {
+			t.Fatalf("W31-5: proven PL-READY missing claimable/actions.claim: %+v", it)
+		}
+		if it := byID["PL-SPEC"]; it.Claimable || !it.NotReady || it.Actions == nil || it.Actions.Claim != nil || it.Actions.UnavailableReason != "marked not-ready by label" {
+			t.Fatalf("W31-5/P20A-5: PL-SPEC should be not_ready with nil claim action and UnavailableReason='marked not-ready by label': %+v (actions=%+v)", it, it.Actions)
+		}
+
+		// 2. Provisional source: PL-READY must have claimable=false and actions.claim=nil.
+		buf.Reset()
+		ctx.SourceAuthority = &RobotSourceAuthority{ClaimSafe: false}
+		if handled, err := reg.DispatchFlag("robot-plan", ctx); !handled || err != nil {
+			t.Fatalf("dispatch robot-plan (provisional): handled=%v err=%v", handled, err)
+		}
+		resp = struct {
+			Plan analysis.ExecutionPlan `json:"plan"`
+		}{}
+		if err := json.Unmarshal(buf.Bytes(), &resp); err != nil {
+			t.Fatalf("unmarshal provisional robot-plan: %v", err)
+		}
+		for _, tr := range resp.Plan.Tracks {
+			for _, it := range tr.Items {
+				if it.Claimable || (it.Actions != nil && it.Actions.Claim != nil) {
+					t.Fatalf("W31-5: provisional robot-plan leaked claim action on %s: %+v", it.ID, it)
+				}
+			}
+		}
+	})
+
+	t.Run("W31-1_And_W31-6_EndToEndExportFeedbackAndComposableDiffSince", func(t *testing.T) {
+		exe := buildTestBinary(t)
+		repo := t.TempDir()
+		runGit := func(args ...string) {
+			t.Helper()
+			cmd := exec.Command("git", args...)
+			cmd.Dir = repo
+			cmd.Env = append(os.Environ(),
+				"GIT_AUTHOR_NAME=Tester",
+				"GIT_AUTHOR_EMAIL=test@example.com",
+				"GIT_COMMITTER_NAME=Tester",
+				"GIT_COMMITTER_EMAIL=test@example.com",
+			)
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("git %v failed: %v\n%s", args, err, out)
+			}
+		}
+		runGit("init", "-b", "main")
+		if err := os.MkdirAll(filepath.Join(repo, ".beads"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		v1 := strings.Join([]string{
+			`{"id":"W31-1","title":"Initial baseline task","status":"open","priority":2,"issue_type":"task","created_at":"2026-10-01T12:00:00Z","updated_at":"2026-10-01T12:00:00Z"}`,
+			`{"id":"W31-2","title":"Soon closed bug","status":"open","priority":1,"issue_type":"bug","created_at":"2026-10-01T12:00:00Z","updated_at":"2026-10-01T12:00:00Z"}`,
+		}, "\n") + "\n"
+		if err := os.WriteFile(filepath.Join(repo, ".beads", "issues.jsonl"), []byte(v1), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		runGit("add", ".")
+		runGit("commit", "-m", "v1 baseline")
+
+		v2 := strings.Join([]string{
+			`{"id":"W31-1","title":"Initial baseline task","status":"open","priority":0,"issue_type":"task","created_at":"2026-10-01T12:00:00Z","updated_at":"2026-11-20T12:00:00Z"}`,
+			`{"id":"W31-2","title":"Soon closed bug","status":"closed","priority":1,"issue_type":"bug","created_at":"2026-10-01T12:00:00Z","updated_at":"2026-11-20T12:00:00Z","closed_at":"2026-11-20T12:00:00Z"}`,
+			`{"id":"W31-3","title":"Added feature","status":"open","priority":1,"issue_type":"feature","created_at":"2026-11-20T12:00:00Z","updated_at":"2026-11-20T12:00:00Z"}`,
+		}, "\n") + "\n"
+		if err := os.WriteFile(filepath.Join(repo, ".beads", "issues.jsonl"), []byte(v2), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		runGit("add", ".")
+		runGit("commit", "-m", "v2 changes")
+
+		// W31-1: Write custom feedback.json with heavy priority_boost weight and verify --export triage score changes.
+		outDir := t.TempDir()
+		recNoFB := filepath.Join(outDir, "triage-rec.yaml")
+		recYAML := "name: triage-col\nmetrics: [triage]\nview:\n  columns: [id, title]\n  show_metrics: true\n"
+		if err := os.WriteFile(recNoFB, []byte(recYAML), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		csvBefore := filepath.Join(outDir, "before.csv")
+		if _, stderr, err := runCommandWithTimeout(t, repo, exe, "--export", csvBefore, "--export-format", "csv", "--export-include-graph=false", "--recipe", recNoFB); err != nil {
+			t.Fatalf("--export before feedback failed: %v\n%s", err, stderr)
+		}
+		fb := analysis.DefaultFeedbackData()
+		for i := 0; i < analysis.MinFeedbackSamples; i++ {
+			fb.Events = append(fb.Events, analysis.FeedbackEvent{
+				IssueID:   "W31-1",
+				Action:    "accept",
+				Timestamp: now,
+				Score:     0.8,
+			})
+		}
+		for i := range fb.Adjustments {
+			if fb.Adjustments[i].Name == "PriorityBoost" {
+				fb.Adjustments[i].Adjustment = 2.0
+				fb.Adjustments[i].Samples = analysis.MinFeedbackSamples
+			} else if fb.Adjustments[i].Name == "Staleness" {
+				fb.Adjustments[i].Adjustment = 0.5
+				fb.Adjustments[i].Samples = analysis.MinFeedbackSamples
+			}
+		}
+		fb.Stats.TotalAccepted = analysis.MinFeedbackSamples
+		if err := fb.Save(filepath.Join(repo, ".beads")); err != nil {
+			t.Fatalf("save feedback: %v", err)
+		}
+		csvAfter := filepath.Join(outDir, "after.csv")
+		if _, stderr, err := runCommandWithTimeout(t, repo, exe, "--export", csvAfter, "--export-format", "csv", "--export-include-graph=false", "--recipe", recNoFB); err != nil {
+			t.Fatalf("--export after feedback failed: %v\n%s", err, stderr)
+		}
+		bBefore, _ := os.ReadFile(csvBefore)
+		bAfter, _ := os.ReadFile(csvAfter)
+		if string(bBefore) == string(bAfter) {
+			t.Fatalf("W31-1 regression: --export ignored .beads/feedback.json weights (CSV identical):\n%s", bBefore)
+		}
+
+		// W31-6a: --export-md + --diff-since HEAD~1
+		mdPath := filepath.Join(outDir, "report.md")
+		if _, stderr, err := runCommandWithTimeout(t, repo, exe, "--export-md", mdPath, "--diff-since", "HEAD~1"); err != nil {
+			t.Fatalf("--export-md --diff-since HEAD~1 failed: %v\n%s", err, stderr)
+		}
+		mdContent, _ := os.ReadFile(mdPath)
+		if !strings.Contains(string(mdContent), "## Changes Since `HEAD~1`") || !strings.Contains(string(mdContent), "`W31-3`") || !strings.Contains(string(mdContent), "`W31-2`") {
+			t.Fatalf("W31-6 --export-md missing diff section:\n%s", mdContent)
+		}
+
+		// W31-6b: --priority-brief + --diff-since HEAD~1
+		briefPath := filepath.Join(outDir, "brief.md")
+		if _, stderr, err := runCommandWithTimeout(t, repo, exe, "--priority-brief", briefPath, "--diff-since", "HEAD~1"); err != nil {
+			t.Fatalf("--priority-brief --diff-since HEAD~1 failed: %v\n%s", err, stderr)
+		}
+		briefContent, _ := os.ReadFile(briefPath)
+		if !strings.Contains(string(briefContent), "## Changes Since `HEAD~1`") || !strings.Contains(string(briefContent), "`W31-3`") {
+			t.Fatalf("W31-6 --priority-brief missing diff section:\n%s", briefContent)
+		}
+
+		// W31-6c + P20A-6: --agent-brief + --diff-since HEAD~1 + --robot-max-results 1 writes diff.json, lists it in meta.json, embeds in brief.md, and caps plan.json!
+		agentDir := filepath.Join(outDir, "agent-bundle")
+		if _, stderr, err := runCommandWithTimeout(t, repo, exe, "--agent-brief", agentDir, "--diff-since", "HEAD~1", "--robot-max-results", "1"); err != nil {
+			t.Fatalf("--agent-brief --diff-since HEAD~1 failed: %v\n%s", err, stderr)
+		}
+		agentDiffRaw, err := os.ReadFile(filepath.Join(agentDir, "diff.json"))
+		if err != nil {
+			t.Fatalf("W31-6 --agent-brief missing diff.json: %v", err)
+		}
+		var agentDiffDoc struct {
+			DiffSince string                 `json:"diff_since"`
+			Diff      *analysis.SnapshotDiff `json:"diff"`
+		}
+		if err := json.Unmarshal(agentDiffRaw, &agentDiffDoc); err != nil || agentDiffDoc.Diff == nil || agentDiffDoc.Diff.Summary.IssuesAdded != 1 || agentDiffDoc.Diff.Summary.IssuesClosed != 1 {
+			t.Fatalf("W31-6 --agent-brief invalid diff.json (err=%v): %s", err, agentDiffRaw)
+		}
+		agentMetaRaw, _ := os.ReadFile(filepath.Join(agentDir, "meta.json"))
+		if !strings.Contains(string(agentMetaRaw), `"diff.json"`) {
+			t.Fatalf("W31-6 --agent-brief meta.json did not record diff.json:\n%s", agentMetaRaw)
+		}
+		agentPlanRaw, _ := os.ReadFile(filepath.Join(agentDir, "plan.json"))
+		if !strings.Contains(string(agentPlanRaw), `"claimable"`) {
+			t.Fatalf("W31-5 --agent-brief plan.json missing claimable field:\n%s", agentPlanRaw)
+		}
+		var agentPlanDoc struct {
+			Plan analysis.ExecutionPlan `json:"plan"`
+		}
+		if err := json.Unmarshal(agentPlanRaw, &agentPlanDoc); err != nil {
+			t.Fatalf("unmarshal agent plan.json: %v", err)
+		}
+		planItemsTotal := 0
+		for _, tr := range agentPlanDoc.Plan.Tracks {
+			planItemsTotal += len(tr.Items)
+		}
+		if planItemsTotal > 1 {
+			t.Fatalf("P20A-6 regression: --agent-brief --robot-max-results 1 emitted %d plan items (want <=1): %s", planItemsTotal, agentPlanRaw)
+		}
+
+		// P20A-7: --export with unsupported format (csv) + --diff-since must fail fast with a clear error (not silently drop diff).
+		if _, stderr, err := runCommandWithTimeout(t, repo, exe, "--export", filepath.Join(outDir, "bad.csv"), "--export-format", "csv", "--export-include-graph=false", "--diff-since", "HEAD~1"); err == nil || !strings.Contains(stderr, "--diff-since is only supported with markdown, html, or json") {
+			t.Fatalf("P20A-7 regression: --export csv --diff-since should fail clearly, err=%v stderr=%s", err, stderr)
+		}
+
+		// W31-6d: --export-pages + --diff-since HEAD~1 writes data/diff.json and sets meta.has_diff=true
+		pagesDir := filepath.Join(outDir, "pages-diff")
+		if _, stderr, err := runCommandWithTimeout(t, repo, exe, "--export-pages", pagesDir, "--diff-since", "HEAD~1"); err != nil {
+			t.Fatalf("--export-pages --diff-since HEAD~1 failed: %v\n%s", err, stderr)
+		}
+		pagesMetaRaw, err := os.ReadFile(filepath.Join(pagesDir, "data", "meta.json"))
+		if err != nil || !strings.Contains(string(pagesMetaRaw), `"has_diff": true`) {
+			t.Fatalf("W31-6 --export-pages data/meta.json missing has_diff=true (err=%v):\n%s", err, pagesMetaRaw)
+		}
+		if _, err := os.Stat(filepath.Join(pagesDir, "data", "diff.json")); err != nil {
+			t.Fatalf("W31-6 --export-pages missing data/diff.json: %v", err)
+		}
+
+		// Negative controls: --robot-diff + --export-md AND --diff-since + --robot-triage MUST still be rejected!
+		for _, badArgs := range [][]string{
+			{"--robot-diff", "--diff-since", "HEAD~1", "--export-md", filepath.Join(outDir, "bad.md")},
+			{"--diff-since", "HEAD~1", "--robot-triage"},
+		} {
+			if _, stderr, err := runCommandWithTimeout(t, repo, exe, badArgs...); err == nil || !strings.Contains(stderr, "multiple primary robot commands specified") {
+				t.Fatalf("W31-6 negative control %v should be rejected, err=%v stderr=%s", badArgs, err, stderr)
+			}
 		}
 	})
 }

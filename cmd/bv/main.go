@@ -204,11 +204,26 @@ func validateEnumFlags(flags *flag.FlagSet, rules []enumFlagRule) error {
 	return nil
 }
 
+func isDiffComposableExportActive(flags *flag.FlagSet) bool {
+	for _, name := range []string{"export", "export-md", "export-pages", "priority-brief", "agent-brief"} {
+		if isFlagActive(flags, name) || (primaryStringCommandFlags[name] && flags.Changed(name)) {
+			return true
+		}
+	}
+	return false
+}
+
 func validateExclusivePrimaryCommands(flags *flag.FlagSet, groups []primaryCommandGroup) error {
 	activeGroups := make([]string, 0, len(groups))
 	for _, group := range groups {
 		active := activePrimaryFlags(flags, group.flags)
 		if len(active) == 0 {
+			continue
+		}
+		// Allow --diff-since (without --robot-diff) to compose as a changelog
+		// modifier on export and brief targets while keeping --diff-since
+		// mutually exclusive with other primary commands (e.g. --robot-triage).
+		if len(active) == 1 && active[0] == "--diff-since" && isDiffComposableExportActive(flags) {
 			continue
 		}
 		activeGroups = append(activeGroups, strings.Join(active, ", "))
@@ -1871,7 +1886,7 @@ func main() {
 	searchMode := flag.String("search-mode", "", "Search ranking mode: text or hybrid (default: BV_SEARCH_MODE or text)")
 	searchPreset := flag.String("search-preset", "", "Hybrid preset name (default: BV_SEARCH_PRESET or default)")
 	searchWeights := flag.String("search-weights", "", "Hybrid weights JSON (overrides preset; keys: text,pagerank,status,impact,priority,recency)")
-	diffSince := flag.String("diff-since", "", "Show changes since historical point (commit SHA, branch, tag, or date)")
+	diffSince := flag.String("diff-since", "", "Show changes since historical point (commit SHA, branch, tag, or date; composable with --export, --export-md, --export-pages, --priority-brief, --agent-brief)")
 	asOf := flag.String("as-of", "", "View state at point in time (commit SHA, branch, tag, or date)")
 	noCache := flag.Bool("no-cache", false, "Bypass disk cache for robot triage (also: BV_NO_CACHE=1)")
 	forceFullAnalysis := flag.Bool("force-full-analysis", false, "Compute all metrics regardless of graph size (may be slow for large graphs)")
@@ -2052,6 +2067,7 @@ func main() {
 		ForecastLabel:       forecastLabel,
 		ForecastSprint:      forecastSprint,
 		ForecastAgents:      forecastAgents,
+		NotReadyLabels:      robotNotReadyLabels,
 	})
 	phaseThreeRobotRegistry := newRobotRegistry()
 	registerPhaseThreeRobotHandlers(&phaseThreeRobotRegistry, phaseThreeRobotHandlerConfig{
@@ -2346,12 +2362,14 @@ func main() {
 			strings.TrimSpace(env.ToonDefaultFormat.Get()) != ""
 
 		primaryRobotRegistries := []*RobotRegistry{&phaseOneRobotRegistry, &phaseTwoRobotRegistry, &phaseThreeRobotRegistry}
+		isDiffExportComposition := *diffSince != "" && !*robotDiff &&
+			(*exportFile != "" || *exportReport != "" || *exportPages != "" || *priorityBrief != "" || *agentBrief != "")
 		robotMode := envRobot ||
 			anyRobotModeActive(primaryRobotRegistries...) ||
-			// When stdout is non-TTY, --diff-since auto-enables JSON output. Mark this
+			// When stdout is non-TTY, standalone --diff-since auto-enables JSON output. Mark this
 			// as robot mode early so parsers keep stdout JSON clean.
-			(*diffSince != "" && !stdoutIsTTY) ||
-			(structuredFormatRequested && (*diffSince != "" || flag.CommandLine.Changed("search") || *checkDrift || *baselineInfo || *initDrift ||
+			(*diffSince != "" && !isDiffExportComposition && !stdoutIsTTY) ||
+			(structuredFormatRequested && ((*diffSince != "" && !isDiffExportComposition) || flag.CommandLine.Changed("search") || *checkDrift || *baselineInfo || *initDrift ||
 				*agentsAdd || *agentsRemove || *agentsUpdate || *agentsCheck || *agentsReset || *agentsDryRun || *agentsForce ||
 				*feedbackAccept != "" || *feedbackIgnore != "" || *feedbackReset || *feedbackShow))
 
@@ -4125,12 +4143,26 @@ func main() {
 						fmt.Printf("  → Warning: failed to generate history: %v\n", err)
 					}
 				}
+				var diffJSON []byte
+				if *diffSince != "" {
+					fmt.Printf("  → Computing changelog diff since %s...\n", *diffSince)
+					diffRes, diffErr := computeScopedDiffForCLI(exportContext, *diffSince, projectDir, *workspaceConfig, *repoFilter, *labelScope, *recipeName, exportContext.ActiveRecipe, exportContext.AsOfCommit, *forceFullAnalysis)
+					if diffErr != nil {
+						return fmt.Errorf("computing diff since %s: %w", *diffSince, diffErr)
+					}
+					encoded, mErr := buildExportDiffPayload(exportContext, *diffSince, diffRes)
+					if mErr != nil {
+						return fmt.Errorf("encoding diff data: %w", mErr)
+					}
+					diffJSON = encoded
+				}
 				exporter.Config.ETAContext = forecastETACtx
 				exporter.Config.HasSprints = sprintCount > 0 && len(sprintsJSON) > 0
 				exporter.Config.HasSuggestions = suggestionCount > 0 && len(suggestionsJSON) > 0
 				exporter.Config.HasLabels = labelCount > 0 && len(labelsJSON) > 0
 				exporter.Config.HasForecast = len(forecastJSON) > 0
 				exporter.Config.HasHistory = len(historyJSON) > 0
+				exporter.Config.HasDiff = len(diffJSON) > 0
 
 				// Prepare optional WASM scorer assets before ExportBundle so
 				// beads.sqlite3 and data/meta.json accurately record has_hybrid_wasm.
@@ -4176,6 +4208,13 @@ func main() {
 						fmt.Printf("  → Warning: failed to write history.json: %v\n", err)
 					} else {
 						fmt.Printf("  → history.json (%d commits)\n", historyCommitCount)
+					}
+				}
+				if exporter.Config.HasDiff {
+					if err := bundle.WriteFile("data/diff.json", diffJSON, 0644); err != nil {
+						fmt.Printf("  → Warning: failed to write diff.json: %v\n", err)
+					} else {
+						fmt.Printf("  → diff.json (since %s)\n", *diffSince)
 					}
 				}
 
@@ -5122,6 +5161,15 @@ func main() {
 				}
 			}
 			populatePriorityBriefExecutiveData(&config, robotDispatchContext, briefFeedbackWeights, *robotIncludeInactive, *forceFullAnalysis, *robotMaxResults, briefNow)
+			if *diffSince != "" {
+				diffRes, diffErr := computeScopedDiffForCLI(robotDispatchContext, *diffSince, projectDir, *workspaceConfig, *repoFilter, *labelScope, *recipeName, recipeForScope, asOfResolved, *forceFullAnalysis)
+				if diffErr != nil {
+					fmt.Fprintf(os.Stderr, "Error computing diff since %s: %v\n", *diffSince, diffErr)
+					exitCLI(1)
+				}
+				config.Diff = diffRes.Diff
+				config.DiffSince = *diffSince
+			}
 			brief, err := export.GeneratePriorityBriefFromTriageJSON(triageJSON, config)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error generating priority brief: %v\n", err)
@@ -5269,6 +5317,17 @@ func main() {
 				}
 			}
 			populatePriorityBriefExecutiveData(&config, robotDispatchContext, agentFeedbackWeights, *robotIncludeInactive, *forceFullAnalysis, *robotMaxResults, agentBriefNow)
+			var agentDiffRes *cliScopedDiffResult
+			if *diffSince != "" {
+				var diffErr error
+				agentDiffRes, diffErr = computeScopedDiffForCLI(robotDispatchContext, *diffSince, projectDir, *workspaceConfig, *repoFilter, *labelScope, *recipeName, recipeForScope, asOfResolved, *forceFullAnalysis)
+				if diffErr != nil {
+					fmt.Fprintf(os.Stderr, "Error computing diff since %s: %v\n", *diffSince, diffErr)
+					exitCLI(1)
+				}
+				config.Diff = agentDiffRes.Diff
+				config.DiffSince = *diffSince
+			}
 			brief, err := export.GeneratePriorityBriefFromTriageJSON(triageJSON, config)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error generating brief: %v\n", err)
@@ -5304,7 +5363,12 @@ func main() {
 				}
 			}
 			if agentAn != nil {
-				plan := agentAn.GetExecutionPlan()
+				planNotReady := resolveNotReadyLabels(phaseThreeRobotHandlerConfig{NotReadyLabels: robotNotReadyLabels})
+				plan := agentAn.GetExecutionPlanWithOptions(planNotReady)
+				annotatePlanItemsWithActions(&plan, agentExportCtx.GraphIssues(), agentExportCtx.claimsProven())
+				if *robotMaxResults > 0 {
+					capExecutionPlanTracks(&plan, *robotMaxResults)
+				}
 				planCtx := agentExportCtx
 				planCtx.Command = "robot-plan"
 				planEnvelope := struct {
@@ -5369,6 +5433,14 @@ func main() {
 							bundleFiles = append(bundleFiles, "history.json")
 							fmt.Printf("  → history.json (%d commits)\n", len(histRep.Commits))
 						}
+					}
+				}
+			}
+			if agentDiffRes != nil {
+				if diffJSON, dErr := buildExportDiffPayload(agentExportCtx, *diffSince, agentDiffRes); dErr == nil && len(diffJSON) > 0 {
+					if wErr := export.SafeWriteOutput(filepath.Join(*agentBrief, "diff.json"), diffJSON, 0644); wErr == nil {
+						bundleFiles = append(bundleFiles, "diff.json")
+						fmt.Printf("  → diff.json (since %s)\n", *diffSince)
 					}
 				}
 			}
@@ -5469,114 +5541,30 @@ func main() {
 		// Handle --robot-metrics flag (bv-84tp)
 		dispatchRobotFlagOrExit(&phaseOneRobotRegistry, "robot-metrics", robotDispatchContext)
 
-		// Handle --diff-since flag
-		if *diffSince != "" {
+		// Handle standalone --diff-since / --robot-diff flag
+		// (When composed with --export / --export-md, defer to the report export block below.)
+		if *diffSince != "" && *exportFile == "" && *exportReport == "" {
 			// Auto-enable robot diff for non-interactive/agent/structured contexts
 			if !*robotDiff && (envRobot || !stdoutIsTTY || flag.CommandLine.Changed("format") || structuredFormatRequested) {
 				*robotDiff = true
 			}
 
-			var (
-				historicalIssues   []model.Issue
-				histAuthoritySlice []model.Issue
-				revision           string
-				histCommitTime     time.Time
-			)
-			if *workspaceConfig != "" && robotDispatchContext.SourceAuthority != nil {
-				wsHistIssues, wsAuthIssues, wsRev, wsTime, wsErr := loadWorkspaceHistoricalDiffSource(robotDispatchContext, *diffSince)
-				if wsErr != nil {
-					fmt.Fprintf(os.Stderr, "Error loading workspace issues at %s: %v\n", *diffSince, wsErr)
-					exitCLI(1)
-				}
-				historicalIssues = wsHistIssues
-				histAuthoritySlice = wsAuthIssues
-				revision = wsRev
-				histCommitTime = wsTime
-			} else {
-				gitLoader := loader.NewGitLoader(projectDir)
-
-				// Load historical issues (including tombstones + commit metadata) and apply the same scope as current issues
-				histReport, err := gitLoader.LoadAtWithReport(*diffSince)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error loading issues at %s: %v\n", *diffSince, err)
-					exitCLI(1)
-				}
-				historicalIssues = histReport.Issues
-				histAuthoritySlice = make([]model.Issue, 0, len(historicalIssues)+len(histReport.TombstoneIDs))
-				histAuthoritySlice = append(histAuthoritySlice, historicalIssues...)
-				for _, id := range histReport.TombstoneIDs {
-					histAuthoritySlice = append(histAuthoritySlice, model.Issue{ID: id, Status: model.StatusTombstone})
-				}
-				revision = histReport.CommitSHA
-				if revision == "" {
-					revision, err = gitLoader.ResolveRevision(*diffSince)
-					if err != nil {
-						revision = *diffSince
-					}
-				}
-				histCommitTime = histReport.CommitTime
-			}
-			historicalCtx, scopeErr := scopeLoadedIssues(RobotContext{
-				Issues:            historicalIssues,
-				Readiness:         model.NewReadinessIndex(histAuthoritySlice),
-				AsOf:              *diffSince,
-				AsOfCommit:        revision,
-				AsOfCommitTime:    histCommitTime,
-				Repo:              *repoFilter,
-				LabelScope:        *labelScope,
-				Recipe:            *recipeName,
-				ForceFullAnalysis: *forceFullAnalysis,
-			}, recipeForScope)
-			if scopeErr != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", scopeErr)
+			diffRes, diffErr := computeScopedDiffForCLI(robotDispatchContext, *diffSince, projectDir, *workspaceConfig, *repoFilter, *labelScope, *recipeName, recipeForScope, asOfResolved, *forceFullAnalysis)
+			if diffErr != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", diffErr)
 				exitCLI(1)
-			}
-
-			// Create snapshots over full topology (preserving multi-hop cycles/readiness)
-			// while restricting snap.Issues to candidate IDs so out-of-scope issues never leak.
-			fromTime := histCommitTime.UTC()
-			if fromTime.IsZero() {
-				fromTime = historicalCtx.ReferenceNow()
-			}
-			fromSnapshot := newScopedSnapshotForCLI(historicalCtx.GraphIssues(), historicalCtx.Readiness, historicalCtx.CandidateIDs, fromTime, revision, *forceFullAnalysis)
-			toRev := "HEAD"
-			if asOfResolved != "" {
-				toRev = asOfResolved
-			}
-			toSnapshot := newScopedSnapshotForCLI(robotDispatchContext.GraphIssues(), readiness, candidateIDs, robotDispatchContext.ReferenceNow(), toRev, *forceFullAnalysis)
-
-			// Compute diff
-			diff := analysis.CompareSnapshots(fromSnapshot, toSnapshot)
-			if historicalCtx.CandidateIDs != nil || candidateIDs != nil {
-				if candidateIDs != nil {
-					diff.NewCycles = filterCyclesForCandidates(diff.NewCycles, candidateIDs)
-					if diff.NewCycles == nil {
-						diff.NewCycles = [][]string{}
-					}
-				}
-				if historicalCtx.CandidateIDs != nil {
-					diff.ResolvedCycles = filterCyclesForCandidates(diff.ResolvedCycles, historicalCtx.CandidateIDs)
-					if diff.ResolvedCycles == nil {
-						diff.ResolvedCycles = [][]string{}
-					}
-				}
-				fromCycles := len(filterCyclesForCandidates(fromSnapshot.Stats.Cycles(), historicalCtx.CandidateIDs))
-				toCycles := len(filterCyclesForCandidates(toSnapshot.Stats.Cycles(), candidateIDs))
-				diff.MetricDeltas.CycleCount = toCycles - fromCycles
-				diff.Summary.CyclesIntroduced = len(diff.NewCycles)
-				diff.Summary.CyclesResolved = len(diff.ResolvedCycles)
 			}
 
 			if *robotDiff {
 				diffDispatchContext := robotDispatchContext
-				diffDispatchContext.Diff = diff
-				diffDispatchContext.DiffHistoricalIssues = fromSnapshot.Issues
-				diffDispatchContext.DiffFromDataHash = historicalCtx.DataHash
-				diffDispatchContext.DiffResolvedRevision = revision
+				diffDispatchContext.Diff = diffRes.Diff
+				diffDispatchContext.DiffHistoricalIssues = diffRes.HistoricalIssues
+				diffDispatchContext.DiffFromDataHash = diffRes.FromDataHash
+				diffDispatchContext.DiffResolvedRevision = diffRes.FromRevision
 				dispatchRobotFlagOrExit(&phaseTwoRobotRegistry, "robot-diff", diffDispatchContext)
 			} else {
 				// Human-readable output
-				printDiffSummary(diff, *diffSince)
+				printDiffSummary(diffRes.Diff, *diffSince)
 			}
 			exitCLI(0)
 		}
@@ -5684,6 +5672,14 @@ func main() {
 			if err != nil {
 				return err
 			}
+			if *diffSince != "" {
+				if options.Template != "" {
+					return fmt.Errorf("--diff-since cannot be combined with custom --export-template; omit --diff-since or use built-in markdown, html, or json format")
+				}
+				if options.Format != "markdown" && options.Format != "html" && options.Format != "json" {
+					return fmt.Errorf("--diff-since is only supported with markdown, html, or json export formats (got %q)", options.Format)
+				}
+			}
 			if activeRecipe != nil {
 				options.View = activeRecipe.View
 				if len(activeRecipe.Metrics) > 0 {
@@ -5746,6 +5742,9 @@ func main() {
 				reportAnalyzer := analysis.NewAnalyzer(graphIssuesForReport)
 				reportAnalyzer.SetNow(options.GeneratedAt)
 				reportAnalyzer.SetReadinessScope(readiness, candidateIDs)
+				if _, fbWeights := loadRobotFeedbackForContext(robotDispatchContext); fbWeights != nil {
+					reportAnalyzer.SetWeights(*fbWeights)
+				}
 				if robotDispatchContext.RecipeUnblockIDs != nil {
 					reportAnalyzer.SetUnblockScope(robotDispatchContext.RecipeUnblockIDs)
 				}
@@ -5801,6 +5800,15 @@ func main() {
 			options.AsOfCommit = envelope.AsOfCommit
 			options.NotReadyLabels = resolveNotReadyLabels(phaseThreeRobotHandlerConfig{NotReadyLabels: robotNotReadyLabels})
 			options.IncludeInactive = *robotIncludeInactive
+			if *diffSince != "" {
+				diffRes, diffErr := computeScopedDiffForCLI(robotDispatchContext, *diffSince, projectDir, *workspaceConfig, *repoFilter, *labelScope, *recipeName, recipeForScope, asOfResolved, *forceFullAnalysis)
+				if diffErr != nil {
+					fmt.Fprintf(os.Stderr, "Error computing diff since %s: %v\n", *diffSince, diffErr)
+					exitCLI(1)
+				}
+				options.Diff = diffRes.Diff
+				options.DiffSince = *diffSince
+			}
 			content, err := export.GenerateReport(reportIssues, issuesForSearch, options)
 			if err != nil {
 				return fmt.Errorf("rendering report: %w", err)
@@ -9517,6 +9525,9 @@ jq '.Velocity' insights.json
 
 # List critical-path keystones
 jq '.Keystones[:5]' insights.json
+
+# Top operational risk issues (churn, fan variance, cross-repo, stale blocked)
+jq '(.high_risk // [])[:5] | map({issue_id, composite_risk, explanation})' insights.json
 ` + "```" + `
 
 ## Additional Analytical Files (emitted when applicable)
@@ -9544,6 +9555,9 @@ jq '(.sprints // [])[] | {id, name, on_track: .burndown.on_track, remaining: .bu
 # Code hotspots & suspicious orphan commits (with --pages-include-history)
 jq '(.file_hotspots // [])[:5] | .[] | {path, open_beads, co_changed}' history.json
 jq '(.orphans // [])[] | {short_sha, suspicion_score, probable_bead_id, confirm_command}' history.json
+
+# Snapshot changelog since a git ref (with --diff-since <ref>)
+jq '{since: .diff_since, from: .resolved_revision, summary: .diff.summary, added: [.diff.new_issues[].id], closed: [.diff.closed_issues[].id]}' diff.json
 ` + "```" + `
 
 ## Combining Files
@@ -11761,6 +11775,7 @@ func generateRobotSchemas() RobotSchemas {
 				"Slack":             robotNullableArraySchema(map[string]interface{}{"type": "object"}),
 				"Velocity":          map[string]interface{}{"type": []string{"object", "null"}},
 				"top_what_ifs":      map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "object"}},
+				"high_risk":         map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "object"}},
 				"advanced_insights": map[string]interface{}{"type": "object"},
 				"usage_hints":       map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
 			},
@@ -13076,7 +13091,7 @@ func robotBlockerChainEntrySchema() map[string]interface{} {
 }
 
 func robotWhatIfOutputSchema() map[string]interface{} {
-	return robotFileCommandOutputSchema("Robot What-If Output", "Simulated downstream unblock impact of completing an issue", map[string]interface{}{
+	schema := robotFileCommandOutputSchema("Robot What-If Output", "Simulated downstream unblock impact of completing one or more comma-separated issues", map[string]interface{}{
 		"result": map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
@@ -13088,7 +13103,26 @@ func robotWhatIfOutputSchema() map[string]interface{} {
 			},
 			"required": []string{"issue_id", "title", "status", "priority", "delta"},
 		},
-	}, []string{"generated_at", "data_hash", "output_format", "version", "result"})
+		"batch_result": map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"issue_ids":         map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+				"issues":            map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "object"}},
+				"missing_ids":       map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+				"active_count":      map[string]interface{}{"type": "integer"},
+				"synergy_unblocks":  map[string]interface{}{"type": "integer"},
+				"synergy_issue_ids": map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+				"delta":             whatIfDeltaSchema(),
+			},
+			"required": []string{"issue_ids", "issues", "active_count", "synergy_unblocks", "delta"},
+		},
+		"usage_hints": map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+	}, []string{"generated_at", "data_hash", "output_format", "version"})
+	schema["anyOf"] = []map[string]interface{}{
+		{"required": []string{"result"}},
+		{"required": []string{"batch_result"}},
+	}
+	return schema
 }
 
 func robotCheckDepOutputSchema() map[string]interface{} {
@@ -13655,7 +13689,7 @@ func cliModifierFlagRules(isNonTUICLIInvocation bool) []modifierFlagRule {
 			"export-pages", "emit-script", "priority-brief", "agent-brief",
 		}},
 		{modifier: "robot-not-ready-labels", requires: []string{
-			"robot-triage", "robot-triage-by-track", "robot-triage-by-label", "robot-next",
+			"robot-triage", "robot-triage-by-track", "robot-triage-by-label", "robot-next", "robot-plan",
 			"emit-script", "priority-brief", "agent-brief", "export", "export-md", "export-pages", "pages", "export-graph",
 		}},
 		{modifier: "min-confidence", requires: []string{"robot-history", "bead-history", "robot-commit"}},
@@ -13866,6 +13900,151 @@ type exportSprintsDocument struct {
 	ActiveSprintID string              `json:"active_sprint_id,omitempty"`
 	SprintCount    int                 `json:"sprint_count"`
 	Sprints        []exportSprintEntry `json:"sprints"`
+}
+
+type cliScopedDiffResult struct {
+	Diff             *analysis.SnapshotDiff
+	HistoricalIssues []model.Issue
+	FromDataHash     string
+	FromRevision     string
+	ToRevision       string
+}
+
+func computeScopedDiffForCLI(
+	ctx RobotContext,
+	diffSinceSpec string,
+	projectDir string,
+	workspaceConfig string,
+	repoFilter string,
+	labelScope string,
+	recipeName string,
+	recipeForScope *recipe.Recipe,
+	asOfResolved string,
+	forceFullAnalysis bool,
+) (*cliScopedDiffResult, error) {
+	var (
+		historicalIssues   []model.Issue
+		histAuthoritySlice []model.Issue
+		revision           string
+		histCommitTime     time.Time
+	)
+	if workspaceConfig != "" && ctx.SourceAuthority != nil {
+		wsHistIssues, wsAuthIssues, wsRev, wsTime, wsErr := loadWorkspaceHistoricalDiffSource(ctx, diffSinceSpec)
+		if wsErr != nil {
+			return nil, fmt.Errorf("loading workspace issues at %s: %w", diffSinceSpec, wsErr)
+		}
+		historicalIssues = wsHistIssues
+		histAuthoritySlice = wsAuthIssues
+		revision = wsRev
+		histCommitTime = wsTime
+	} else {
+		gitLoader := loader.NewGitLoader(projectDir)
+		histReport, err := gitLoader.LoadAtWithReport(diffSinceSpec)
+		if err != nil {
+			return nil, fmt.Errorf("loading issues at %s: %w", diffSinceSpec, err)
+		}
+		historicalIssues = histReport.Issues
+		histAuthoritySlice = make([]model.Issue, 0, len(historicalIssues)+len(histReport.TombstoneIDs))
+		histAuthoritySlice = append(histAuthoritySlice, historicalIssues...)
+		for _, id := range histReport.TombstoneIDs {
+			histAuthoritySlice = append(histAuthoritySlice, model.Issue{ID: id, Status: model.StatusTombstone})
+		}
+		revision = histReport.CommitSHA
+		if revision == "" {
+			revision, err = gitLoader.ResolveRevision(diffSinceSpec)
+			if err != nil {
+				revision = diffSinceSpec
+			}
+		}
+		histCommitTime = histReport.CommitTime
+	}
+	historicalCtx, scopeErr := scopeLoadedIssues(RobotContext{
+		Issues:            historicalIssues,
+		Readiness:         model.NewReadinessIndex(histAuthoritySlice),
+		AsOf:              diffSinceSpec,
+		AsOfCommit:        revision,
+		AsOfCommitTime:    histCommitTime,
+		Repo:              repoFilter,
+		LabelScope:        labelScope,
+		Recipe:            recipeName,
+		ForceFullAnalysis: forceFullAnalysis,
+	}, recipeForScope)
+	if scopeErr != nil {
+		return nil, scopeErr
+	}
+
+	fromTime := histCommitTime.UTC()
+	if fromTime.IsZero() {
+		fromTime = historicalCtx.ReferenceNow()
+	}
+	fromSnapshot := newScopedSnapshotForCLI(historicalCtx.GraphIssues(), historicalCtx.Readiness, historicalCtx.CandidateIDs, fromTime, revision, forceFullAnalysis)
+	toRev := "HEAD"
+	if asOfResolved != "" {
+		toRev = asOfResolved
+	}
+	toSnapshot := newScopedSnapshotForCLI(ctx.GraphIssues(), ctx.Readiness, ctx.CandidateIDs, ctx.ReferenceNow(), toRev, forceFullAnalysis)
+
+	diff := analysis.CompareSnapshots(fromSnapshot, toSnapshot)
+	if historicalCtx.CandidateIDs != nil || ctx.CandidateIDs != nil {
+		if ctx.CandidateIDs != nil {
+			diff.NewCycles = filterCyclesForCandidates(diff.NewCycles, ctx.CandidateIDs)
+			if diff.NewCycles == nil {
+				diff.NewCycles = [][]string{}
+			}
+		}
+		if historicalCtx.CandidateIDs != nil {
+			diff.ResolvedCycles = filterCyclesForCandidates(diff.ResolvedCycles, historicalCtx.CandidateIDs)
+			if diff.ResolvedCycles == nil {
+				diff.ResolvedCycles = [][]string{}
+			}
+		}
+		fromCycles := len(filterCyclesForCandidates(fromSnapshot.Stats.Cycles(), historicalCtx.CandidateIDs))
+		toCycles := len(filterCyclesForCandidates(toSnapshot.Stats.Cycles(), ctx.CandidateIDs))
+		diff.MetricDeltas.CycleCount = toCycles - fromCycles
+		diff.Summary.CyclesIntroduced = len(diff.NewCycles)
+		diff.Summary.CyclesResolved = len(diff.ResolvedCycles)
+	}
+	return &cliScopedDiffResult{
+		Diff:             diff,
+		HistoricalIssues: fromSnapshot.Issues,
+		FromDataHash:     historicalCtx.DataHash,
+		FromRevision:     revision,
+		ToRevision:       toRev,
+	}, nil
+}
+
+func buildExportDiffPayload(ctx RobotContext, diffSinceSpec string, res *cliScopedDiffResult) ([]byte, error) {
+	if res == nil || res.Diff == nil {
+		return nil, nil
+	}
+	diffCopy := *res.Diff
+	diffCopy.ToTimestamp = ctx.ReferenceNow()
+	fromDataHash := res.FromDataHash
+	if fromDataHash == "" {
+		fromDataHash = analysis.ComputeDataHash(res.HistoricalIssues)
+	}
+	diffCtx := ctx
+	diffCtx.Command = "robot-diff"
+	payload := struct {
+		RobotEnvelope
+		DiffSince        string                 `json:"diff_since,omitempty"`
+		ResolvedRevision string                 `json:"resolved_revision"`
+		FromRevision     string                 `json:"from_revision,omitempty"`
+		ToRevision       string                 `json:"to_revision,omitempty"`
+		FromDataHash     string                 `json:"from_data_hash"`
+		ToDataHash       string                 `json:"to_data_hash"`
+		Diff             *analysis.SnapshotDiff `json:"diff"`
+	}{
+		RobotEnvelope:    diffCtx.EnvelopeWithHash(ctx.DataHash),
+		DiffSince:        diffSinceSpec,
+		ResolvedRevision: res.FromRevision,
+		FromRevision:     res.FromRevision,
+		ToRevision:       res.ToRevision,
+		FromDataHash:     fromDataHash,
+		ToDataHash:       ctx.DataHash,
+		Diff:             &diffCopy,
+	}
+	return json.MarshalIndent(payload, "", "  ")
 }
 
 func buildExportSprintsPayload(ctx RobotContext, workDir string, exportIssues []model.Issue, stats *analysis.GraphStats, now time.Time) ([]byte, int, error) {
