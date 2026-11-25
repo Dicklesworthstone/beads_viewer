@@ -20,7 +20,9 @@ if [ "$source_check" -eq 1 ] && [ "$dir" != pkg/export/viewer_assets/vendor ]; t
 fi
 manifest="$dir/MANIFEST.json"
 [ -f "$manifest" ] || { echo "verify_vendor: missing $manifest" >&2; exit 1; }
-command -v jq >/dev/null || { echo "verify_vendor: jq is required" >&2; exit 2; }
+for tool in jq sha256sum; do
+  command -v "$tool" >/dev/null || { echo "INCOMPLETE: verify_vendor: $tool is required" >&2; exit 2; }
+done
 
 problems=0
 listed=0

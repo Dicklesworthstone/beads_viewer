@@ -89,6 +89,39 @@ trackers can accept those stale claims. The guard shipped in
 [br v0.6.0](https://github.com/Dicklesworthstone/beads_rust/releases/tag/v0.6.0).
 A per-run tools directory is sufficient; the tests create fresh tracker fixtures.
 
+### Required tooling
+
+The repository does not vendor or install these. A complete gate needs all of
+them on PATH. Because the pinned Rust compiler for the graph-WASM rebuild is
+`x86_64-unknown-linux-gnu`, a complete gate runs only on an x86_64 Linux host;
+other hosts can run every other stage for diagnostics.
+
+| Tool | Version | Used by | If absent |
+|------|---------|---------|-----------|
+| Go | exactly the `go.mod` version (Go 1.26.11), `GOTOOLCHAIN=local` | every stage | the gate refuses to start |
+| Python 3, Git | any current release | receipts, source digest, archive checks | the gate refuses to start |
+| `jq` | any | stages 7 and 9 | stage SKIPPED |
+| `sha256sum` | GNU coreutils or compatible | stages 7 and 8 | stage 7 SKIPPED, stage 8 FAILED |
+| `rustup` with `nightly-2026-08-31-x86_64-unknown-linux-gnu`, its `wasm32-unknown-unknown` target, and a populated Cargo registry cache | pinned in `scripts/build_graph_wasm.sh` | stage 7 (graph-WASM source rebuild), stage 10 (`graph_wasm_test.sh`) | stage SKIPPED |
+| `wasm-bindgen` | 0.2.128, the exact executable whose SHA-256 is pinned in `scripts/build_graph_wasm.sh` (`WASM_BINDGEN` selects another path) | stages 7 and 10 | missing: SKIPPED; another version or build: FAILED |
+| `wasm-opt` (Binaryen) | version 132, the pinned executable (`WASM_OPT` selects another path) | stages 7 and 10 | missing: SKIPPED; another version or build: FAILED |
+| Node.js | with WebAssembly support | stage 10 (`graph_wasm_test.sh`) | stage SKIPPED |
+| GoReleaser | v2.18.1, the version the retained release workflow pins | stage 10 packaging test, `release_gate.sh package` | stage SKIPPED; `package` fails closed |
+| PowerShell (`pwsh`, or `PWSH=/path`) | 7.x | stage 10 (`install_ps1_test.sh`) | stage SKIPPED |
+| `govulncheck` | v1.9.0 | stage 11 | the gate installs the pinned version itself (needs network) |
+| `br` | 0.6.0 or newer | live-tracker e2e tests | those tests skip; the stage still runs |
+
+`scripts/release_gate.sh preflight` checks all of these without building
+anything. It reads the graph-WASM pins from `scripts/build_graph_wasm.sh`,
+compares each tool's reported version and executable hash, and lists every
+missing or mismatched prerequisite in `missing_prerequisites`, on stderr, and
+in `release_eligible_if_run_now`. `scripts/release_gate.sh run` prints the same
+list before stage 1 and continues for diagnostics. A helper that reports
+`INCOMPLETE:` and exits 2 because a tool is absent is recorded as SKIPPED, so
+the summary separates "this host lacks the tooling" (`INCOMPLETE`, exit 2) from
+a failed check (`FAILED`, exit 1). Either way the receipt is ineligible and
+packaging refuses it.
+
 For RCH, use a complete sanitized clone and transfer settings that preserve
 Git history and tracked Beads data. Set `TMPDIR` in the remote command to an
 existing directory outside that clone, for example

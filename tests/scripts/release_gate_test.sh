@@ -134,6 +134,12 @@ if [[ "$0" = *check_action_pins.sh ]] && [ "${FIXTURE_STAGE_FAIL:-0}" = 1 ]; the
   echo 'planted fixture stage failure' >&2
   exit 23
 fi
+if [[ "$0" = *verify_vendor.sh ]]; then
+  case "${FIXTURE_VENDOR_EXIT:-}" in
+    incomplete) echo 'INCOMPLETE: planted fixture tool unavailable' >&2; exit 2 ;;
+    unmarked) echo 'planted fixture exit 2 without an INCOMPLETE line' >&2; exit 2 ;;
+  esac
+fi
 echo "fixture helper: $0"
 SH
   chmod +x "$fixture/$script"
@@ -395,6 +401,61 @@ reject missing-receipt 'missing RELEASE_GATE_RECEIPT' env RELEASE_GATE_RECEIPT= 
 
 run_gate failed "$fixture" 1 FIXTURE_STAGE_FAIL=1
 reject failed-stage diagnostic env RELEASE_GATE_RECEIPT="$gate_receipt" bash "$fixture/scripts/release_gate.sh" verify-source
+
+# A helper that reports INCOMPLETE (exit 2) lacks tooling on this host: the
+# stage is SKIPPED and the run incomplete, never passed and never "failed".
+# Exit 2 without that line is an ordinary failure.
+run_gate incomplete-tool "$fixture" 2 FIXTURE_VENDOR_EXIT=incomplete
+python3 - "$gate_receipt" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1]))
+assert r['eligible'] is False
+row = r['stages'][6]
+assert (row['name'], row['status'], row['exit_code']) == ('vendor-hashes', 'skipped', 200), row
+assert [s['name'] for s in r['stages'] if s['status'] != 'passed'] == ['vendor-hashes'], r['stages']
+PY
+grep -q '^7  vendor-hashes  SKIPPED' "$tmp/gate-incomplete-tool.log" || { cat "$tmp/gate-incomplete-tool.log"; fail 'INCOMPLETE helper not shown as SKIPPED'; }
+grep -q '0 failed, 1 skipped' "$tmp/gate-incomplete-tool.log" || { cat "$tmp/gate-incomplete-tool.log"; fail 'INCOMPLETE helper counted as a failure'; }
+if grep -q 'RELEASE GATE PASSED' "$tmp/gate-incomplete-tool.log"; then fail 'INCOMPLETE helper produced a passing gate'; fi
+reject incomplete-tool diagnostic env RELEASE_GATE_RECEIPT="$gate_receipt" bash "$fixture/scripts/release_gate.sh" verify-source
+run_gate unmarked-exit-2 "$fixture" 1 FIXTURE_VENDOR_EXIT=unmarked
+python3 - "$gate_receipt" <<'PY'
+import json, sys
+row = json.load(open(sys.argv[1]))['stages'][6]
+assert (row['name'], row['status'], row['exit_code']) == ('vendor-hashes', 'failed', 2), row
+PY
+echo 'ok: INCOMPLETE helper exit is SKIPPED (ineligible); unmarked exit 2 stays FAILED'
+
+# Preflight names every missing or mismatched prerequisite in one list, reading
+# the graph-WASM pins from the real build script, and never calls them eligible.
+wasm_pins="$(clone_fixture wasm-pins)"
+cp "$root/scripts/build_graph_wasm.sh" "$wasm_pins/scripts/build_graph_wasm.sh"
+commit_fixture "$wasm_pins" 'fixture with the real graph-WASM build script'
+printf '#!/usr/bin/env bash\necho "wrong-tool 0.0.0"\n' >"$tmp/tools/wrong-version"
+chmod +x "$tmp/tools/wrong-version"
+env WASM_BINDGEN="$tmp/tools/wrong-version" WASM_OPT="$tmp/no-such-wasm-opt" PWSH="$tmp/tools/pwsh-fixture" \
+  bash "$wasm_pins/scripts/release_gate.sh" preflight >"$tmp/preflight-wasm.json" 2>"$tmp/preflight-wasm.err" || {
+  cat "$tmp/preflight-wasm.json" "$tmp/preflight-wasm.err"; fail 'preflight with missing tools must report, not abort'; }
+python3 - "$tmp/preflight-wasm.json" "$tmp/tools/wrong-version" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1]))
+pins = r['graph_wasm']['pins']
+assert all(pins.get(k) for k in ('toolchain', 'target', 'host', 'wasm_bindgen', 'wasm_opt',
+                                 'wasm_bindgen_sha256', 'wasm_opt_sha256')), pins
+missing = r['missing_prerequisites']
+assert any(f"at {sys.argv[2]} reports 'wrong-tool 0.0.0'; need {pins['wasm_bindgen']!r}" in m for m in missing), missing
+assert any(m.endswith(f"wasm-opt not found (need {pins['wasm_opt']})") for m in missing), missing
+assert r['graph_wasm']['ready'] is False and r['release_eligible_if_run_now'] is False
+PY
+grep -q 'a complete gate cannot pass on this host' "$tmp/preflight-wasm.err" || { cat "$tmp/preflight-wasm.err"; fail 'preflight did not summarize missing prerequisites'; }
+env PWSH="$tmp/tools/pwsh-fixture" bash "$fixture/scripts/release_gate.sh" preflight >"$tmp/preflight-no-script.json" 2>/dev/null || fail 'preflight aborted without the build script'
+python3 - "$tmp/preflight-no-script.json" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1]))
+assert 'graph WASM (stage 7, stage 10): cannot read scripts/build_graph_wasm.sh' in r['missing_prerequisites'], r
+assert r['release_eligible_if_run_now'] is False
+PY
+echo 'ok: preflight lists missing and mismatched graph-WASM tools from the build script pins'
 run_gate no-pwsh "$fixture" 2 PWSH=/no/such/pwsh
 reject missing-pwsh diagnostic env RELEASE_GATE_RECEIPT="$gate_receipt" bash "$fixture/scripts/release_gate.sh" verify-source
 

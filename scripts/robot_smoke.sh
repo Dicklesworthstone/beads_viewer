@@ -22,7 +22,7 @@ if [ -z "$bv" ]; then
   bv="$tmp/bv"
   (cd "$root" && go build -o "$bv" ./cmd/bv)
 fi
-command -v jq >/dev/null || { echo "robot_smoke: jq is required" >&2; exit 2; }
+command -v jq >/dev/null || { echo "INCOMPLETE: robot_smoke: jq is required" >&2; exit 2; }
 
 # Non-mutating commands executed against both the target repository and the
 # synthetic fixture. Format: command_name|args|json?(1/0)

@@ -22,6 +22,11 @@
 #                      stays a manual run (tests/scripts/verify_isomorphic_test.sh).
 #  11 vulnerabilities  pinned source-mode govulncheck for every release target
 #
+# External tools (goreleaser, pwsh, node, jq, sha256sum, rustup with the pinned
+# nightly, wasm-bindgen, wasm-opt) are listed in docs/RELEASING.md under
+# "Required tooling"; `preflight` and the start of `run` name any that are
+# missing. A helper that prints `INCOMPLETE:` and exits 2 is recorded SKIPPED.
+#
 # Environment:
 #   RELEASE_GATE_SKIP="7 8"        skip listed stages (each skip is logged as
 #                                  SKIPPED; incomplete diagnostic run exits 2)
@@ -184,6 +189,89 @@ def toolchain():
 def dataset():
     path = root / "tests/testdata/benchmark/medium.jsonl"
     return {"path": str(path.relative_to(root)), "sha256": digest(path) if path.is_file() else None}
+
+def tool_output(*argv):
+    try:
+        return subprocess.run(argv, cwd=root, capture_output=True, text=True, timeout=60).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+def graph_wasm_prerequisites():
+    # Stage 7 rebuilds the shipped graph WASM with exact pinned tools. Read the
+    # pins from the build script rather than copying them here: that script is
+    # a fingerprinted pipeline input, so it stays the single source of truth.
+    # Mirrors its prerequisite checks without building or downloading anything.
+    problems = []
+    try:
+        text = (root / "scripts/build_graph_wasm.sh").read_text()
+    except OSError:
+        return {"ready": False, "pins": {}, "problems": ["cannot read scripts/build_graph_wasm.sh"]}
+    patterns = {
+        "toolchain": r"^toolchain=(\S+)$",
+        "target": r"^target=(\S+)$",
+        "host": r"'host: ([\w.-]+)'",
+        "wasm_bindgen": r"= '(wasm-bindgen [^']+)' \] \|\| fail",
+        "wasm_opt": r"= '(wasm-opt version [^']+)' \] \|\| fail",
+        "wasm_bindgen_sha256": r'sha256sum "\$bindgen".*= ([0-9a-f]{64}) \]',
+        "wasm_opt_sha256": r'sha256sum "\$wasmopt".*= ([0-9a-f]{64}) \]',
+    }
+    pins = {}
+    for key, pattern in patterns.items():
+        match = re.search(pattern, text, re.M)
+        pins[key] = match.group(1) if match else None
+        if not match:
+            problems.append(f"cannot read the {key} pin from scripts/build_graph_wasm.sh")
+    rustup = shutil.which("rustup")
+    toolchain, target, host = pins["toolchain"], pins["target"], pins["host"]
+    if not rustup:
+        problems.append("rustup not found")
+    elif toolchain and host:
+        if f"{toolchain}-{host}" not in tool_output(rustup, "toolchain", "list"):
+            problems.append(f"Rust {toolchain}-{host} is not installed (the pinned rebuild runs on that host only)")
+        elif target and target not in tool_output(rustup, "target", "list", "--installed", "--toolchain", toolchain):
+            problems.append(f"Rust target {target} is not installed for {toolchain}")
+    for name, override, version_key, hash_key in (
+            ("wasm-bindgen", "WASM_BINDGEN", "wasm_bindgen", "wasm_bindgen_sha256"),
+            ("wasm-opt", "WASM_OPT", "wasm_opt", "wasm_opt_sha256")):
+        want = pins[version_key]
+        path = shutil.which(os.environ.get(override) or name)
+        if not path:
+            problems.append(f"{name} not found (need {want})")
+            continue
+        reported = tool_output(path, "--version").strip()
+        try:
+            actual = digest(path)
+        except OSError:
+            actual = None
+        if reported != want:
+            problems.append(f"{name} at {path} reports {reported or 'nothing'!r}; need {want!r}")
+        elif pins[hash_key] and actual != pins[hash_key]:
+            problems.append(f"{name} at {path} is {want} but not the pinned executable (sha256 differs)")
+    cargo_home = pathlib.Path(os.environ.get("CARGO_HOME") or pathlib.Path.home() / ".cargo")
+    if not (cargo_home / "registry").is_dir():
+        problems.append(f"no Cargo registry cache at {cargo_home / 'registry'} (the rebuild is offline)")
+    return {"ready": not problems, "pins": pins, "problems": problems}
+
+def host_prerequisites():
+    # External tools a complete gate needs beyond Go and Python. Each missing
+    # one makes a stage SKIPPED (or FAILED) and the receipt ineligible.
+    pwsh_cmd = os.environ.get("PWSH", "pwsh")
+    found = {"goreleaser": shutil.which("goreleaser"), "pwsh": shutil.which(pwsh_cmd),
+             "node": shutil.which("node")}
+    graph_wasm = graph_wasm_prerequisites()
+    missing = []
+    if not found["goreleaser"]:
+        missing.append("goreleaser: not found (stage 10 packaging test skipped; package fails closed)")
+    if not found["pwsh"]:
+        missing.append(f"{pwsh_cmd}: not found (stage 10 install_ps1_test skipped; set PWSH=/path/to/pwsh)")
+    if not found["node"]:
+        missing.append("node: not found (stage 10 graph_wasm_test skipped)")
+    if not shutil.which("jq"):
+        missing.append("jq: not found (stages 7 and 9 skipped)")
+    if not shutil.which("sha256sum"):
+        missing.append("sha256sum: not found (stage 7 skipped, stage 8 fails)")
+    missing.extend(f"graph WASM (stage 7, stage 10): {problem}" for problem in graph_wasm["problems"])
+    return found, graph_wasm, missing
 
 def load():
     if receipt_path is None or not outside(receipt_path).is_file():
@@ -445,10 +533,10 @@ try:
         ds = dataset()
         if ds["sha256"] is None:
             fail(f"missing frozen benchmark dataset: {ds['path']}")
-        pwsh_cmd = os.environ.get("PWSH", "pwsh")
-        goreleaser_bin = shutil.which("goreleaser")
-        pwsh_bin = shutil.which(pwsh_cmd)
+        found, graph_wasm, missing = host_prerequisites()
+        goreleaser_bin, pwsh_bin, node_bin = found["goreleaser"], found["pwsh"], found["node"]
         shellcheck_bin = shutil.which("shellcheck")
+        br_bin = shutil.which("br")
         govulncheck_bin = shutil.which("govulncheck")
         govulncheck_status = "install_on_audit_v1.9.0"
         if govulncheck_bin:
@@ -459,11 +547,6 @@ try:
             # (ValueError) and unreadable build info through `go version -m`.
             except (ValueError, subprocess.CalledProcessError):
                 govulncheck_status = f"path_unpinned_will_install_v1.9.0 ({govulncheck_bin})"
-        skip_helpers = []
-        if not goreleaser_bin:
-            skip_helpers.append("goreleaser (stage 10 packaging live-run skipped; package subcommand fails closed)")
-        if not pwsh_bin:
-            skip_helpers.append(f"{pwsh_cmd} (stage 10 install_ps1_test skipped)")
         clean_source = not src["dirty"] and not src["ignored_build_inputs"]
         report = {
             "clean_source": clean_source,
@@ -477,14 +560,26 @@ try:
             "helpers": {
                 "goreleaser": goreleaser_bin or "missing (skip-200 in stage 10; fail-closed in package)",
                 "pwsh": pwsh_bin or "missing (skip-200 in stage 10)",
+                "node": node_bin or "missing (skip-200 in stage 10)",
                 "shellcheck": shellcheck_bin or "missing (optional static lint)",
+                "br": br_bin or "missing (optional; live-tracker e2e tests skip)",
             },
-            "release_eligible_if_run_now": bool(clean_source and goreleaser_bin and pwsh_bin),
-            "stage_10_skip_notes": skip_helpers,
+            "graph_wasm": graph_wasm,
+            "missing_prerequisites": missing,
+            "release_eligible_if_run_now": bool(clean_source and not missing),
+            "stage_10_skip_notes": [line for line in missing if "stage 10" in line],
         }
         print(json.dumps(report, indent=2, sort_keys=True))
+        if missing:
+            print("preflight: a complete gate cannot pass on this host until these are installed"
+                  " (see docs/RELEASING.md, Required tooling):", file=sys.stderr)
+            for line in missing:
+                print(f"  - {line}", file=sys.stderr)
         if not clean_source and os.environ.get("RELEASE_GATE_ALLOW_DIRTY_PREFLIGHT") != "1":
             fail("preflight found dirty or undeclared build inputs (commit/clean before release gate)")
+    elif mode == "prerequisites":
+        for line in host_prerequisites()[2]:
+            print(line)
     elif mode == "audit":
         audit_source()
     elif mode == "init":
@@ -653,6 +748,15 @@ receipt init "${diagnostic_env[@]}" || exit 1
 log="$output/gate.log"
 : >"$log"
 echo "release gate $ts on $(git rev-parse --short HEAD) ($(go version)); receipt: $RELEASE_GATE_RECEIPT" | tee -a "$log"
+# Name every missing external tool now rather than one at a time when its
+# stage runs. The run continues for diagnostics; it cannot become eligible.
+prerequisites="$(receipt prerequisites)" || exit 1
+if [ -n "$prerequisites" ]; then
+  {
+    echo "missing prerequisites (the stages that need them will be SKIPPED or FAILED; this run cannot be eligible):"
+    printf '%s\n' "$prerequisites" | sed 's/^/  - /'
+  } | tee -a "$log"
+fi
 
 skip_list=" ${RELEASE_GATE_SKIP:-} "
 failed=()
@@ -738,7 +842,10 @@ docs_parity() {
 
 script_stage() {
   # script_stage <path> <args...>: run a helper script, honouring RELEASE_GATE_ALLOW_MISSING.
-  local script="$1"; shift
+  # A helper that exits 2 after an `INCOMPLETE:` line could not run on this
+  # host (a pinned tool, compiler or cache is absent). Record that as SKIPPED,
+  # which keeps the receipt ineligible, rather than as a failed check.
+  local script="$1" transcript status; shift
   if [ ! -x "$script" ]; then
     if [ "${RELEASE_GATE_ALLOW_MISSING:-0}" = "1" ]; then
       echo "MISSING_OK $script"
@@ -747,7 +854,14 @@ script_stage() {
     echo "missing helper script $script (set RELEASE_GATE_ALLOW_MISSING=1 to skip while it is pending)"
     return 1
   fi
-  "$script" "$@"
+  transcript="$output/$(basename "$script").out"
+  "$script" "$@" 2>&1 | tee "$transcript"
+  status=${PIPESTATUS[0]}
+  if [ "$status" -eq 2 ] && grep -q '^INCOMPLETE: ' "$transcript"; then
+    echo "INCOMPLETE_SKIP $script: required tooling is unavailable here; run scripts/release_gate.sh preflight"
+    return 200
+  fi
+  return "$status"
 }
 
 benchmarks() {
