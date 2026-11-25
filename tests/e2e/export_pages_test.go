@@ -3184,7 +3184,22 @@ func TestExportPages_RecordsLoadSizes(t *testing.T) {
 	} else {
 		t.Fatalf("stat repository Git metadata: %v", err)
 	}
-	var total, vendor int64
+	// Optional companions are absent when the tracker has nothing to put in them.
+	optionalSize := func(rel string) *int64 {
+		info, err := os.Stat(filepath.Join(out, rel))
+		if os.IsNotExist(err) {
+			return nil
+		}
+		if err != nil {
+			t.Fatalf("bundle file %s: %v", rel, err)
+		}
+		n := info.Size()
+		return &n
+	}
+	// chunks_total is the chunked copy of beads.sqlite3 written above the 5 MiB
+	// threshold. The viewer fetches the chunks or the whole file, never both, so
+	// it counts toward the deployed bundle but not toward one visitor's download.
+	var total, vendor, chunks int64
 	if err := filepath.Walk(out, func(path string, info os.FileInfo, err error) error {
 		if err != nil || info.IsDir() {
 			return err
@@ -3192,6 +3207,9 @@ func TestExportPages_RecordsLoadSizes(t *testing.T) {
 		total += info.Size()
 		if strings.Contains(path, string(filepath.Separator)+"vendor"+string(filepath.Separator)) {
 			vendor += info.Size()
+		}
+		if strings.HasPrefix(path, filepath.Join(out, "chunks")+string(filepath.Separator)) {
+			chunks += info.Size()
 		}
 		return nil
 	}); err != nil {
@@ -3209,20 +3227,25 @@ func TestExportPages_RecordsLoadSizes(t *testing.T) {
 		t.Fatalf("graph_layout.json decode: %v", err)
 	}
 
+	ptr := func(n int64) *int64 { return &n }
+	members := map[string]*int64{
+		"index_html":        ptr(size("index.html")),
+		"beads_sqlite3":     ptr(size("beads.sqlite3")),
+		"chunks_total":      ptr(chunks),
+		"graph_layout_json": ptr(int64(len(layoutBytes))),
+		"triage_json":       ptr(size(filepath.Join("data", "triage.json"))),
+		"history_json":      historyBytes,
+		"labels_json":       optionalSize(filepath.Join("data", "labels.json")),
+		"suggestions_json":  optionalSize(filepath.Join("data", "suggestions.json")),
+		"vendor_total":      ptr(vendor),
+		"bundle_total":      ptr(total),
+	}
 	record := map[string]any{
-		"generated_at":   time.Now().UTC().Format(time.RFC3339),
-		"issues":         layout.NodeCount,
-		"edges":          layout.EdgeCount,
-		"history_status": historyStatus,
-		"bytes": map[string]any{
-			"index_html":        size("index.html"),
-			"beads_sqlite3":     size("beads.sqlite3"),
-			"graph_layout_json": int64(len(layoutBytes)),
-			"triage_json":       size(filepath.Join("data", "triage.json")),
-			"history_json":      historyBytes,
-			"vendor_total":      vendor,
-			"bundle_total":      total,
-		},
+		"generated_at":    time.Now().UTC().Format(time.RFC3339),
+		"issues":          layout.NodeCount,
+		"edges":           layout.EdgeCount,
+		"history_status":  historyStatus,
+		"bytes":           members,
 		"first_render_ms": nil,
 		"note":            "first_render_ms is measured only when BV_HEADLESS_BROWSER names a browser; absent here",
 	}
@@ -3253,18 +3276,105 @@ func TestExportPages_RecordsLoadSizes(t *testing.T) {
 			t.Fatalf("%s is missing; run this test with BV_RECORD_PERF=1 to record it: %v", recordPath, err)
 		}
 		var prior struct {
-			Bytes struct {
-				BundleTotal int64 `json:"bundle_total"`
-			} `json:"bytes"`
+			Bytes map[string]*int64 `json:"bytes"`
 		}
 		if err := json.Unmarshal(committed, &prior); err != nil {
 			t.Fatalf("decode %s: %v", recordPath, err)
 		}
-		if prior.Bytes.BundleTotal > 0 && total > prior.Bytes.BundleTotal*5/4 {
-			t.Fatalf("bundle_total grew from %d to %d bytes (more than 25%%); re-record with BV_RECORD_PERF=1 if intended", prior.Bytes.BundleTotal, total)
+		if recorded := prior.Bytes["bundle_total"]; recorded != nil && *recorded > 0 && total > *recorded*5/4 {
+			t.Fatalf("bundle_total grew from %d to %d bytes (more than 25%%); re-record with BV_RECORD_PERF=1 only once the growth is understood and intended. Per member:\n%s",
+				*recorded, total, bundleGrowthReport(prior.Bytes, members))
 		}
 	}
 	if layout.NodeCount == 0 || size("beads.sqlite3") == 0 {
 		t.Fatalf("bundle should carry the repository's issues")
+	}
+}
+
+// bundleGrowthReport lists every bundle member's recorded and current size,
+// largest growth first, then members the record lacks or the bundle no longer
+// has. A tripped size budget then names what grew instead of only the total.
+func bundleGrowthReport(recorded, current map[string]*int64) string {
+	type row struct {
+		name          string
+		before, after *int64
+		delta         int64
+		compared      bool // present in both the record and the bundle
+	}
+	var rows []row
+	for name, after := range current {
+		before := recorded[name]
+		r := row{name: name, before: before, after: after}
+		if before != nil && after != nil {
+			r.delta, r.compared = *after-*before, true
+		}
+		rows = append(rows, r)
+	}
+	for name, before := range recorded {
+		if _, ok := current[name]; !ok {
+			rows = append(rows, row{name: name, before: before})
+		}
+	}
+	slices.SortFunc(rows, func(a, b row) int {
+		switch {
+		case a.compared != b.compared:
+			if a.compared {
+				return -1
+			}
+			return 1
+		case a.delta != b.delta:
+			if a.delta > b.delta {
+				return -1
+			}
+			return 1
+		}
+		return strings.Compare(a.name, b.name)
+	})
+	var out strings.Builder
+	for _, r := range rows {
+		switch {
+		case r.compared:
+			fmt.Fprintf(&out, "  %s: %d -> %d (%+d)\n", r.name, *r.before, *r.after, r.delta)
+		case r.after != nil:
+			fmt.Fprintf(&out, "  %s: %d (not in the record)\n", r.name, *r.after)
+		case r.before != nil:
+			fmt.Fprintf(&out, "  %s: %d -> absent\n", r.name, *r.before)
+		}
+	}
+	return out.String()
+}
+
+func TestBundleGrowthReport_NamesEachMemberLargestGrowthFirst(t *testing.T) {
+	n := func(v int64) *int64 { return &v }
+	recorded := map[string]*int64{
+		"beads_sqlite3": n(6892544),
+		"history_json":  n(126925),
+		"index_html":    n(366672),
+		"triage_json":   n(15060),
+		"bundle_total":  n(20600571),
+		"retired_json":  n(10),
+		"no_history":    nil,
+	}
+	current := map[string]*int64{
+		"beads_sqlite3": n(7001088),
+		"history_json":  n(2686804),
+		"index_html":    n(494434),
+		"triage_json":   n(4981),
+		"bundle_total":  n(25073259),
+		"labels_json":   n(1368834),
+		"no_history":    nil,
+	}
+	want := strings.Join([]string{
+		"  bundle_total: 20600571 -> 25073259 (+4472688)",
+		"  history_json: 126925 -> 2686804 (+2559879)",
+		"  index_html: 366672 -> 494434 (+127762)",
+		"  beads_sqlite3: 6892544 -> 7001088 (+108544)",
+		"  triage_json: 15060 -> 4981 (-10079)",
+		"  labels_json: 1368834 (not in the record)",
+		"  retired_json: 10 -> absent",
+		"",
+	}, "\n")
+	if got := bundleGrowthReport(recorded, current); got != want {
+		t.Fatalf("bundleGrowthReport mismatch\ngot:\n%s\nwant:\n%s", got, want)
 	}
 }
