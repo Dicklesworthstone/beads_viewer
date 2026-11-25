@@ -30,3 +30,19 @@
 - `go build ./...` - Build successful
 - `go test ./...` - All tests pass (25 packages)
 - `go mod vendor` - Vendor directory synced
+
+---
+
+**Date:** 2026-11-25  |  **Project:** beads_viewer  |  **Language:** Go 1.26.11
+
+`go get -u ./...` offered six updates. One was taken; five were held.
+
+| Module | Old | New | Decision |
+|--------|-----|-----|----------|
+| github.com/charmbracelet/x/exp/slice (indirect, via glamour) | v0.0.0-20260511125431-fe5d686e0c99 | v0.1.0 | updated: the tag is byte-identical to the pseudo-version already in use |
+| github.com/alecthomas/chroma/v2 | v2.24.1 | v2.27.0 | held: patched copy in `third_party/chroma`; bumping `go.mod` alone would not change the code that builds. Upgrade by re-porting the patch (docs/RELEASING.md, "Vendored dependency patches") |
+| github.com/goccy/go-json | v0.10.6 | v0.12.0 | held: patched copy in `third_party/go-json` (decoder-cache fix, docs/PROVENANCE.md), and on the JSONL loader hot path, so an upgrade needs the patch re-ported plus a loader benchmark A/B |
+| modernc.org/libc, modernc.org/memory (indirect) | v1.80.1, v1.12.1 | v1.82.13, v1.13.0 | held: `modernc.org/sqlite` v1.63.0 (the latest) requires exactly libc v1.80.1; modernc.org/sqlite must run with the libc version it was generated against |
+| github.com/xo/terminfo (indirect, via colorprofile) | v0.0.0-20220910002029-abceb7e1c41e | v1.3.1 | held: v1 changes color-level detection (a terminal whose terminfo reports 8-16 colors gets basic color instead of none), which could change TUI rendering; wait for colorprofile to adopt it |
+
+Verification: `go mod tidy`, `go mod vendor` (only `vendor/modules.txt` changes), `go vet ./...` and `go test -p 4 ./...`.
