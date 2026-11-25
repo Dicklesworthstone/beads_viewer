@@ -2,7 +2,7 @@
 
 All notable changes to **Beads Viewer (`bv`)** are documented here. Versions are listed newest-first, with GitHub Releases distinguished from tag-only versions.
 
-Scope window: this update covers `v0.27.0..v0.28.0` (time-travel clusters, orphan-commit audit, one-pass export companions, operational risk and collateral-aware cycle cuts, Darwin/ARM64 parity, and `modernc.org/sqlite` v1.63.0) on top of `v0.26.0..v0.27.0` (Go 1.26.11 and `x/net`
+Scope window: this update covers `v0.28.0..v0.29.0` (the 47th robot command `--robot-check-dep`, batch what-if, scoped plans and historical diffs, History causality and Risk/ETA sorts in the TUI, decision intel and diff summaries in Pages exports, two Pages viewer regressions fixed before release, and release-gate tooling preflight) on top of `v0.27.0..v0.28.0` (time-travel clusters, orphan-commit audit, one-pass export companions, operational risk and collateral-aware cycle cuts, Darwin/ARM64 parity, and `modernc.org/sqlite` v1.63.0) on top of `v0.26.0..v0.27.0` (Go 1.26.11 and `x/net`
 v0.63.0 security toolchain, 11-stage source+binary `govulncheck` release gate,
 Wave 18–21 reality-check fixes across analysis, correlation, TUI, WASM, and the
 46-command robot CLI, and refreshed Go dependencies) on top of `v0.25.2..v0.26.0`
@@ -24,6 +24,7 @@ the latest tag, including installer changes usable with already released binarie
 
 | Version | Date | Publication | Orientation |
 |---|---|---|---|
+| [`v0.29.0`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.29.0) | 2026-11-25 | GitHub Release | `--robot-check-dep` (47th robot command), batch `--robot-whatif`, plans that respect not-ready labels, scoped historical diffs, History causality and Risk/ETA sorts, decision intel and diff summaries in Pages exports, and a release-gate preflight that names every missing tool. |
 | [`v0.28.0`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.28.0) | 2026-11-23 | GitHub Release | Orphan-commit audit, time-travel clusters, one-pass export companions, operational risk & collateral-aware cycle cuts, Darwin kqueue/ARM64 parity, and `modernc.org/sqlite` v1.63.0. |
 | [`v0.27.0`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.27.0) | 2026-11-21 | GitHub Release | Go 1.26.11 and `x/net` v0.63.0 security toolchain (#215), 11-stage source+binary `govulncheck` release gate, Wave 18–21 reality-check fixes across analysis/correlation/TUI/WASM/46-command robot CLI, and refreshed Go dependencies. |
 | [`v0.26.0`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.26.0) | 2026-11-02 | GitHub Release | Live SQLite trackers load from one consistent snapshot and recover from lost notifications and transient failures; correlation and exports stay on the selected source; TUI state survives refreshes; native deadlines and external references everywhere; GH #210–#214 and a #197 export fix. |
@@ -42,6 +43,18 @@ the latest tag, including installer changes usable with already released binarie
 
 ## Unreleased
 
+No changes since `v0.29.0` yet.
+
+---
+
+## v0.29.0 — 2026-11-25
+
+Pre-flight dependency checks and batch what-if in the robot CLI and the TUI,
+plans and historical diffs that respect scope, History causality and Risk/ETA
+sorts, decision intel and diff summaries in Pages exports, two Pages viewer
+regressions found and fixed before release, and a release gate that names
+every missing tool before it starts.
+
 ### CLI, Robot Protocol, and Analysis
 - **Pre-flight dependency validation (`--robot-check-dep`):** add the 47th registered robot command (`--robot-check-dep fromID:toID[,from2:to2]`, intent alias `check-dep`) to validate proposed blocking edges against the full issue graph for cycles, readiness impact, cross-repo links, and writable same-origin command emission (`1b29841b`, `5bee30dc`, `eb4fab38`).
 - **Batch counterfactual simulation (`--robot-whatif <id1,id2>`):** add `ComputeWhatIfBatch` in `pkg/analysis` and batch support in `--robot-whatif` (emitting `batch_result` with `synergy_issue_ids` for jointly unblocked diamond dependents), while keeping single-ID `result` contracts intact and rejecting empty IDs (`86632206`, `518917b7`).
@@ -52,9 +65,25 @@ the latest tag, including installer changes usable with already released binarie
 - **Interactive graph dependency preflight & cut-vertex accuracy:** add `D` (check add dependency) and `c` (copy checked dep command) in Graph view with automatic stale-verdict invalidation on reload/scope/time-travel changes, and mark cut vertices only while active (`f2315d44`, `5abbc07e`).
 - **History causality, risk/ETA list sorts, and scoped time travel:** add `W` causality/wait analysis in History view, per-repo qualified history orphans, `SortRisk` (`Risk ↓`) and `SortETA` (`ETA ↑`) list sort modes, and scoped workspace time travel while aligning `O` keybindings across views (`33a8cbfc`, `2f375ac9`, `9c0cceb1`).
 - **Decision intelligence, batch what-if, diff summaries, and check-dep HUD in exports:** add decision-intel summaries, snapshot diff summaries, filtered what-if counts, computed requested metric columns, nil-issue guards in SQLite export, and interactive check-dep / batch what-if controls in HTML exports (`0177b16a`, `10ce5ebc`, `12851003`, `82b72c4a`, `f19e925a`, `7f955c6f`, `31ca0656`).
+- **Pages viewer fixes found before release:**
+  - The "Changes Since" card added in `31ca0656` read `hasDiff` and `diffData`, which `viewer.js` never defined, so every dashboard load threw Alpine ReferenceErrors and the card never appeared. `viewer.js` now declares both next to the other optional companions and loads `data/diff.json` when `meta.has_diff` is set (`6a382568`).
+  - In Tree mode, collapsing a node re-listed its descendants at the top level: the unvisited-row fallback added in `0177b16a` walked exactly the rows the collapsed walk skipped. The fallback now skips rows with a collapsed ancestor, and the browser journey's W30-6 check passes (`c21ef157`).
 
-### Documentation and Verification
-- **Registry-driven sort-mode docgen & post-`v0.28.0` docs parity:** derive `docgen.RenderSortModesTable()` from `ui.GetSortModeDocs()` covering all 9 `SortMode` values, update `README.md` (`nine distinct sort modes`, `risk`/`eta` recipe metrics, `--robot-check-dep` and batch `--robot-whatif` summary rows, `v0.28.0` archive examples), `SKILL.md`, and `docs/RELEASING.md` (`v0.27.0` and `v0.28.0` verification entries), add `c` to the Graph shortcuts sidebar, strip wall-clock compute durations from exported `data/triage.json` under `SOURCE_DATE_EPOCH` so `triage.json` and `coi-serviceworker.js` `OFFLINE_ASSETS` stay bit-identical under load, and isolate host `PATH` in `TestRobotAlertsSourceInconsistencyAndScopedLabelReadiness` so host-installed `bd` binaries do not affect synthetic Dolt workspace tests.
+### Groundwork Not Yet Wired Into Commands
+These land the library code and tests only; no command, view or export calls them in this release.
+- `analysis.ComputeCrossRepoFlow` summarizes active blocking handoffs between repositories, and the insights model can render them in the priority panel through `SetCrossRepoFlow` (`47d98f9a`, `bc91ba87`).
+- Export metadata gains an optional `has_drift` flag beside `has_diff`; it is omitted while false, so current bundles keep their meta shape (`6eb74b23`).
+- `Bundle.RemoveManagedFile` removes a stale optional companion only when it is a regular file inside the bundle root, refusing escapes, absolute paths, directories and symlinks (`2c44321f`, `69c274e1`).
+
+### Release Gate (#206)
+- `scripts/release_gate.sh preflight` checks every external tool a complete gate needs without building or downloading anything: GoReleaser, PowerShell, Node, `jq`, `sha256sum`, the pinned graph-WASM nightly and its `wasm32` target, wasm-bindgen 0.2.128 and wasm-opt 132 (by version and executable hash), the Cargo registry cache, and any Rust build override the rebuild refuses. `run` lists the same gaps before stage 1, and a helper that exits 2 with an `INCOMPLETE:` line is recorded SKIPPED rather than FAILED; the receipt stays ineligible either way. `docs/RELEASING.md` gains a Required tooling table (`390fb2a1`, `538f399e`).
+- The gate's own self-test no longer inherits the outer run's diagnostic settings (`RELEASE_GATE_SKIP`, `RELEASE_GATE_ALLOW_MISSING`, receipt and benchmark variables), which made a diagnostic run report stage 10 as FAILED (`501a58e7`).
+
+### Tests, Dependencies, and Documentation
+- When the Pages size budget fails, the test names each bundle member's recorded and current size, largest growth first (#204, `6bd8b659`). The gh-authenticated wizard prerequisite test uses its own temporary git identity instead of the developer's global one (`370f544f`).
+- Take `golang.org/x/exp/slice` v0.1.0 (indirect; the module tree is identical to the pseudo-version it replaces) and record in `docs/planning/UPGRADE_LOG.md` why five other updates are held (`938540a8`, `6c3693c3`).
+- `docs/RELEASING.md` describes earlier releases' gate hosts by role and no longer cites internal tracker IDs.
+- **Registry-driven sort-mode docgen & post-`v0.28.0` docs parity (`09f6df4e`):** derive `docgen.RenderSortModesTable()` from `ui.GetSortModeDocs()` covering all 9 `SortMode` values, update `README.md` (`nine distinct sort modes`, `risk`/`eta` recipe metrics, `--robot-check-dep` and batch `--robot-whatif` summary rows, `v0.28.0` archive examples), `SKILL.md`, and `docs/RELEASING.md` (`v0.27.0` and `v0.28.0` verification entries), add `c` to the Graph shortcuts sidebar, strip wall-clock compute durations from exported `data/triage.json` under `SOURCE_DATE_EPOCH` so `triage.json` and `coi-serviceworker.js` `OFFLINE_ASSETS` stay bit-identical under load, and isolate host `PATH` in `TestRobotAlertsSourceInconsistencyAndScopedLabelReadiness` so host-installed `bd` binaries do not affect synthetic Dolt workspace tests.
 
 ---
 
@@ -2311,7 +2340,14 @@ Initial release of Beads Viewer -- a keyboard-driven terminal interface for the 
 
 ---
 
-[Unreleased]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.24.1...HEAD
+[Unreleased]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.29.0...HEAD
+[v0.29.0]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.28.0...v0.29.0
+[v0.28.0]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.27.0...v0.28.0
+[v0.27.0]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.26.0...v0.27.0
+[v0.26.0]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.25.2...v0.26.0
+[v0.25.2]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.25.1...v0.25.2
+[v0.25.1]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.25.0...v0.25.1
+[v0.25.0]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.24.1...v0.25.0
 [v0.24.1]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.24.0...v0.24.1
 [v0.24.0]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.23.0...v0.24.0
 [v0.23.0]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.22.0...v0.23.0
