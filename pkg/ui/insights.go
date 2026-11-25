@@ -153,6 +153,7 @@ type InsightsModel struct {
 	advancedInsights *analysis.AdvancedInsights
 	globalCapacity   *GlobalCapacitySummary
 	feedbackSummary  *analysis.FeedbackJSON
+	crossRepoFlow    *analysis.CrossRepoFlow
 	priorityHints    map[string]*analysis.PriorityRecommendation
 	issueMap         map[string]*model.Issue
 	theme            Theme
@@ -341,6 +342,18 @@ func (m *InsightsModel) SetFeedbackSummary(fb *analysis.FeedbackJSON) {
 		return
 	}
 	m.feedbackSummary = fb
+	m.detailContent = ""
+	if m.ready && m.focusedPanel == PanelPriority {
+		m.updateDetailContent()
+	}
+}
+
+// SetCrossRepoFlow attaches scoped cross-repo handoff bottlenecks for multi-repo workspaces (W33-4).
+func (m *InsightsModel) SetCrossRepoFlow(flow *analysis.CrossRepoFlow) {
+	if m.crossRepoFlow == flow {
+		return
+	}
+	m.crossRepoFlow = flow
 	m.detailContent = ""
 	if m.ready && m.focusedPanel == PanelPriority {
 		m.updateDetailContent()
@@ -2606,6 +2619,42 @@ func (m *InsightsModel) renderPriorityExtrasMD() string {
 				}
 				sb.WriteString("- **Top Adjustments:** " + strings.Join(parts, " • ") + "\n")
 			}
+		}
+		sb.WriteString("\n")
+	}
+	if crf := m.crossRepoFlow; crf != nil && crf.TotalCrossRepoDeps > 0 {
+		sb.WriteString("### 🔀 Cross-Repo Handoffs\n\n")
+		line := fmt.Sprintf("- **Active Edges:** `%d` across `%d` repos", crf.TotalCrossRepoDeps, len(crf.Repos))
+		if len(crf.BottleneckRepos) > 0 {
+			bRepos := make([]string, 0, min(len(crf.BottleneckRepos), 3))
+			for i, r := range crf.BottleneckRepos {
+				if i >= 3 {
+					break
+				}
+				bRepos = append(bRepos, "`"+r+"`")
+			}
+			line += " • **Bottlenecks:** " + strings.Join(bRepos, ", ")
+		}
+		sb.WriteString(line + "\n")
+		if len(crf.Dependencies) > 0 {
+			edgeParts := make([]string, 0, min(len(crf.Dependencies), 3))
+			for i, dep := range crf.Dependencies {
+				if i >= 3 {
+					break
+				}
+				edgeParts = append(edgeParts, fmt.Sprintf("`%s`→`%s` (`%d`)", dep.FromRepo, dep.ToRepo, dep.IssueCount))
+			}
+			sb.WriteString("- **Top Flows:** " + strings.Join(edgeParts, " • ") + "\n")
+		}
+		if len(crf.TopHandoffBlockers) > 0 {
+			hbParts := make([]string, 0, min(len(crf.TopHandoffBlockers), 3))
+			for i, hb := range crf.TopHandoffBlockers {
+				if i >= 3 {
+					break
+				}
+				hbParts = append(hbParts, fmt.Sprintf("`%s` (`%s`, `%d` blocked)", hb.IssueID, hb.SourceRepo, hb.BlockedCount))
+			}
+			sb.WriteString("- **Key Blockers:** " + strings.Join(hbParts, " • ") + "\n")
 		}
 		sb.WriteString("\n")
 	}
