@@ -911,6 +911,7 @@ func (e *SQLiteExporter) insertMeta(db *sql.DB) error {
 		"has_labels":       strconv.FormatBool(e.Config.HasLabels),
 		"has_forecast":     strconv.FormatBool(e.Config.HasForecast),
 		"has_diff":         strconv.FormatBool(e.Config.HasDiff),
+		"has_drift":        strconv.FormatBool(e.Config.HasDrift),
 	}
 
 	if e.gitHash != "" {
@@ -1035,6 +1036,7 @@ func (e *SQLiteExporter) writeRobotOutputs(bundle *Bundle, dataDir string) error
 		HasLabels:      e.Config.HasLabels,
 		HasForecast:    e.Config.HasForecast,
 		HasDiff:        e.Config.HasDiff,
+		HasDrift:       e.Config.HasDrift,
 	}
 	if err := e.writeRobotJSON(bundle, filepath.Join(dataDir, "meta.json"), meta); err != nil {
 		return fmt.Errorf("write meta.json: %w", err)
