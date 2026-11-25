@@ -4,7 +4,7 @@
 # Retain external outputs/receipts so a verifier can inspect or re-execute them.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/../.." && pwd)"
-tmp="$(mktemp -d /tmp/bv-graph-wasm-test.XXXXXX)"
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/bv-graph-wasm-test.XXXXXX")"
 echo "graph-WASM test artifacts: $tmp"
 fail() { echo "FAIL: $*" >&2; exit 1; }
 for tool in node python3 rustup; do

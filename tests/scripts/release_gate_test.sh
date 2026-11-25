@@ -23,7 +23,7 @@ case "$scope" in
 esac
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
-tmp="$(mktemp -d /tmp/bv-release-gate-test.XXXXXX)"
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/bv-release-gate-test.XXXXXX")"
 fixture="$tmp/source with spaces"
 mkdir -p "$fixture" "$tmp/tools"
 echo "release gate test artifacts: $tmp"
