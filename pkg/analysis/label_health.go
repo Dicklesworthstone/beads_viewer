@@ -3506,3 +3506,236 @@ func (hv *HistoricalVelocity) GetWeeklyAverage() float64 {
 	}
 	return float64(total) / float64(hv.WeeksAnalyzed)
 }
+
+// RepoDependency represents active blocking dependencies between two repositories in workspace mode (W32-6).
+type RepoDependency struct {
+	FromRepo   string   `json:"from_repo"`   // Repository containing the blocker issue(s)
+	ToRepo     string   `json:"to_repo"`     // Repository containing the blocked issue(s)
+	IssueCount int      `json:"issue_count"` // Number of distinct active cross-repo blocking edges
+	IssueIDs   []string `json:"issue_ids"`   // Deduplicated sorted blocked issue IDs
+	BlockerIDs []string `json:"blocker_ids"` // Deduplicated sorted blocker issue IDs
+}
+
+// RepoHandoffBlocker highlights an active issue in one repository that directly blocks open work in other repositories.
+type RepoHandoffBlocker struct {
+	IssueID      string   `json:"issue_id"`
+	Title        string   `json:"title"`
+	SourceRepo   string   `json:"source_repo"`
+	BlockedRepos []string `json:"blocked_repos"`
+	BlockedCount int      `json:"blocked_count"`
+	BlockedIDs   []string `json:"blocked_ids"`
+}
+
+// CrossRepoFlow summarizes cross-repository blocking dependencies and handoff bottlenecks (W32-6).
+type CrossRepoFlow struct {
+	Repos              []string             `json:"repos"`
+	Dependencies       []RepoDependency     `json:"dependencies"`
+	TotalCrossRepoDeps int                  `json:"total_cross_repo_deps"`
+	BottleneckRepos    []string             `json:"bottleneck_repos,omitempty"`
+	TopHandoffBlockers []RepoHandoffBlocker `json:"top_handoff_blockers,omitempty"`
+}
+
+// normalizeCrossRepoKey canonicalizes repository names consistently with workspace/UI repo keys.
+func normalizeCrossRepoKey(raw string) string {
+	key := strings.TrimSpace(raw)
+	key = strings.TrimRight(key, "-:_")
+	key = strings.ToLower(key)
+	if key == "" || key == "." {
+		return ""
+	}
+	return key
+}
+
+// ComputeCrossRepoFlow analyzes active blocking dependencies crossing distinct SourceRepo boundaries.
+// Returns nil for single-repo projects or when no active cross-repo blocking edges exist (zero single-repo JSON diff).
+// When candidateIDs is non-nil, both endpoints of each counted edge must belong to candidateIDs so scoped exports never leak hidden IDs.
+func ComputeCrossRepoFlow(issues []model.Issue, candidateIDs map[string]bool) *CrossRepoFlow {
+	if len(issues) < 2 {
+		return nil
+	}
+	issueMap := make(map[string]model.Issue, len(issues))
+	for _, iss := range issues {
+		if candidateIDs != nil && !candidateIDs[iss.ID] {
+			continue
+		}
+		issueMap[iss.ID] = iss
+	}
+	repoSet := make(map[string]struct{})
+	for _, iss := range issueMap {
+		if iss.Status == model.StatusTombstone {
+			continue
+		}
+		if r := normalizeCrossRepoKey(iss.SourceRepo); r != "" {
+			repoSet[r] = struct{}{}
+		}
+	}
+	if len(repoSet) < 2 {
+		return nil
+	}
+
+	type repoPairKey struct{ from, to string }
+	type pairAccum struct {
+		blockedSet map[string]struct{}
+		blockerSet map[string]struct{}
+		edgeSet    map[string]struct{}
+	}
+	depAccum := make(map[repoPairKey]*pairAccum)
+	outgoingCountByRepo := make(map[string]int)
+
+	type blockerAccum struct {
+		issue        model.Issue
+		sourceRepo   string
+		blockedRepos map[string]struct{}
+		blockedIDs   map[string]struct{}
+	}
+	blockerMap := make(map[string]*blockerAccum)
+	totalCross := 0
+
+	for _, blocked := range issueMap {
+		if isClosedLikeStatus(blocked.Status) {
+			continue
+		}
+		toRepo := normalizeCrossRepoKey(blocked.SourceRepo)
+		if toRepo == "" {
+			continue
+		}
+		for _, dep := range blocked.Dependencies {
+			if dep == nil || !dep.Type.IsBlocking() {
+				continue
+			}
+			blocker, ok := issueMap[dep.DependsOnID]
+			if !ok || isClosedLikeStatus(blocker.Status) {
+				continue
+			}
+			fromRepo := normalizeCrossRepoKey(blocker.SourceRepo)
+			if fromRepo == "" || fromRepo == toRepo {
+				continue
+			}
+			key := repoPairKey{from: fromRepo, to: toRepo}
+			acc, exists := depAccum[key]
+			if !exists {
+				acc = &pairAccum{
+					blockedSet: make(map[string]struct{}),
+					blockerSet: make(map[string]struct{}),
+					edgeSet:    make(map[string]struct{}),
+				}
+				depAccum[key] = acc
+			}
+			edgeKey := blocker.ID + "\x00" + blocked.ID
+			if _, dup := acc.edgeSet[edgeKey]; dup {
+				continue
+			}
+			acc.edgeSet[edgeKey] = struct{}{}
+			acc.blockedSet[blocked.ID] = struct{}{}
+			acc.blockerSet[blocker.ID] = struct{}{}
+			outgoingCountByRepo[fromRepo]++
+			totalCross++
+
+			bAcc, bExists := blockerMap[blocker.ID]
+			if !bExists {
+				bAcc = &blockerAccum{
+					issue:        blocker,
+					sourceRepo:   fromRepo,
+					blockedRepos: make(map[string]struct{}),
+					blockedIDs:   make(map[string]struct{}),
+				}
+				blockerMap[blocker.ID] = bAcc
+			}
+			bAcc.blockedRepos[toRepo] = struct{}{}
+			bAcc.blockedIDs[blocked.ID] = struct{}{}
+		}
+	}
+
+	if totalCross == 0 {
+		return nil
+	}
+
+	repos := make([]string, 0, len(repoSet))
+	for r := range repoSet {
+		repos = append(repos, r)
+	}
+	sort.Strings(repos)
+
+	deps := make([]RepoDependency, 0, len(depAccum))
+	for key, acc := range depAccum {
+		issueIDs := make([]string, 0, len(acc.blockedSet))
+		for id := range acc.blockedSet {
+			issueIDs = append(issueIDs, id)
+		}
+		sort.Strings(issueIDs)
+		blockerIDs := make([]string, 0, len(acc.blockerSet))
+		for id := range acc.blockerSet {
+			blockerIDs = append(blockerIDs, id)
+		}
+		sort.Strings(blockerIDs)
+		deps = append(deps, RepoDependency{
+			FromRepo:   key.from,
+			ToRepo:     key.to,
+			IssueCount: len(acc.edgeSet),
+			IssueIDs:   issueIDs,
+			BlockerIDs: blockerIDs,
+		})
+	}
+	sort.Slice(deps, func(i, j int) bool {
+		if deps[i].IssueCount != deps[j].IssueCount {
+			return deps[i].IssueCount > deps[j].IssueCount
+		}
+		if deps[i].FromRepo != deps[j].FromRepo {
+			return deps[i].FromRepo < deps[j].FromRepo
+		}
+		return deps[i].ToRepo < deps[j].ToRepo
+	})
+
+	bottlenecks := make([]string, 0, len(outgoingCountByRepo))
+	for r := range outgoingCountByRepo {
+		bottlenecks = append(bottlenecks, r)
+	}
+	sort.Slice(bottlenecks, func(i, j int) bool {
+		if outgoingCountByRepo[bottlenecks[i]] != outgoingCountByRepo[bottlenecks[j]] {
+			return outgoingCountByRepo[bottlenecks[i]] > outgoingCountByRepo[bottlenecks[j]]
+		}
+		return bottlenecks[i] < bottlenecks[j]
+	})
+	if len(bottlenecks) > 5 {
+		bottlenecks = bottlenecks[:5]
+	}
+
+	handoffs := make([]RepoHandoffBlocker, 0, len(blockerMap))
+	for _, bAcc := range blockerMap {
+		bRepos := make([]string, 0, len(bAcc.blockedRepos))
+		for r := range bAcc.blockedRepos {
+			bRepos = append(bRepos, r)
+		}
+		sort.Strings(bRepos)
+		bIDs := make([]string, 0, len(bAcc.blockedIDs))
+		for id := range bAcc.blockedIDs {
+			bIDs = append(bIDs, id)
+		}
+		sort.Strings(bIDs)
+		handoffs = append(handoffs, RepoHandoffBlocker{
+			IssueID:      bAcc.issue.ID,
+			Title:        bAcc.issue.Title,
+			SourceRepo:   bAcc.sourceRepo,
+			BlockedRepos: bRepos,
+			BlockedCount: len(bIDs),
+			BlockedIDs:   bIDs,
+		})
+	}
+	sort.Slice(handoffs, func(i, j int) bool {
+		if handoffs[i].BlockedCount != handoffs[j].BlockedCount {
+			return handoffs[i].BlockedCount > handoffs[j].BlockedCount
+		}
+		return handoffs[i].IssueID < handoffs[j].IssueID
+	})
+	if len(handoffs) > 10 {
+		handoffs = handoffs[:10]
+	}
+
+	return &CrossRepoFlow{
+		Repos:              repos,
+		Dependencies:       deps,
+		TotalCrossRepoDeps: totalCross,
+		BottleneckRepos:    bottlenecks,
+		TopHandoffBlockers: handoffs,
+	}
+}
