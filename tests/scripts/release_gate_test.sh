@@ -433,7 +433,8 @@ cp "$root/scripts/build_graph_wasm.sh" "$wasm_pins/scripts/build_graph_wasm.sh"
 commit_fixture "$wasm_pins" 'fixture with the real graph-WASM build script'
 printf '#!/usr/bin/env bash\necho "wrong-tool 0.0.0"\n' >"$tmp/tools/wrong-version"
 chmod +x "$tmp/tools/wrong-version"
-env WASM_BINDGEN="$tmp/tools/wrong-version" WASM_OPT="$tmp/no-such-wasm-opt" PWSH="$tmp/tools/pwsh-fixture" \
+env -u CARGO_BUILD_TARGET RUSTFLAGS=-Cfixture-override \
+  WASM_BINDGEN="$tmp/tools/wrong-version" WASM_OPT="$tmp/no-such-wasm-opt" PWSH="$tmp/tools/pwsh-fixture" \
   bash "$wasm_pins/scripts/release_gate.sh" preflight >"$tmp/preflight-wasm.json" 2>"$tmp/preflight-wasm.err" || {
   cat "$tmp/preflight-wasm.json" "$tmp/preflight-wasm.err"; fail 'preflight with missing tools must report, not abort'; }
 python3 - "$tmp/preflight-wasm.json" "$tmp/tools/wrong-version" <<'PY'
@@ -445,6 +446,9 @@ assert all(pins.get(k) for k in ('toolchain', 'target', 'host', 'wasm_bindgen', 
 missing = r['missing_prerequisites']
 assert any(f"at {sys.argv[2]} reports 'wrong-tool 0.0.0'; need {pins['wasm_bindgen']!r}" in m for m in missing), missing
 assert any(m.endswith(f"wasm-opt not found (need {pins['wasm_opt']})") for m in missing), missing
+# build_graph_wasm.sh reports INCOMPLETE for a set build override, so preflight names it.
+assert any(m.endswith('RUSTFLAGS is set; the pinned rebuild refuses build overrides (unset it for the gate)') for m in missing), missing
+assert not any('CARGO_BUILD_TARGET' in m for m in missing), missing
 assert r['graph_wasm']['ready'] is False and r['release_eligible_if_run_now'] is False
 PY
 grep -q 'a complete gate cannot pass on this host' "$tmp/preflight-wasm.err" || { cat "$tmp/preflight-wasm.err"; fail 'preflight did not summarize missing prerequisites'; }

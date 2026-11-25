@@ -221,6 +221,16 @@ def graph_wasm_prerequisites():
         pins[key] = match.group(1) if match else None
         if not match:
             problems.append(f"cannot read the {key} pin from scripts/build_graph_wasm.sh")
+    # The build script also reports INCOMPLETE when any Rust build override it
+    # refuses is set (RUSTFLAGS, RUSTC_WRAPPER, ...). Read that list too, so a
+    # shell profile export is named here rather than as a stage-7 skip later.
+    match = re.search(r"^for override in (.*?); do$", text, re.M | re.S)
+    overrides = match.group(1).replace("\\\n", " ").split() if match else []
+    if not overrides:
+        problems.append("cannot read the build-override list from scripts/build_graph_wasm.sh")
+    for name in overrides:
+        if os.environ.get(name):
+            problems.append(f"{name} is set; the pinned rebuild refuses build overrides (unset it for the gate)")
     rustup = shutil.which("rustup")
     toolchain, target, host = pins["toolchain"], pins["target"], pins["host"]
     if not rustup:

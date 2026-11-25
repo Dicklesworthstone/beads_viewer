@@ -115,7 +115,9 @@ other hosts can run every other stage for diagnostics.
 anything. It reads the graph-WASM pins from `scripts/build_graph_wasm.sh`,
 compares each tool's reported version and executable hash, and lists every
 missing or mismatched prerequisite in `missing_prerequisites`, on stderr, and
-in `release_eligible_if_run_now`. `scripts/release_gate.sh run` prints the same
+in `release_eligible_if_run_now`. It also names any Rust build override that
+the build script refuses (`RUSTFLAGS`, `RUSTC_WRAPPER`, `RUSTUP_TOOLCHAIN` and
+the others it lists); unset them for the gate. `scripts/release_gate.sh run` prints the same
 list before stage 1 and continues for diagnostics. A helper that reports
 `INCOMPLETE:` and exits 2 because a tool is absent is recorded as SKIPPED, so
 the summary separates "this host lacks the tooling" (`INCOMPLETE`, exit 2) from
