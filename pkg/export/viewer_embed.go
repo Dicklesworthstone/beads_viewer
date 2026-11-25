@@ -126,6 +126,32 @@ func (b *Bundle) CopyFile(name string, source io.Reader, perm os.FileMode) error
 	})
 }
 
+// RemoveManagedFile removes a previously generated regular file inside the bundle root.
+// It refuses non-local paths, directories, and symlinks (via Lstat) so re-export /
+// --watch-export cleanup of stale optional companions can never touch outside files (W33-1).
+func (b *Bundle) RemoveManagedFile(name string) error {
+	if b == nil || b.root == nil {
+		return nil
+	}
+	if !filepath.IsLocal(name) {
+		return fmt.Errorf("export path must remain within the selected directory: %q", name)
+	}
+	info, err := b.root.Lstat(name)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect stale export file %s: %w", name, err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("refusing to remove non-regular export file: %s", name)
+	}
+	if err := b.root.Remove(name); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove stale export file %s: %w", name, err)
+	}
+	return nil
+}
+
 func (b *Bundle) writeFile(name string, perm os.FileMode, write func(io.Writer) error) error {
 	if !filepath.IsLocal(name) {
 		return fmt.Errorf("export path must remain within the selected directory: %q", name)
