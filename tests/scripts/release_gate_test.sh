@@ -8,6 +8,14 @@
 # for all receipt/package controls. The default mode uses real govulncheck.
 set -euo pipefail
 export GOTOOLCHAIN=local
+# Stage 10 runs this test inside a gate run, which may carry diagnostic
+# settings (RELEASE_GATE_SKIP in the retained ci.yml, BENCH_REFERENCE=stored,
+# a receipt path). The fixture gates must not inherit them: a "complete"
+# fixture run would turn diagnostic and the test would report the gate broken.
+# Each case below passes the settings it needs explicitly.
+unset RELEASE_GATE_SKIP RELEASE_GATE_ALLOW_MISSING RELEASE_GATE_RECEIPT RELEASE_GATE_DIST \
+  RELEASE_GATE_OUTPUT_DIR RELEASE_GATE_BENCH_PCT BV_SKIP_ENV_TESTS BENCH_REFERENCE BENCH_DATASET \
+  BENCH_COUNT ROBOT_SMOKE_BV ROBOT_SMOKE_SYNTHETIC
 scope="${1:-all}"
 case "$scope" in
   all|audit-environment|gate-mechanics) ;;
