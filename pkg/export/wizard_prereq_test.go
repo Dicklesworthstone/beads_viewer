@@ -61,13 +61,18 @@ exit 0
 	origPath := os.Getenv("PATH")
 	t.Setenv("PATH", fmt.Sprintf("%s%c%s", binDir, os.PathListSeparator, origPath))
 
-	// Provide a minimal global git identity
-	gitConfigPath := filepath.Join(t.TempDir(), "gitconfig")
+	// Provide a minimal global git identity. The identity check runs git with
+	// SanitizedGitEnv, which drops GIT_CONFIG_GLOBAL and GIT_CONFIG_NOSYSTEM,
+	// so git reads the global config from HOME. Put it in a temp HOME;
+	// otherwise this test reads the developer's own ~/.gitconfig and fails
+	// on a machine or CI runner that has no global identity.
+	homeDir := t.TempDir()
+	gitConfigPath := filepath.Join(homeDir, ".gitconfig")
 	if err := os.WriteFile(gitConfigPath, []byte("[user]\n\tname = Test User\n\temail = test@example.com\n"), 0644); err != nil {
 		t.Fatalf("WriteFile gitconfig: %v", err)
 	}
-	t.Setenv("GIT_CONFIG_GLOBAL", gitConfigPath)
-	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	t.Setenv("HOME", homeDir)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(homeDir, ".config"))
 
 	wizard := NewWizard("/tmp/test")
 	wizard.config.DeployTarget = "github"
