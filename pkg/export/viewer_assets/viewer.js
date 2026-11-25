@@ -5573,6 +5573,10 @@ function beadsApp() {
     forecastData: null,
     hasForecast: false,
 
+    // Snapshot changelog card (data/diff.json from --diff-since, gated on meta.has_diff)
+    diffData: null,
+    hasDiff: false,
+
     // Loaded git correlation history (populated when data/history.json loads)
     historyData: null,
 
@@ -6179,6 +6183,19 @@ function beadsApp() {
               }
             } catch (fcErr) {
               console.log('[Viewer] Optional forecast.json unavailable:', fcErr);
+            }
+          })());
+        }
+        if (this.meta?.has_diff === true || this.meta?.has_diff === 'true') {
+          optTasks.push((async () => {
+            try {
+              const diffResp = await fetch(`./data/diff.json?_t=${Date.now()}`, optionalFetchOpts());
+              if (diffResp.ok) {
+                this.diffData = await diffResp.json();
+                this.hasDiff = Boolean(this.diffData?.diff);
+              }
+            } catch (diffErr) {
+              console.log('[Viewer] Optional diff.json unavailable:', diffErr);
             }
           })());
         }
