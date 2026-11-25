@@ -1073,3 +1073,92 @@ func TestBundleHybridWasmEvaluatedAndPrepared(t *testing.T) {
 		t.Fatalf("MarkHybridWasmPrepared must set both Prepared=true (%v) and Evaluated=true (%v)", bPrepared.HybridWasmPrepared(), bPrepared.HybridWasmEvaluated())
 	}
 }
+
+func TestWave33_BundleRemoveManagedFileAndOfflineAssetsPruning(t *testing.T) {
+	tmpDir := t.TempDir()
+	bundle, err := OpenBundle(tmpDir)
+	if err != nil {
+		t.Fatalf("OpenBundle: %v", err)
+	}
+	defer bundle.Close()
+
+	// Write base + optional companions and build service worker manifest.
+	if err := bundle.WriteFile("data/meta.json", []byte(`{"issue_count":1}`), 0o644); err != nil {
+		t.Fatalf("write meta.json: %v", err)
+	}
+	if err := bundle.WriteFile("data/diff.json", []byte(`{"diff":{}}`), 0o644); err != nil {
+		t.Fatalf("write diff.json: %v", err)
+	}
+	if err := bundle.WriteFile("data/drift.json", []byte(`{"has_drift":false}`), 0o644); err != nil {
+		t.Fatalf("write drift.json: %v", err)
+	}
+	if err := bundle.CopyEmbeddedAssets("Prune Test 1"); err != nil {
+		t.Fatalf("CopyEmbeddedAssets 1: %v", err)
+	}
+	sw1, err := os.ReadFile(filepath.Join(tmpDir, "coi-serviceworker.js"))
+	if err != nil {
+		t.Fatalf("read sw1: %v", err)
+	}
+	if !strings.Contains(string(sw1), `"data/diff.json"`) || !strings.Contains(string(sw1), `"data/drift.json"`) {
+		t.Fatalf("precondition failed: expected diff.json and drift.json in OFFLINE_ASSETS:\n%s", string(sw1))
+	}
+
+	// Prune optional companions and rebuild assets -> must vanish from disk AND OFFLINE_ASSETS.
+	if err := bundle.RemoveManagedFile("data/diff.json"); err != nil {
+		t.Fatalf("RemoveManagedFile(diff.json): %v", err)
+	}
+	if err := bundle.RemoveManagedFile("data/drift.json"); err != nil {
+		t.Fatalf("RemoveManagedFile(drift.json): %v", err)
+	}
+	// Idempotent remove of already-missing file must return nil.
+	if err := bundle.RemoveManagedFile("data/drift.json"); err != nil {
+		t.Fatalf("RemoveManagedFile idempotent miss returned error: %v", err)
+	}
+	if err := bundle.CopyEmbeddedAssets("Prune Test 2"); err != nil {
+		t.Fatalf("CopyEmbeddedAssets 2: %v", err)
+	}
+	for _, rel := range []string{"data/diff.json", "data/drift.json"} {
+		if _, statErr := os.Stat(filepath.Join(tmpDir, rel)); !os.IsNotExist(statErr) {
+			t.Fatalf("W33-1 stale companion %s still exists on disk", rel)
+		}
+	}
+	sw2, err := os.ReadFile(filepath.Join(tmpDir, "coi-serviceworker.js"))
+	if err != nil {
+		t.Fatalf("read sw2: %v", err)
+	}
+	if strings.Contains(string(sw2), `"data/diff.json"`) || strings.Contains(string(sw2), `"data/drift.json"`) {
+		t.Fatalf("W33-1 stale companions remained in coi-serviceworker.js OFFLINE_ASSETS:\n%s", string(sw2))
+	}
+	if !strings.Contains(string(sw2), `"data/meta.json"`) {
+		t.Fatalf("W33-1 pruned required data/meta.json from OFFLINE_ASSETS")
+	}
+
+	// Negative security controls: traversal, absolute path, directory, and symlink must all be refused.
+	if err := bundle.RemoveManagedFile("../outside.json"); err == nil {
+		t.Fatal("RemoveManagedFile must refuse path traversal")
+	}
+	if err := bundle.RemoveManagedFile("/tmp/absolute.json"); err == nil {
+		t.Fatal("RemoveManagedFile must refuse absolute paths")
+	}
+	if err := os.MkdirAll(filepath.Join(tmpDir, "data", "subdir"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := bundle.RemoveManagedFile("data/subdir"); err == nil {
+		t.Fatal("RemoveManagedFile must refuse removing directories")
+	}
+	if runtime.GOOS != "windows" {
+		extFile := filepath.Join(t.TempDir(), "protected.json")
+		if err := os.WriteFile(extFile, []byte("keep"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(extFile, filepath.Join(tmpDir, "data", "symlink.json")); err != nil {
+			t.Skipf("symlink unavailable: %v", err)
+		}
+		if err := bundle.RemoveManagedFile("data/symlink.json"); err == nil {
+			t.Fatal("RemoveManagedFile must refuse removing symlinks")
+		}
+		if got, rErr := os.ReadFile(extFile); rErr != nil || string(got) != "keep" {
+			t.Fatalf("RemoveManagedFile symlink check disturbed external target: err=%v data=%q", rErr, string(got))
+		}
+	}
+}
