@@ -102,7 +102,7 @@ other hosts can run every other stage for diagnostics.
 | Python 3, Git | any current release | receipts, source digest, archive checks | the gate refuses to start |
 | `jq` | any | stages 7 and 9 | stage SKIPPED |
 | `sha256sum` | GNU coreutils or compatible | stages 7 and 8 | stage 7 SKIPPED, stage 8 FAILED |
-| `rustup` with `nightly-2026-08-31-x86_64-unknown-linux-gnu`, its `wasm32-unknown-unknown` target, and a populated Cargo registry cache | pinned in `scripts/build_graph_wasm.sh` | stage 7 (graph-WASM source rebuild), stage 10 (`graph_wasm_test.sh`) | stage SKIPPED |
+| `rustup` with `nightly-2026-08-31-x86_64-unknown-linux-gnu`, its `wasm32-unknown-unknown` target, its `rust-src` component, and a populated Cargo registry cache | pinned in `scripts/build_graph_wasm.sh`; `rust-src` is not checked, and the minimal profile in `bv-graph-wasm/rust-toolchain.toml` leaves it out, so add it with `rustup component add rust-src --toolchain nightly-2026-08-31` | stage 7 (graph-WASM source rebuild), stage 10 (`graph_wasm_test.sh`) | stage SKIPPED; without `rust-src`, stage 7 FAILED (the rebuilt WASM is 64 bytes shorter because standard-library panic paths differ) |
 | `wasm-bindgen` | 0.2.128, the exact executable whose SHA-256 is pinned in `scripts/build_graph_wasm.sh` (`WASM_BINDGEN` selects another path) | stages 7 and 10 | missing: SKIPPED; another version or build: FAILED |
 | `wasm-opt` (Binaryen) | version 132, the pinned executable (`WASM_OPT` selects another path) | stages 7 and 10 | missing: SKIPPED; another version or build: FAILED |
 | Node.js | with WebAssembly support | stage 10 (`graph_wasm_test.sh`) | stage SKIPPED |
