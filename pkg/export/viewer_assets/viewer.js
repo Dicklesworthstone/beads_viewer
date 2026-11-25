@@ -8487,9 +8487,17 @@ function beadsApp() {
       for (const rootId of roots) {
         walk(rootId, 0);
       }
-      // Safety fallback: include any unvisited nodes as roots.
+      // Safety fallback: include any node no root reached as a root. A node
+      // under a collapsed ancestor was skipped on purpose and stays hidden;
+      // parentOf is acyclic, so the ancestor walk ends.
+      const hiddenByCollapse = (id) => {
+        for (let cur = parentOf.get(id); cur; cur = parentOf.get(cur)) {
+          if (this.issuesTreeCollapsed[cur]) return true;
+        }
+        return false;
+      };
       for (const iss of rows) {
-        if (!visited.has(iss.id)) walk(iss.id, 0);
+        if (!visited.has(iss.id) && !hiddenByCollapse(iss.id)) walk(iss.id, 0);
       }
       this.issuesTreeFlatRows = flat;
     },
