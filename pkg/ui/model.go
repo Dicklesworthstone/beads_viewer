@@ -5245,6 +5245,35 @@ func (m *Model) activeScopeAnalysis() (*analysis.Analyzer, *analysis.GraphStats,
 	return m.boardScopedAnalyzer, m.boardScopedAnalysis, m.boardScopedETACtx
 }
 
+// retainPriorityHintsForReload returns the priority hints that are still valid
+// after a reload: the issue still exists, is not closed, and still has the
+// priority the hint was computed from. A reload delivers Phase 1 data first and
+// Phase 2 replaces the whole map when it finishes. Dropping every hint in
+// between made the "Priority Hint" line in the detail pane (and the hint badges)
+// vanish and reappear on each background reload, shifting the text below it
+// (#217). A non-empty input is never mutated (it may be shared with an earlier
+// Phase 2 result); the kept hints go into a new map.
+func retainPriorityHintsForReload(prev map[string]*analysis.PriorityRecommendation, issueMap map[string]*model.Issue) map[string]*analysis.PriorityRecommendation {
+	if len(prev) == 0 {
+		if prev == nil {
+			return make(map[string]*analysis.PriorityRecommendation)
+		}
+		return prev
+	}
+	kept := make(map[string]*analysis.PriorityRecommendation, len(prev))
+	for id, hint := range prev {
+		if hint == nil {
+			continue
+		}
+		issue := issueMap[id]
+		if issue == nil || isClosedLikeStatus(issue.Status) || issue.Priority != hint.CurrentPriority {
+			continue
+		}
+		kept[id] = hint
+	}
+	return kept
+}
+
 func (m *Model) activeScopePriorityHints() map[string]*analysis.PriorityRecommendation {
 	if !m.workspaceMode || m.activeRepos == nil {
 		return m.priorityHints
@@ -6796,11 +6825,8 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Clear caches that need recomputation
 		m.labelHealthCached = false
 		m.attentionCached = false
-		if m.priorityHints == nil {
-			m.priorityHints = make(map[string]*analysis.PriorityRecommendation)
-		} else {
-			clear(m.priorityHints)
-		}
+		// Phase 2 replaces the hints; keep the ones still valid until then (#217).
+		m.priorityHints = retainPriorityHintsForReload(m.priorityHints, m.issueMap)
 		if m.labelDrilldownCache == nil {
 			m.labelDrilldownCache = make(map[string][]model.Issue)
 		} else {
@@ -7450,8 +7476,8 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.syncBoardReadinessAndFullIssues()
 
-		// Clear stale priority hints (will be repopulated after Phase 2)
-		m.priorityHints = make(map[string]*analysis.PriorityRecommendation)
+		// Phase 2 replaces the hints; keep the ones still valid until then (#217).
+		m.priorityHints = retainPriorityHintsForReload(m.priorityHints, m.issueMap)
 
 		// Recompute stats
 		var statsStart time.Time
