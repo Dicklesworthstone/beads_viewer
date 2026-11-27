@@ -234,6 +234,7 @@ func TestReloadKeepsPriorityHintUntilPhase2(t *testing.T) {
 				"H-1": injected, "H-2": hint("H-2"), "H-3": hint("H-3"), "H-4": hint("H-4"),
 			}
 			m.updateListDelegate()
+			m.insightsPanel.SetPriorityHints(m.priorityHints)
 			if !m.selectListIssueByID("H-1") {
 				t.Fatal("could not select H-1")
 			}
@@ -253,12 +254,18 @@ func TestReloadKeepsPriorityHintUntilPhase2(t *testing.T) {
 			if view := ansi.Strip(m.viewport.View()); !strings.Contains(view, "Priority Hint:") || !strings.Contains(view, "P2 → P3") {
 				t.Fatalf("Priority Hint vanished from the detail pane on reload (#217):\n%s", view)
 			}
-			if m.priorityHints["H-1"] != injected {
-				t.Fatalf("still-valid hint for H-1 was dropped: %+v", m.priorityHints)
-			}
-			for _, id := range []string{"H-2", "H-3", "H-4"} {
-				if h := m.priorityHints[id]; h != nil {
-					t.Fatalf("stale hint for %s survived the reload: %+v", id, h)
+			// The insights panel keeps the map it was given until its next
+			// refresh; it must see the same pruned hints.
+			for name, hints := range map[string]map[string]*analysis.PriorityRecommendation{
+				"model": m.priorityHints, "insights panel": m.insightsPanel.priorityHints,
+			} {
+				if hints["H-1"] != injected {
+					t.Fatalf("%s: still-valid hint for H-1 was dropped: %+v", name, hints)
+				}
+				for _, id := range []string{"H-2", "H-3", "H-4"} {
+					if h := hints[id]; h != nil {
+						t.Fatalf("%s: stale hint for %s survived the reload: %+v", name, id, h)
+					}
 				}
 			}
 

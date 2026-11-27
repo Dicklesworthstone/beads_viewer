@@ -5245,33 +5245,27 @@ func (m *Model) activeScopeAnalysis() (*analysis.Analyzer, *analysis.GraphStats,
 	return m.boardScopedAnalyzer, m.boardScopedAnalysis, m.boardScopedETACtx
 }
 
-// retainPriorityHintsForReload returns the priority hints that are still valid
+// retainPriorityHintsForReload keeps the priority hints that are still valid
 // after a reload: the issue still exists, is not closed, and still has the
 // priority the hint was computed from. A reload delivers Phase 1 data first and
 // Phase 2 replaces the whole map when it finishes. Dropping every hint in
 // between made the "Priority Hint" line in the detail pane (and the hint badges)
-// vanish and reappear on each background reload, shifting the text below it
-// (#217). A non-empty input is never mutated (it may be shared with an earlier
-// Phase 2 result); the kept hints go into a new map.
-func retainPriorityHintsForReload(prev map[string]*analysis.PriorityRecommendation, issueMap map[string]*model.Issue) map[string]*analysis.PriorityRecommendation {
-	if len(prev) == 0 {
-		if prev == nil {
-			return make(map[string]*analysis.PriorityRecommendation)
-		}
-		return prev
+// vanish and reappear on each reload, shifting the text below it (#217).
+//
+// Stale hints are deleted in place, as the old clear() did, so the list
+// delegate and the insights panel, which hold this same map until their next
+// refresh, see the pruned hints too.
+func retainPriorityHintsForReload(hints map[string]*analysis.PriorityRecommendation, issueMap map[string]*model.Issue) map[string]*analysis.PriorityRecommendation {
+	if hints == nil {
+		return make(map[string]*analysis.PriorityRecommendation)
 	}
-	kept := make(map[string]*analysis.PriorityRecommendation, len(prev))
-	for id, hint := range prev {
-		if hint == nil {
-			continue
-		}
+	for id, hint := range hints {
 		issue := issueMap[id]
-		if issue == nil || isClosedLikeStatus(issue.Status) || issue.Priority != hint.CurrentPriority {
-			continue
+		if hint == nil || issue == nil || isClosedLikeStatus(issue.Status) || issue.Priority != hint.CurrentPriority {
+			delete(hints, id)
 		}
-		kept[id] = hint
 	}
-	return kept
+	return hints
 }
 
 func (m *Model) activeScopePriorityHints() map[string]*analysis.PriorityRecommendation {
