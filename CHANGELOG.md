@@ -2,7 +2,7 @@
 
 All notable changes to **Beads Viewer (`bv`)** are documented here. Versions are listed newest-first, with GitHub Releases distinguished from tag-only versions.
 
-Scope window: this update covers `v0.28.0..v0.29.0` (the 47th robot command `--robot-check-dep`, batch what-if, scoped plans and historical diffs, History causality and Risk/ETA sorts in the TUI, decision intel and diff summaries in Pages exports, two Pages viewer regressions fixed before release, and release-gate tooling preflight) on top of `v0.27.0..v0.28.0` (time-travel clusters, orphan-commit audit, one-pass export companions, operational risk and collateral-aware cycle cuts, Darwin/ARM64 parity, and `modernc.org/sqlite` v1.63.0) on top of `v0.26.0..v0.27.0` (Go 1.26.11 and `x/net`
+Scope window: this update covers `v0.29.0..v0.29.1` (the flashing "Priority Hint" fix for #217, gate self-test artifacts kept under `TMPDIR`, and `rust-src` named as a graph-WASM rebuild prerequisite) on top of `v0.28.0..v0.29.0` (the 47th robot command `--robot-check-dep`, batch what-if, scoped plans and historical diffs, History causality and Risk/ETA sorts in the TUI, decision intel and diff summaries in Pages exports, two Pages viewer regressions fixed before release, and release-gate tooling preflight) on top of `v0.27.0..v0.28.0` (time-travel clusters, orphan-commit audit, one-pass export companions, operational risk and collateral-aware cycle cuts, Darwin/ARM64 parity, and `modernc.org/sqlite` v1.63.0) on top of `v0.26.0..v0.27.0` (Go 1.26.11 and `x/net`
 v0.63.0 security toolchain, 11-stage source+binary `govulncheck` release gate,
 Wave 18–21 reality-check fixes across analysis, correlation, TUI, WASM, and the
 46-command robot CLI, and refreshed Go dependencies) on top of `v0.25.2..v0.26.0`
@@ -24,6 +24,7 @@ the latest tag, including installer changes usable with already released binarie
 
 | Version | Date | Publication | Orientation |
 |---|---|---|---|
+| [`v0.29.1`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.29.1) | 2026-11-28 | GitHub Release | The detail pane's "Priority Hint" line no longer flashes when the beads data is written (#217); gate self-tests keep their artifacts under `TMPDIR`. |
 | [`v0.29.0`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.29.0) | 2026-11-25 | GitHub Release | `--robot-check-dep` (47th robot command), batch `--robot-whatif`, plans that respect not-ready labels, scoped historical diffs, History causality and Risk/ETA sorts, decision intel and diff summaries in Pages exports, and a release-gate preflight that names every missing tool. |
 | [`v0.28.0`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.28.0) | 2026-11-23 | GitHub Release | Orphan-commit audit, time-travel clusters, one-pass export companions, operational risk & collateral-aware cycle cuts, Darwin kqueue/ARM64 parity, and `modernc.org/sqlite` v1.63.0. |
 | [`v0.27.0`](https://github.com/Dicklesworthstone/beads_viewer/releases/tag/v0.27.0) | 2026-11-21 | GitHub Release | Go 1.26.11 and `x/net` v0.63.0 security toolchain (#215), 11-stage source+binary `govulncheck` release gate, Wave 18–21 reality-check fixes across analysis/correlation/TUI/WASM/46-command robot CLI, and refreshed Go dependencies. |
@@ -43,7 +44,22 @@ the latest tag, including installer changes usable with already released binarie
 
 ## Unreleased
 
-No changes since `v0.29.0` yet.
+No changes since `v0.29.1` yet.
+
+---
+
+## v0.29.1 — 2026-11-28
+
+A patch release: the detail pane's "Priority Hint" line no longer flashes
+each time the beads data is written, plus two release-gate follow-ups. No
+command, flag or output format changes.
+
+### TUI
+- **Priority hints survive a reload (#217):** since v0.28.0, both reload paths (the default synchronous file reload and the background worker's snapshot) emptied the priority hints until the Phase 2 analysis of the new data finished. Every write to the beads data, for example an agent running `br`, made the "Priority Hint" line vanish and the lines below it jump. A reload now keeps each hint whose issue still exists, is still open, and still has the priority the hint was computed from; Phase 2 replaces the hints as before (`63287b74`). Stale hints are deleted in place, so the list badges and the insights panel, which share the same map, never show a hint for an issue that was just reprioritized, closed or removed (`9db3cf1c`). `TestReloadKeepsPriorityHintUntilPhase2` covers both reload paths.
+
+### Release Gate and Documentation
+- The gate's self-tests (`tests/scripts/release_gate_test.sh` and `tests/scripts/graph_wasm_test.sh`) create their retained artifact directories under `${TMPDIR:-/tmp}` instead of a hard-coded `/tmp`. About 1.3 GB per run is kept on purpose, which could fill a small `/tmp` tmpfs even when the gate was given a private `TMPDIR` (`9f335e88`).
+- `docs/RELEASING.md` and `bv-graph-wasm/README.md` name the pinned nightly's `rust-src` component as a graph-WASM rebuild prerequisite: without it the rebuilt module is 64 bytes shorter and stage 7 fails (`4adef7cb`).
 
 ---
 
@@ -2340,7 +2356,8 @@ Initial release of Beads Viewer -- a keyboard-driven terminal interface for the 
 
 ---
 
-[Unreleased]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.29.0...HEAD
+[Unreleased]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.29.1...HEAD
+[v0.29.1]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.29.0...v0.29.1
 [v0.29.0]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.28.0...v0.29.0
 [v0.28.0]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.27.0...v0.28.0
 [v0.27.0]: https://github.com/Dicklesworthstone/beads_viewer/compare/v0.26.0...v0.27.0
