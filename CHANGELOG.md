@@ -57,7 +57,8 @@ command, flag or output format changes.
 ### TUI
 - **Priority hints survive a reload (#217):** since v0.28.0, both reload paths (the default synchronous file reload and the background worker's snapshot) emptied the priority hints until the Phase 2 analysis of the new data finished. Every write to the beads data, for example an agent running `br`, made the "Priority Hint" line vanish and the lines below it jump. A reload now keeps each hint whose issue still exists, is still open, and still has the priority the hint was computed from; Phase 2 replaces the hints as before (`63287b74`). Stale hints are deleted in place, so the list badges and the insights panel, which share the same map, never show a hint for an issue that was just reprioritized, closed or removed (`9db3cf1c`). `TestReloadKeepsPriorityHintUntilPhase2` covers both reload paths.
 
-### Release Gate and Documentation
+### Release Gate, Tests and Documentation
+- A History view regression test (A15-6, the blast-radius footer's "recent" closed count) stopped depending on the date it runs: it now evaluates the view at its fixture's own clock, so the closed bead no longer ages out of the 7-day window. It had started failing on 2026-11-27 with no code change. Test-only; no product change.
 - The gate's self-tests (`tests/scripts/release_gate_test.sh` and `tests/scripts/graph_wasm_test.sh`) create their retained artifact directories under `${TMPDIR:-/tmp}` instead of a hard-coded `/tmp`. About 1.3 GB per run is kept on purpose, which could fill a small `/tmp` tmpfs even when the gate was given a private `TMPDIR` (`9f335e88`).
 - `docs/RELEASING.md` and `bv-graph-wasm/README.md` name the pinned nightly's `rust-src` component as a graph-WASM rebuild prerequisite: without it the rebuilt module is 64 bytes shorter and stage 7 fails (`4adef7cb`).
 

@@ -10442,6 +10442,10 @@ func TestWave29_Pass15Fixes_And_W29_TUI(t *testing.T) {
 				"2222222222222222222222222222222222222222": {"H-CLOSED"},
 			},
 		}, theme)
+		// The fixture's commits are fixed relative to refNow, and the blast-radius footer only
+		// counts closed beads touched in the 7 days before the view's clock. Pin that clock to
+		// refNow: on the wall clock, H-CLOSED aged out of the window on 2026-11-27.
+		hv.SetReferenceTime(refNow)
 		hv.SetSize(220, 40)
 		hv.SetOrphans([]correlation.OrphanCandidate{
 			{
