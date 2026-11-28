@@ -11,9 +11,9 @@ import path from 'node:path';
 import http from 'node:http';
 import { spawn } from 'node:child_process';
 
-const [browser, bundle, artifacts, mode = 'journeys', updatedBundle, projectBundle, capabilitiesBundle, multiRepoBundle] = process.argv.slice(2);
+const [browser, bundle, artifacts, mode = 'journeys', updatedBundle, projectBundle, capabilitiesBundle, multiRepoBundle, capabilitiesDiffBundle] = process.argv.slice(2);
 assert.ok(browser && bundle && artifacts, 'browser, bundle, artifacts required');
-assert.ok(['journeys', 'offline-only', 'blocking-types', 'what-if', 'hits', 'readiness', 'metric-visibility', 'suggestion-visibility', 'layout-seeds', 'precomputed-metrics', 'graph-startup', 'graph-reload', 'history-loading', 'timeline', 'timeline-controls', 'timeline-baseline', 'timeline-removal', 'timeline-animation', 'timeline-sprints', 'timeline-performance'].includes(mode), 'unknown browser test mode');
+assert.ok(['journeys', 'offline-only', 'first-render-timing', 'blocking-types', 'what-if', 'hits', 'readiness', 'metric-visibility', 'suggestion-visibility', 'layout-seeds', 'precomputed-metrics', 'graph-startup', 'graph-reload', 'history-loading', 'timeline', 'timeline-controls', 'timeline-baseline', 'timeline-removal', 'timeline-animation', 'timeline-sprints', 'timeline-performance'].includes(mode), 'unknown browser test mode');
 fs.mkdirSync(artifacts, { recursive: true });
 const records = [];
 let brokenAsset = '', changedAsset = '', workerRevision = 0, chrome, server, socket;
@@ -132,6 +132,7 @@ async function openPage(name, width = 1280, offline = false, initialPath = '/') 
   await send('Fetch.enable', { patterns: [{ urlPattern: '*' }] }, sessionId);
   await send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true }, sessionId);
   if (offline) await setOffline(page, true);
+  page.navStartedAt = performance.now();
   await send('Page.navigate', { url: origin + initialPath }, sessionId);
   return page;
 }
@@ -629,7 +630,7 @@ async function historyLoadingJourney(page) {
     const start = Date.now();
     // Start without awaiting: an unbounded request must fail our browser assertion,
     // rather than hang the CDP evaluation waiting for the app's promise.
-    await evaluate(page, `void ${app}.initForceGraphView()`);
+    await evaluate(page, `void ${app}.initForceGraphView({ forceHistoryRefresh: true })`);
     await waitFor(page, `${app}.forceGraphReady && !${app}.forceGraphLoading && !${app}.forceGraphError`,
       `${variant}: optional history must release graph loading`, 6000);
     loads++;
@@ -1302,9 +1303,27 @@ async function journey(page, mobile) {
       ${app}.toggleIssuesTreeNode('browser-root');
       const collapsedIds = ${app}.issuesTreeFlatRows.map(r => r.issue.id);
       ${app}.toggleIssuesTreeNode('browser-root');
-      return { expandedRows, collapsedIds };
+      // P18B-8: Verify collapseAllIssuesTree collapses mid-level parents hidden under an already-collapsed root.
+      DB_STATE.db.run("INSERT INTO dependencies (issue_id, depends_on_id, type) VALUES ('browser-other', 'browser-detail', 'parent-child')");
+      const prevModeRows = ${app}.issuesModeRows;
+      const otherRow = execQuery("SELECT * FROM issue_overview_mv WHERE id = 'browser-other'")[0];
+      if (otherRow && !${app}.issuesModeRows.some(r => r.id === 'browser-other')) {
+        ${app}.issuesModeRows = [...${app}.issuesModeRows, otherRow];
+      }
+      ${app}.rebuildIssuesTreeRows();
+      // Collapse root first so browser-detail (a mid-level parent) is hidden from issuesTreeFlatRows.
+      ${app}.toggleIssuesTreeNode('browser-root');
+      ${app}.collapseAllIssuesTree();
+      // Now expand root: browser-detail MUST still be collapsed (hiding browser-other)!
+      ${app}.toggleIssuesTreeNode('browser-root');
+      const afterNestedCollapseIds = ${app}.issuesTreeFlatRows.map(r => r.issue.id);
+      ${app}.expandAllIssuesTree();
+      const afterExpandAllIds = ${app}.issuesTreeFlatRows.map(r => r.issue.id);
+      ${app}.issuesModeRows = prevModeRows;
+      return { expandedRows, collapsedIds, afterNestedCollapseIds, afterExpandAllIds };
     } finally {
-      DB_STATE.db.run("DELETE FROM dependencies WHERE issue_id = 'browser-detail' AND depends_on_id = 'browser-root' AND type = 'parent-child'");
+      DB_STATE.db.run("DELETE FROM dependencies WHERE issue_id IN ('browser-detail', 'browser-other') AND type = 'parent-child'");
+      ${app}.issuesTreeCollapsed = {};
       ${app}.rebuildIssuesTreeRows();
     }
   })()`);
@@ -1317,6 +1336,48 @@ async function journey(page, mobile) {
     `${page.name}: W30-6 Tree mode nests parent-child hierarchy with [closed/total] rollup`
   );
   assert.deepEqual(treeProbe.collapsedIds, ['browser-root'], `${page.name}: W30-6 Tree mode collapse hides descendants`);
+  assert.deepEqual(treeProbe.afterNestedCollapseIds, ['browser-root', 'browser-detail'], `${page.name}: P18B-8 collapseAllIssuesTree collapses hidden mid-level parents`);
+  assert.deepEqual(treeProbe.afterExpandAllIds, ['browser-root', 'browser-detail', 'browser-other'], `${page.name}: P18B-8 expandAllIssuesTree reveals full 3-level hierarchy`);
+  // W37-5: Blocking Tree mode nests blocker -> blocked chains, surfaces unblocks/ETA/risk pills (with real severity styling), and preserves zero horizontal overflow on desktop & mobile-360.
+  await click(page, '#issues-tree-mode-blocking');
+  await waitFor(page, `${app}.issuesTreeMode === 'blocking' && document.querySelector('#issues-tree-view [data-tree-id="browser-detail"]')?.getAttribute('data-tree-depth') === '1'`, 'W37-5 Blocking tree mode nests browser-detail under browser-root');
+  const blockingTreeAudit = await evaluate(page, `(async () => {
+    const a = ${app};
+    const origRow = a.issuesTreeFlatRows.find(r => r.issue.id === 'browser-root')?.issue;
+    const origRisk = origRow ? origRow.risk_score : undefined;
+    if (origRow) origRow.risk_score = 0.75;
+    await new Promise(r => setTimeout(r, 40));
+    try {
+      const rootEl = document.querySelector('#issues-tree-view [data-tree-id="browser-root"]');
+      const detailEl = document.querySelector('#issues-tree-view [data-tree-id="browser-detail"]');
+      const unblocksPill = rootEl?.querySelector('[data-tree-unblocks]');
+      const riskPill = rootEl?.querySelector('[data-tree-risk]');
+      const etaPills = [...document.querySelectorAll('#issues-tree-view [data-tree-eta]')].filter(${visible}).map(el => el.textContent.trim());
+      const overflow = document.documentElement.scrollWidth - document.documentElement.clientWidth;
+      return {
+        mode: a.issuesTreeMode,
+        rootDepth: rootEl?.getAttribute('data-tree-depth'),
+        detailDepth: detailEl?.getAttribute('data-tree-depth'),
+        unblocksVisible: Boolean(unblocksPill && (${visible})(unblocksPill)),
+        unblocksText: (unblocksPill?.textContent || '').trim(),
+        riskVisible: Boolean(riskPill && (${visible})(riskPill)),
+        riskClass: riskPill?.className || '',
+        etaCount: etaPills.length,
+        overflow,
+      };
+    } finally {
+      if (origRow) origRow.risk_score = origRisk;
+      await new Promise(r => setTimeout(r, 20));
+    }
+  })()`);
+  assert.equal(blockingTreeAudit.mode, 'blocking', `${page.name}: W37-5 Blocking tree mode active`);
+  assert.equal(blockingTreeAudit.rootDepth, '0', `${page.name}: W37-5 blocker browser-root sits at depth 0`);
+  assert.equal(blockingTreeAudit.detailDepth, '1', `${page.name}: W37-5 blocked browser-detail nests at depth 1`);
+  assert.ok(blockingTreeAudit.unblocksVisible && blockingTreeAudit.unblocksText.includes('1'), `${page.name}: W37-5 tree surfaces unblocks pill on blocker: ${JSON.stringify(blockingTreeAudit)}`);
+  assert.ok(blockingTreeAudit.riskVisible && blockingTreeAudit.riskClass.includes('red'), `${page.name}: P30-B1 tree risk pill applies high-severity red class via numeric risk_score: ${JSON.stringify(blockingTreeAudit)}`);
+  assert.ok(blockingTreeAudit.overflow <= 1, `${page.name}: W37-5 Blocking tree has zero horizontal overflow (overflow=${blockingTreeAudit.overflow})`);
+  await click(page, '#issues-tree-mode-hierarchy');
+  await waitFor(page, `${app}.issuesTreeMode === 'hierarchy'`, 'W37-5 return to Hierarchy tree mode');
   await click(page, '#issues-mode-list');
   await waitFor(page, `${app}.issuesViewMode === 'list'`, 'return to List mode cleanly');
   await capture(page, 'filtered');
@@ -1487,18 +1548,71 @@ async function journey(page, mobile) {
   await click(page, '#graph-filter-clear');
   await waitFor(page, `${app}.graphVisibleTotal === 4`, 'reset restores all 4 graph nodes');
   await click(page, '#graph-filter-toggle-btn');
-  // W30-4: Interactive Pre-Flight Dependency Validator ("Check Add Dep A → B") in Static Site Graph
-  const checkDepCycle = await evaluate(page, `${app}.evaluateGraphCheckDep('browser-root', 'browser-detail')`);
-  assert.equal(checkDepCycle.canAdd, false, `${page.name}: W30-4 cycle check rejects browser-root -> browser-detail`);
-  assert.equal(checkDepCycle.wouldCycle, true, `${page.name}: W30-4 sets wouldCycle=true`);
-  assert.deepEqual(checkDepCycle.cyclePath, ['browser-root', 'browser-detail', 'browser-root'], `${page.name}: W30-4 returns full cycle path`);
-  assert.equal(checkDepCycle.command, '', `${page.name}: W30-4 emits no command on cycle`);
+  // W30-4 + P18B-1/2/6/10: Interactive Pre-Flight Dependency Validator ("Check Add Dep A → B") in Static Site Graph
+  const pickingProbe = await evaluate(page, `(() => {
+    ${app}.graphDetailNode = null;
+    ${app}.startGraphCheckDep('browser-root');
+    const hsStart = ${app}.forceGraphModule.getHighlightState();
+    const targetNode = ${app}.forceGraphModule.getGraph().graphData().nodes.find(n => n.id === 'browser-detail');
+    // Simulate real force-graph node click while picking is active via the registered onNodeClick handler.
+    const clickHandler = ${app}.forceGraphModule.getGraph().onNodeClick();
+    if (typeof clickHandler === 'function' && targetNode) {
+      clickHandler(targetNode, { shiftKey: false, ctrlKey: false, metaKey: false });
+    }
+    const hsCycle = ${app}.forceGraphModule.getHighlightState();
+    return {
+      hsStart,
+      hsCycle,
+      detailOpenAfterPick: ${app}.graphDetailNode !== null,
+      selectedModalOpenAfterPick: ${app}.selectedIssue !== null,
+      result: ${app}.graphCheckDepResult ? JSON.parse(JSON.stringify(${app}.graphCheckDepResult)) : null,
+    };
+  })()`);
+  assert.equal(pickingProbe.hsStart.checkDepPicking, true, `${page.name}: P18B-2 startGraphCheckDep enables checkDepPicking`);
+  assert.equal(pickingProbe.detailOpenAfterPick, false, `${page.name}: P18B-2 picking target node does not open detail drawer`);
+  assert.equal(pickingProbe.selectedModalOpenAfterPick, false, `${page.name}: P18B-2 picking target node does not open issue modal`);
+  assert.equal(pickingProbe.hsCycle.checkDepPicking, false, `${page.name}: P18B-2 evaluating target disables checkDepPicking`);
+  assert.ok(pickingProbe.hsCycle.nodes.every(x => typeof x === 'string') && pickingProbe.hsCycle.nodes.includes('browser-root') && pickingProbe.hsCycle.nodes.includes('browser-detail'), `${page.name}: P18B-1 highlightedNodes holds string node IDs (not node objects)`);
+  assert.ok(pickingProbe.hsCycle.links.every(x => typeof x === 'string') && pickingProbe.hsCycle.links.includes('browser-detail\0browser-root'), `${page.name}: P18B-1 highlightedLinks holds edgeKey strings (not link objects)`);
+  assert.equal(pickingProbe.result.canAdd, false, `${page.name}: W30-4 cycle check rejects browser-root -> browser-detail`);
+  assert.equal(pickingProbe.result.wouldCycle, true, `${page.name}: W30-4 sets wouldCycle=true`);
+  assert.deepEqual(pickingProbe.result.cyclePath, ['browser-root', 'browser-detail', 'browser-root'], `${page.name}: W30-4 returns full cycle path`);
+  assert.equal(pickingProbe.result.command, '', `${page.name}: W30-4 emits no command on cycle`);
   await waitFor(page, `(${visible})(document.querySelector('#graph-checkdep-hud')) && document.querySelector('#graph-checkdep-hud').textContent.includes('Cycle')`, 'Check Add Dep HUD shows cycle verdict');
+  // P18B-6: Invalid/unknown issue ID renders Invalid warning (never green Safe).
+  const checkDepInvalid = await evaluate(page, `${app}.evaluateGraphCheckDep('browser-root', 'missing-ghost-id')`);
+  assert.equal(checkDepInvalid.canAdd, false, `${page.name}: P18B-6 invalid ID sets canAdd=false`);
+  await waitFor(page, `document.querySelector('#graph-checkdep-hud').textContent.includes('Invalid') && !document.querySelector('#graph-checkdep-hud').textContent.includes('Safe')`, 'Check Add Dep HUD shows Invalid (not Safe) for unknown ID');
   const checkDepSafe = await evaluate(page, `${app}.evaluateGraphCheckDep('browser-other', 'browser-root')`);
   assert.equal(checkDepSafe.canAdd, true, `${page.name}: W30-4 allows acyclic browser-other -> browser-root`);
   assert.equal(checkDepSafe.wouldBlockActionable, true, `${page.name}: W30-4 flags blocking ready work`);
   assert.equal(checkDepSafe.command, 'br dep add browser-other browser-root', `${page.name}: W30-4 emits authoritative br dep add command`);
   await waitFor(page, `(${visible})(document.querySelector('#graph-checkdep-copy-cmd'))`, 'Check Add Dep HUD shows Copy br dep add button on safe edge');
+  // P19-7 + P20B-5: Verify #graph-checkdep-hud AND #graph-right-controls fit inside 360px mobile viewport
+  // (using getBoundingClientRect().right on position:fixed Graph view, not just scrollWidth).
+  const checkDepBounds = await evaluate(page, `(() => {
+    const hud = document.querySelector('#graph-checkdep-hud')?.getBoundingClientRect();
+    const right = document.querySelector('#graph-right-controls')?.getBoundingClientRect();
+    return {
+      innerWidth: window.innerWidth,
+      scrollWidth: document.documentElement.scrollWidth,
+      hudRight: hud ? Math.round(hud.right) : 0,
+      rightCtrlRight: right ? Math.round(right.right) : 0,
+    };
+  })()`);
+  assert.ok(
+    checkDepBounds.scrollWidth <= checkDepBounds.innerWidth + 1 &&
+    checkDepBounds.hudRight <= checkDepBounds.innerWidth + 1 &&
+    checkDepBounds.rightCtrlRight <= checkDepBounds.innerWidth + 1,
+    `${page.name}: P19-7/P20B-5 #graph-checkdep-hud & #graph-right-controls must stay within viewport: ${JSON.stringify(checkDepBounds)}`
+  );
+  // P19-3: Pressing 'r' (resetView) clears Check Add Dep HUD and resets picking state cleanly.
+  await evaluate(page, `${app}.startGraphCheckDep('browser-root')`);
+  await waitFor(page, `${app}.graphCheckDepMode === true`, 'Check Add Dep picking active before resetView');
+  await evaluate(page, `${app}.forceGraphModule.resetView()`);
+  await waitFor(page, `!${app}.graphCheckDepMode && !${app}.graphCheckDepResult && !${app}.forceGraphModule.getHighlightState().checkDepPicking`, 'P19-3 resetView clears Check Add Dep HUD and picking state');
+  await evaluate(page, `${app}.evaluateGraphCheckDep('browser-other', 'browser-root')`);
+  await waitFor(page, `Boolean(${app}.graphCheckDepResult)`, 're-open Check Add Dep HUD before Escape test');
   await key(page, 'Escape');
   await waitFor(page, `!${app}.graphCheckDepMode && !${app}.graphCheckDepResult`, 'Escape dismisses Check Add Dep HUD cleanly');
   // Verify showIssue on excluded ID displays warning toast instead of blank modal.
@@ -2287,7 +2401,7 @@ async function capabilitiesJourney(page) {
       inDegSpread: Math.max(...inDegSizes) > Math.min(...inDegSizes),
     };
   })()`);
-  assert.deepEqual(sizeMetricAudit.options, ['pagerank', 'betweenness', 'eigenvector', 'inDegree', 'outDegree', 'criticalPath', 'kcore', 'hitsHub', 'hitsAuth', 'slack'], '#graphSizeMetric exposes all 10 graph metrics');
+  assert.deepEqual(sizeMetricAudit.options, ['pagerank', 'betweenness', 'eigenvector', 'inDegree', 'outDegree', 'criticalPath', 'kcore', 'hitsHub', 'hitsAuth', 'slack', 'risk'], '#graphSizeMetric exposes all 11 graph metrics');
   assert.equal(sizeMetricAudit.metricAfterInDeg, 'inDegree');
   assert.equal(sizeMetricAudit.metricAfterEigen, 'eigenvector');
   assert.ok(sizeMetricAudit.inDegValid && sizeMetricAudit.eigenValid && sizeMetricAudit.inDegSpread, `getNodeSize scales cleanly across sizeMetric options: ${JSON.stringify(sizeMetricAudit)}`);
@@ -2925,6 +3039,138 @@ async function capabilitiesJourney(page) {
     confirmHiddenProvisional: true,
   }, `B13-4 + B14-2 + W28-4 label sort flip, clusters/orphans/co_changed rendering & provisional confirm gating verified: ${JSON.stringify(labelSortFlip)}`);
 
+  // Wave 38: W38-1 feedback effective_weights resolution (applied vs unapplied, Go PascalCase keys,
+  // Adaptive badge & reactive modal score breakdown), W38-7 guarded Priority Recommendation copy button
+  // (actual click + copiedCommandText), and W38-6 compact lifecycle milestones + cycle_time in Issue Modal.
+  const wave38InsightsAndModalCheck = await evaluate(page, `(async () => {
+    const appData = ${app};
+    const origTriage = appData.triageData;
+    const origForecast = appData.forecastData;
+    const origHistory = appData.historyData;
+    const origCopied = appData.copiedCommandText;
+    try {
+      const defaultW = resolveEffectiveTriageWeights({});
+      // W38-1a: Unapplied feedback (applied: false) must NOT override defaults or show Adaptive badge.
+      appData.triageData = {
+        ...(origTriage || {}),
+        source_authority: { claim_safe: true, state: 'authoritative' },
+        feedback: {
+          enabled: true,
+          applied: false,
+          effective_weights: { PageRank: 0.45, Betweenness: 0.25, BlockerRatio: 0.15, Staleness: 0.05, PriorityBoost: 0.05, TimeToImpact: 0.03, Urgency: 0.01, Risk: 0.01 },
+        },
+      };
+      await new Promise(r => setTimeout(r, 40));
+      const unappliedIgnored = Math.abs(appData.getEffectiveTriageWeights().pagerank - defaultW.pagerank) < 1e-6;
+      const adaptiveHiddenWhenUnapplied = !(${visible})(document.querySelector('[data-adaptive-weights-badge]'));
+
+      // W38-1b: Applied feedback (applied: true) with Go PascalCase keys updates UI weights, Adaptive badge, and modal bars.
+      appData.triageData = {
+        ...(origTriage || {}),
+        source_authority: { claim_safe: true, state: 'authoritative' },
+        feedback: {
+          enabled: true,
+          applied: true,
+          effective_weights: { PageRank: 0.45, Betweenness: 0.25, BlockerRatio: 0.15, Staleness: 0.05, PriorityBoost: 0.05, TimeToImpact: 0.03, Urgency: 0.01, Risk: 0.01 },
+        },
+      };
+      await new Promise(r => setTimeout(r, 50));
+      const appliedWeightsOk = Math.abs(appData.getEffectiveTriageWeights().pagerank - 0.45) < 1e-6;
+      const adaptiveShownWhenApplied = (${visible})(document.querySelector('[data-adaptive-weights-badge]'));
+      const modalBarsAppliedWeight = appData.getScoreBreakdownBars({ pagerank: 0.5, betweenness: 0.2 })[0]?.weight === 0.45;
+
+      // W38-7: [data-priority-copy-btn] visible only when action_command present AND canEmitRoutedMutationCommand(),
+      // and actually clicking it copies command via copyShellCommand without throwing ReferenceError.
+      appData.copiedCommandText = '';
+      appData.forecastData = {
+        ...(origForecast || {}),
+        priority_recommendations: [{
+          issue_id: 'cap-auth-root',
+          title: 'OAuth login gateway',
+          current_priority: 3,
+          suggested_priority: 0,
+          direction: 'increase',
+          confidence: 0.9,
+          reasoning: ['Blocks critical path'],
+          action_command: 'br update --json --priority=0 -- cap-auth-root',
+        }],
+      };
+      await new Promise(r => setTimeout(r, 50));
+      const prioCopyBtn = document.querySelector('[data-priority-copy-btn]');
+      const prioCopyVisibleLive = Boolean(prioCopyBtn && (${visible})(prioCopyBtn));
+      prioCopyBtn?.click();
+      await new Promise(r => setTimeout(r, 40));
+      const prioCopyClickedCmd = appData.copiedCommandText === 'br update --json --priority=0 -- cap-auth-root';
+
+      appData.triageData = { ...(appData.triageData || {}), source_authority: { claim_safe: false, state: 'provisional_jsonl' } };
+      await new Promise(r => setTimeout(r, 50));
+      const prioCopyBtnAfter = document.querySelector('[data-priority-copy-btn]');
+      const prioCopyHiddenProvisional = !prioCopyBtnAfter || !(${visible})(prioCopyBtnAfter);
+
+      // W38-6: Compact lifecycle milestones object + cycle_time pills render in Issue Modal (with edge-case hour formatting) and close cleanly.
+      const hourFmtEdgeOk = appData.formatLifecycleHours(null) === '' && appData.formatLifecycleHours('') === '' && appData.formatLifecycleHours(0.995) === '1.0h';
+      appData.historyData = {
+        ...(origHistory || {}),
+        histories: {
+          ...(origHistory?.histories || {}),
+          'cap-auth-root': {
+            cycle_time: { create_to_claim_hours: 2.5, claim_to_close_hours: 18.0, total_hours: 20.5 },
+            milestones: { created: '2026-03-01', claimed: '2026-03-02', closed: '2026-03-03' },
+          },
+        },
+      };
+      appData.selectIssue('cap-auth-root');
+      await new Promise(r => setTimeout(r, 80));
+      const lcEl = document.getElementById('modal-lifecycle');
+      const lcText = lcEl?.textContent || '';
+      const lifecycleRendered = Boolean(
+        lcEl && (${visible})(lcEl) &&
+        lcText.includes('Create→Claim: 2.5h') &&
+        lcText.includes('Claim→Close: 18.0h') &&
+        lcText.includes('Total: 20.5h') &&
+        lcText.includes('Mar 1, 2026') &&
+        lcText.includes('Mar 3, 2026')
+      );
+      appData.closeIssue();
+      await new Promise(r => setTimeout(r, 60));
+      const modalClosedCleanly = !appData.selectedIssue;
+
+      return {
+        unappliedIgnored,
+        adaptiveHiddenWhenUnapplied,
+        appliedWeightsOk,
+        adaptiveShownWhenApplied,
+        modalBarsAppliedWeight,
+        prioCopyVisibleLive,
+        prioCopyClickedCmd,
+        prioCopyHiddenProvisional,
+        hourFmtEdgeOk,
+        lifecycleRendered,
+        modalClosedCleanly,
+      };
+    } finally {
+      if (appData.selectedIssue) appData.closeIssue();
+      appData.triageData = origTriage;
+      appData.forecastData = origForecast;
+      appData.historyData = origHistory;
+      appData.copiedCommandText = origCopied;
+      await new Promise(r => setTimeout(r, 40));
+    }
+  })()`);
+  assert.deepEqual(wave38InsightsAndModalCheck, {
+    unappliedIgnored: true,
+    adaptiveHiddenWhenUnapplied: true,
+    appliedWeightsOk: true,
+    adaptiveShownWhenApplied: true,
+    modalBarsAppliedWeight: true,
+    prioCopyVisibleLive: true,
+    prioCopyClickedCmd: true,
+    prioCopyHiddenProvisional: true,
+    hourFmtEdgeOk: true,
+    lifecycleRendered: true,
+    modalClosedCleanly: true,
+  }, `Wave 38 SPA checks (W38-1 feedback weights, W38-6 modal lifecycle, W38-7 guarded priority copy): ${JSON.stringify(wave38InsightsAndModalCheck)}`);
+
   // Wave 25: Issues quick filters (#filter-in-cycle-btn, #filter-articulation-btn), new sorts (pagerank/betweenness/due/estimate), and Detail Modal K-Core/Slack/Correlated Commits
   await click(page, 'a[href="#/issues"]');
   await waitFor(page, `${app}.view === 'issues'`, 'navigated to issues for Wave 25 quick filter and structural metric check');
@@ -2983,6 +3229,67 @@ async function capabilitiesJourney(page) {
     rootChainOnBlocked: true,
     rootChainSuppressedOnClosed: true,
   }, `Issues new sorts (incl. eta), active-only structural metrics, ETA pills, root blocker chain, and non-empty correlated commits verified: ${JSON.stringify(wave25DetailMetrics)}`);
+
+  // RC-C42 / MR-12: Verify commit_catalog & bead_catalog deduplicated history.json hydrates
+  // identically to legacy flat history.json in real Headless Chrome.
+  const mr12HistoryCheck = await evaluate(page, `(() => {
+    const a = ${app};
+    const hd = a.historyData;
+    const origHD = hd;
+    const hasCommitCatalog = Boolean(hd?.commit_catalog && Object.keys(hd.commit_catalog).length > 0);
+    const dedupCommits = a.getIssueCommits('cap-auth-root');
+    const dedupRelated = a.getIssueRelatedWork('cap-auth-root');
+    // Construct a legacy flat historyData with catalogs stripped and fields inlined.
+    const flatCommits = dedupCommits.map(c => ({ ...c }));
+    const flatRelated = (dedupRelated.length > 0 ? dedupRelated : [{
+      bead_id: 'cap-auth-ui',
+      title: 'Legacy flat related title',
+      status: 'open',
+      relation_type: 'commit_overlap',
+      relevance: 80,
+      shared_commits: 1,
+    }]).map(r => ({ ...r }));
+    const catRelated = flatRelated.map(r => ({
+      bead_id: r.bead_id,
+      relation_type: r.relation_type,
+      relevance: r.relevance,
+      shared_commits: r.shared_commits,
+    }));
+    const beadCatalog = {};
+    for (const r of flatRelated) beadCatalog[r.bead_id] = { title: r.title, status: r.status };
+    try {
+      a.historyData = {
+        ...hd,
+        commit_catalog: undefined,
+        bead_catalog: undefined,
+        histories: { ...(hd?.histories || {}), 'cap-auth-root': { commits: flatCommits, related: flatRelated } },
+      };
+      const legacyHydratedCommits = a.getIssueCommits('cap-auth-root');
+      const legacyHydratedRelated = a.getIssueRelatedWork('cap-auth-root');
+      a.historyData = {
+        ...hd,
+        bead_catalog: beadCatalog,
+        histories: { ...(hd?.histories || {}), 'cap-auth-root': { commits: hd?.histories?.['cap-auth-root']?.commits || flatCommits, related: catRelated } },
+      };
+      const catalogHydratedRelated = a.getIssueRelatedWork('cap-auth-root');
+      return {
+        hasCommitCatalog,
+        dedupCommitsLen: dedupCommits.length,
+        commitsExactMatch: JSON.stringify(dedupCommits) === JSON.stringify(legacyHydratedCommits),
+        relatedExactMatch: JSON.stringify(catalogHydratedRelated) === JSON.stringify(legacyHydratedRelated),
+        firstRelatedTitlePresent: Boolean(catalogHydratedRelated[0]?.title && catalogHydratedRelated[0]?.status),
+      };
+    } finally {
+      a.historyData = origHD;
+    }
+  })()`);
+  assert.deepEqual(mr12HistoryCheck, {
+    hasCommitCatalog: true,
+    dedupCommitsLen: mr12HistoryCheck.dedupCommitsLen >= 1 ? mr12HistoryCheck.dedupCommitsLen : 1,
+    commitsExactMatch: true,
+    relatedExactMatch: true,
+    firstRelatedTitlePresent: true,
+  }, `RC-C42 / MR-12 catalog vs legacy flat history hydration must match identically: ${JSON.stringify(mr12HistoryCheck)}`);
 
   // Wave 27/28 B11-1 + B11-2 + B13-1 + B13-4 + B13-5 + B13-6 + B13-7 + B14-3 + B14-4 + B14-8 + B14-9 + W27-2 + W28-2:
   // Real non-tautological WASM fast-path & fallback parity, real 'eta' sort with closed/non-numeric/negative tie-break,
@@ -3166,6 +3473,47 @@ async function capabilitiesJourney(page) {
     const clearedHiddenDetail = ${app}.graphDetailNode === null;
     mod.clearFilters();
     await new Promise(r => setTimeout(r, 40));
+    // W33-2 + P24B-6 + P24B-7: Static Site Interactive Dep-Removal & Cycle-Cut Preflight
+    const cycleRemPos = window.bvCheckProposedDepRemoval('cap-auth-root', 'cap-auth-ui');
+    const cycleRemMiss = window.bvCheckProposedDepRemoval('cap-hub-leaf', 'cap-billing-b');
+    // P24B-6: Test isSafeDepArg against a REAL inserted leading-dash ID + blocking edge (exists=true, command='')!
+    // P24B-7: Test pure-JS Johnson cycle fallback (with bvGraphWasm temporarily null) on a 2-cycle overlapping SCC!
+    let unsafeFlagCmd = 'NOT_RUN';
+    let unsafeFlagExists = false;
+    let jsFallbackCycles = null;
+    try {
+      DB_STATE.db.run("INSERT INTO issues (id, title, status, priority, issue_type, created_at, updated_at) VALUES ('-evil-flag', 'Flag injection node', 'open', 1, 'task', '2026-09-01T12:00:00Z', '2026-09-01T12:00:00Z')");
+      DB_STATE.db.run("INSERT INTO issue_overview_mv (id, title, status, priority, issue_type, created_at, updated_at, is_actionable) VALUES ('-evil-flag', 'Flag injection node', 'open', 1, 'task', '2026-09-01T12:00:00Z', '2026-09-01T12:00:00Z', 0)");
+      DB_STATE.db.run("INSERT INTO dependencies (issue_id, depends_on_id, type) VALUES ('-evil-flag', 'cap-auth-root', 'blocks')");
+      const unsafeCheck = window.bvCheckProposedDepRemoval('-evil-flag', 'cap-auth-root');
+      unsafeFlagExists = Boolean(unsafeCheck?.exists);
+      unsafeFlagCmd = unsafeCheck?.command ?? 'UNDEFINED';
+
+      // Overlapping 2-cycle SCC: cap-auth-root <-> cap-auth-ui PLUS cap-auth-ui -> cap-hub-leaf -> cap-auth-root
+      DB_STATE.db.run("INSERT INTO dependencies (issue_id, depends_on_id, type) VALUES ('cap-auth-ui', 'cap-hub-leaf', 'blocks')");
+      const savedWasm = window.bvGraphWasm;
+      try {
+        window.bvGraphWasm = null;
+        const fb = window.bvCheckProposedDepRemoval('cap-auth-ui', 'cap-hub-leaf');
+        jsFallbackCycles = { before: fb.cyclesBefore, after: fb.cyclesAfter, broken: fb.cyclesBroken };
+      } finally {
+        window.bvGraphWasm = savedWasm;
+      }
+    } finally {
+      DB_STATE.db.run("DELETE FROM dependencies WHERE (issue_id = '-evil-flag' AND depends_on_id = 'cap-auth-root') OR (issue_id = 'cap-auth-ui' AND depends_on_id = 'cap-hub-leaf')");
+      DB_STATE.db.run("DELETE FROM issue_overview_mv WHERE id = '-evil-flag'");
+      DB_STATE.db.run("DELETE FROM issues WHERE id = '-evil-flag'");
+    }
+    ${app}.evaluateGraphCheckDepRemoval('cap-auth-root', 'cap-auth-ui');
+    await new Promise(r => setTimeout(r, 50));
+    const remHudVisible = (${visible})(document.querySelector('#graph-checkdep-hud'));
+    const remHudText = (document.querySelector('#graph-checkdep-hud')?.textContent || '').trim();
+    const remCopyBtnVisible = (${visible})(document.querySelector('#graph-checkdep-copy-cmd'));
+    ${app}.resetGraphCheckDep();
+    await new Promise(r => setTimeout(r, 30));
+    // W33-3 negative control on non-diff export: hasDiff=false, #filter-changed-btn & #graph-filter-changed-only hidden
+    const nonDiffHasDiff = Boolean(${app}.hasDiff);
+    const nonDiffGraphBtnHidden = !(${visible})(document.querySelector('#graph-filter-changed-only'));
     return {
       etaVisible,
       rbVisible,
@@ -3175,6 +3523,17 @@ async function capabilitiesJourney(page) {
       stillOnGraphAfterClose,
       missingToastShown,
       clearedHiddenDetail,
+      cycleRemPos: cycleRemPos ? { exists: cycleRemPos.exists, canRemove: cycleRemPos.canRemove, cyclesBroken: cycleRemPos.cyclesBroken, newlyUnblocked: cycleRemPos.newlyUnblocked, command: cycleRemPos.command } : null,
+      cycleRemMissExists: Boolean(cycleRemMiss?.exists),
+      unsafeFlagExists,
+      unsafeFlagCmd,
+      jsFallbackCycles,
+      remHudVisible,
+      remHudHasRemove: remHudText.includes('Remove'),
+      remHudHasCutCycle: /Breaks/i.test(remHudText),
+      remCopyBtnVisible,
+      nonDiffHasDiff,
+      nonDiffGraphBtnHidden,
     };
   })()`);
   assert.deepEqual(graphDrawerDOM, {
@@ -3186,7 +3545,473 @@ async function capabilitiesJourney(page) {
     stillOnGraphAfterClose: true,
     missingToastShown: true,
     clearedHiddenDetail: true,
-  }, `Wave 28 B13-1/B13-4/B13-5/W27-2 Graph Detail Drawer & hidden root-blocker modal isolation verified: ${JSON.stringify(graphDrawerDOM)}`);
+    cycleRemPos: {
+      exists: true,
+      canRemove: true,
+      cyclesBroken: 1,
+      newlyUnblocked: ['cap-auth-root'],
+      command: 'br dep remove cap-auth-root cap-auth-ui',
+    },
+    cycleRemMissExists: false,
+    unsafeFlagExists: true,
+    unsafeFlagCmd: '',
+    jsFallbackCycles: { before: 3, after: 2, broken: 1 },
+    remHudVisible: true,
+    remHudHasRemove: true,
+    remHudHasCutCycle: true,
+    remCopyBtnVisible: true,
+    nonDiffHasDiff: false,
+    nonDiffGraphBtnHidden: true,
+  }, `Wave 28/33 Graph Detail Drawer, W33-2 Dep-Removal Preflight, P24B-6/7 guards, and W33-3 non-diff negative control verified: ${JSON.stringify(graphDrawerDOM)}`);
+
+  // RC-C41 / MR-11: Verify zero duplicate history.json fetches from initForceGraphView(), dense-cycle (>100)
+  // cyclesTruncated warning, #graph-detail-panel & Issue Detail Modal inline blocker removal preflight
+  // (with command withholding), and #filter-high-risk-btn + createDefaultFilters() round-trip/reset.
+  const graphHistoryDuplicateFetches = records.filter(r =>
+    r.page === 'capabilities' &&
+    r.method === 'Network.requestWillBeSent' &&
+    new URL(r.params.request.url).pathname === '/data/history.json' &&
+    (r.params.initiator?.stack?.callFrames || []).some(f => f.functionName === 'initForceGraphView')
+  );
+  assert.deepEqual(graphHistoryDuplicateFetches, [], 'RC-C41 initForceGraphView() must reuse this.historyData without duplicate /data/history.json fetches');
+
+  const rcC41CapsAudit = await evaluate(page, `(async () => {
+    const a = ${app};
+    const vis = ${visible};
+
+    // 1. Surface 2: #graph-detail-panel inline direct-blocker removal preflight
+    a.focusOrShowGraphNode('cap-auth-root');
+    await new Promise(r => setTimeout(r, 80));
+    const graphBlockerBtn = document.querySelector('#graph-detail-direct-blockers .graph-detail-remove-blocker-btn[data-remove-from="cap-auth-root"][data-remove-to="cap-auth-ui"]');
+    const graphBlockerBtnVisible = Boolean(graphBlockerBtn && vis(graphBlockerBtn));
+    if (graphBlockerBtn) graphBlockerBtn.click();
+    await new Promise(r => setTimeout(r, 60));
+    const graphPanelRemOk = Boolean(
+      a.graphCheckDepResult?.operation === 'remove' &&
+      a.graphCheckDepResult?.exists === true &&
+      a.graphCheckDepResult?.fromId === 'cap-auth-root' &&
+      a.graphCheckDepResult?.toId === 'cap-auth-ui' &&
+      vis(document.querySelector('#graph-checkdep-hud'))
+    );
+    a.resetGraphCheckDep();
+
+    // 2. Surface 1: Issue Detail Modal inline per-blocker removal preflight + command withholding + clear on close
+    a.selectIssue('cap-auth-root');
+    await new Promise(r => setTimeout(r, 80));
+    // P27-1 / P28-B2: Module-scope getHighRiskSummary cache hits on repeat call AND invalidates when triageData changes!
+    const hrBeforeSwap = a.getHighRiskSummary(8);
+    const hrRepeatSame = hrBeforeSwap === a.getHighRiskSummary(8);
+    const savedTriageForCache = a.triageData;
+    a.triageData = { ...(savedTriageForCache || {}) };
+    const hrAfterSwapDiff = a.getHighRiskSummary(8) !== hrBeforeSwap;
+    a.triageData = savedTriageForCache;
+    const highRiskCacheHit = hrRepeatSame && hrAfterSwapDiff;
+    // W36-2 / P28-B4 / P28-B6 / P28-B7: Issue Detail Modal renders scoped #modal-issue-alerts & #modal-issue-suggestions
+    const origTriageW36 = a.triageData;
+    const origSuggW36 = a.suggestionsData;
+    const origDriftW36 = a.driftData;
+    const origHasDriftW36 = a.hasDrift;
+    let modalAlertsSuggOk = false;
+    try {
+      a.triageData = {
+        ...(origTriageW36 || {}),
+        alerts: [
+          { type: 'stale_issue', severity: 'warning', issue_id: 'cap-auth-root', message: 'W36 modal alert on cap-auth-root' },
+          { type: 'cycle_detected', severity: 'error', issue_id: 'cap-auth-root', message: 'W36 error alert ranks first' },
+          { type: 'stale_issue', severity: 'warning', issue_id: 'cap-billing-a', message: 'Unrelated billing alert' },
+        ],
+      };
+      a.driftData = {
+        has_drift: true,
+        alerts: [
+          { type: 'stale_issue', severity: 'warning', issue_id: 'cap-auth-root', message: 'W36 modal alert on cap-auth-root', suggested_action: 'Backfilled drift action' },
+        ],
+      };
+      a.hasDrift = true;
+      a.suggestionsData = {
+        ...(origSuggW36 || {}),
+        suggestions: [
+          { type: 'cycle_warning', target_bead: 'cap-auth-root', related_bead: 'cap-auth-root', summary: 'Break auth cycle', reason: 'Unblocks downstream auth', confidence: 0.85, action_command: 'br dep remove cap-auth-root cap-auth-ui' },
+          { type: 'cycle_warning', target_bead: 'cap-billing-a', summary: 'Unrelated billing suggestion', confidence: 0.9, action_command: 'br dep remove cap-billing-a cap-billing-b' },
+        ],
+      };
+      await new Promise(r => setTimeout(r, 60));
+      const issueAlerts = a.getIssueAlerts('cap-auth-root');
+      const issueSuggs = a.getIssueSuggestions('cap-auth-root');
+      const errorFirstAndBackfilled = issueAlerts.length === 2 &&
+        issueAlerts[0].severity === 'error' &&
+        issueAlerts[1].suggested_action === 'Backfilled drift action' &&
+        issueSuggs.length === 1 &&
+        issueSuggs[0].other_bead === '';
+      const alertsBox = document.querySelector('#modal-issue-alerts');
+      const suggBox = document.querySelector('#modal-issue-suggestions');
+      const alertsText = alertsBox?.textContent || '';
+      const suggText = suggBox?.textContent || '';
+      const suggCopyBtn = suggBox?.querySelector('button[title*="Copy"]');
+      const copyVisWhenWritable = Boolean(suggCopyBtn && vis(suggCopyBtn));
+      // Provisional source authority must hide suggestion command copy button & strip action_command
+      a.triageData = { ...a.triageData, source_authority: { claim_safe: false, trust_level: 'provisional' } };
+      await new Promise(r => setTimeout(r, 40));
+      const suggCopyBtnAfter = suggBox?.querySelector('button[title*="Copy"]');
+      const copyHiddenWhenProvisional = Boolean(suggCopyBtn) && (!suggCopyBtnAfter || !vis(suggCopyBtnAfter)) && a.getIssueSuggestions('cap-auth-root')[0]?.action_command === '';
+      modalAlertsSuggOk = Boolean(
+        errorFirstAndBackfilled &&
+        vis(alertsBox) &&
+        alertsText.includes('W36 modal alert on cap-auth-root') &&
+        !alertsText.includes('Unrelated billing alert') &&
+        vis(suggBox) &&
+        suggText.includes('Break auth cycle') &&
+        !suggText.includes('Unrelated billing suggestion') &&
+        copyVisWhenWritable &&
+        copyHiddenWhenProvisional
+      );
+    } finally {
+      a.triageData = origTriageW36;
+      a.suggestionsData = origSuggW36;
+      a.driftData = origDriftW36;
+      a.hasDrift = origHasDriftW36;
+      await new Promise(r => setTimeout(r, 40));
+    }
+    const modalRemBtn = document.querySelector('.modal-dep-remove-btn[data-remove-from="cap-auth-root"][data-remove-to="cap-auth-ui"]');
+    const modalRemBtnVisible = Boolean(modalRemBtn && vis(modalRemBtn));
+    if (modalRemBtn) modalRemBtn.click();
+    await new Promise(r => setTimeout(r, 60));
+    const modalRemVisible = Boolean(vis(document.querySelector('#modal-dep-removal-result')));
+    const modalCopyBtn = document.querySelector('#modal-dep-removal-copy-btn');
+    let modalCopyClickedNoError = false;
+    if (modalCopyBtn && vis(modalCopyBtn)) {
+      modalCopyBtn.click();
+      await new Promise(r => setTimeout(r, 40));
+      modalCopyClickedNoError = true;
+    }
+    const modalRemRes = a.modalDepRemovalResult ? {
+      exists: a.modalDepRemovalResult.exists,
+      cyclesBroken: a.modalDepRemovalResult.cyclesBroken,
+      newlyUnblocked: [...(a.modalDepRemovalResult.newlyUnblocked || [])],
+      hasCmd: Boolean(a.modalDepRemovalResult.command && a.modalDepRemovalResult.command.startsWith('br dep remove ')),
+      copyVisible: Boolean(modalCopyBtn && vis(modalCopyBtn)),
+      copyClickedNoError: modalCopyClickedNoError,
+    } : null;
+
+    // W35-6: Issue Detail Modal Check Add Dep + Batch What-If (all real capabilitiesBundle IDs)
+    const addTargetInput = document.querySelector('#modal-check-add-target');
+    const addSubmitBtn = document.querySelector('#modal-check-add-btn');
+    let modalCheckAddCycleOk = false;
+    let modalCheckAddSafeOk = false;
+    if (addTargetInput && addSubmitBtn) {
+      // 1. Existing blocking edge: cap-auth-root -> cap-auth-ui
+      a.modalCheckAddTarget = 'cap-auth-ui';
+      addSubmitBtn.click();
+      await new Promise(r => setTimeout(r, 50));
+      const dupDetected = Boolean(vis(document.querySelector('#modal-check-add-result')) && a.modalCheckAddResult?.alreadyExists === true);
+      // 2. New cycle creation: cap-hub-leaf -> cap-auth-root already exists, so cap-auth-root -> cap-hub-leaf would cycle
+      a.modalCheckAddTarget = 'cap-hub-leaf';
+      addSubmitBtn.click();
+      await new Promise(r => setTimeout(r, 50));
+      const newCycleDetected = Boolean(
+        vis(document.querySelector('#modal-check-add-result')) &&
+        a.modalCheckAddResult?.alreadyExists === false &&
+        a.modalCheckAddResult?.wouldCycle === true &&
+        a.modalCheckAddResult?.canAdd === false
+      );
+      modalCheckAddCycleOk = dupDetected && newCycleDetected;
+      // 3. Safe cross-component addition: cap-auth-root -> cap-billing-a
+      a.modalCheckAddTarget = 'cap-billing-a';
+      addSubmitBtn.click();
+      await new Promise(r => setTimeout(r, 50));
+      const addCopyBtn = document.querySelector('#modal-check-add-copy-btn');
+      if (addCopyBtn && vis(addCopyBtn)) addCopyBtn.click();
+      await new Promise(r => setTimeout(r, 30));
+      modalCheckAddSafeOk = Boolean(
+        vis(document.querySelector('#modal-check-add-result')) &&
+        a.modalCheckAddResult?.canAdd === true &&
+        a.modalCheckAddResult?.wouldCycle === false &&
+        a.modalCheckAddResult?.command === 'br dep add cap-auth-root cap-billing-a'
+      );
+    }
+    const batchBtn = document.querySelector('#modal-whatif-batch-btn');
+    let modalBatchWhatIfOk = false;
+    if (batchBtn && vis(batchBtn)) {
+      // P27-12: Test 2-issue Modal Batch What-If (exercises whatIfCloseBatch, not just single whatIfClose!)
+      batchBtn.click();
+      await new Promise(r => setTimeout(r, 40));
+      a.toggleModalWhatIfBatch('cap-auth-ui');
+      await new Promise(r => setTimeout(r, 50));
+      const batchBoxVisible = Boolean(vis(document.querySelector('#modal-whatif-batch-result')));
+      const batchParVisible = Boolean(vis(document.querySelector('#modal-whatif-batch-parallel')));
+      const batchHasTwo = a.modalWhatIfBatchIds.length === 2 && a.modalWhatIfBatchResult?.active_count === 2;
+      // Closed target must be rejected without mutating modalWhatIfBatchIds (P27-5)
+      const closedRejected = a.toggleModalWhatIfBatch('cap-closed-prereq') === null && a.modalWhatIfBatchIds.length === 2;
+      const clearBatchBtn = document.querySelector('#modal-whatif-batch-clear-btn');
+      if (clearBatchBtn) clearBatchBtn.click();
+      await new Promise(r => setTimeout(r, 40));
+      modalBatchWhatIfOk = batchBoxVisible && batchParVisible && batchHasTwo && closedRejected && a.modalWhatIfBatchIds.length === 0;
+    }
+
+    // Negative control: historical as_of withholds modal command cleanly.
+    const savedAsOf = a.meta?.as_of;
+    let modalWithheldOk = false;
+    try {
+      if (a.meta) a.meta.as_of = 'HEAD~1';
+      if (modalRemBtn) modalRemBtn.click();
+      await new Promise(r => setTimeout(r, 60));
+      modalWithheldOk = Boolean(
+        a.modalDepRemovalResult?.exists === true &&
+        a.modalDepRemovalResult?.command === '' &&
+        !vis(document.querySelector('#modal-dep-removal-copy-btn'))
+      );
+    } finally {
+      if (a.meta) {
+        if (savedAsOf === undefined) delete a.meta.as_of;
+        else a.meta.as_of = savedAsOf;
+      }
+    }
+    a.closeIssue();
+    await new Promise(r => setTimeout(r, 60));
+    const modalClearedOnClose = a.modalDepRemovalResult === null && a.modalCheckAddResult === null;
+
+    // 3. Dense-cycle (>100 cycles) cyclesTruncated === true + inconclusive warning in viewer.js & #graph-checkdep-hud (P26-B2)
+    let denseTrunc = null;
+    let graphHudTruncWarningVisible = false;
+    try {
+      for (let i = 0; i < 7; i++) {
+        const id = 'dense-' + i;
+        DB_STATE.db.run("INSERT INTO issues (id, title, status, priority, issue_type, created_at, updated_at) VALUES (?, ?, 'open', 1, 'task', '2026-09-01T12:00:00Z', '2026-09-01T12:00:00Z')", [id, 'Dense ' + i]);
+        DB_STATE.db.run("INSERT INTO issue_overview_mv (id, title, status, priority, issue_type, created_at, updated_at, is_actionable) VALUES (?, ?, 'open', 1, 'task', '2026-09-01T12:00:00Z', '2026-09-01T12:00:00Z', 0)", [id, 'Dense ' + i]);
+      }
+      for (let i = 0; i < 7; i++) {
+        for (let j = 0; j < 7; j++) {
+          if (i !== j) {
+            DB_STATE.db.run("INSERT INTO dependencies (issue_id, depends_on_id, type) VALUES (?, ?, 'blocks')", ['dense-' + i, 'dense-' + j]);
+          }
+        }
+      }
+      const tr = window.bvCheckProposedDepRemoval('dense-0', 'dense-1');
+      a.evaluateGraphCheckDepRemoval('dense-0', 'dense-1');
+      await new Promise(r => setTimeout(r, 60));
+      graphHudTruncWarningVisible = Boolean(vis(document.querySelector('#graph-checkdep-trunc-warning')));
+      denseTrunc = {
+        exists: tr.exists,
+        cyclesTruncated: tr.cyclesTruncated,
+        cyclesBefore: tr.cyclesBefore,
+        cyclesAfter: tr.cyclesAfter,
+        cyclesBroken: tr.cyclesBroken,
+        wouldBreakAllCycles: tr.wouldBreakAllCycles,
+        hasInconclusiveWarning: /inconclusive/i.test(tr.warning || ''),
+      };
+    } finally {
+      DB_STATE.db.run("DELETE FROM dependencies WHERE issue_id LIKE 'dense-%' OR depends_on_id LIKE 'dense-%'");
+      DB_STATE.db.run("DELETE FROM issue_overview_mv WHERE id LIKE 'dense-%'");
+      DB_STATE.db.run("DELETE FROM issues WHERE id LIKE 'dense-%'");
+    }
+
+    // P26-B8: Leaving #/graph clears active graphCheckDepResult cleanly
+    // W35-2 / P27-12 / P28-B2 / P28-B10: Graph Risk size metric & strictly non-vacuous (>0) High-Risk-Only node filtering via real SQLite -> graph.js loadData pipeline
+    const riskOptExists = Boolean(document.querySelector('#graphSizeMetric option[value="risk"]'));
+    a.setGraphSizeMetric('risk');
+    const riskMetricSelected = a.graphSizeMetric === 'risk';
+    a.setGraphSizeMetric('pagerank');
+    const allNodesBeforeHr = a.forceGraphModule.getGraph().graphData().nodes.slice();
+    const hadNativeHr = allNodesBeforeHr.some(n => !['closed', 'tombstone'].includes(String(n.status || '').toLowerCase()) && Number(n.risk_score || 0) >= 0.5);
+    const origSqlRiskRows = execQuery("SELECT risk_score FROM issue_overview_mv WHERE id = 'cap-auth-root'");
+    const origSqlRisk = origSqlRiskRows?.[0]?.risk_score ?? 0;
+    let graphHighRiskFilterActive = false;
+    let graphHighRiskFilterCleared = false;
+    try {
+      if (!hadNativeHr) {
+        DB_STATE.db.run("UPDATE issue_overview_mv SET risk_score = 0.82 WHERE id = 'cap-auth-root'");
+        await a.initForceGraphView();
+      }
+      const loadedNodesHr = a.forceGraphModule.getGraph().graphData().nodes.slice();
+      const expectedHrIds = loadedNodesHr
+        .filter(n => !['closed', 'tombstone'].includes(String(n.status || '').toLowerCase()) && Number(n.risk_score || 0) >= 0.5)
+        .map(n => n.id)
+        .sort();
+      a.applyGraphFilter('highRiskOnly', true);
+      const filteredHrIds = a.forceGraphModule.getGraph().graphData().nodes.map(n => n.id).sort();
+      graphHighRiskFilterActive = Boolean(
+        a.graphFilters.highRiskOnly &&
+        a.hasActiveGraphFilters &&
+        expectedHrIds.length > 0 &&
+        filteredHrIds.length < loadedNodesHr.length &&
+        JSON.stringify(filteredHrIds) === JSON.stringify(expectedHrIds)
+      );
+      a.clearGraphFilters();
+      graphHighRiskFilterCleared = Boolean(
+        !a.graphFilters.highRiskOnly &&
+        a.forceGraphModule.getGraph().graphData().nodes.length === loadedNodesHr.length
+      );
+    } finally {
+      if (!hadNativeHr) {
+        DB_STATE.db.run("UPDATE issue_overview_mv SET risk_score = ? WHERE id = 'cap-auth-root'", [origSqlRisk]);
+        await a.initForceGraphView();
+      }
+    }
+
+    // W35-3 / P27-3 / P27-12: Cycle-break suggestions preserve numeric collateral AND fallback re-sorts cleanly
+    const cbSuggestions = a.getCycleBreaks(5);
+    const cbList = cbSuggestions?.suggestions || cbSuggestions?.top_suggestions || [];
+    let cbFallbackResortedOk = false;
+    const activeG = GRAPH_STATE.activeGraph || GRAPH_STATE.graph;
+    if (activeG && typeof activeG.cycleBreakSuggestions === 'function') {
+      const origFn = activeG.cycleBreakSuggestions.bind(activeG);
+      activeG.cycleBreakSuggestions = (lim, maxC) => ({
+        suggestions: [
+          { from_id: 'cap-auth-ui', to_id: 'cap-auth-root', cycles_broken: 1 }, // cap-auth-root has higher active in-degree (2: cap-auth-ui + cap-hub-leaf)
+          { from_id: 'cap-auth-root', to_id: 'cap-auth-ui', cycles_broken: 1 }, // cap-auth-ui has lower active in-degree (1: cap-auth-root)
+        ],
+      });
+      try {
+        const fb = a.getCycleBreaks(5);
+        const fbList = fb?.suggestions || [];
+        cbFallbackResortedOk = fbList.length === 2 &&
+          fbList[0].from_id === 'cap-auth-root' &&
+          fbList[0].to_id === 'cap-auth-ui' &&
+          fbList[0].collateral === 1 &&
+          fbList[1].collateral === 2;
+      } finally {
+        activeG.cycleBreakSuggestions = origFn;
+      }
+    }
+    const cycleBreakHasCollateral = cbList.length > 0 && cbList.every(s => Number.isFinite(Number(s.collateral)) && Number(s.collateral) >= 0) && cbFallbackResortedOk;
+
+    // W35-4: whatIfCloseBatch computes exact synergy_unblocks & parallel_gain = direct - active_count; closed target has active_count === 0
+    const batchEval = window.beadsViewer.whatIfCloseBatch(['cap-auth-root', 'cap-auth-ui']);
+    const closedEval = whatIfClose('cap-closed-prereq');
+    const batchSynergyFieldsOk = Boolean(
+      batchEval &&
+      Number.isInteger(batchEval.synergy_unblocks) &&
+      Array.isArray(batchEval.synergy_issue_ids) &&
+      batchEval.parallel_gain === (batchEval.direct_unblocks - batchEval.active_count) &&
+      closedEval &&
+      closedEval.active_count === 0 &&
+      closedEval.parallel_gain === 0
+    );
+
+    // 4. MR-11 + P26-B5/B6/B8 + P30-B6: Re-populate checkDep right before leaving #/graph so clearing is non-vacuous!
+    a.evaluateGraphCheckDepRemoval('cap-auth-root', 'cap-auth-ui');
+    const hadCheckDepBeforeLeave = Boolean(a.graphCheckDepResult);
+    window.location.hash = '#/issues';
+    await new Promise(r => setTimeout(r, 120));
+    const graphCheckDepClearedOnLeave = hadCheckDepBeforeLeave && a.graphCheckDepResult === null;
+    a.clearFilters();
+    await new Promise(r => setTimeout(r, 60));
+    const hrBtn = document.querySelector('#filter-high-risk-btn');
+    const hrBtnVisible = Boolean(hrBtn && vis(hrBtn));
+    if (hrBtn) hrBtn.click();
+    await new Promise(r => setTimeout(r, 80));
+    const hrPillVisible = Boolean(vis(document.querySelector('#active-high-risk-filter-pill')));
+    const hrOnState = {
+      highRisk: Boolean(a.filters.highRisk),
+      urlHasHighRisk: window.location.hash.includes('highrisk=true'),
+      hasActive: Boolean(a.hasActiveFilters),
+      pillVisible: hrPillVisible,
+    };
+    const hrPillBtn = document.querySelector('#active-high-risk-filter-pill');
+    if (hrPillBtn) hrPillBtn.click();
+    await new Promise(r => setTimeout(r, 60));
+    const hrPillCleared = !a.filters.highRisk && !a.hasActiveFilters;
+    a.navigateToIssuesWithFilter({ highRisk: true });
+    await new Promise(r => setTimeout(r, 60));
+    const navHighRiskPreserved = Boolean(a.filters.highRisk);
+    a.clearFilters();
+    await new Promise(r => setTimeout(r, 60));
+    const hrClearedState = {
+      highRisk: Boolean(a.filters.highRisk),
+      urlHasHighRisk: window.location.hash.includes('highrisk=true'),
+      hasActive: Boolean(a.hasActiveFilters),
+    };
+    // Verify EVERY filter key in createDefaultFilters() activates hasActiveFilters and resets cleanly.
+    const defaultKeys = Object.keys(window.beadsViewer.createDefaultFilters());
+    const registryMissed = [];
+    for (const k of defaultKeys) {
+      a.clearFilters();
+      const def = window.beadsViewer.createDefaultFilters()[k];
+      if (Array.isArray(def)) a.filters[k] = [k === 'priority' ? 1 : 'open'];
+      else if (typeof def === 'boolean') a.filters[k] = true;
+      else if (def === null) a.filters[k] = true;
+      else a.filters[k] = 'alice';
+      if (!a.hasActiveFilters) registryMissed.push(k + ':hasActive');
+      a.clearFilters();
+      if (a.hasActiveFilters) registryMissed.push(k + ':clear');
+    }
+
+    return {
+      graphBlockerBtnVisible,
+      graphPanelRemOk,
+      highRiskCacheHit,
+      modalAlertsSuggOk,
+      modalRemBtnVisible,
+      modalRemVisible,
+      modalRemRes,
+      modalCheckAddCycleOk,
+      modalCheckAddSafeOk,
+      modalBatchWhatIfOk,
+      modalWithheldOk,
+      modalClearedOnClose,
+      denseTrunc,
+      graphHudTruncWarningVisible,
+      graphCheckDepClearedOnLeave,
+      riskOptExists,
+      riskMetricSelected,
+      graphHighRiskFilterActive,
+      graphHighRiskFilterCleared,
+      cycleBreakHasCollateral,
+      batchSynergyFieldsOk,
+      hrBtnVisible,
+      hrOnState,
+      hrPillCleared,
+      navHighRiskPreserved,
+      hrClearedState,
+      registryKeyCount: defaultKeys.length,
+      registryMissed,
+    };
+  })()`);
+  assert.deepEqual(rcC41CapsAudit, {
+    graphBlockerBtnVisible: true,
+    graphPanelRemOk: true,
+    highRiskCacheHit: true,
+    modalAlertsSuggOk: true,
+    modalRemBtnVisible: true,
+    modalRemVisible: true,
+    modalRemRes: {
+      exists: true,
+      cyclesBroken: 1,
+      newlyUnblocked: ['cap-auth-root'],
+      hasCmd: true,
+      copyVisible: true,
+      copyClickedNoError: true,
+    },
+    modalCheckAddCycleOk: true,
+    modalCheckAddSafeOk: true,
+    modalBatchWhatIfOk: true,
+    modalWithheldOk: true,
+    modalClearedOnClose: true,
+    denseTrunc: {
+      exists: true,
+      cyclesTruncated: true,
+      cyclesBefore: 100,
+      cyclesAfter: 100,
+      cyclesBroken: 0,
+      wouldBreakAllCycles: false,
+      hasInconclusiveWarning: true,
+    },
+    graphHudTruncWarningVisible: true,
+    graphCheckDepClearedOnLeave: true,
+    riskOptExists: true,
+    riskMetricSelected: true,
+    graphHighRiskFilterActive: true,
+    graphHighRiskFilterCleared: true,
+    cycleBreakHasCollateral: true,
+    batchSynergyFieldsOk: true,
+    hrBtnVisible: true,
+    hrOnState: { highRisk: true, urlHasHighRisk: true, hasActive: true, pillVisible: true },
+    hrPillCleared: true,
+    navHighRiskPreserved: true,
+    hrClearedState: { highRisk: false, urlHasHighRisk: false, hasActive: false },
+    registryKeyCount: 14,
+    registryMissed: [],
+  }, `RC-C41 / Pass 26 / Wave 35 modal & graph preflight, risk parity, collateral, synergy, and filter registry verified: ${JSON.stringify(rcC41CapsAudit)}`);
 
   // B13-4 + B14-4: 360px mobile overflow audit across capabilitiesBundle (#/insights, #/issues, Issue Modal, #/graph Drawer)
   await send('Emulation.setDeviceMetricsOverride', { width: 360, height: 800, deviceScaleFactor: 2, mobile: true }, page.session);
@@ -3214,6 +4039,48 @@ async function capabilitiesJourney(page) {
   await delay(100);
   const mobGraphDrawerOverflow = await evaluate(page, `${app}.graphDetailNode?.id === 'cap-auth-ui' && document.documentElement.scrollWidth <= 361`);
   assert.equal(mobGraphDrawerOverflow, true, 'B14-4 360px mobile capabilitiesBundle #/graph Detail Drawer has zero horizontal overflow');
+  // P24B-5: Opening #graph-cycle-hud on 360px mobile must keep BOTH #graph-cycle-hud and #graph-right-controls inside viewport!
+  await evaluate(page, `(() => { ${app}.graphDetailNode = null; ${app}.highlightCyclesInGraph(); })()`);
+  await delay(100);
+  const mobCycleHudBounds = await evaluate(page, `(() => {
+    const hud = document.querySelector('#graph-cycle-hud')?.getBoundingClientRect();
+    const right = document.querySelector('#graph-right-controls')?.getBoundingClientRect();
+    const res = {
+      innerWidth: window.innerWidth,
+      scrollWidth: document.documentElement.scrollWidth,
+      hudVisible: Boolean(hud && hud.width > 0),
+      hudRight: hud ? Math.round(hud.right) : 0,
+      rightCtrlRight: right ? Math.round(right.right) : 0,
+    };
+    ${app}.highlightCyclesInGraph();
+    return res;
+  })()`);
+  assert.ok(
+    mobCycleHudBounds.hudVisible &&
+    mobCycleHudBounds.scrollWidth <= 361 &&
+    mobCycleHudBounds.hudRight <= 361 &&
+    mobCycleHudBounds.rightCtrlRight <= 361,
+    `P24B-5 360px mobile #graph-cycle-hud & #graph-right-controls must stay within viewport: ${JSON.stringify(mobCycleHudBounds)}`
+  );
+  // P27-4 / P27-12: Opening #graph-whatif-hud on 360px mobile must stay inside viewport without horizontal overflow!
+  await evaluate(page, `(() => { ${app}.forceGraphModule.performBatchWhatIf(['cap-auth-root', 'cap-auth-ui']); })()`);
+  await delay(100);
+  const mobWhatIfHudBounds = await evaluate(page, `(() => {
+    const hud = document.querySelector('#graph-whatif-hud')?.getBoundingClientRect();
+    const res = {
+      scrollWidth: document.documentElement.scrollWidth,
+      hudVisible: Boolean(hud && hud.width > 0),
+      hudRight: hud ? Math.round(hud.right) : 0,
+    };
+    ${app}.resetGraphWhatIf();
+    return res;
+  })()`);
+  assert.ok(
+    mobWhatIfHudBounds.hudVisible &&
+    mobWhatIfHudBounds.scrollWidth <= 361 &&
+    mobWhatIfHudBounds.hudRight <= 361,
+    `P27-4 360px mobile #graph-whatif-hud must stay within viewport: ${JSON.stringify(mobWhatIfHudBounds)}`
+  );
   await send('Emulation.setDeviceMetricsOverride', { width: 1280, height: 900, deviceScaleFactor: 1, mobile: false }, page.session);
 
   // Corpus-global MAX(blocks_count) hybrid impact normalization, [C-1] template/pinned hybrid status parity, & exact-ID substring search.
@@ -3470,6 +4337,8 @@ async function capabilitiesJourney(page) {
         viewerCloseBlockedEpicUnblocked: viewerCloseBlockedEpic.unblocked_issue_ids.slice().sort(),
         viewerBatchBlockedEpicUnblocked: viewerBatchBlockedEpic.unblocked_issue_ids.slice().sort(),
         viewerBatchEpicAndOwnUnblocked: viewerBatchEpicAndOwnBlocker.unblocked_issue_ids.slice().sort(),
+        viewerBatchEpicAndOwnSynergy: (viewerBatchEpicAndOwnBlocker.synergy_issue_ids || []).slice().sort(),
+        viewerBatchEpicAndOwnParallelGain: viewerBatchEpicAndOwnBlocker.parallel_gain,
         allWhatIfBlockedEpicUnblocked: (allWhatIfBlockedEpic?.result?.unblocked_issue_ids || []).slice().sort(),
         allWhatIfBlockedEpicDirect: allWhatIfBlockedEpic?.result?.direct_unblocks || 0,
         viewerCloseChildPrereqUnblocked: viewerCloseChildPrereq.unblocked_issue_ids.slice().sort(),
@@ -3478,6 +4347,8 @@ async function capabilitiesJourney(page) {
         graphBlockedEpicUnblocked: graphBlockedEpicUnblocked.slice().sort(),
         graphBatchSingleEpicUnblocked: graphBatchSingleEpicUnblocked.slice().sort(),
         graphBatchEpicAndOwnUnblocked: graphBatchEpicAndOwnUnblocked.slice().sort(),
+        graphBatchEpicAndOwnSynergy: (graphBatchEpicAndOwn?.synergy_issue_ids || []).slice().sort(),
+        graphBatchEpicAndOwnParallelGain: graphBatchEpicAndOwn?.parallel_gain,
         graphChildPrereqUnblocked: graphChildPrereqUnblocked.slice().sort(),
         gvdHasEphemeral: gvd.issues.some(i => i.id === 'seq-ephemeral' && Number(i.ephemeral) === 1),
         bridgesFromTo: bridges.map(b => b.from + '->' + b.to),
@@ -3549,11 +4420,15 @@ async function capabilitiesJourney(page) {
   assert.deepEqual(trackCAudit.viewerCloseBlockedEpicUnblocked, ['pc-blocked-child'], '[C-1] viewer.js whatIfClose(pc-blocked-epic) unblocks pc-blocked-child while withholding pc-dual-gated-child (own blocker open)');
   assert.deepEqual(trackCAudit.viewerBatchBlockedEpicUnblocked, ['pc-blocked-child'], '[C-1] viewer.js whatIfCloseBatch([pc-blocked-epic]) unblocks pc-blocked-child and withholds pc-dual-gated-child');
   assert.deepEqual(trackCAudit.viewerBatchEpicAndOwnUnblocked, ['pc-blocked-child', 'pc-dual-gated-child'], '[C-1] viewer.js whatIfCloseBatch([pc-blocked-epic, pc-child-own-blocker]) unblocks both children');
+  assert.deepEqual(trackCAudit.viewerBatchEpicAndOwnSynergy, ['pc-dual-gated-child'], 'W35-4 viewer.js whatIfCloseBatch detects exact diamond synergy unlock pc-dual-gated-child');
+  assert.equal(trackCAudit.viewerBatchEpicAndOwnParallelGain, 0, 'W35-4 viewer.js whatIfCloseBatch parallel_gain equals direct_unblocks (2) - active_count (2)');
   assert.equal(trackCAudit.allWhatIfBlockedEpicDirect, 1, '[C-1] viewer.js allWhatIf() evaluates blocked open parent epic with direct_unblocks=1');
   assert.deepEqual(trackCAudit.allWhatIfBlockedEpicUnblocked, ['pc-blocked-child'], '[C-1] viewer.js allWhatIf() unblocks pc-blocked-child for pc-blocked-epic');
   assert.deepEqual(trackCAudit.graphBlockedEpicUnblocked, ['pc-blocked-child'], '[C-1] graph.js performWhatIf(pc-blocked-epic) unblocks pc-blocked-child while pc-gate is open');
   assert.deepEqual(trackCAudit.graphBatchSingleEpicUnblocked, ['pc-blocked-child'], '[C-1] graph.js performBatchWhatIf([pc-blocked-epic]) unblocks pc-blocked-child');
   assert.deepEqual(trackCAudit.graphBatchEpicAndOwnUnblocked, ['pc-blocked-child', 'pc-dual-gated-child'], '[C-1] graph.js performBatchWhatIf([pc-blocked-epic, pc-child-own-blocker]) unblocks both children');
+  assert.deepEqual(trackCAudit.graphBatchEpicAndOwnSynergy, ['pc-dual-gated-child'], 'W35-4 graph.js performBatchWhatIf detects exact diamond synergy unlock pc-dual-gated-child');
+  assert.equal(trackCAudit.graphBatchEpicAndOwnParallelGain, 0, 'W35-4 graph.js performBatchWhatIf parallel_gain equals direct_unblocks (2) - active_count (2)');
   assert.deepEqual(trackCAudit.viewerCloseChildPrereqUnblocked, ['pc-gated-child'], 'unblocked open parent pc-unblocked-epic does NOT block pc-gated-child');
   assert.deepEqual(trackCAudit.graphChildPrereqUnblocked, ['pc-gated-child'], 'graph.js performWhatIf confirms unblocked open parent does NOT block child');
   assert.deepEqual(trackCAudit.viewerCloseUnderClosedUnblocked, ['pc-child-under-closed'], 'closed parent pc-closed-epic stops open-ancestor blocker inheritance');
@@ -4019,6 +4894,63 @@ async function capabilitiesJourney(page) {
   const recovered = await evaluate(page, `(() => { window.open = window.__origOpen; return window.__errorRecovered; })()`);
   assert.deepEqual(recovered, ['action', 'handler', './index.html#recovered|_blank|noopener,noreferrer'], 'runErrorAction executes action, handler, and url recovery');
 
+  // W32-4 + W32-6 + P22B-7b: Verify cyclic #/insights telemetry (N/A (cycle), paused Execution Waves
+  // referencing "cycles below", and single-repo suppression of #insights-cross-repo-card & #insights-drift-card).
+  await click(page, 'a[href="#/insights"]');
+  await waitFor(page, `${app}.view === 'insights' && ${app}.graphReady`, 'navigated to #/insights on cyclic single-repo capabilities bundle');
+  const capInsightsW32 = await evaluate(page, `(() => {
+    const wavesCard = document.getElementById('insights-execution-waves-card');
+    const crossRepoCard = document.getElementById('insights-cross-repo-card');
+    const driftCard = document.getElementById('insights-drift-card');
+    return {
+      cpText: document.getElementById('graph-health-cp-length')?.textContent?.trim() || '',
+      floatText: document.getElementById('graph-health-total-float')?.textContent?.trim() || '',
+      wavesVisible: (${visible})(wavesCard),
+      wavesText: wavesCard?.textContent || '',
+      crossRepoVisible: (${visible})(crossRepoCard),
+      driftVisible: (${visible})(driftCard),
+    };
+  })()`);
+  assert.equal(capInsightsW32.cpText, 'N/A (cycle)', `W32-4 cyclic capabilities shows N/A (cycle) critical depth: ${JSON.stringify(capInsightsW32)}`);
+  assert.equal(capInsightsW32.floatText, 'N/A (cycle)', `W32-4 cyclic capabilities shows N/A (cycle) schedule float: ${JSON.stringify(capInsightsW32)}`);
+  assert.equal(capInsightsW32.wavesVisible, true, 'W32-4 cyclic capabilities shows paused Execution Waves card');
+  assert.ok(capInsightsW32.wavesText.includes('Paused while dependency cycles exist') && capInsightsW32.wavesText.includes('resolve cycles below'),
+    `P22B-6 cyclic Execution Waves card points to Cycle Navigator below: ${capInsightsW32.wavesText}`);
+  assert.equal(capInsightsW32.crossRepoVisible, false, 'W32-6 single-repo capabilities hides #insights-cross-repo-card');
+  assert.equal(capInsightsW32.driftVisible, false, 'W32-4 no-baseline capabilities hides #insights-drift-card');
+
+  // P28-B2 / P29-10: Verify #insights-high-risk-card reactively updates via dbVersion++ alone (without touching triageData!).
+  const hrInsightsCardAudit = await evaluate(page, `(async () => {
+    const a = ${app};
+    const origRiskRows = execQuery("SELECT id, risk_score FROM issue_overview_mv WHERE id = 'cap-auth-root'");
+    const origRisk = origRiskRows?.[0]?.risk_score ?? 0;
+    try {
+      DB_STATE.db.run("UPDATE issue_overview_mv SET risk_score = 0.85 WHERE id = 'cap-auth-root'");
+      a.dbVersion = (a.dbVersion || 0) + 1;
+      await new Promise(r => setTimeout(r, 80));
+      const card = document.getElementById('insights-high-risk-card');
+      const visibleAfterLoad = Boolean(card && (${visible})(card));
+      const hasIssueId = (card?.textContent || '').includes('cap-auth-root');
+      const total = a.getHighRiskSummary(8).total;
+      DB_STATE.db.run("UPDATE issue_overview_mv SET risk_score = ? WHERE id = 'cap-auth-root'", [origRisk]);
+      a.dbVersion = (a.dbVersion || 0) + 1;
+      await new Promise(r => setTimeout(r, 80));
+      const visibleAfterRestore = Boolean(card && (${visible})(card));
+      return {
+        visible: visibleAfterLoad,
+        hasIssueId,
+        total,
+        visibleAfterRestore,
+      };
+    } finally {
+      DB_STATE.db.run("UPDATE issue_overview_mv SET risk_score = ? WHERE id = 'cap-auth-root'", [origRisk]);
+      a.dbVersion = (a.dbVersion || 0) + 1;
+      await new Promise(r => setTimeout(r, 40));
+    }
+  })()`);
+  assert.ok(hrInsightsCardAudit.visible && hrInsightsCardAudit.hasIssueId && hrInsightsCardAudit.total >= 1 && hrInsightsCardAudit.visibleAfterRestore === false,
+    `P28-B2/P29-10 #insights-high-risk-card reactively updates on dbVersion++ alone without replacing triageData: ${JSON.stringify(hrInsightsCardAudit)}`);
+
   await capture(page, 'capabilities');
   clean(page);
   assert.deepEqual(
@@ -4301,15 +5233,117 @@ async function standaloneGraphJourney(page) {
       !document.getElementById('btn-recent').classList.contains('active');
     const allVisibleAfterReset = DATA.nodes.filter(n => currentVisibilityFilter(n)).length;
 
-    // W30-4: Standalone HTML Graph Check Add Dep cycle + safe + Escape reset
-    const standaloneCycle = window.bvRunStandaloneCheckDep('cap-auth-root', 'cap-hub-leaf');
+    // W30-4 + P18B-4/6/10: Standalone HTML Graph Check Add Dep via context menu + node click + provisional suppression + Invalid + Escape
+    const rootNode = DATA.nodes.find(n => n.id === 'cap-auth-root');
+    const hubNode = DATA.nodes.find(n => n.id === 'cap-hub-leaf');
+    contextNode = rootNode;
+    document.getElementById('ctx-checkdep').click();
+    const checkDepModeAfterCtx = checkDepMode && checkDepFromId === 'cap-auth-root';
+    const clickFn = Graph.onNodeClick();
+    if (typeof clickFn === 'function' && hubNode) clickFn(hubNode);
     const bannerCycleText = document.getElementById('checkdep-banner-text')?.textContent || '';
     const copyVisibleOnCycle = document.getElementById('btn-checkdep-copy')?.style.display !== 'none';
+    const standaloneCycle = window.bvCheckStandaloneDep('cap-auth-root', 'cap-hub-leaf');
+
+    // P18B-6: Unknown node ID renders Invalid (never green Safe).
+    const standaloneInvalid = window.bvRunStandaloneCheckDep('cap-auth-root', 'missing-ghost-id');
+    const bannerInvalidText = document.getElementById('checkdep-banner-text')?.textContent || '';
+
+    // P18B-4: Provisional source_authority (claim_safe=false) suppresses br dep add command.
+    const origAuth = DATA.source_authority;
+    DATA.source_authority = { state: 'provisional_jsonl', claim_safe: false };
+    const standaloneProvisional = window.bvRunStandaloneCheckDep('cap-billing-a', 'cap-hub-leaf');
+    const copyVisibleWhenProvisional = document.getElementById('btn-checkdep-copy')?.style.display !== 'none';
+    DATA.source_authority = origAuth;
+
+    // P19-4: Workspace source_kind suppresses br dep add command (prefixed IDs cannot run against single CWD).
+    const origSourceKind = DATA.source_kind;
+    DATA.source_kind = 'workspace';
+    const standaloneWorkspace = window.bvRunStandaloneCheckDep('cap-billing-a', 'cap-hub-leaf');
+    const copyVisibleWhenWorkspace = document.getElementById('btn-checkdep-copy')?.style.display !== 'none';
+    DATA.source_kind = origSourceKind;
+
+    // W31-2 + P20B-3 + P20B-6: Standalone HTML Batch What-If diamond synergy + real Shift+click lifecycle + normal selectNode clears overlay.
+    const savedWhatIfNodes = DATA.nodes.slice();
+    const savedWhatIfLinks = DATA.links.slice();
+    let batchDiamondResult = null;
+    let shiftSteps = [];
+    let shiftBannerText = '';
+    let closedShiftIgnored = false;
+    let normalSelectClearedWhatIf = false;
+    try {
+      const synA = { id: 'syn-a', title: 'Syn A', status: 'open', priority: 1, type: 'task' };
+      const synB = { id: 'syn-b', title: 'Syn B', status: 'open', priority: 1, type: 'task' };
+      const synD = { id: 'syn-d', title: 'Syn Diamond', status: 'open', priority: 1, type: 'task' };
+      const synE = { id: 'syn-e', title: 'Syn Cascade', status: 'open', priority: 2, type: 'task' };
+      DATA.nodes.push(synA, synB, synD, synE);
+      DATA.links.push(
+        { source: 'syn-d', target: 'syn-a', type: 'blocks' },
+        { source: 'syn-d', target: 'syn-b', type: 'blocks' },
+        { source: 'syn-e', target: 'syn-d', type: 'blocks' }
+      );
+      const singleA = window.bvSimulateWhatIfClose(['syn-a']);
+      const singleB = window.bvSimulateWhatIfClose(['syn-b']);
+      const pairAB = window.bvSimulateWhatIfClose(['syn-a', 'syn-b']);
+      batchDiamondResult = {
+        singleADirect: singleA.direct.length,
+        singleBDirect: singleB.direct.length,
+        pairDirect: pairAB.direct,
+        pairCascade: pairAB.cascade,
+        pairSynergy: pairAB.synergy,
+      };
+      // Exercise real Graph.onNodeClick Shift+click add -> add 2nd -> closed-node guard -> toggle off -> normal selectNode clear!
+      const nodeClickFn = Graph.onNodeClick();
+      nodeClickFn(synA, { shiftKey: true }); shiftSteps.push(activeWhatIfIds.length);
+      nodeClickFn(synB, { shiftKey: true }); shiftSteps.push(activeWhatIfIds.length);
+      shiftBannerText = document.getElementById('whatif-banner-text')?.textContent || '';
+      const closedNode = DATA.nodes.find(n => n.id === 'cap-closed-prereq');
+      const prevSelected = selectedNode?.id || null;
+      nodeClickFn(closedNode, { shiftKey: true });
+      closedShiftIgnored = activeWhatIfIds.length === 2 && (selectedNode?.id || null) === prevSelected;
+      // Normal click on another node (selectNode) must clear activeWhatIfIds & banner cleanly (P20B-3).
+      selectNode(DATA.nodes.find(n => n.id === 'cap-auth-root'));
+      normalSelectClearedWhatIf = activeWhatIfIds.length === 0 && !document.getElementById('whatif-banner')?.classList.contains('visible');
+      // Shift+click add then toggle off back to 0.
+      nodeClickFn(synA, { shiftKey: true }); shiftSteps.push(activeWhatIfIds.length);
+      nodeClickFn(synA, { shiftKey: true }); shiftSteps.push(activeWhatIfIds.length);
+      clearWhatIfSimulation();
+    } finally {
+      DATA.nodes = savedWhatIfNodes;
+      DATA.links = savedWhatIfLinks;
+    }
+
     const standaloneSafe = window.bvRunStandaloneCheckDep('cap-billing-a', 'cap-hub-leaf');
     const bannerSafeText = document.getElementById('checkdep-banner-text')?.textContent || '';
     const copyVisibleOnSafe = document.getElementById('btn-checkdep-copy')?.style.display !== 'none';
-    document.getElementById('btn-checkdep-close').click();
-    const checkDepClosed = !document.getElementById('checkdep-banner')?.classList.contains('visible');
+
+    // P21-4 + P22B-3: Non-tautological standalone isSafeDepArg test with real temporary nodes in DATA.nodes.
+    const savedArgNodes = DATA.nodes.slice();
+    let standaloneArgAudit = null;
+    try {
+      DATA.nodes.push(
+        { id: 'safe-probe', title: 'Safe Probe', status: 'open', priority: 1, type: 'task' },
+        { id: '-evil-flag', title: 'Dash Flag', status: 'open', priority: 1, type: 'task' },
+        { id: 'ctrl\u001b[31m', title: 'Ctrl Char', status: 'open', priority: 1, type: 'task' }
+      );
+      const safeRes = window.bvCheckStandaloneDep('safe-probe', 'cap-hub-leaf');
+      const dashRes = window.bvCheckStandaloneDep('-evil-flag', 'cap-hub-leaf');
+      const ctrlRes = window.bvCheckStandaloneDep('ctrl\u001b[31m', 'cap-hub-leaf');
+      standaloneArgAudit = {
+        safeCanAdd: safeRes.canAdd,
+        safeCmd: safeRes.command,
+        dashCanAdd: dashRes.canAdd,
+        dashCmd: dashRes.command,
+        ctrlCanAdd: ctrlRes.canAdd,
+        ctrlCmd: ctrlRes.command,
+      };
+    } finally {
+      DATA.nodes = savedArgNodes;
+    }
+
+    // W32-3 negative control: non-diff standalone graph keeps #diff-banner and #btn-diff-only hidden.
+    const nonDiffBannerHidden = document.getElementById('diff-banner')?.style.display === 'none';
+    const nonDiffBtnHidden = document.getElementById('btn-diff-only')?.style.display === 'none';
 
     return {
       sidebarSlackText,
@@ -4325,24 +5359,66 @@ async function standaloneGraphJourney(page) {
       billingColorAfterOff,
       recentClosedAfterReset,
       allVisibleAfterReset,
+      checkDepModeAfterCtx,
       standaloneCycle,
       bannerCycleText,
       copyVisibleOnCycle,
+      standaloneInvalid,
+      bannerInvalidText,
+      standaloneProvisional,
+      copyVisibleWhenProvisional,
+      standaloneWorkspace,
+      copyVisibleWhenWorkspace,
+      batchDiamondResult,
+      shiftSteps,
+      shiftBannerText,
+      closedShiftIgnored,
+      normalSelectClearedWhatIf,
       standaloneSafe,
       bannerSafeText,
       copyVisibleOnSafe,
-      checkDepClosed,
+      standaloneArgAudit,
+      nonDiffBannerHidden,
+      nonDiffBtnHidden,
     };
   })()`);
+  // P18B-10: Dismiss Standalone Graph Check Add Dep via real Escape keypress.
+  await key(page, 'Escape');
+  await waitFor(page, `!document.getElementById('checkdep-banner')?.classList.contains('visible') && !checkDepMode && checkDepFromId === null`, 'W30-4 standalone Escape dismisses Check Add Dep banner');
   assert.equal(recentAndPathAudit.sidebarSlackText, 'N/A (cycle)', 'selectNode sets #m-slack to N/A (cycle) when slack_available=false');
   assert.equal(recentAndPathAudit.sidebarSlackHighlighted, false, 'selectNode never adds .highlight to #m-slack when slack_available=false');
+  assert.equal(recentAndPathAudit.checkDepModeAfterCtx, true, 'P18B-10 #ctx-checkdep enters interactive picking mode');
   assert.equal(recentAndPathAudit.standaloneCycle.wouldCycle, true, 'W30-4 standalone graph detects cycle cap-auth-root -> cap-hub-leaf');
   assert.equal(recentAndPathAudit.copyVisibleOnCycle, false, 'W30-4 standalone graph hides Copy cmd button on cycle');
   assert.ok(recentAndPathAudit.bannerCycleText.includes('Cycle'), `W30-4 standalone cycle banner: ${recentAndPathAudit.bannerCycleText}`);
+  assert.equal(recentAndPathAudit.standaloneInvalid.canAdd, false, 'P18B-6 standalone graph rejects unknown ID');
+  assert.ok(recentAndPathAudit.bannerInvalidText.includes('Invalid') && !recentAndPathAudit.bannerInvalidText.includes('Safe'), `P18B-6 standalone invalid banner: ${recentAndPathAudit.bannerInvalidText}`);
+  assert.equal(recentAndPathAudit.standaloneProvisional.canAdd, true, 'P18B-4 standalone graph still validates safety when provisional');
+  assert.equal(recentAndPathAudit.standaloneProvisional.command, '', 'P18B-4 standalone graph suppresses br dep add when claim_safe=false');
+  assert.equal(recentAndPathAudit.copyVisibleWhenProvisional, false, 'P18B-4 standalone graph hides Copy button when claim_safe=false');
+  assert.equal(recentAndPathAudit.standaloneWorkspace.canAdd, true, 'P19-4 standalone graph validates safety for workspace export');
+  assert.equal(recentAndPathAudit.standaloneWorkspace.command, '', 'P19-4 standalone graph suppresses br dep add when source_kind=workspace');
+  assert.equal(recentAndPathAudit.copyVisibleWhenWorkspace, false, 'P19-4 standalone graph hides Copy button when source_kind=workspace');
+  assert.equal(recentAndPathAudit.batchDiamondResult.singleADirect, 0, 'W31-2 diamond single-close A unblocks 0');
+  assert.equal(recentAndPathAudit.batchDiamondResult.singleBDirect, 0, 'W31-2 diamond single-close B unblocks 0');
+  assert.deepEqual(recentAndPathAudit.batchDiamondResult.pairDirect, ['syn-d'], 'W31-2 diamond batch [A,B] directly unblocks syn-d');
+  assert.deepEqual(recentAndPathAudit.batchDiamondResult.pairCascade, ['syn-d', 'syn-e'], 'W31-2 diamond batch [A,B] cascades to syn-d + syn-e');
+  assert.deepEqual(recentAndPathAudit.batchDiamondResult.pairSynergy, ['syn-d'], 'W31-2 diamond batch [A,B] identifies syn-d as synergy unblock');
+  assert.deepEqual(recentAndPathAudit.shiftSteps, [1, 2, 1, 0], 'W31-2/P20B-6 real Shift+click toggles 1->2->1->0');
+  assert.equal(recentAndPathAudit.closedShiftIgnored, true, 'P20B-3 Shift+click on closed node does not select or corrupt batch');
+  assert.equal(recentAndPathAudit.normalSelectClearedWhatIf, true, 'P20B-3 normal selectNode clears What-If overlay cleanly');
+  assert.ok(recentAndPathAudit.shiftBannerText.includes('synergy'), `W31-2 standalone batch banner mentions synergy: ${recentAndPathAudit.shiftBannerText}`);
   assert.equal(recentAndPathAudit.standaloneSafe.canAdd, true, 'W30-4 standalone graph allows acyclic cap-billing-a -> cap-hub-leaf');
   assert.equal(recentAndPathAudit.copyVisibleOnSafe, true, 'W30-4 standalone graph shows Copy cmd button on safe edge');
   assert.ok(recentAndPathAudit.bannerSafeText.includes('Safe'), `W30-4 standalone safe banner: ${recentAndPathAudit.bannerSafeText}`);
-  assert.equal(recentAndPathAudit.checkDepClosed, true, 'W30-4 standalone Check Add Dep Reset closes banner');
+  assert.equal(recentAndPathAudit.standaloneArgAudit?.safeCanAdd, true, 'P22B-3 standalone safe control passes canAdd');
+  assert.equal(recentAndPathAudit.standaloneArgAudit?.safeCmd, 'br dep add safe-probe cap-hub-leaf', 'P22B-3 standalone safe control emits br dep add');
+  assert.equal(recentAndPathAudit.standaloneArgAudit?.dashCanAdd, true, 'P22B-3 standalone leading-dash ID reaches isSafeDepArg with canAdd=true');
+  assert.equal(recentAndPathAudit.standaloneArgAudit?.dashCmd, '', 'P22B-3 standalone leading-dash ID withholds br dep add');
+  assert.equal(recentAndPathAudit.standaloneArgAudit?.ctrlCanAdd, true, 'P22B-3 standalone control-char ID reaches isSafeDepArg with canAdd=true');
+  assert.equal(recentAndPathAudit.standaloneArgAudit?.ctrlCmd, '', 'P22B-3 standalone control-char ID withholds br dep add');
+  assert.equal(recentAndPathAudit.nonDiffBannerHidden, true, 'W32-3 negative control hides #diff-banner when --diff-since was not used');
+  assert.equal(recentAndPathAudit.nonDiffBtnHidden, true, 'W32-3 negative control hides #btn-diff-only when --diff-since was not used');
   assert.equal(recentAndPathAudit.recentOpenAfterClick, true);
   assert.deepEqual(recentAndPathAudit.recentIds, ['cap-hub-leaf']);
   assert.equal(recentAndPathAudit.startAfterFirst, 'cap-hub-leaf');
@@ -4407,19 +5483,29 @@ async function standaloneGraphJourney(page) {
     const linkPairs = new Set(DATA.links.map(l => (typeof l.source === 'object' ? l.source.id : l.source) + '\\0' + (typeof l.target === 'object' ? l.target.id : l.target)));
     const allBreaksRealLinks = cycleBreaks.every(b => linkPairs.has(b.from + '\\0' + b.to));
 
-    // Cycle Inspector: click #btn-cycles -> banner opens at [1/2] with exact non-doubled path -> [2/2] -> close
+    // Cycle Inspector: click #btn-cycles -> banner opens at [1/2] with exact non-doubled path -> W33-2 Preview Cut -> [2/2] -> close
     document.getElementById('btn-cycles').click();
     const cycleBannerOpen = document.getElementById('cycle-banner').classList.contains('visible');
     const cycleLabel1 = document.getElementById('cycle-banner-text').textContent.trim();
+    const previewCutBtn = document.getElementById('btn-cycle-preview-cut');
+    const previewCutVisible = Boolean(previewCutBtn && previewCutBtn.style.display !== 'none');
+    const standaloneRemPos = typeof window.bvCheckStandaloneDepRemoval === 'function' ? window.bvCheckStandaloneDepRemoval('cap-auth-root', 'cap-auth-ui') : null;
+    const standaloneRemMiss = typeof window.bvCheckStandaloneDepRemoval === 'function' ? window.bvCheckStandaloneDepRemoval('cap-hub-leaf', 'cap-billing-b') : null;
+    if (previewCutBtn && previewCutVisible) previewCutBtn.click();
+    const checkDepAfterPreviewCut = document.getElementById('checkdep-banner')?.classList.contains('visible') &&
+      (document.getElementById('checkdep-banner-text')?.textContent || '').includes('Remove');
+    document.getElementById('btn-checkdep-close')?.click();
+    document.getElementById('btn-cycles').click();
     document.getElementById('btn-cycle-next').click();
     const cycleLabel2 = document.getElementById('cycle-banner-text').textContent.trim();
     document.getElementById('btn-cycle-close').click();
     const cycleBannerClosed = !document.getElementById('cycle-banner').classList.contains('visible');
 
-    // Closed node context menu must hide #ctx-whatif and runWhatIfSimulation must ignore closed nodes
+    // Closed node context menu must hide BOTH #ctx-whatif and #ctx-whatif-batch, and runWhatIfSimulation must ignore closed nodes
     const closedNode = Graph.graphData().nodes.find(n => n.id === 'cap-closed-prereq');
     showContextMenu(closedNode, { clientX: 200, clientY: 200 });
-    const ctxWhatIfHiddenOnClosed = document.getElementById('ctx-whatif').style.display === 'none';
+    const ctxWhatIfHiddenOnClosed = document.getElementById('ctx-whatif').style.display === 'none' &&
+      document.getElementById('ctx-whatif-batch').style.display === 'none';
     hideContextMenu();
     runWhatIfSimulation('cap-closed-prereq');
     const closedWhatIfIgnored = !document.getElementById('whatif-banner').classList.contains('visible');
@@ -4438,6 +5524,10 @@ async function standaloneGraphJourney(page) {
     const tabKeys = tabButtons.map(b => b.dataset.tab);
     tabButtons.find(b => b.dataset.tab === 'alerts')?.click();
     const alertsTabActive = document.querySelector('#triage-tabs .triage-tab-btn[data-tab="alerts"]')?.classList.contains('active');
+    // W36-4 negative control on 100%-cyclic capabilities fixture: Structural tab renders cleanly with empty-state message
+    tabButtons.find(b => b.dataset.tab === 'structural')?.click();
+    const structuralTabActive = document.querySelector('#triage-tabs .triage-tab-btn[data-tab="structural"]')?.classList.contains('active');
+    const structuralEmptyOk = (document.getElementById('triage-list')?.textContent || '').includes('No structural unlock insights available');
     document.getElementById('btn-triage').click();
 
     // Wave 26 B9-1: verify parent-child & withheld-status What-If accuracy on synthetic graph snapshot
@@ -4581,6 +5671,70 @@ async function standaloneGraphJourney(page) {
     const heatmapLabelAfterReset = document.getElementById('heatmap-metric')?.textContent?.trim();
     const cycleBreaksHaveCollateral = cycleBreaks.every(b => typeof b.collateral === 'number' && typeof b.rationale === 'string' && b.rationale.length > 0);
 
+    // P24B-2 + P24B-3: Verify standalone self-loop removal, parent-child self-loop rejection,
+    // >25-node cycle detection (28-node ring), and O(V+E) speed on a 28-node diamond DAG!
+    const origNodesP24 = DATA.nodes;
+    const origLinksP24 = DATA.links;
+    let p24b23Audit = null;
+    try {
+      // (a) Blocking self-loop with unrelated missing external blocker -> breaks cycle, stays blocked!
+      DATA.nodes = [
+        { id: 'SL-1', title: 'Self loop + ext blocker', status: 'open', priority: 1, blocked_by: ['SL-1', 'GHOST-EXT'] },
+        { id: 'PC-1', title: 'Parent-child self loop', status: 'open', priority: 1, blocked_by: ['PC-1'] },
+      ];
+      DATA.links = [
+        { source: 'SL-1', target: 'SL-1', type: 'blocks' },
+        { source: 'PC-1', target: 'PC-1', type: 'parent-child' },
+      ];
+      const slRes = window.bvCheckStandaloneDepRemoval('SL-1', 'SL-1');
+      const pcRes = window.bvCheckStandaloneDepRemoval('PC-1', 'PC-1');
+
+      // (b) 28-node cycle (>25 nodes) must NOT be skipped!
+      const ringNodes = [];
+      const ringLinks = [];
+      for (let i = 0; i < 28; i++) {
+        ringNodes.push({ id: 'R-' + i, title: 'Ring ' + i, status: 'open', priority: 1 });
+        ringLinks.push({ source: 'R-' + i, target: 'R-' + ((i + 1) % 28), type: 'blocks' });
+      }
+      DATA.nodes = ringNodes;
+      DATA.links = ringLinks;
+      const ringRes = window.bvCheckStandaloneDepRemoval('R-0', 'R-1');
+
+      // (c) 40-node 13-diamond chain DAG (2^13 simple paths, 0 cycles) must return cyclesBefore=0 fast (<200ms)!
+      const dagNodes = [{ id: 'D-0', title: 'D0', status: 'open', priority: 1 }];
+      const dagLinks = [];
+      for (let layer = 0; layer < 13; layer++) {
+        const prev = layer === 0 ? 'D-0' : ('D-' + (layer * 3));
+        const a = 'D-' + (layer * 3 + 1);
+        const b = 'D-' + (layer * 3 + 2);
+        const join = 'D-' + (layer * 3 + 3);
+        dagNodes.push({ id: a, title: a, status: 'open', priority: 1 });
+        dagNodes.push({ id: b, title: b, status: 'open', priority: 1 });
+        dagNodes.push({ id: join, title: join, status: 'open', priority: 1 });
+        dagLinks.push({ source: prev, target: a, type: 'blocks' });
+        dagLinks.push({ source: prev, target: b, type: 'blocks' });
+        dagLinks.push({ source: a, target: join, type: 'blocks' });
+        dagLinks.push({ source: b, target: join, type: 'blocks' });
+      }
+      DATA.nodes = dagNodes;
+      DATA.links = dagLinks;
+      const t0 = performance.now();
+      const dagRes = window.bvCheckStandaloneDepRemoval('D-0', 'D-1');
+      const dagMs = performance.now() - t0;
+
+      p24b23Audit = {
+        slCycles: [slRes.cyclesBefore, slRes.cyclesAfter, slRes.cyclesBroken, slRes.wouldBreakAllCycles],
+        slPreservesExtBlocker: slRes.newlyUnblocked.length === 0,
+        pcSelfLoopRejected: pcRes.exists === false,
+        ringCycles: [ringRes.cyclesBefore, ringRes.cyclesAfter, ringRes.cyclesBroken, ringRes.wouldBreakAllCycles],
+        dagCycles: [dagRes.cyclesBefore, dagRes.cyclesAfter],
+        dagFastMs: dagMs < 200,
+      };
+    } finally {
+      DATA.nodes = origNodesP24;
+      DATA.links = origLinksP24;
+    }
+
     return {
       cyclesCount,
       cycleBreaksCount,
@@ -4590,6 +5744,11 @@ async function standaloneGraphJourney(page) {
       cycleLabel1,
       cycleLabel2,
       cycleBannerClosed,
+      previewCutVisible,
+      standaloneRemPos: standaloneRemPos ? { exists: standaloneRemPos.exists, cyclesBroken: standaloneRemPos.cyclesBroken, newlyUnblocked: standaloneRemPos.newlyUnblocked } : null,
+      standaloneRemMissExists: Boolean(standaloneRemMiss?.exists),
+      checkDepAfterPreviewCut,
+      p24b23Audit,
       ctxWhatIfHiddenOnClosed,
       closedWhatIfIgnored,
       whatIfVisible,
@@ -4598,6 +5757,8 @@ async function standaloneGraphJourney(page) {
       triageOpen,
       tabKeys,
       alertsTabActive,
+      structuralTabActive,
+      structuralEmptyOk,
       b91ParentChildOk,
       openNodeHasETA,
       closedNodeNoETA,
@@ -4623,14 +5784,28 @@ async function standaloneGraphJourney(page) {
   assert.equal(/(cap-[a-z-]+) → \1/.test(wave25StandaloneAudit.cycleLabel1), false,
     `Cycle Inspector path must not double closing node: ${wave25StandaloneAudit.cycleLabel1}`);
   assert.equal(wave25StandaloneAudit.cycleBannerClosed, true, 'closing #btn-cycle-close hides #cycle-banner');
+  assert.equal(wave25StandaloneAudit.previewCutVisible, true, 'P24B-6 standalone #btn-cycle-preview-cut visible in #cycle-banner');
+  assert.deepEqual(wave25StandaloneAudit.standaloneRemPos, { exists: true, cyclesBroken: 1, newlyUnblocked: ['cap-auth-root'] }, 'P24B-6 standalone dep removal preflight on cap-auth-root -> cap-auth-ui');
+  assert.equal(wave25StandaloneAudit.standaloneRemMissExists, false, 'P24B-6 standalone dep removal negative control rejects missing edge');
+  assert.equal(wave25StandaloneAudit.checkDepAfterPreviewCut, true, 'P24B-6 clicking #btn-cycle-preview-cut opens #checkdep-banner with Remove');
+  assert.deepEqual(wave25StandaloneAudit.p24b23Audit, {
+    slCycles: [1, 0, 1, true],
+    slPreservesExtBlocker: true,
+    pcSelfLoopRejected: true,
+    ringCycles: [1, 0, 1, true],
+    dagCycles: [0, 0],
+    dagFastMs: true,
+  }, `P24B-2/P24B-3 standalone self-loops, parent-child rejection, 28-node ring, and diamond DAG O(V+E) verified: ${JSON.stringify(wave25StandaloneAudit.p24b23Audit)}`);
   assert.equal(wave25StandaloneAudit.ctxWhatIfHiddenOnClosed, true, '#ctx-whatif is hidden on closed nodes');
   assert.equal(wave25StandaloneAudit.closedWhatIfIgnored, true, 'runWhatIfSimulation ignores closed nodes');
   assert.equal(wave25StandaloneAudit.whatIfVisible, true, 'runWhatIfSimulation opens #whatif-banner');
   assert.equal(wave25StandaloneAudit.whatIfSummaryHasRoot, true, '#whatif-banner-text names target node cap-auth-root');
   assert.equal(wave25StandaloneAudit.whatIfCleared, true, '#btn-whatif-close hides #whatif-banner');
   assert.equal(wave25StandaloneAudit.triageOpen, true, '#btn-triage opens #triage-panel');
-  assert.deepEqual(wave25StandaloneAudit.tabKeys, ['recommendations', 'quick_wins', 'blockers', 'alerts'], '4-tab Triage panel renders Top/Quick Wins/Blockers/Alerts');
+  assert.deepEqual(wave25StandaloneAudit.tabKeys, ['recommendations', 'quick_wins', 'blockers', 'alerts', 'high_risk', 'structural'], '6-tab Triage panel renders Top/Quick Wins/Blockers/Alerts/High Risk/Structural');
   assert.equal(wave25StandaloneAudit.alertsTabActive, true, 'clicking Alerts triage tab activates it');
+  assert.equal(wave25StandaloneAudit.structuralTabActive, true, 'W36-4 clicking Structural triage tab activates it');
+  assert.equal(wave25StandaloneAudit.structuralEmptyOk, true, 'W36-4 cyclic standalone fixture cleanly reports no structural unlock insights');
   assert.equal(wave25StandaloneAudit.b91ParentChildOk, true, 'Wave 26 B9-1/W26-3 standalone parent-child What-If & root blocker accuracy verified');
   assert.equal(wave25StandaloneAudit.openNodeHasETA, true, 'Wave 26 W26-4 standalone open nodes carry ETA forecasts');
   assert.equal(wave25StandaloneAudit.closedNodeNoETA, true, 'Wave 26 W26-4 standalone closed nodes suppress ETA forecasts');
@@ -4645,9 +5820,426 @@ async function standaloneGraphJourney(page) {
   assert.equal(wave25StandaloneAudit.riskSizedFinite, true, 'Wave 29 W29-4 Size: Risk produces finite node radii');
   assert.equal(wave25StandaloneAudit.cycleBreaksHaveCollateral, true, 'Wave 29 W29-4 standalone DATA.cycle_breaks carries collateral + rationale');
 
+  // RC-C41: Standalone HTML dense-cycle (>100) cyclesTruncated + Surface 3 #node-detail inline blocker removal preflight
+  const rcC41StandaloneAudit = await evaluate(page, `(async () => {
+    const vis = ${visible};
+
+    // 1. Dense-cycle (>100 cycles) K_7 fixture proves cyclesTruncated === true + inconclusive warning
+    const origNodeLen = DATA.nodes.length;
+    const origLinkLen = DATA.links.length;
+    let denseTrunc = null;
+    try {
+      for (let i = 0; i < 7; i++) {
+        const id = 'dense-' + i;
+        const blockers = [];
+        for (let j = 0; j < 7; j++) if (i !== j) blockers.push('dense-' + j);
+        DATA.nodes.push({ id, title: 'Dense ' + i, status: 'open', priority: 1, type: 'task', blocked_by: blockers });
+      }
+      for (let i = 0; i < 7; i++) {
+        for (let j = 0; j < 7; j++) {
+          if (i !== j) DATA.links.push({ source: 'dense-' + i, target: 'dense-' + j, type: 'blocks' });
+        }
+      }
+      const tr = window.bvCheckStandaloneDepRemoval('dense-0', 'dense-1');
+      denseTrunc = {
+        exists: tr.exists,
+        cyclesTruncated: tr.cyclesTruncated,
+        cyclesBefore: tr.cyclesBefore,
+        cyclesAfter: tr.cyclesAfter,
+        cyclesBroken: tr.cyclesBroken,
+        wouldBreakAllCycles: tr.wouldBreakAllCycles,
+        hasInconclusiveWarning: /inconclusive/i.test(tr.warning || ''),
+      };
+    } finally {
+      DATA.nodes.length = origNodeLen;
+      DATA.links.length = origLinkLen;
+    }
+
+    // 2. Surface 3: Standalone #node-detail inline per-blocker removal preflight + as_of command withholding
+    const rootNode = DATA.nodes.find(n => n.id === 'cap-auth-root');
+    if (rootNode) selectNode(rootNode);
+    await new Promise(r => setTimeout(r, 40));
+    const blockersWrapVisible = Boolean(vis(document.querySelector('#detail-blockers-wrap')));
+    const cutBtn = document.querySelector('#detail-blockers-list .btn-detail-remove-blocker[data-remove-from="cap-auth-root"][data-remove-to="cap-auth-ui"]');
+    const cutBtnVisible = Boolean(cutBtn && vis(cutBtn));
+    if (cutBtn) cutBtn.click();
+    await new Promise(r => setTimeout(r, 40));
+    const bannerText = (document.querySelector('#checkdep-banner-text')?.textContent || '').trim();
+    const bannerVisible = Boolean(vis(document.querySelector('#checkdep-banner')));
+    const copyVisibleWritable = Boolean(vis(document.querySelector('#btn-checkdep-copy')));
+
+    const savedAsOf = DATA.as_of;
+    let copyHiddenAsOf = false;
+    let navBlockerFocusedId = '';
+    let clearedBlockersList = false;
+    let highRiskTabOk = false;
+    try {
+      DATA.as_of = 'HEAD~1';
+      if (cutBtn) cutBtn.click();
+      await new Promise(r => setTimeout(r, 40));
+      copyHiddenAsOf = !vis(document.querySelector('#btn-checkdep-copy'));
+      // P26-B4: Click blocker nav button (must invoke focusVisibleGraphNode with zero ReferenceError!)
+      const navBlockerBtn = document.querySelector('#detail-blockers-list .btn-detail-blocker-nav');
+      if (navBlockerBtn) {
+        navBlockerBtn.click();
+        await new Promise(r => setTimeout(r, 40));
+        navBlockerFocusedId = selectedNode?.id || '';
+      }
+      // W35-2 / P27-12: Non-vacuous Standalone HTML High Risk 5th tab test (positive probe + exact .triage-item match)
+      const triageBtn = document.getElementById('btn-triage');
+      if (triageBtn && document.getElementById('triage-panel')?.style.display === 'none') triageBtn.click();
+      const hrTabBtn = document.querySelector('.triage-tab-btn[data-tab="high_risk"]');
+      if (hrTabBtn) {
+        const probeNode = DATA.nodes.find(n => n.id === 'cap-auth-root');
+        const savedRisk = probeNode ? probeNode.risk_score : undefined;
+        try {
+          if (probeNode && !(Number(probeNode.risk_score || 0) >= 0.5)) probeNode.risk_score = 0.82;
+          hrTabBtn.click();
+          await new Promise(r => setTimeout(r, 30));
+          const expectedIds = DATA.nodes
+            .filter(n => isActiveNodeStatus(n.status) && Number(n.risk_score || 0) >= 0.5)
+            .sort((a, b) => (Number(b.risk_score || 0) - Number(a.risk_score || 0)) || String(a.id).localeCompare(String(b.id)))
+            .map(n => n.id);
+          const renderedIds = [...document.querySelectorAll('#triage-list .triage-item')].map(el => el.dataset.id || el.querySelector('.triage-item-id')?.textContent?.trim() || '');
+          highRiskTabOk = hrTabBtn.classList.contains('active') &&
+            expectedIds.length > 0 &&
+            renderedIds.length === expectedIds.length &&
+            expectedIds.every((id, i) => renderedIds[i] === id);
+        } finally {
+          if (probeNode) {
+            if (savedRisk === undefined) delete probeNode.risk_score;
+            else probeNode.risk_score = savedRisk;
+          }
+        }
+      }
+      if (triageBtn && document.getElementById('triage-panel')?.style.display !== 'none') triageBtn.click();
+    } finally {
+      if (savedAsOf === undefined) delete DATA.as_of;
+      else DATA.as_of = savedAsOf;
+      document.querySelector('#btn-checkdep-close')?.click();
+      clearSelection();
+      clearedBlockersList = !vis(document.querySelector('#detail-blockers-wrap')) && (document.querySelector('#detail-blockers-list')?.innerHTML || '') === '';
+    }
+
+    return {
+      denseTrunc,
+      blockersWrapVisible,
+      cutBtnVisible,
+      bannerVisible,
+      bannerHasEdge: bannerText.includes('Remove cap-auth-root → cap-auth-ui'),
+      copyVisibleWritable,
+      copyHiddenAsOf,
+      navBlockerFocusedId,
+      clearedBlockersList,
+      highRiskTabOk,
+    };
+  })()`);
+  assert.deepEqual(rcC41StandaloneAudit, {
+    denseTrunc: {
+      exists: true,
+      cyclesTruncated: true,
+      cyclesBefore: 100,
+      cyclesAfter: 100,
+      cyclesBroken: 0,
+      wouldBreakAllCycles: false,
+      hasInconclusiveWarning: true,
+    },
+    blockersWrapVisible: true,
+    cutBtnVisible: true,
+    bannerVisible: true,
+    bannerHasEdge: true,
+    copyVisibleWritable: true,
+    copyHiddenAsOf: true,
+    navBlockerFocusedId: 'cap-auth-ui',
+    clearedBlockersList: true,
+    highRiskTabOk: true,
+  }, `RC-C41 / Pass 26 / Wave 35 standalone HTML dense-cycle truncation, blocker nav, clearSelection, and High Risk tab verified: ${JSON.stringify(rcC41StandaloneAudit)}`);
+
   await capture(page, 'standalone-graph');
   clean(page);
   console.log(`PASS: ${page.name} standalone HTML graph filters, blocked colors, active-only critical badge, addToRecent, heatmap dimming, and Path Finder ON/OFF reset`);
+}
+
+async function standaloneGraphDiffJourney(page) {
+  await waitFor(page, `typeof Graph !== 'undefined' && typeof applyFilters === 'function' && Boolean(DATA.diff_summary) && DATA.nodes.length === 6`, 'standalone diff HTML graph booted');
+  const diffAudit = await evaluate(page, `(() => {
+    const summary = DATA.diff_summary;
+    const banner = document.getElementById('diff-banner');
+    const bannerText = document.getElementById('diff-banner-text')?.textContent || '';
+    const diffBtn = document.getElementById('btn-diff-only');
+    const bannerVisible = Boolean(banner && banner.style.display !== 'none');
+    const diffBtnVisible = Boolean(diffBtn && diffBtn.style.display !== 'none');
+    const addedNode = DATA.nodes.find(n => n.id === 'cap-hub-leaf');
+    const closedNode = DATA.nodes.find(n => n.id === 'cap-closed-prereq');
+    populatePanelContent('docked-', addedNode);
+    const addedBadges = [...document.querySelectorAll('#docked-badges .badge')].map(el => el.textContent.trim());
+    populatePanelContent('docked-', closedNode);
+    const closedBadges = [...document.querySelectorAll('#docked-badges .badge')].map(el => el.textContent.trim());
+
+    // Toggle "Changed only" filter on -> only nodes with diff_status stay visible!
+    diffBtn.click();
+    const diffOnlyAfterOn = diffOnlyFilter;
+    const visibleOnDiffOnly = DATA.nodes.filter(n => currentVisibilityFilter(n)).map(n => n.id);
+    const allVisibleHaveDiff = DATA.nodes.filter(n => currentVisibilityFilter(n)).every(n => Boolean(n.diff_status));
+    // Verify #btn-diff-filter-toggle toggles off -> restores all 6 nodes.
+    document.getElementById('btn-diff-filter-toggle').click();
+    const diffOnlyAfterToggleOff = diffOnlyFilter;
+    const visibleAfterToggleOff = DATA.nodes.filter(n => currentVisibilityFilter(n)).length;
+
+    // Re-enable Changed only, then verify #btn-reset clears diffOnlyFilter and restores all 6 nodes!
+    diffBtn.click();
+    document.getElementById('btn-reset').click();
+    const diffOnlyAfterReset = diffOnlyFilter;
+    const visibleAfterReset = DATA.nodes.filter(n => currentVisibilityFilter(n)).length;
+
+    // Context menu #ctx-whatif-batch toggles active nodes and hides on closed nodes (W32-3 + P22B-5b).
+    const openNodeA = DATA.nodes.find(n => n.id === 'cap-auth-root');
+    const openNodeB = DATA.nodes.find(n => n.id === 'cap-billing-a');
+    showContextMenu(closedNode, { clientX: 120, clientY: 120 });
+    const ctxBatchHiddenClosed = document.getElementById('ctx-whatif-batch')?.style.display === 'none';
+    hideContextMenu();
+    showContextMenu(openNodeA, { clientX: 120, clientY: 120 });
+    const ctxBatchVisibleOpen = document.getElementById('ctx-whatif-batch')?.style.display !== 'none';
+    document.getElementById('ctx-whatif-batch').click();
+    const batchAfterA = [...activeWhatIfIds];
+    showContextMenu(openNodeB, { clientX: 120, clientY: 120 });
+    document.getElementById('ctx-whatif-batch').click();
+    const batchAfterB = [...activeWhatIfIds];
+    clearWhatIfSimulation();
+
+    const bannerRect = banner?.getBoundingClientRect();
+    const legendEl = document.getElementById('heatmap-legend');
+    const legendRect = legendEl?.getBoundingClientRect();
+    const diffBannerClearOfLegend = !bannerRect || !legendRect || legendRect.width === 0 ||
+      bannerRect.right <= legendRect.left + 1 || bannerRect.bottom <= legendRect.top + 1 || bannerRect.top >= legendRect.bottom - 1;
+    return {
+      summary,
+      bannerVisible,
+      bannerText,
+      diffBannerClearOfLegend,
+      historyStats: DATA.history_stats || null,
+      historyBadgeVisible: Boolean(document.getElementById('stat-history') && document.getElementById('stat-history').style.display !== 'none'),
+      historyBadgeText: (document.getElementById('stat-history-value')?.textContent || '').trim(),
+      diffBtnVisible,
+      addedDiffStatus: addedNode?.diff_status || '',
+      closedDiffStatus: closedNode?.diff_status || '',
+      addedBadges,
+      closedBadges,
+      diffOnlyAfterOn,
+      visibleOnDiffOnly,
+      allVisibleHaveDiff,
+      diffOnlyAfterToggleOff,
+      visibleAfterToggleOff,
+      diffOnlyAfterReset,
+      visibleAfterReset,
+      ctxBatchHiddenClosed,
+      ctxBatchVisibleOpen,
+      batchAfterA,
+      batchAfterB,
+    };
+  })()`);
+  assert.equal(diffAudit.summary?.diff_since, 'HEAD~1', `W32-3 standalone diff exports diff_since=HEAD~1: ${JSON.stringify(diffAudit.summary)}`);
+  assert.ok((diffAudit.summary?.issues_added || 0) >= 2 && (diffAudit.summary?.issues_closed || 0) >= 1, `W32-3 standalone diff counts added & closed: ${JSON.stringify(diffAudit.summary)}`);
+  assert.equal(diffAudit.bannerVisible, true, 'W32-3 #diff-banner visible when --diff-since is set');
+  assert.equal(diffAudit.diffBannerClearOfLegend, true, 'P30-B4 #diff-banner wraps clear of .heatmap-legend at 1280px');
+  assert.ok(diffAudit.bannerText.includes('HEAD~1'), `W32-3 #diff-banner mentions HEAD~1: ${diffAudit.bannerText}`);
+  if (diffAudit.summary?.health_trend) {
+    assert.ok(diffAudit.bannerText.includes('trend: ' + diffAudit.summary.health_trend),
+      `W37-7 #diff-banner surfaces health_trend: ${diffAudit.bannerText}`);
+  }
+  assert.ok((diffAudit.historyStats?.total_commits || 0) > 0 && diffAudit.historyBadgeVisible && diffAudit.historyBadgeText.includes('commits'),
+    `W37-7 #stat-history renders git history summary badge with real correlated commits: ${JSON.stringify({ visible: diffAudit.historyBadgeVisible, text: diffAudit.historyBadgeText, stats: diffAudit.historyStats })}`);
+  assert.equal(diffAudit.diffBtnVisible, true, 'W32-3 #btn-diff-only toolbar toggle visible');
+  assert.equal(diffAudit.addedDiffStatus, 'added', 'W32-3 cap-hub-leaf marked added');
+  assert.equal(diffAudit.closedDiffStatus, 'closed', 'W32-3 cap-closed-prereq marked closed');
+  assert.ok(diffAudit.addedBadges.some(b => /added/i.test(b)), `W32-3 docked panel renders Added diff badge: ${JSON.stringify(diffAudit.addedBadges)}`);
+  assert.ok(diffAudit.closedBadges.some(b => /closed/i.test(b)), `W32-3 docked panel renders Closed diff badge: ${JSON.stringify(diffAudit.closedBadges)}`);
+  assert.equal(diffAudit.diffOnlyAfterOn, true, 'W32-3 clicking #btn-diff-only enables diffOnlyFilter');
+  assert.equal(diffAudit.allVisibleHaveDiff, true, 'W32-3 diffOnlyFilter shows only changed nodes');
+  assert.ok(diffAudit.visibleOnDiffOnly.includes('cap-hub-leaf') && diffAudit.visibleOnDiffOnly.includes('cap-closed-prereq'),
+    `W32-3 diffOnlyFilter retains added & closed nodes: ${JSON.stringify(diffAudit.visibleOnDiffOnly)}`);
+  assert.equal(diffAudit.diffOnlyAfterToggleOff, false, 'W32-3 #btn-diff-filter-toggle clears diffOnlyFilter');
+  assert.equal(diffAudit.visibleAfterToggleOff, 6, 'W32-3 clearing diffOnlyFilter restores all 6 nodes');
+  assert.equal(diffAudit.diffOnlyAfterReset, false, 'W32-3 #btn-reset clears diffOnlyFilter');
+  assert.equal(diffAudit.visibleAfterReset, 6, 'W32-3 #btn-reset restores all 6 nodes');
+  assert.equal(diffAudit.ctxBatchHiddenClosed, true, 'P22B-5b #ctx-whatif-batch hidden on closed nodes');
+  assert.equal(diffAudit.ctxBatchVisibleOpen, true, 'W32-3 #ctx-whatif-batch visible on active nodes');
+  assert.deepEqual(diffAudit.batchAfterA, ['cap-auth-root'], 'W32-3 #ctx-whatif-batch queues first open node');
+  assert.deepEqual(diffAudit.batchAfterB, ['cap-auth-root', 'cap-billing-a'], 'W32-3 #ctx-whatif-batch appends second open node');
+  // W33-2: Standalone HTML Graph Dep-Removal & Cycle-Cut Preflight assertions (positive & negative controls).
+  const w33StandaloneRem = await evaluate(page, `(() => {
+    const pos = window.bvCheckStandaloneDepRemoval('cap-auth-root', 'cap-auth-ui');
+    const miss = window.bvCheckStandaloneDepRemoval('cap-hub-leaf', 'cap-billing-b');
+    document.getElementById('btn-cycles').click();
+    const btn = document.getElementById('btn-cycle-preview-cut');
+    const btnShown = Boolean(btn && btn.style.display !== 'none');
+    btn?.click();
+    const bannerOpen = document.getElementById('checkdep-banner')?.classList.contains('visible');
+    const bannerText = (document.getElementById('checkdep-banner-text')?.textContent || '').trim();
+    document.getElementById('btn-checkdep-close')?.click();
+    return {
+      pos: pos ? { exists: pos.exists, canRemove: pos.canRemove, cyclesBroken: pos.cyclesBroken, newlyUnblocked: pos.newlyUnblocked, command: pos.command } : null,
+      missExists: Boolean(miss?.exists),
+      btnShown,
+      bannerOpen,
+      bannerHasRemove: bannerText.includes('Remove'),
+    };
+  })()`);
+  assert.deepEqual(w33StandaloneRem, {
+    pos: {
+      exists: true,
+      canRemove: true,
+      cyclesBroken: 1,
+      newlyUnblocked: ['cap-auth-root'],
+      command: 'br dep remove cap-auth-root cap-auth-ui',
+    },
+    missExists: false,
+    btnShown: true,
+    bannerOpen: true,
+    bannerHasRemove: true,
+  }, `W33-2 standalone HTML dep-removal preflight & #btn-cycle-preview-cut verified: ${JSON.stringify(w33StandaloneRem)}`);
+  await capture(page, 'standalone-graph-diff');
+  clean(page);
+  console.log(`PASS: ${page.name} W32-3 standalone HTML --diff-since HEAD~1 overlay, changed-only filter, badges, and #ctx-whatif-batch`);
+}
+
+async function capabilitiesDiffJourney(page, standaloneDiffPage) {
+  await waitFor(page, `typeof Alpine !== 'undefined' && !${app}.loading && ${app}.stats.total === 4 && ${app}.graphReady`, 'diff-fixture bundle booted with 4 issues (3 changed, 1 unchanged)');
+  await waitFor(page, `${app}.hasDiff === true && Boolean(${app}.diffData?.diff)`, 'W33-3 capabilities-diff loaded data/diff.json');
+  await waitFor(page, '!!navigator.serviceWorker.controller', 'capabilities-diff worker controls page');
+  await delay(300);
+  await waitFor(page, `typeof Alpine !== 'undefined' && !${app}.loading && ${app}.hasDiff === true && Boolean(${app}.diffData?.diff)`, 'capabilities-diff settled after SW activation');
+
+  // 0. P28-B1: Real Go-exported data/diff.json renders #dashboard-diff-card AND real analysis.MetricDeltas chips!
+  const realDiffCardAudit = await evaluate(page, `(() => {
+    const card = document.getElementById('dashboard-diff-card');
+    const chips = [...document.querySelectorAll('#dashboard-diff-card [data-diff-metric-delta]')].filter(${visible}).map(el => el.dataset.diffMetricDelta);
+    const md = ${app}.diffData?.diff?.metric_deltas || {};
+    return {
+      cardVisible: Boolean(card && (${visible})(card)),
+      chips,
+      mdKeys: Object.keys(md).filter(k => ['open_issues', 'blocked_issues', 'total_edges', 'component_count'].includes(k) && md[k] !== 0),
+    };
+  })()`);
+  assert.equal(realDiffCardAudit.cardVisible, true, `P28-B1 real capabilities-diff #dashboard-diff-card visible: ${JSON.stringify(realDiffCardAudit)}`);
+  assert.ok(realDiffCardAudit.chips.length > 0 && JSON.stringify(realDiffCardAudit.chips.slice().sort()) === JSON.stringify(realDiffCardAudit.mdKeys.slice().sort()),
+    `P28-B1 real Go diff.json metric_deltas render matching [data-diff-metric-delta] chips: ${JSON.stringify(realDiffCardAudit)}`);
+
+  // 1. Navigate to Issues -> #filter-changed-btn is visible; [data-diff-badge] renders strictly on the 3 changed issues (NOT diff-unchanged)!
+  await click(page, 'a[href="#/issues"]');
+  await waitFor(page, `${app}.view === 'issues' && (${visible})(document.querySelector('#filter-changed-btn'))`, 'W33-3 #filter-changed-btn visible when data/diff.json present');
+  const listBadgesCount = await evaluate(page, `[...document.querySelectorAll('[data-diff-badge]')].filter(${visible}).length`);
+  assert.equal(listBadgesCount, 3, `W33-3/P24B-6 expected exactly 3 visible [data-diff-badge] pills (excluding diff-unchanged), got ${listBadgesCount}`);
+
+  // Toggle Δ Changed filter -> STRICTLY reduces 4 -> 3 issues (excluding diff-unchanged) and sets URL ?changed=true!
+  await click(page, '#filter-changed-btn');
+  await waitFor(page, `${app}.filters.changedOnly === true && window.location.hash.includes('changed=true') && ${app}.issues.length === 3`, 'W33-3/P24B-6 Δ Changed button strictly reduces Issues 4 -> 3');
+  const changedFilteredAudit = await evaluate(page, `(() => {
+    const map = ${app}.getDiffStatusMap();
+    const ids = ${app}.issues.map(i => i.id).sort();
+    return {
+      ids,
+      excludedUnchanged: !ids.includes('diff-unchanged'),
+      hasAdded: map['diff-added'] === 'added',
+      hasModified: map['diff-modified'] === 'modified',
+      hasClosed: map['diff-closed'] === 'closed',
+    };
+  })()`);
+  assert.deepEqual(changedFilteredAudit, {
+    ids: ['diff-added', 'diff-closed', 'diff-modified'],
+    excludedUnchanged: true,
+    hasAdded: true,
+    hasModified: true,
+    hasClosed: true,
+  }, `W33-3/P24B-6 Δ Changed filter strictly isolates changed issues: ${JSON.stringify(changedFilteredAudit)}`);
+
+  // Switch to Board mode & Tree mode -> [data-diff-badge] renders on all 3 changed cards/rows!
+  await click(page, '#issues-mode-board');
+  await waitFor(page, `${app}.issuesViewMode === 'board' && (${visible})(document.querySelector('#issues-board-view'))`, 'W33-3 Board mode visible');
+  const boardDiffBadges = await evaluate(page, `[...document.querySelectorAll('#issues-board-view [data-diff-badge]')].filter(${visible}).length`);
+  assert.equal(boardDiffBadges, 3, `W33-3 expected 3 visible [data-diff-badge] pills in Board mode, got ${boardDiffBadges}`);
+  await click(page, '#issues-mode-tree');
+  await waitFor(page, `${app}.issuesViewMode === 'tree' && (${visible})(document.querySelector('#issues-tree-view'))`, 'W33-3 Tree mode visible');
+  const treeDiffBadges = await evaluate(page, `[...document.querySelectorAll('#issues-tree-view [data-diff-badge]')].filter(${visible}).length`);
+  assert.equal(treeDiffBadges, 3, `W33-3 expected 3 visible [data-diff-badge] pills in Tree mode, got ${treeDiffBadges}`);
+  await click(page, '#issues-mode-list');
+  await click(page, '#filter-changed-btn');
+  await waitFor(page, `${app}.filters.changedOnly === false && ${app}.issues.length === 4`, 'W33-3 toggling Δ Changed off restores all 4 issues');
+
+  // 2. Open Issue Detail Modal on diff-added (+NEW), diff-modified (~MODIFIED with field delta priority P2 -> P0), AND diff-unchanged (banner hidden)!
+  await evaluate(page, `${app}.showIssue('diff-added')`);
+  await waitFor(page, `${app}.selectedIssue?.id === 'diff-added' && (${visible})(document.querySelector('#issue-detail-diff-banner'))`, 'W33-3 #issue-detail-diff-banner visible for newly added issue');
+  const addedBannerText = await evaluate(page, `(document.querySelector('#issue-detail-diff-banner')?.textContent || '').trim()`);
+  assert.ok(addedBannerText.includes('+NEW') && addedBannerText.includes('HEAD~1'), `W33-3 diff-added banner: ${addedBannerText}`);
+  await evaluate(page, `${app}.closeIssue()`);
+
+  await evaluate(page, `${app}.showIssue('diff-modified')`);
+  await waitFor(page, `${app}.selectedIssue?.id === 'diff-modified' && (${visible})(document.querySelector('#issue-detail-diff-banner'))`, 'P24B-6 #issue-detail-diff-banner visible for modified issue');
+  const modBannerText = await evaluate(page, `(document.querySelector('#issue-detail-diff-banner')?.textContent || '').trim()`);
+  assert.ok(modBannerText.includes('~MODIFIED') && modBannerText.includes('priority:') && modBannerText.includes('P2') && modBannerText.includes('P0'),
+    `P24B-6 modified issue diff banner must render field-level priority P2 -> P0 delta: ${modBannerText}`);
+  await evaluate(page, `${app}.closeIssue()`);
+
+  await evaluate(page, `${app}.showIssue('diff-unchanged')`);
+  await waitFor(page, `${app}.selectedIssue?.id === 'diff-unchanged'`, 'opened diff-unchanged modal');
+  assert.equal(await evaluate(page, `(${visible})(document.querySelector('#issue-detail-diff-banner'))`), false, 'P24B-6 unchanged issue must hide #issue-detail-diff-banner');
+  await evaluate(page, `${app}.closeIssue()`);
+
+  // 3. Navigate to #/graph -> open #graph-filter-hud -> toggle #graph-filter-changed-only (P24B-1 + P24B-6)!
+  await click(page, 'a[href="#/graph"]');
+  await waitFor(page, `${app}.view === 'graph' && ${app}.forceGraphReady && !${app}.forceGraphLoading && !!${app}.forceGraphModule?.getGraph?.()`, 'W33-3 capabilities-diff graph ready');
+  await click(page, '#graph-filter-toggle-btn');
+  await waitFor(page, `(${visible})(document.querySelector('#graph-filter-changed-only'))`, 'W33-3 #graph-filter-changed-only visible in Graph Filter HUD');
+  await click(page, '#graph-filter-changed-only');
+  await waitFor(page, `${app}.graphFilters.changedOnly === true && ${app}.graphVisibleTotal === 3`, 'P24B-1/P24B-6 #graph-filter-changed-only stays checked and reduces graph 4 -> 3');
+  const graphDiffAudit = await evaluate(page, `(() => {
+    const cb = document.getElementById('graph-filter-changed-only');
+    const clearBtn = document.getElementById('graph-filter-clear');
+    const nodes = ${app}.forceGraphModule.getGraph().graphData().nodes.map(n => n.id).sort();
+    return {
+      checkedAfterOn: Boolean(cb?.checked),
+      hasActiveGraphFilters: Boolean(${app}.hasActiveGraphFilters),
+      clearBtnVisible: Boolean(clearBtn && (${visible})(clearBtn)),
+      nodes,
+    };
+  })()`);
+  assert.deepEqual(graphDiffAudit, {
+    checkedAfterOn: true,
+    hasActiveGraphFilters: true,
+    clearBtnVisible: true,
+    nodes: ['diff-added', 'diff-closed', 'diff-modified'],
+  }, `P24B-1/P24B-6 graph changedOnly filter stays checked, exposes visible Reset button, and strictly drops diff-unchanged: ${JSON.stringify(graphDiffAudit)}`);
+  // Clicking the checkbox a second time must cleanly uncheck it and restore all 4 nodes (proving user is not trapped, P24B-1)!
+  await click(page, '#graph-filter-changed-only');
+  await waitFor(page, `${app}.graphFilters.changedOnly === false && ${app}.graphVisibleTotal === 4`, 'P24B-1 unchecking #graph-filter-changed-only restores all 4 nodes');
+  assert.equal(await evaluate(page, `Boolean(document.getElementById('graph-filter-changed-only')?.checked)`), false, 'P24B-1 checkbox unchecks cleanly');
+
+  // 4. Non-tautological Standalone HTML diffOnlyFilter check (strictly drops 4 -> 3, excluding diff-unchanged)!
+  if (standaloneDiffPage) {
+    await waitFor(standaloneDiffPage, `typeof Graph !== 'undefined' && Array.isArray(DATA?.nodes) && DATA.nodes.length === 4`, 'standalone diff-fixture ready with 4 nodes');
+    const saDiffReduction = await evaluate(standaloneDiffPage, `(() => {
+      const before = DATA.nodes.filter(n => currentVisibilityFilter(n)).map(n => n.id).sort();
+      document.getElementById('btn-diff-only').click();
+      const filtered = DATA.nodes.filter(n => currentVisibilityFilter(n)).map(n => n.id).sort();
+      document.getElementById('btn-reset').click();
+      const afterReset = DATA.nodes.filter(n => currentVisibilityFilter(n)).map(n => n.id).sort();
+      const historyBadgeHidden = document.getElementById('stat-history')?.style.display === 'none';
+      const historyCommits = DATA.history_stats?.total_commits || 0;
+      return { before, filtered, afterReset, historyBadgeHidden, historyCommits };
+    })()`);
+    assert.deepEqual({ before: saDiffReduction.before, filtered: saDiffReduction.filtered, afterReset: saDiffReduction.afterReset }, {
+      before: ['diff-added', 'diff-closed', 'diff-modified', 'diff-unchanged'],
+      filtered: ['diff-added', 'diff-closed', 'diff-modified'],
+      afterReset: ['diff-added', 'diff-closed', 'diff-modified', 'diff-unchanged'],
+    }, `P24B-6 standalone HTML diffOnlyFilter strictly filters 4 -> 3 (excluding diff-unchanged): ${JSON.stringify(saDiffReduction)}`);
+    assert.equal(saDiffReduction.historyCommits, 0, 'W37-7 negative control: tracker-only diff-fixture yields 0 correlated commits');
+    assert.equal(saDiffReduction.historyBadgeHidden, true, 'W37-7 negative control: #stat-history stays hidden when total_commits === 0');
+    clean(standaloneDiffPage);
+  }
+
+  await capture(page, 'capabilities-diff');
+  clean(page);
+  console.log(`PASS: ${page.name} W33-3/P24B-1/P24B-6 non-tautological static-site & standalone --diff-since HEAD~1 (4 -> 3) badges, Δ Changed filter, modal field-delta banner, and graph diff filter`);
 }
 
 async function multiRepoJourney(page, standalonePage) {
@@ -4658,6 +6250,39 @@ async function multiRepoJourney(page, standalonePage) {
 
   await click(page, 'a[href="#/issues"]');
   await waitFor(page, `${app}.view === 'issues' && (${visible})(document.querySelector('#filter-repo-select'))`, 'multi-repo #filter-repo-select visible in Issues view');
+  // P23-1 + P24B-4: Verify Execution Waves never falsely mark normal open Wave 2+ items (web-login) as [not-ready],
+  // while lifecycle-withheld Wave 2+ items (pinned=1) ARE accurately flagged isNotReady=true!
+  const waveP23Audit = await evaluate(page, `(() => {
+    const waves = getExecutionWaves().waves || [];
+    const w1 = waves.find(w => w.wave === 1)?.items || [];
+    const w2 = waves.find(w => w.wave === 2)?.items || [];
+    const webLogin = w2.find(i => i.id === 'web-login');
+    const apiAuth = w1.find(i => i.id === 'api-auth');
+    let wave2PinnedNotReady = null;
+    try {
+      DB_STATE.db.run("UPDATE issues SET pinned = 1 WHERE id = 'web-login'");
+      GRAPH_STATE._issueMetricsCache = null;
+      const w2Pinned = (getExecutionWaves().waves || []).find(w => w.wave === 2)?.items?.find(i => i.id === 'web-login');
+      wave2PinnedNotReady = w2Pinned ? Boolean(w2Pinned.isNotReady) : null;
+    } finally {
+      DB_STATE.db.run("UPDATE issues SET pinned = 0 WHERE id = 'web-login'");
+      GRAPH_STATE._issueMetricsCache = null;
+    }
+    return {
+      waveCount: waves.length,
+      apiAuthReady: Boolean(apiAuth && !apiAuth.isNotReady),
+      webLoginInWave2: Boolean(webLogin),
+      webLoginNotReadyFlag: webLogin ? Boolean(webLogin.isNotReady) : null,
+      wave2PinnedNotReady,
+    };
+  })()`);
+  assert.deepEqual(waveP23Audit, {
+    waveCount: 2,
+    apiAuthReady: true,
+    webLoginInWave2: true,
+    webLoginNotReadyFlag: false,
+    wave2PinnedNotReady: true,
+  }, `P23-1/P24B-4 Wave 2 normal open web-login isNotReady=false while pinned=1 Wave 2 isNotReady=true: ${JSON.stringify(waveP23Audit)}`);
   assert.deepEqual(await evaluate(page, `[...${app}.filterOptions.repos]`), ['api', 'web'], 'filterOptions.repos contains sorted multi-repo values');
 
   // Select 'api' via dropdown -> filters Issues, updates ?repo=api URL, displays removable #active-repo-filter-pill!
@@ -4715,6 +6340,292 @@ async function multiRepoJourney(page, standalonePage) {
     return s;
   })()`);
   assert.deepEqual(batchSteps, [0, 1, 2, 1, 0], 'Batch What-If toggles cleanly through 0->1->2->1->0');
+  // P19-4 + P20B-1 + P20B-2: Verify export_meta persists real source_authority & source_kind in SQLite getMeta(),
+  // and test same-repo edge ('web-settings' -> 'web-login', crossRepo=false) emits command under single-repo
+  // but suppresses command under source_kind='workspace' even when triageData is null (exercising meta fallback)!
+  const wsCheckDepAudit = await evaluate(page, `(() => {
+    const exportedMetaSourceKind = ${app}.meta?.source_kind || '';
+    const exportedMetaAuthType = typeof ${app}.meta?.source_authority;
+    const prevTriage = ${app}.triageData;
+    const prevMetaKind = ${app}.meta?.source_kind;
+    const prevMetaAuth = ${app}.meta?.source_authority;
+    // Control: single-repo same-repo edge emits br dep add web-settings web-login.
+    ${app}.triageData = null;
+    ${app}.meta.source_kind = 'sqlite';
+    ${app}.meta.source_authority = { state: 'complete', claim_safe: true };
+    const singleRepoRes = JSON.parse(JSON.stringify(${app}.evaluateGraphCheckDep('web-settings', 'web-login')));
+    // Workspace: exact same same-repo edge with source_kind='workspace' suppresses command via meta fallback!
+    ${app}.meta.source_kind = 'workspace';
+    const wsRes = JSON.parse(JSON.stringify(${app}.evaluateGraphCheckDep('web-settings', 'web-login')));
+    // Restore cleanly and reset graph highlight state (P20B-2).
+    ${app}.resetGraphCheckDep();
+    ${app}.triageData = prevTriage;
+    ${app}.meta.source_kind = prevMetaKind;
+    ${app}.meta.source_authority = prevMetaAuth;
+    return { exportedMetaSourceKind, exportedMetaAuthType, singleRepoRes, wsRes };
+  })()`);
+  assert.ok(wsCheckDepAudit.exportedMetaSourceKind.length > 0 && wsCheckDepAudit.exportedMetaAuthType === 'object', `P20B-1 export_meta persists source_kind & parsed source_authority: ${JSON.stringify(wsCheckDepAudit)}`);
+  assert.equal(wsCheckDepAudit.singleRepoRes.crossRepo, false, 'P20B-2 same-repo control edge web-settings -> web-login has crossRepo=false');
+  assert.deepEqual(wsCheckDepAudit.singleRepoRes.command, 'br dep add web-settings web-login', 'P20B-2 same-repo control emits br dep add under single-repo');
+  assert.equal(wsCheckDepAudit.wsRes.canAdd, true, 'P19-4 static site workspace check-dep still reports safe');
+  assert.equal(wsCheckDepAudit.wsRes.command, '', 'P19-4/P20B-1 static site suppresses br dep add via meta.source_kind=workspace even without triageData');
+
+  // P21-4 + P22B-3: Non-tautological Static Site viewer.js isSafeDepArg test!
+  // Insert real open api-repo rows into issue_overview_mv so bvCheckProposedDependency reaches isSafeDepArg
+  // (canAdd=true, crossRepo=false) and prove safe ID emits command while '-' and ESC control IDs withhold it.
+  const p214SafeArgAudit = await evaluate(page, `(() => {
+    const prevTriage = ${app}.triageData;
+    const prevMetaKind = ${app}.meta?.source_kind;
+    const prevMetaAuth = ${app}.meta?.source_authority;
+    const ts = '2026-10-02T12:00:00Z';
+    try {
+      DB_STATE.db.run(
+        "INSERT INTO issue_overview_mv (id, title, description, status, priority, issue_type, labels, created_at, updated_at, source_repo, dependency_state, is_actionable, pagerank, betweenness, eigenvector, critical_path_depth, triage_score, blocks_count, blocked_by_count, blocker_count, dependent_count, critical_depth, in_cycle, comment_count) VALUES " +
+        "('api-safe-probe', 'Safe Probe', '', 'open', 1, 'task', '[]', ?, ?, 'api', 'satisfied', 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), " +
+        "('-evil-flag', 'Dash Flag', '', 'open', 1, 'task', '[]', ?, ?, 'api', 'satisfied', 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0), " +
+        "(?, 'Ctrl Char', '', 'open', 1, 'task', '[]', ?, ?, 'api', 'satisfied', 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)",
+        [ts, ts, ts, ts, 'api\\u001b[31m', ts, ts]
+      );
+      const safeRes = window.bvCheckProposedDependency('api-safe-probe', 'api-auth', { allowCommand: true });
+      const dashRes = window.bvCheckProposedDependency('-evil-flag', 'api-auth', { allowCommand: true });
+      const ctrlRes = window.bvCheckProposedDependency('api\\u001b[31m', 'api-auth', { allowCommand: true });
+      return {
+        safeCanAdd: safeRes?.canAdd,
+        safeCrossRepo: safeRes?.crossRepo,
+        safeCmd: safeRes?.command ?? '',
+        dashCanAdd: dashRes?.canAdd,
+        dashCrossRepo: dashRes?.crossRepo,
+        dashCmd: dashRes?.command ?? '',
+        ctrlCanAdd: ctrlRes?.canAdd,
+        ctrlCrossRepo: ctrlRes?.crossRepo,
+        ctrlCmd: ctrlRes?.command ?? '',
+      };
+    } finally {
+      DB_STATE.db.run("DELETE FROM issue_overview_mv WHERE id IN ('api-safe-probe', '-evil-flag', ?)", ['api\\u001b[31m']);
+      ${app}.triageData = prevTriage;
+      ${app}.meta.source_kind = prevMetaKind;
+      ${app}.meta.source_authority = prevMetaAuth;
+    }
+  })()`);
+  assert.equal(p214SafeArgAudit.safeCanAdd, true, `P22B-3 safe probe reaches canAdd=true: ${JSON.stringify(p214SafeArgAudit)}`);
+  assert.equal(p214SafeArgAudit.safeCrossRepo, false, 'P22B-3 safe probe is same-repo api -> api');
+  assert.equal(p214SafeArgAudit.safeCmd, 'br dep add api-safe-probe api-auth', 'P22B-3 safe probe emits br dep add');
+  assert.equal(p214SafeArgAudit.dashCanAdd, true, `P22B-3 leading-dash ID must reach canAdd=true (non-tautological): ${JSON.stringify(p214SafeArgAudit)}`);
+  assert.equal(p214SafeArgAudit.dashCrossRepo, false, 'P22B-3 leading-dash ID is same-repo');
+  assert.equal(p214SafeArgAudit.dashCmd, '', `P21-4/P22B-3 leading-dash ID must withhold br dep add: ${JSON.stringify(p214SafeArgAudit)}`);
+  assert.equal(p214SafeArgAudit.ctrlCanAdd, true, `P22B-3 control-char ID must reach canAdd=true (non-tautological): ${JSON.stringify(p214SafeArgAudit)}`);
+  assert.equal(p214SafeArgAudit.ctrlCrossRepo, false, 'P22B-3 control-char ID is same-repo');
+  assert.equal(p214SafeArgAudit.ctrlCmd, '', `P21-4/P22B-3 control-char ID must withhold br dep add: ${JSON.stringify(p214SafeArgAudit)}`);
+
+  // W32-4 + W32-6: Navigate to #/insights on acyclic multi-repo bundle and verify:
+  // 1) All 4 newly wired WASM exports (degeneracy, criticalPathLength, totalFloat, topologicalSort Execution Waves)
+  // 2) Cross-Repo Handoffs card renders api -> web (api-auth) cleanly
+  // 3) Baseline Drift card stays hidden when meta.has_drift is false (zero 404s) and renders cleanly when populated
+  await click(page, 'a[href="#/insights"]');
+  await waitFor(page, `${app}.view === 'insights' && ${app}.graphReady`, 'navigated to #/insights on multi-repo bundle');
+  const w32InsightsAudit = await evaluate(page, `(() => {
+    const tel = window.bvGetGraphHealthTelemetry ? window.bvGetGraphHealthTelemetry() : null;
+    const waves = window.bvGetExecutionWaves ? window.bvGetExecutionWaves() : null;
+    const crossRepoCard = document.getElementById('insights-cross-repo-card');
+    const wavesCard = document.getElementById('insights-execution-waves-card');
+    const driftCard = document.getElementById('insights-drift-card');
+    return {
+      tel,
+      waves: JSON.parse(JSON.stringify(waves)),
+      degText: document.getElementById('graph-health-degeneracy')?.textContent?.trim() || '',
+      cpText: document.getElementById('graph-health-cp-length')?.textContent?.trim() || '',
+      floatText: document.getElementById('graph-health-total-float')?.textContent?.trim() || '',
+      crossRepoVisible: (${visible})(crossRepoCard),
+      crossRepoText: crossRepoCard?.textContent || '',
+      wavesVisible: (${visible})(wavesCard),
+      wavesText: wavesCard?.textContent || '',
+      driftInitiallyHidden: !${app}.hasDrift && !(${visible})(driftCard),
+    };
+  })()`);
+  assert.equal(w32InsightsAudit.tel?.ready, true, `W32-4 graph health telemetry ready: ${JSON.stringify(w32InsightsAudit)}`);
+  assert.equal(w32InsightsAudit.tel?.hasCycles, false, `W32-4 multi-repo fixture is acyclic: ${JSON.stringify(w32InsightsAudit)}`);
+  assert.ok(w32InsightsAudit.tel?.degeneracy >= 1 && w32InsightsAudit.degText !== '', `W32-4 degeneracy wired: ${JSON.stringify(w32InsightsAudit)}`);
+  assert.ok(Number(w32InsightsAudit.tel?.criticalPathLength) >= 1 && w32InsightsAudit.cpText !== 'N/A (cycle)', `W32-4 criticalPathLength wired: ${JSON.stringify(w32InsightsAudit)}`);
+  assert.ok(w32InsightsAudit.tel?.totalFloat !== null && w32InsightsAudit.floatText !== 'N/A (cycle)', `W32-4 totalFloat wired: ${JSON.stringify(w32InsightsAudit)}`);
+  assert.equal(w32InsightsAudit.wavesVisible, true, `W32-4 Execution Waves card visible: ${JSON.stringify(w32InsightsAudit)}`);
+  assert.ok(Array.isArray(w32InsightsAudit.waves?.waves) && w32InsightsAudit.waves.waves.length >= 2, `W32-4 expected >=2 execution waves (Wave 1 api-auth/web-settings -> Wave 2 web-login): ${JSON.stringify(w32InsightsAudit.waves)}`);
+  assert.ok(w32InsightsAudit.waves.waves[0].items.some(i => i.id === 'api-auth') && w32InsightsAudit.waves.waves[1].items.some(i => i.id === 'web-login'),
+    `W32-4 topological execution order puts blocker api-auth in Wave 1 and blocked web-login in Wave 2: ${JSON.stringify(w32InsightsAudit.waves)}`);
+  assert.equal(w32InsightsAudit.crossRepoVisible, true, `W32-6 Cross-Repo Handoffs card visible on multi-repo bundle: ${JSON.stringify(w32InsightsAudit)}`);
+  assert.ok(w32InsightsAudit.crossRepoText.includes('api') && w32InsightsAudit.crossRepoText.includes('web') && w32InsightsAudit.crossRepoText.includes('api-auth'),
+    `W32-6 Cross-Repo Handoffs card shows api -> web and api-auth: ${w32InsightsAudit.crossRepoText}`);
+  assert.equal(w32InsightsAudit.driftInitiallyHidden, true, `W32-4 Baseline Drift card hidden when meta.has_drift is false: ${JSON.stringify(w32InsightsAudit)}`);
+
+  // W32-6 + P22B-7b: Click Cross-Repo Blocker button api-auth -> calls showIssue('api-auth') cleanly, then return to #/insights!
+  await click(page, '#insights-cross-repo-card button span', 'api-auth');
+  await waitFor(page, `${app}.selectedIssue?.id === 'api-auth'`, 'W32-6 clicking Cross-Repo Blocker opens api-auth detail modal');
+  await key(page, 'Escape');
+  await waitFor(page, `!${app}.selectedIssue`, 'Escape closes api-auth modal after Cross-Repo Blocker click-through');
+  await click(page, 'a[href="#/insights"]');
+  await waitFor(page, `${app}.view === 'insights' && ${app}.graphReady`, 'returned to #/insights after Cross-Repo Blocker click-through');
+
+  // P22B-4: Non-actionable Wave 1 item (is_actionable=0) must NOT label Wave 1 "Ready Now" and must tag [not-ready]!
+  const p22b4WaveAudit = await evaluate(page, `(() => {
+    try {
+      DB_STATE.db.run("UPDATE issue_overview_mv SET is_actionable = 0 WHERE id = 'web-settings'");
+      GRAPH_STATE._issueMetricsCache = null;
+      const waves = window.bvGetExecutionWaves();
+      const w1 = waves?.waves?.[0] || null;
+      return {
+        label: w1?.label || '',
+        readyCount: w1?.readyCount,
+        items: (w1?.items || []).map(i => ({ id: i.id, isActionable: i.isActionable })),
+      };
+    } finally {
+      DB_STATE.db.run("UPDATE issue_overview_mv SET is_actionable = 1 WHERE id = 'web-settings'");
+      GRAPH_STATE._issueMetricsCache = null;
+    }
+  })()`);
+  assert.equal(p22b4WaveAudit.label, 'Wave 1 (No Blocking Deps · 1 ready)', `P22B-4 Wave 1 label reflects partial readiness accurately: ${JSON.stringify(p22b4WaveAudit)}`);
+  assert.equal(p22b4WaveAudit.readyCount, 1, 'P22B-4 Wave 1 readyCount=1');
+  assert.deepEqual(p22b4WaveAudit.items, [
+    { id: 'api-auth', isActionable: true },
+    { id: 'web-settings', isActionable: false },
+  ], `P22B-4 Wave 1 sorts actionable first and marks withheld item isActionable=false: ${JSON.stringify(p22b4WaveAudit)}`);
+
+  // W32-4 + P22B-1 + P22B-2: Baseline Drift card sanitizes multi-line Result.Summary(), reads baseline.commit_sha,
+  // sorts critical ahead of 6 info alerts before .slice(0, 6), and classifies info-only drift as 'info' (not 'warning')!
+  const p22bDriftAudit = await evaluate(page, `(() => {
+    ${app}.driftData = {
+      has_drift: true,
+      baseline: { commit_sha: 'deadbeef99' },
+      baseline_description: 'Pre-release baseline snapshot',
+      summary: 'Drift Analysis Summary\\n======================\\n\\n🔴 CRITICAL: 1 issue(s)\\n',
+      skipped_checks: [{ type: 'baseline_scope', reason: 'Baseline scope mismatch' }],
+      alerts: [
+        { severity: 'info', type: 'info_1', message: 'Info 1' },
+        { severity: 'info', type: 'info_2', message: 'Info 2' },
+        { severity: 'info', type: 'info_3', message: 'Info 3' },
+        { severity: 'info', type: 'info_4', message: 'Info 4' },
+        { severity: 'info', type: 'info_5', message: 'Info 5' },
+        { severity: 'info', type: 'info_6', message: 'Info 6' },
+        { severity: 'critical', type: 'new_cycle', issue_id: 'api-auth', message: 'Critical new cycle detected', suggested_action: 'Break auth cycle edge', delta: 1 },
+      ],
+    };
+    ${app}.hasDrift = true;
+    const critSummary = JSON.parse(JSON.stringify(${app}.getDriftSummary()));
+    return { critSummary };
+  })()`);
+  await waitFor(page, `(${visible})(document.getElementById('insights-drift-card'))`, 'W32-4 #insights-drift-card visible when hasDrift=true');
+  const driftCardAudit = await evaluate(page, `(async () => {
+    const card = document.getElementById('insights-drift-card');
+    const descEl = document.getElementById('insights-drift-baseline-desc');
+    const skipEl = document.getElementById('insights-drift-skipped');
+    const text = card?.textContent || '';
+    const descVis = Boolean(descEl && (${visible})(descEl) && descEl.textContent.includes('Pre-release baseline snapshot'));
+    const skipVis = Boolean(skipEl && (${visible})(skipEl) && skipEl.textContent.includes('baseline_scope'));
+    const hasSuggestedAction = text.includes('Break auth cycle edge');
+    const apiAuthBtn = card ? [...card.querySelectorAll('button')].find(b => b.textContent.trim() === 'api-auth') : null;
+    let clickedModalId = '';
+    if (apiAuthBtn) {
+      apiAuthBtn.click();
+      await new Promise(r => setTimeout(r, 60));
+      clickedModalId = ${app}.selectedIssue?.id || '';
+      ${app}.closeIssue();
+      window.location.hash = '#/insights';
+      await new Promise(r => setTimeout(r, 60));
+    }
+    return {
+      text,
+      descVis,
+      skipVis,
+      hasSuggestedAction,
+      clickedModalId,
+    };
+  })()`);
+  const driftCardText = driftCardAudit.text;
+  assert.equal(driftCardAudit.descVis, true, `W36-3 #insights-drift-baseline-desc renders baseline_description: ${JSON.stringify(driftCardAudit)}`);
+  assert.equal(driftCardAudit.skipVis, true, `W36-3 #insights-drift-skipped renders skipped_checks: ${JSON.stringify(driftCardAudit)}`);
+  assert.equal(driftCardAudit.hasSuggestedAction, true, `W36-3 #insights-drift-card renders suggested_action: ${JSON.stringify(driftCardAudit)}`);
+  assert.equal(driftCardAudit.clickedModalId, 'api-auth', `W36-3 clicking drift issue_id button opens api-auth modal: ${JSON.stringify(driftCardAudit)}`);
+  assert.equal(p22bDriftAudit.critSummary.status, 'critical', 'P22B-2 critical alert sets status=critical');
+  assert.equal(p22bDriftAudit.critSummary.alerts[0]?.severity, 'critical', `P22B-2 critical alert promoted ahead of 6 info alerts before slice(0,6): ${JSON.stringify(p22bDriftAudit.critSummary.alerts)}`);
+  assert.equal(p22bDriftAudit.critSummary.baselineCommit, 'deadbeef99', 'P22B-1 reads baseline.commit_sha fallback');
+  assert.ok(!p22bDriftAudit.critSummary.summary.includes('\n') && !p22bDriftAudit.critSummary.summary.includes('===='),
+    `P22B-1 sanitizes multi-line Result.Summary() into clean 1-line summary: ${p22bDriftAudit.critSummary.summary}`);
+  assert.ok(driftCardText.includes('Baseline Drift Monitor') && driftCardText.includes('base deadbee') && driftCardText.includes('Critical new cycle detected'),
+    `W32-4/P22B-1/2 #insights-drift-card rendered drift summary, commit & promoted critical alert: ${driftCardText}`);
+  const infoOnlyStatus = await evaluate(page, `(() => {
+    ${app}.driftData = {
+      has_drift: true,
+      baseline_commit: 'abc1234567',
+      alerts: [{ severity: 'info', type: 'node_count_change', message: 'Minor info drift', delta: 1 }],
+    };
+    const st = ${app}.getDriftSummary()?.status || '';
+    ${app}.driftData = null;
+    ${app}.hasDrift = false;
+    return st;
+  })()`);
+  assert.equal(infoOnlyStatus, 'info', 'P22B-2 info-only drift classifies as info (not warning)');
+
+  // P19-13 + P20B-6: Navigate cleanly to #/issues Board mode, assert concrete visual Kanban column order
+  // (different from flat list order) and real navigateIssue(1) stepping, then restore mode & route!
+  await click(page, 'a[href="#/issues"]');
+  await waitFor(page, `${app}.view === 'issues'`, 'navigated to #/issues for P19-13 board nav check');
+  await click(page, '#issues-mode-board');
+  await waitFor(page, `${app}.issuesViewMode === 'board'`, 'switched to board mode for P19-13 check');
+  const boardNavCheck = await evaluate(page, `(() => {
+    const navIds = ${app}.currentIssueNavIds();
+    const listIds = ${app}.issues.map(i => i.id);
+    ${app}.selectIssue('api-auth');
+    ${app}.navigateIssue(1);
+    const secondSelectedId = ${app}.selectedIssue?.id || '';
+    ${app}.closeIssue();
+    return { navIds, listIds, secondSelectedId };
+  })()`);
+  assert.deepEqual(boardNavCheck.navIds, ['api-auth', 'web-login', 'web-settings', 'api-health'], `P19-13/P20B-6 Board mode nav follows concrete Kanban column order (open/in_progress/blocked/closed): ${JSON.stringify(boardNavCheck)}`);
+  assert.equal(boardNavCheck.secondSelectedId, 'web-login', 'P20B-6 navigateIssue(1) steps to 2nd Kanban card web-login (not closed list item api-health)');
+  await click(page, '#issues-mode-list');
+  await waitFor(page, `${app}.issuesViewMode === 'list'`, 'restored list mode after P19-13 check');
+
+  // W31-6 + P20B-4 + P20B-6: Navigate to #/ Dashboard FIRST, verify #dashboard-diff-card is hidden when meta.has_diff=false,
+  // then verify populated diffData renders Added, Closed, Removed (non-clickable span), and badges cleanly!
+  await click(page, 'a[href="#/"]');
+  await waitFor(page, `${app}.view === 'dashboard'`, 'navigated to dashboard for W31-6 diff card check');
+  const diffHiddenOnDashboard = await evaluate(page, `!${app}.hasDiff && !(${visible})(document.getElementById('dashboard-diff-card'))`);
+  assert.equal(diffHiddenOnDashboard, true, 'W31-6/P20B-6 #dashboard-diff-card hidden on active Dashboard when meta.has_diff is false');
+  await evaluate(page, `(() => {
+    ${app}.diffData = {
+      diff_since: 'HEAD~1',
+      diff: {
+        summary: { total_changes: 3, issues_added: 1, issues_closed: 1, issues_reopened: 0, issues_removed: 1, issues_modified: 0, health_trend: 'improving' },
+        metric_deltas: { cycle_count: 0, open_issues: -1, blocked_issues: -2, total_edges: 1, component_count: -1 },
+        new_cycles: [['api-auth', 'web-login']],
+        resolved_cycles: [['api-health', 'web-settings']],
+        new_issues: [{ id: 'api-auth', title: 'Auth API' }],
+        closed_issues: [{ id: 'api-health', title: 'Health API' }],
+        reopened_issues: [],
+        removed_issues: [{ id: 'legacy-removed-1', title: 'Deleted task' }],
+        modified_issues: [],
+      },
+    };
+    ${app}.hasDiff = true;
+  })()`);
+  await waitFor(page, `(${visible})(document.getElementById('dashboard-diff-card')) && document.getElementById('dashboard-diff-card').textContent.includes('HEAD~1') && document.getElementById('dashboard-diff-card').textContent.includes('+1 new') && document.getElementById('dashboard-diff-card').textContent.includes('legacy-removed-1')`, 'W31-6/P20B-4 #dashboard-diff-card renders changes + removed_issues since HEAD~1');
+  const w36DiffCardAudit = await evaluate(page, `(() => {
+    const newCyc = document.getElementById('diff-new-cycles-row');
+    const resCyc = document.getElementById('diff-resolved-cycles-row');
+    const chips = [...document.querySelectorAll('#dashboard-diff-card [data-diff-metric-delta]')].filter(${visible}).map(el => el.dataset.diffMetricDelta);
+    return {
+      newCycVis: Boolean(newCyc && (${visible})(newCyc) && newCyc.textContent.includes('api-auth')),
+      resCycVis: Boolean(resCyc && (${visible})(resCyc) && resCyc.textContent.includes('api-health')),
+      chips,
+    };
+  })()`);
+  assert.deepEqual(w36DiffCardAudit, {
+    newCycVis: true,
+    resCycVis: true,
+    chips: ['open_issues', 'blocked_issues', 'total_edges', 'component_count'],
+  }, `W36-3 #dashboard-diff-card renders new_cycles, resolved_cycles, and all 4 real MetricDeltas chips: ${JSON.stringify(w36DiffCardAudit)}`);
+  await evaluate(page, `(() => { ${app}.hasDiff = false; ${app}.diffData = null; })()`);
+  await click(page, 'a[href="#/graph"]');
+  await waitFor(page, `${app}.view === 'graph'`, 'returned to graph view after W31-6 diff card check');
+
   // Verify getTriageAlerts() preserves multi-issue_ids, sorts critical->warning->info, and renders blue info badge.
   const alertOrderCheck = await evaluate(page, `(() => {
     const prev = ${app}.triageData;
@@ -4765,6 +6676,32 @@ async function multiRepoJourney(page, standalonePage) {
   assert.equal(sprintViewAudit.hasSprintBead, true, '#/sprints lists clickable sprint scope beads');
   assert.equal(sprintViewAudit.hasUtcRangeText, true, '#/sprints displays absolute UTC start/end date range');
 
+  // Wave 38 (W38-3): #sprint-scope-changes strip stays hidden when empty and renders clickable chips when populated.
+  const wave38ScopeChangesAudit = await evaluate(page, `(async () => {
+    const appData = ${app};
+    const sp = appData.activeSprint;
+    if (!sp) return { ok: false };
+    const origChanges = sp.scope_changes;
+    try {
+      sp.scope_changes = [];
+      await new Promise(r => setTimeout(r, 40));
+      const hiddenWhenEmpty = !(${visible})(document.getElementById('sprint-scope-changes'));
+      sp.scope_changes = [{ issue_id: 'api-auth', action: 'added', date: '2026-10-05T12:00:00Z' }];
+      await new Promise(r => setTimeout(r, 40));
+      const el = document.getElementById('sprint-scope-changes');
+      const shownWhenPopulated = Boolean(el && (${visible})(el) && (el.textContent || '').includes('+api-auth') && (el.textContent || '').includes('Oct 5, 2026'));
+      return { ok: true, hiddenWhenEmpty, shownWhenPopulated };
+    } finally {
+      sp.scope_changes = origChanges;
+      await new Promise(r => setTimeout(r, 40));
+    }
+  })()`);
+  assert.deepEqual(wave38ScopeChangesAudit, {
+    ok: true,
+    hiddenWhenEmpty: true,
+    shownWhenPopulated: true,
+  }, `W38-3 #sprint-scope-changes visibility & rendering: ${JSON.stringify(wave38ScopeChangesAudit)}`);
+
   // Direct reload on #/sprints renders #sprint-burndown-chart after loading completes (not stuck on 0x0 hidden main)
   await reload(page);
   await waitFor(page, `typeof Alpine !== 'undefined' && !${app}.loading && ${app}.view === 'sprints' && ${app}.hasSprints`, 'direct #/sprints reload ready');
@@ -4809,8 +6746,31 @@ async function multiRepoJourney(page, standalonePage) {
       offenders,
     };
   })()`);
+  // P22B-7c: Also check 360px mobile #/insights with all 3 Wave 32 cards (Drift, Cross-Repo, Execution Waves)
+  // visible simultaneously -> zero horizontal overflow!
+  await evaluate(mobileSprintPage, `(() => {
+    ${app}.driftData = {
+      has_drift: true,
+      baseline_commit: 'abc1234567',
+      summary: '1 warning drift alert',
+      alerts: [{ severity: 'warning', type: 'blocked_increase', message: 'Blocked issues increased by 1 across long workspace label', delta: 1 }],
+    };
+    ${app}.hasDrift = true;
+    window.location.hash = '#/insights';
+  })()`);
+  await waitFor(mobileSprintPage, `${app}.view === 'insights' && ${app}.graphReady && (${visible})(document.getElementById('insights-drift-card')) && (${visible})(document.getElementById('insights-cross-repo-card')) && (${visible})(document.getElementById('insights-execution-waves-card'))`, '360px mobile #/insights renders all 3 Wave 32 cards');
+  await delay(100);
+  const mobileInsightsOverflow = await evaluate(mobileSprintPage, `(() => {
+    const sw = document.documentElement.scrollWidth;
+    const offenders = sw <= 361 ? [] : [...document.querySelectorAll('*')]
+      .map(el => ({ tag: el.tagName, id: el.id, cls: String(el.className || '').slice(0, 40), right: Math.round(el.getBoundingClientRect().right) }))
+      .filter(o => o.right > 361)
+      .slice(0, 5);
+    return { scrollWidth: sw, noHorizOverflow: sw <= 361, offenders };
+  })()`);
   clean(mobileSprintPage);
   await send('Target.closeTarget', { targetId: mobileSprintPage.target });
+  assert.equal(mobileInsightsOverflow.noHorizOverflow, true, `P22B-7c 360px mobile #/insights Wave 32 cards have zero horizontal overflow: ${JSON.stringify(mobileInsightsOverflow)}`);
   assert.equal(mobileFiveNavAudit.visibleCount, 5, `expected 5 visible mobile nav items with hasSprints=true: ${JSON.stringify(mobileFiveNavAudit)}`);
   assert.equal(mobileFiveNavAudit.allWithin360, true, `all 5 mobile nav items fit within 360px: ${JSON.stringify(mobileFiveNavAudit)}`);
   assert.equal(mobileFiveNavAudit.noHorizOverflow, true, `no horizontal overflow at 360px on #/sprints: ${JSON.stringify(mobileFiveNavAudit)}`);
@@ -4847,6 +6807,37 @@ async function multiRepoJourney(page, standalonePage) {
     return { shown, webCount, resetCount };
   })()`);
   assert.deepEqual(standaloneRepoAudit, { shown: true, webCount: 2, resetCount: 4 }, 'standalone HTML #filter-repo filters and resets multi-repo nodes');
+  // W36-4 / P28-B5 positive control on acyclic multi-repo standalone HTML (REAL Go-exported DATA.advanced_insights):
+  // Structural tab renders real Top-K/K-Path items, clears competing overlays (#whatif-banner), highlights visible nodes,
+  // and refuses to dim canvas / shows hidden toast when active filters hide the structural nodes!
+  const standaloneStructuralAudit = await evaluate(standalonePage, `(() => {
+    document.getElementById('btn-triage').click();
+    document.querySelector('#triage-tabs .triage-tab-btn[data-tab="structural"]')?.click();
+    const firstItem = document.querySelector('#triage-list .structural-item, #triage-list .structural-path-item');
+    if (!firstItem) return { hasItem: false };
+    runWhatIfSimulation('api-auth');
+    const whatIfWasOpen = document.getElementById('whatif-banner')?.classList.contains('visible');
+    firstItem.click();
+    const clearedWhatIf = !document.getElementById('whatif-banner')?.classList.contains('visible');
+    const highlightedVisible = highlightedNodes.size > 0;
+    const stFilter = document.getElementById('filter-status');
+    stFilter.value = 'closed';
+    stFilter.onchange({ target: stFilter });
+    firstItem.click();
+    const respectsHiddenFilter = highlightedNodes.size === 0 && (document.getElementById('toast')?.textContent || '').includes('hidden');
+    stFilter.value = 'all';
+    stFilter.onchange({ target: stFilter });
+    clearSelection();
+    document.getElementById('btn-triage').click();
+    return { hasItem: true, whatIfWasOpen, clearedWhatIf, highlightedVisible, respectsHiddenFilter };
+  })()`);
+  assert.deepEqual(standaloneStructuralAudit, {
+    hasItem: true,
+    whatIfWasOpen: true,
+    clearedWhatIf: true,
+    highlightedVisible: true,
+    respectsHiddenFilter: true,
+  }, `W36-4/P28-B5 standalone HTML Structural tab real DATA.advanced_insights highlighting, competing-banner cleanup & filter respect verified: ${JSON.stringify(standaloneStructuralAudit)}`);
   clean(standalonePage);
   console.log('PASS: multi-repo Issues dropdown/pill/badge/URL, Graph Filter HUD repo filter, and standalone HTML repo filter');
 }
@@ -4954,9 +6945,78 @@ try {
     const caps = await openPage('capabilities');
     await capabilitiesJourney(caps);
     await send('Target.closeTarget', { targetId: caps.target });
+    // RC-C41 / MR-11: Booting a non-diff export directly at #/issues?changed=true must auto-clear
+    // filters.changedOnly instead of trapping the user on an empty table (WHERE 1 = 0).
+    const nonDiffChanged = await openPage('non-diff-changed', 1280, false, '/#/issues?changed=true');
+    await waitFor(nonDiffChanged, `typeof Alpine !== 'undefined' && !${app}.loading && ${app}.stats.total > 0 && !${app}.error && !${app}.globalError`, 'non-diff ?changed=true boot');
+    const nonDiffChangedState = await evaluate(nonDiffChanged, `(() => {
+      const a = ${app};
+      return {
+        hasDiff: Boolean(a.hasDiff),
+        changedOnly: Boolean(a.filters.changedOnly),
+        issuesShown: a.issues.length,
+        hashHasChanged: window.location.hash.includes('changed='),
+      };
+    })()`);
+    assert.deepEqual(nonDiffChangedState, {
+      hasDiff: false,
+      changedOnly: false,
+      issuesShown: nonDiffChangedState.issuesShown > 0 ? nonDiffChangedState.issuesShown : 1,
+      hashHasChanged: false,
+    }, `RC-C41 non-diff #/issues?changed=true must auto-clear changedOnly and show issues: ${JSON.stringify(nonDiffChangedState)}`);
+    // Also wait for worker activation, then open Graph view and prove 0 additional /data/history.json fetches (initForceGraphView reuses this.historyData).
+    await waitFor(nonDiffChanged, '!!navigator.serviceWorker.controller', 'non-diff-changed worker active');
+    await delay(300);
+    await waitFor(nonDiffChanged, `typeof Alpine !== 'undefined' && !${app}.loading && ${app}.stats.total > 0`, 'non-diff-changed ready after SW');
+    const beforeGraphReqIdx = records.length;
+    await evaluate(nonDiffChanged, `window.location.hash = '#/graph'`);
+    await waitFor(nonDiffChanged, `${app}.forceGraphReady && !${app}.forceGraphLoading`, 'non-diff-changed graph loaded');
+    const postBootGraphHistoryReqs = records.slice(beforeGraphReqIdx).filter(r =>
+      r.page === 'non-diff-changed' &&
+      r.method === 'Network.requestWillBeSent' &&
+      new URL(r.params.request.url).pathname === '/data/history.json'
+    );
+    assert.deepEqual(postBootGraphHistoryReqs, [], 'RC-C41 opening Graph view after boot must issue 0 additional /data/history.json requests');
+    clean(nonDiffChanged);
+    await send('Target.closeTarget', { targetId: nonDiffChanged.target });
+
+    // P26-B3: Booting directly at /#/graph must deduplicate /data/history.json via ensureHistoryLoaded (exactly 1 request + populated time-travel)
+    const directGraph = await openPage('direct-graph-boot', 1280, false, '/#/graph');
+    await waitFor(directGraph, '!!navigator.serviceWorker.controller', 'direct /#/graph worker active');
+    await delay(300);
+    await waitFor(directGraph, `typeof Alpine !== 'undefined' && !${app}.loading && ${app}.forceGraphReady && !${app}.forceGraphLoading`, 'direct /#/graph settled after SW');
+    const beforeDirectGraphIdx = records.length;
+    await evaluate(directGraph, 'window.__directGraphReload = true');
+    await send('Page.reload', { ignoreCache: false }, directGraph.session);
+    await waitFor(directGraph, `!window.__directGraphReload && typeof Alpine !== 'undefined' && !${app}.loading && ${app}.forceGraphReady && !${app}.forceGraphLoading`, 'direct /#/graph boot ready');
+    const directGraphHistoryReqs = records.slice(beforeDirectGraphIdx).filter(r =>
+      r.page === 'direct-graph-boot' &&
+      r.method === 'Network.requestWillBeSent' &&
+      new URL(r.params.request.url).pathname === '/data/history.json'
+    );
+    const directGraphState = await evaluate(directGraph, `({
+      hasHistoryMeta: ${app}.meta?.has_history === true || ${app}.meta?.has_history === 'true',
+      commitCount: ${app}.historyData?.commits?.length || 0,
+      timeTravelAvailable: Boolean(${app}.timeTravelAvailable),
+    })`);
+    assert.equal(directGraphHistoryReqs.length, 1, `P26-B3 direct /#/graph boot on capabilitiesBundle must issue exactly 1 /data/history.json fetch, got ${directGraphHistoryReqs.length}`);
+    assert.ok(directGraphState.hasHistoryMeta && directGraphState.commitCount > 0 && directGraphState.timeTravelAvailable, `P26-B3 direct /#/graph boot must hydrate historyData and timeTravelAvailable: ${JSON.stringify(directGraphState)}`);
+    clean(directGraph);
+    await send('Target.closeTarget', { targetId: directGraph.target });
     const standalone = await openPage('standalone-graph', 1280, false, '/standalone-graph.html');
     await standaloneGraphJourney(standalone);
     await send('Target.closeTarget', { targetId: standalone.target });
+    const standaloneDiff = await openPage('standalone-graph-diff', 1280, false, '/standalone-graph-diff.html');
+    await standaloneGraphDiffJourney(standaloneDiff);
+    await send('Target.closeTarget', { targetId: standaloneDiff.target });
+    if (capabilitiesDiffBundle) {
+      activeBundle = capabilitiesDiffBundle;
+      const capsDiff = await openPage('capabilities-diff');
+      const capsStandaloneDiff = await openPage('capabilities-diff-standalone', 1280, false, '/standalone-graph-diff.html');
+      await capabilitiesDiffJourney(capsDiff, capsStandaloneDiff);
+      await send('Target.closeTarget', { targetId: capsDiff.target });
+      await send('Target.closeTarget', { targetId: capsStandaloneDiff.target });
+    }
     if (multiRepoBundle) {
       activeBundle = multiRepoBundle;
       const multi = await openPage('multi-repo');
@@ -4968,7 +7028,35 @@ try {
     activeBundle = bundle;
   }
   const desktop = await openPage('desktop');
-  if (mode === 'graph-startup') {
+  if (mode === 'first-render-timing') {
+    await waitFor(
+      desktop,
+      `typeof Alpine !== 'undefined' && !${app}.loading && Number.isInteger(${app}.stats.total) && ${app}.graphReady && !${app}.error && !${app}.globalError && (${app}.stats.total === 0 || document.querySelectorAll('[aria-label^="View issue "]').length > 0)`,
+      'first render complete (issue list painted + graphReady)',
+      45000
+    );
+    await evaluate(desktop, 'new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))');
+    const wallMs = Math.round((performance.now() - desktop.navStartedAt) * 10) / 10;
+    const timing = await evaluate(desktop, `(() => {
+      const a = ${app};
+      return {
+        page_perf_ms: Math.round(performance.now() * 10) / 10,
+        rendered_rows: document.querySelectorAll('[aria-label^="View issue "]').length,
+        total_issues: a.stats.total,
+        graph_ready: !!a.graphReady,
+      };
+    })()`);
+    clean(desktop);
+    const payload = {
+      first_render_ms: Math.max(0.1, wallMs),
+      page_perf_ms: timing.page_perf_ms,
+      rendered_rows: timing.rendered_rows,
+      total_issues: timing.total_issues,
+      graph_ready: timing.graph_ready,
+    };
+    fs.writeFileSync(path.join(artifacts, 'first-render-timing.json'), JSON.stringify(payload, null, 2) + '\n');
+    console.log('FIRST_RENDER_TIMING_JSON=' + JSON.stringify(payload));
+  } else if (mode === 'graph-startup') {
     await graphStartupJourney(desktop);
     await send('Target.closeTarget',{targetId:desktop.target});
     await graphStartupJourney(await openPage('mobile-360',360));
@@ -5068,11 +7156,11 @@ try {
     );
     assert.deepEqual(
       records.filter(r => {
-        if (!['project', 'capabilities', 'standalone-graph', 'desktop', 'mobile-360'].some(prefix => r.page === prefix || r.page?.startsWith(prefix + ':'))) return false;
+        if (!['project', 'capabilities', 'capabilities-diff', 'capabilities-diff-standalone', 'non-diff-changed', 'direct-graph-boot', 'multi-repo', 'multi-repo-standalone', 'standalone-graph', 'standalone-graph-diff', 'desktop', 'mobile-360'].some(prefix => r.page === prefix || r.page?.startsWith(prefix + ':'))) return false;
         if (r.method !== 'Network.responseReceived' || r.params.response.status < 400) return false;
         const pathname = new URL(r.params.response.url).pathname;
-        // desktop/mobile-360 fixture intentionally contains sanitized <img src="x"> XSS probe and has no git repo for optional history.json
-        if ((r.page?.startsWith('desktop') || r.page?.startsWith('mobile-360')) && (pathname === '/x' || pathname === '/data/history.json')) return false;
+        // desktop/mobile-360 fixture intentionally contains sanitized <img src="x"> XSS probe (never exempt /data/history.json — RC-C41!)
+        if ((r.page?.startsWith('desktop') || r.page?.startsWith('mobile-360')) && pathname === '/x') return false;
         return true;
       }),
       [],

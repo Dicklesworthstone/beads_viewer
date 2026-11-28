@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -205,7 +206,7 @@ func validateEnumFlags(flags *flag.FlagSet, rules []enumFlagRule) error {
 }
 
 func isDiffComposableExportActive(flags *flag.FlagSet) bool {
-	for _, name := range []string{"export", "export-md", "export-pages", "priority-brief", "agent-brief"} {
+	for _, name := range []string{"export", "export-md", "export-graph", "export-pages", "pages", "priority-brief", "agent-brief"} {
 		if isFlagActive(flags, name) || (primaryStringCommandFlags[name] && flags.Changed(name)) {
 			return true
 		}
@@ -1862,7 +1863,7 @@ func main() {
 	// Graph export (bv-136)
 	robotGraph := flag.Bool("robot-graph", false, "Output dependency graph as JSON/DOT/Mermaid for AI agents")
 	graphFormat := flag.String("graph-format", "json", "Graph output format: json, dot, mermaid")
-	graphRoot := flag.String("graph-root", "", "Subgraph from specific root issue ID")
+	graphRoot := flag.String("graph-root", "", "Scope to descendant subgraph from a specific root/epic issue ID (or neighborhood with --robot-graph/--graph-depth)")
 	graphDepth := flag.Int("graph-depth", 0, "Max depth for subgraph (0 = unlimited)")
 	// Graph snapshot export (bv-94)
 	exportGraph := flag.String("export-graph", "", "Export graph: .html for interactive, .png/.svg for static (auto-names if empty)")
@@ -1886,7 +1887,7 @@ func main() {
 	searchMode := flag.String("search-mode", "", "Search ranking mode: text or hybrid (default: BV_SEARCH_MODE or text)")
 	searchPreset := flag.String("search-preset", "", "Hybrid preset name (default: BV_SEARCH_PRESET or default)")
 	searchWeights := flag.String("search-weights", "", "Hybrid weights JSON (overrides preset; keys: text,pagerank,status,impact,priority,recency)")
-	diffSince := flag.String("diff-since", "", "Show changes since historical point (commit SHA, branch, tag, or date; composable with --export, --export-md, --export-pages, --priority-brief, --agent-brief)")
+	diffSince := flag.String("diff-since", "", "Show changes since historical point (commit SHA, branch, tag, or date; composable with --export, --export-md, --export-graph, --export-pages, --pages, --priority-brief, --agent-brief)")
 	asOf := flag.String("as-of", "", "View state at point in time (commit SHA, branch, tag, or date)")
 	noCache := flag.Bool("no-cache", false, "Bypass disk cache for robot triage (also: BV_NO_CACHE=1)")
 	forceFullAnalysis := flag.Bool("force-full-analysis", false, "Compute all metrics regardless of graph size (may be slow for large graphs)")
@@ -1949,9 +1950,9 @@ func main() {
 	// Blocker chain analysis flag (bv-nlo0)
 	robotBlockerChain := flag.String("robot-blocker-chain", "", "Output full blocker chain analysis for issue ID as JSON")
 	// What-if impact simulation flag (bv-apal.36)
-	robotWhatIf := flag.String("robot-whatif", "", "Simulate completing issue ID(s) (comma-separated for batch) and output downstream unblock impact as JSON")
+	robotWhatIf := flag.String("robot-whatif", "", "Simulate completing one or more comma-separated issue IDs and output downstream unblock impact (and joint synergy for batches) as JSON")
 	// Pre-flight dependency cycle & readiness impact validator (W29-5)
-	robotCheckDep := flag.String("robot-check-dep", "", "Validate proposed blocking dependency edge(s) for cycles and readiness impact before adding (format: fromID:toID[,from2:to2])")
+	robotCheckDep := flag.String("robot-check-dep", "", "Validate proposed blocking dependency additions (fromID:toID) or removals (remove:fromID:toID) for cycles and readiness impact")
 	// Coding agent session search correlation flag (bv-apal.88)
 	robotCass := flag.String("robot-cass", "", "Output correlated coding-agent sessions (cass) for bead ID as JSON")
 	// Impact network graph flag (bv-48kr)
@@ -2362,8 +2363,7 @@ func main() {
 			strings.TrimSpace(env.ToonDefaultFormat.Get()) != ""
 
 		primaryRobotRegistries := []*RobotRegistry{&phaseOneRobotRegistry, &phaseTwoRobotRegistry, &phaseThreeRobotRegistry}
-		isDiffExportComposition := *diffSince != "" && !*robotDiff &&
-			(*exportFile != "" || *exportReport != "" || *exportPages != "" || *priorityBrief != "" || *agentBrief != "")
+		isDiffExportComposition := *diffSince != "" && !*robotDiff && isDiffComposableExportActive(flag.CommandLine)
 		robotMode := envRobot ||
 			anyRobotModeActive(primaryRobotRegistries...) ||
 			// When stdout is non-TTY, standalone --diff-since auto-enables JSON output. Mark this
@@ -3606,6 +3606,9 @@ func main() {
 		robotDispatchContext.LabelScope = *labelScope
 		robotDispatchContext.Recipe = *recipeName
 		robotDispatchContext.Repo = *repoFilter
+		if !*robotGraph {
+			robotDispatchContext.GraphRoot = strings.TrimSpace(*graphRoot)
+		}
 		robotDispatchContext.ForceFullAnalysis = *forceFullAnalysis
 		// Name the source BEFORE scopeLoadedIssues so recipeMetricsForContext
 		// (including workspace triage feedback loading) sees SourceKind and SourcePath.
@@ -3800,6 +3803,10 @@ func main() {
 				results = results[:limit]
 			}
 
+			issueByID := make(map[string]model.Issue, len(issuesForSearch))
+			for _, iss := range issuesForSearch {
+				issueByID[iss.ID] = iss
+			}
 			titleByID := make(map[string]string, len(issuesForSearch))
 			for _, iss := range issuesForSearch {
 				titleByID[iss.ID] = iss.Title
@@ -3874,31 +3881,92 @@ func main() {
 					exitCLI(1)
 				}
 				out.Results = make([]robotSearchResult, 0, max(len(results), len(hybridResults)))
+				searchNow := robotDispatchContext.ReferenceNow()
+				searchClaimsProven := robotDispatchContext.claimsProven()
+				searchNotReadyLabels := resolveNotReadyLabels(phaseThreeRobotHandlerConfig{NotReadyLabels: robotNotReadyLabels})
+				var searchParentsWithOpenChildren map[string]bool
+				if searchAn := robotDispatchContext.GraphAnalyzer(); searchAn != nil {
+					searchParentsWithOpenChildren = searchAn.ParentsWithOpenChildren()
+				}
+				hasAnyNotReadyLabel := func(labels, targets []string) bool {
+					if len(labels) == 0 || len(targets) == 0 {
+						return false
+					}
+					for _, lbl := range labels {
+						nl := strings.ToLower(strings.TrimSpace(lbl))
+						if nl == "" {
+							continue
+						}
+						for _, t := range targets {
+							if nl == strings.ToLower(strings.TrimSpace(t)) {
+								return true
+							}
+						}
+					}
+					return false
+				}
+				buildSearchResult := func(id string, score, textScore float64, comp map[string]float64) robotSearchResult {
+					res := robotSearchResult{
+						IssueID:         id,
+						Score:           score,
+						TextScore:       textScore,
+						Title:           titleByID[id],
+						ComponentScores: comp,
+					}
+					if iss, ok := issueByID[id]; ok {
+						res.Status = string(iss.Status)
+						res.Priority = iss.Priority
+						res.IssueType = string(iss.IssueType)
+						if len(iss.Labels) > 0 {
+							res.Labels = append([]string(nil), iss.Labels...)
+						}
+						res.Assignee = iss.Assignee
+						res.SourceRepo = iss.SourceRepo
+						res.NotReady = hasAnyNotReadyLabel(iss.Labels, searchNotReadyLabels)
+						if readiness != nil {
+							res.IsActionable = readiness.Ready(id, searchNow)
+							res.Claimable = searchClaimsProven &&
+								!res.NotReady &&
+								iss.IssueType != model.TypeEpic &&
+								strings.TrimSpace(iss.Assignee) == "" &&
+								!searchParentsWithOpenChildren[id] &&
+								readiness.Claimable(id, searchNow)
+						}
+						var act model.IssueActions
+						if !searchClaimsProven {
+							res.Claimable = false
+							act = iss.Actions(false)
+							act.Claim = nil
+							act.UnavailableReason = "source authority is incomplete or stale"
+						} else {
+							act = iss.Actions(res.Claimable)
+							if res.NotReady && (act.UnavailableReason == "" || act.UnavailableReason == "snapshot does not establish claim readiness") {
+								act.UnavailableReason = "marked not-ready by label"
+							}
+						}
+						if act.Show != nil || act.Claim != nil || act.UnavailableReason != "" {
+							res.Actions = &act
+						}
+					}
+					return res
+				}
 				if searchCfg.Mode == search.SearchModeHybrid {
 					for _, r := range hybridResults {
-						out.Results = append(out.Results, robotSearchResult{
-							IssueID:         r.IssueID,
-							Score:           r.FinalScore,
-							TextScore:       r.TextScore,
-							Title:           titleByID[r.IssueID],
-							ComponentScores: r.ComponentScores,
-						})
+						out.Results = append(out.Results, buildSearchResult(r.IssueID, r.FinalScore, r.TextScore, r.ComponentScores))
 					}
 					out.UsageHints = []string{
-						"jq '.results[] | {id: .issue_id, score: .score, text: .text_score}' - Extract scores",
+						"jq '.results[] | {id: .issue_id, status: .status, priority: .priority, score: .score, claimable: .claimable}' - Extract scored metadata",
+						"jq '.results[] | select(.claimable) | {id: .issue_id, claim: .actions.claim}' - Claimable search hits",
 						"jq '.results[] | {id: .issue_id, components: .component_scores}' - Hybrid breakdown",
 						"jq '.index' - Index update stats (added/updated/removed/embedded)",
 					}
 				} else {
 					for _, r := range results {
-						out.Results = append(out.Results, robotSearchResult{
-							IssueID: r.IssueID,
-							Score:   r.Score,
-							Title:   titleByID[r.IssueID],
-						})
+						out.Results = append(out.Results, buildSearchResult(r.IssueID, r.Score, 0, nil))
 					}
 					out.UsageHints = []string{
-						"jq '.results[] | {id: .issue_id, score: .score, title: .title}' - Extract results",
+						"jq '.results[] | {id: .issue_id, status: .status, priority: .priority, score: .score, title: .title}' - Extract results",
+						"jq '.results[] | select(.claimable) | {id: .issue_id, claim: .actions.claim}' - Claimable search hits",
 						"jq '.index' - Index update stats (added/updated/removed/embedded)",
 					}
 				}
@@ -3926,7 +3994,7 @@ func main() {
 
 		// Handle --pages wizard (bv-10g)
 		if *pagesWizard {
-			if err := runPagesWizard(beadsPath, robotDispatchContext, activeRecipe, *robotIncludeInactive, *forceFullAnalysis, *robotNotReadyLabels, *noHooks, hookOptions); err != nil {
+			if err := runPagesWizard(beadsPath, robotDispatchContext, activeRecipe, *robotIncludeInactive, *forceFullAnalysis, *robotNotReadyLabels, *noHooks, hookOptions, *diffSince, *workspaceConfig, *repoFilter, *labelScope, *recipeName, asOfResolved, *robotHistoryTimeoutMs); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				exitCLI(1)
 			}
@@ -4028,7 +4096,7 @@ func main() {
 					HistoryLimit:     historyLimit,
 					HistoryTimeoutMs: robotHistoryTimeoutMs,
 				})
-				_, exportFeedbackWeights := loadRobotFeedbackForContext(exportContext)
+				exportFeedbackData, exportFeedbackWeights := loadRobotFeedbackForContext(exportContext)
 				triageInputIssues := exportIssues
 				triageCandidates := exportContext.CandidateIDs
 				if (exportContext.ActiveRecipe != nil || exportContext.CandidateIDs != nil) && len(exportIssues) > 0 {
@@ -4060,10 +4128,11 @@ func main() {
 				}
 				exportContext.ForceFullAnalysis = *forceFullAnalysis
 				fullAnalyzer, fullStats := resolveExportFullGraphStats(exportContext, exportIssues, analyzer, stats, *forceFullAnalysis)
+				var pagesDriftResult *drift.Result
 				if !*pagesIncludeClosed || exportContext.ActiveRecipe != nil || exportContext.CandidateIDs != nil {
-					attachDriftAlertsToTriage(&triage, exportContext, fullAnalyzer, fullStats, exportContext.GraphIssues(), *forceFullAnalysis)
+					pagesDriftResult = attachDriftAlertsToTriage(&triage, exportContext, fullAnalyzer, fullStats, exportContext.GraphIssues(), *forceFullAnalysis)
 				} else {
-					attachDriftAlertsToTriage(&triage, exportContext, analyzer, stats, exportIssues, *forceFullAnalysis)
+					pagesDriftResult = attachDriftAlertsToTriage(&triage, exportContext, analyzer, stats, exportIssues, *forceFullAnalysis)
 				}
 
 				// Extract all dependencies (blocking + non-blocking such as parent-child, related, discovered-from)
@@ -4097,6 +4166,10 @@ func main() {
 					return fmt.Errorf("encoding export source authority: %w", err)
 				}
 				exporter.Config.RobotEnvelope = envelope
+				if exportFeedbackData != nil && len(exportFeedbackData.Events) > 0 {
+					fb := exportFeedbackData.ToJSON()
+					exporter.Config.Feedback = &fb
+				}
 				if *pagesTitle != "" {
 					exporter.Config.Title = *pagesTitle
 				}
@@ -4135,7 +4208,7 @@ func main() {
 					}
 					historyCtx.Issues = exportIssues
 					if historyReport, err := generateHistoryForExportContext(historyCtx); err == nil && historyReport != nil {
-						if encoded, mErr := json.MarshalIndent(historyReport, "", "  "); mErr == nil {
+						if encoded, mErr := json.Marshal(historyReport); mErr == nil {
 							historyJSON = encoded
 							historyCommitCount = len(historyReport.Commits)
 						}
@@ -4156,66 +4229,31 @@ func main() {
 					}
 					diffJSON = encoded
 				}
+				driftJSON := buildExportDriftPayload(exportContext, pagesDriftResult)
 				exporter.Config.ETAContext = forecastETACtx
-				exporter.Config.HasSprints = sprintCount > 0 && len(sprintsJSON) > 0
-				exporter.Config.HasSuggestions = suggestionCount > 0 && len(suggestionsJSON) > 0
-				exporter.Config.HasLabels = labelCount > 0 && len(labelsJSON) > 0
-				exporter.Config.HasForecast = len(forecastJSON) > 0
-				exporter.Config.HasHistory = len(historyJSON) > 0
-				exporter.Config.HasDiff = len(diffJSON) > 0
 
-				// Prepare optional WASM scorer assets before ExportBundle so
-				// beads.sqlite3 and data/meta.json accurately record has_hybrid_wasm.
+				// Prepare optional WASM scorer assets and optional data/*.json companions BEFORE
+				// ExportBundle so beads.sqlite3 and data/meta.json accurately record has_* flags
+				// matching what actually landed on disk (P24A-5).
 				if err := prepareBundleWasmAssets(bundle, projectDir, *noHooks); err != nil {
 					return fmt.Errorf("preparing hybrid wasm assets: %w", err)
 				}
+				exporter.Config.HasSprints = writeOrPruneBundleCompanion(bundle, "data/sprints.json", sprintCount > 0 && len(sprintsJSON) > 0, sprintsJSON, fmt.Sprintf("sprints.json (%d sprints)", sprintCount), "  → ")
+				exporter.Config.HasSuggestions = writeOrPruneBundleCompanion(bundle, "data/suggestions.json", suggestionCount > 0 && len(suggestionsJSON) > 0, suggestionsJSON, fmt.Sprintf("suggestions.json (%d suggestions)", suggestionCount), "  → ")
+				exporter.Config.HasLabels = writeOrPruneBundleCompanion(bundle, "data/labels.json", labelCount > 0 && len(labelsJSON) > 0, labelsJSON, fmt.Sprintf("labels.json (%d labels)", labelCount), "  → ")
+				exporter.Config.HasForecast = writeOrPruneBundleCompanion(bundle, "data/forecast.json", len(forecastJSON) > 0, forecastJSON, "forecast.json", "  → ")
+				exporter.Config.HasHistory = writeOrPruneBundleCompanion(bundle, "data/history.json", len(historyJSON) > 0, historyJSON, fmt.Sprintf("history.json (%d commits)", historyCommitCount), "  → ")
+				exporter.Config.HasDiff = writeOrPruneBundleCompanion(bundle, "data/diff.json", len(diffJSON) > 0, diffJSON, fmt.Sprintf("diff.json (since %s)", *diffSince), "  → ")
+				driftAlertCount := 0
+				if pagesDriftResult != nil {
+					driftAlertCount = len(pagesDriftResult.Alerts)
+				}
+				exporter.Config.HasDrift = writeOrPruneBundleCompanion(bundle, "data/drift.json", len(driftJSON) > 0, driftJSON, fmt.Sprintf("drift.json (%d alerts)", driftAlertCount), "  → ")
 
 				// Export SQLite database
 				fmt.Println("  → Writing database and JSON files...")
 				if err := exporter.ExportBundle(bundle); err != nil {
 					return fmt.Errorf("exporting: %w", err)
-				}
-				if exporter.Config.HasSprints {
-					if err := bundle.WriteFile("data/sprints.json", sprintsJSON, 0644); err != nil {
-						fmt.Printf("  → Warning: failed to write sprints.json: %v\n", err)
-					} else {
-						fmt.Printf("  → sprints.json (%d sprints)\n", sprintCount)
-					}
-				}
-				if exporter.Config.HasSuggestions {
-					if err := bundle.WriteFile("data/suggestions.json", suggestionsJSON, 0644); err != nil {
-						fmt.Printf("  → Warning: failed to write suggestions.json: %v\n", err)
-					} else {
-						fmt.Printf("  → suggestions.json (%d suggestions)\n", suggestionCount)
-					}
-				}
-				if exporter.Config.HasLabels {
-					if err := bundle.WriteFile("data/labels.json", labelsJSON, 0644); err != nil {
-						fmt.Printf("  → Warning: failed to write labels.json: %v\n", err)
-					} else {
-						fmt.Printf("  → labels.json (%d labels)\n", labelCount)
-					}
-				}
-				if exporter.Config.HasForecast {
-					if err := bundle.WriteFile("data/forecast.json", forecastJSON, 0644); err != nil {
-						fmt.Printf("  → Warning: failed to write forecast.json: %v\n", err)
-					} else {
-						fmt.Println("  → forecast.json")
-					}
-				}
-				if exporter.Config.HasHistory {
-					if err := bundle.WriteFile("data/history.json", historyJSON, 0644); err != nil {
-						fmt.Printf("  → Warning: failed to write history.json: %v\n", err)
-					} else {
-						fmt.Printf("  → history.json (%d commits)\n", historyCommitCount)
-					}
-				}
-				if exporter.Config.HasDiff {
-					if err := bundle.WriteFile("data/diff.json", diffJSON, 0644); err != nil {
-						fmt.Printf("  → Warning: failed to write diff.json: %v\n", err)
-					} else {
-						fmt.Printf("  → diff.json (since %s)\n", *diffSince)
-					}
 				}
 
 				// Generate README.md with project stats (useful for GitHub Pages deployment)
@@ -4580,6 +4618,21 @@ func main() {
 				graphFormatName = "svg"
 				resolvedGraphExportPath = *exportGraph + ".svg"
 			}
+			// P23-3: Validate --diff-since target format and precompute diff BEFORE running pre-export hooks
+			// so invalid refs or unsupported static snapshot formats (.svg/.png) fail cleanly without side effects.
+			var graphDiff *analysis.SnapshotDiff
+			if *diffSince != "" {
+				if graphFormatName != "html" {
+					fmt.Fprintf(os.Stderr, "Error: --diff-since is only supported for interactive HTML --export-graph targets (.html), not %q\n", graphFormatName)
+					exitCLI(1)
+				}
+				diffRes, diffErr := computeScopedDiffForCLI(robotDispatchContext, *diffSince, projectDir, *workspaceConfig, *repoFilter, *labelScope, *recipeName, recipeForScope, asOfResolved, *forceFullAnalysis)
+				if diffErr != nil {
+					fmt.Fprintf(os.Stderr, "Error computing diff since %s: %v\n", *diffSince, diffErr)
+					exitCLI(1)
+				}
+				graphDiff = diffRes.Diff
+			}
 			graphHookExecutor, hookErr := hooks.RunHooks(projectDir, hooks.ExportContext{
 				ExportPath:   resolvedGraphExportPath,
 				ExportFormat: graphFormatName,
@@ -4689,6 +4742,8 @@ func main() {
 					ForceFullAnalysis: *forceFullAnalysis,
 					Triage:            &triage,
 					History:           historyReport,
+					Diff:              graphDiff,
+					DiffSince:         *diffSince,
 					Title:             title,
 					DataHash:          dataHash,
 					Path:              resolvedGraphExportPath,
@@ -5139,7 +5194,7 @@ func main() {
 			if !robotDispatchContext.claimsProven() {
 				suppressUnprovenTriageClaims(&triage)
 			}
-			attachDriftAlertsToTriage(&triage, robotDispatchContext, nil, nil, robotDispatchContext.GraphIssues(), *forceFullAnalysis)
+			briefDriftResult := attachDriftAlertsToTriage(&triage, robotDispatchContext, nil, nil, robotDispatchContext.GraphIssues(), *forceFullAnalysis)
 
 			// Marshal triage to JSON for the export function
 			triageJSON, err := json.Marshal(triage)
@@ -5160,7 +5215,7 @@ func main() {
 					config.MaxBlockers = *robotMaxResults
 				}
 			}
-			populatePriorityBriefExecutiveData(&config, robotDispatchContext, briefFeedbackWeights, *robotIncludeInactive, *forceFullAnalysis, *robotMaxResults, briefNow)
+			populatePriorityBriefExecutiveData(&config, robotDispatchContext, projectDir, briefDriftResult, briefFeedbackWeights, *robotIncludeInactive, *forceFullAnalysis, *robotMaxResults, briefNow)
 			if *diffSince != "" {
 				diffRes, diffErr := computeScopedDiffForCLI(robotDispatchContext, *diffSince, projectDir, *workspaceConfig, *repoFilter, *labelScope, *recipeName, recipeForScope, asOfResolved, *forceFullAnalysis)
 				if diffErr != nil {
@@ -5223,6 +5278,24 @@ func main() {
 					return fmt.Errorf("pre-export hook failed: %w", err)
 				}
 			}
+			// P21-5: Validate and precompute --diff-since BEFORE creating the output directory
+			// or writing any partial files so invalid refs fail atomically.
+			var agentDiffRes *cliScopedDiffResult
+			var agentDiffJSON []byte
+			if *diffSince != "" {
+				var diffErr error
+				agentDiffRes, diffErr = computeScopedDiffForCLI(robotDispatchContext, *diffSince, projectDir, *workspaceConfig, *repoFilter, *labelScope, *recipeName, recipeForScope, asOfResolved, *forceFullAnalysis)
+				if diffErr != nil {
+					fmt.Fprintf(os.Stderr, "Error computing diff since %s: %v\n", *diffSince, diffErr)
+					exitCLI(1)
+				}
+				encodedDiff, dErr := buildExportDiffPayload(robotDispatchContext, *diffSince, agentDiffRes)
+				if dErr != nil {
+					fmt.Fprintf(os.Stderr, "Error encoding diff since %s: %v\n", *diffSince, dErr)
+					exitCLI(1)
+				}
+				agentDiffJSON = encodedDiff
+			}
 			fmt.Printf("Generating agent brief bundle to %s/...\n", *agentBrief)
 
 			// Create output directory
@@ -5232,7 +5305,7 @@ func main() {
 			}
 
 			// Generate triage data
-			_, agentFeedbackWeights := loadRobotFeedbackForContext(robotDispatchContext)
+			agentFeedbackData, agentFeedbackWeights := loadRobotFeedbackForContext(robotDispatchContext)
 			agentHistory, agentHistoryStatus := loadTriageHistoryForContext(robotDispatchContext, phaseThreeRobotHandlerConfig{
 				HistoryLimit:     historyLimit,
 				HistoryTimeoutMs: robotHistoryTimeoutMs,
@@ -5271,7 +5344,18 @@ func main() {
 				agentFullStats = &s
 			}
 			agentDriftResult := attachDriftAlertsToTriage(&triage, agentExportCtx, agentAn, agentFullStats, agentExportCtx.GraphIssues(), *forceFullAnalysis)
-			triagePayload, err := withEnvelope(robotDispatchContext.Envelope(), triage)
+			var triageWithFeedback any = triage
+			if agentFeedbackData != nil && len(agentFeedbackData.Events) > 0 {
+				fb := agentFeedbackData.ToJSON()
+				triageWithFeedback = struct {
+					analysis.TriageResult
+					Feedback *analysis.FeedbackJSON `json:"feedback,omitempty"`
+				}{
+					TriageResult: triage,
+					Feedback:     &fb,
+				}
+			}
+			triagePayload, err := withEnvelope(robotDispatchContext.Envelope(), triageWithFeedback)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error encoding triage authority: %v\n", err)
 				exitCLI(1)
@@ -5316,15 +5400,93 @@ func main() {
 					config.MaxBlockers = *robotMaxResults
 				}
 			}
-			populatePriorityBriefExecutiveData(&config, robotDispatchContext, agentFeedbackWeights, *robotIncludeInactive, *forceFullAnalysis, *robotMaxResults, agentBriefNow)
-			var agentDiffRes *cliScopedDiffResult
-			if *diffSince != "" {
-				var diffErr error
-				agentDiffRes, diffErr = computeScopedDiffForCLI(robotDispatchContext, *diffSince, projectDir, *workspaceConfig, *repoFilter, *labelScope, *recipeName, recipeForScope, asOfResolved, *forceFullAnalysis)
-				if diffErr != nil {
-					fmt.Fprintf(os.Stderr, "Error computing diff since %s: %v\n", *diffSince, diffErr)
-					exitCLI(1)
+			// Compute optional analytical companions (plan, drift, suggestions, labels, forecast, sprints, history)
+			// BEFORE rendering brief.md so brief.md includes parallel tracks & code hotspots without duplicate work (W36-4).
+			bundleFiles := []string{"triage.json", "insights.json", "brief.md", "helpers.md"}
+			agentScopedIssues := issues
+			if candidateIDs != nil {
+				agentScopedIssues = make([]model.Issue, 0, len(candidateIDs))
+				for _, iss := range issues {
+					if candidateIDs[iss.ID] {
+						agentScopedIssues = append(agentScopedIssues, iss)
+					}
 				}
+			}
+			var agentPlanTracks []export.PriorityBriefTrackSummary
+			var agentPlanJSON []byte
+			var agentPlanTrackCount int
+			if agentAn != nil {
+				planNotReady := resolveNotReadyLabels(phaseThreeRobotHandlerConfig{NotReadyLabels: robotNotReadyLabels})
+				plan := agentAn.GetExecutionPlanWithOptions(planNotReady)
+				annotatePlanItemsWithActions(&plan, agentExportCtx.GraphIssues(), agentExportCtx.claimsProven())
+				if *robotMaxResults > 0 {
+					capExecutionPlanTracks(&plan, *robotMaxResults)
+				}
+				enrichExecutionPlan(&plan, agentExportCtx, agentAn, agentFullStats, agentExportCtx.GraphIssues())
+				agentPlanTrackCount = len(plan.Tracks)
+				for _, tr := range plan.Tracks {
+					if len(agentPlanTracks) >= 5 {
+						break
+					}
+					summary := export.PriorityBriefTrackSummary{
+						TrackID:   tr.TrackID,
+						ItemCount: len(tr.Items),
+						Reason:    tr.Reason,
+					}
+					if len(tr.Items) > 0 {
+						summary.TopIssueID = tr.Items[0].ID
+						summary.TopIssueTitle = tr.Items[0].Title
+					}
+					agentPlanTracks = append(agentPlanTracks, summary)
+				}
+				planCtx := agentExportCtx
+				planCtx.Command = "robot-plan"
+				planEnvelope := struct {
+					RobotEnvelope
+					Plan analysis.ExecutionPlan `json:"plan"`
+				}{
+					RobotEnvelope: planCtx.EnvelopeWithHash(dataHash),
+					Plan:          plan,
+				}
+				if pj, pErr := json.MarshalIndent(planEnvelope, "", "  "); pErr == nil && len(pj) > 0 {
+					agentPlanJSON = pj
+				}
+			}
+			var agentHistRep *TimeTravelHistory
+			if *pagesIncludeHistory {
+				agentHistCtx := agentExportCtx
+				if len(agentHistCtx.FullIssues) == 0 {
+					agentHistCtx.FullIssues = agentExportCtx.GraphIssues()
+				}
+				agentHistCtx.Issues = agentScopedIssues
+				if histRep, hErr := generateHistoryForExportContext(agentHistCtx); hErr == nil && histRep != nil {
+					agentHistRep = histRep
+				}
+			}
+
+			populatePriorityBriefExecutiveData(&config, robotDispatchContext, projectDir, agentDriftResult, agentFeedbackWeights, *robotIncludeInactive, *forceFullAnalysis, *robotMaxResults, agentBriefNow)
+			config.ExecutionTracks = agentPlanTracks
+			if agentHistRep != nil {
+				config.OrphanCommitCount = len(agentHistRep.Orphans)
+				hotspotLimit := 5
+				if *robotMaxResults > 0 {
+					hotspotLimit = *robotMaxResults
+				}
+				for _, fh := range agentHistRep.FileHotspots {
+					if fh.TotalBeads < 2 {
+						continue
+					}
+					config.FileHotspots = append(config.FileHotspots, export.PriorityBriefHotspotSummary{
+						Path:       fh.Path,
+						TotalBeads: fh.TotalBeads,
+						OpenBeads:  fh.OpenBeads,
+					})
+					if len(config.FileHotspots) >= hotspotLimit {
+						break
+					}
+				}
+			}
+			if agentDiffRes != nil {
 				config.Diff = agentDiffRes.Diff
 				config.DiffSince = *diffSince
 			}
@@ -5350,41 +5512,13 @@ func main() {
 			}
 			fmt.Println("  → helpers.md")
 
-			// Generate optional analytical companions (plan, drift, suggestions, labels, forecast, sprints, history)
-			// reusing the weighted full-graph analysis pass computed above (W28-6 + W29-2 + P16A-11).
-			bundleFiles := []string{"triage.json", "insights.json", "brief.md", "helpers.md"}
-			agentScopedIssues := issues
-			if candidateIDs != nil {
-				agentScopedIssues = make([]model.Issue, 0, len(candidateIDs))
-				for _, iss := range issues {
-					if candidateIDs[iss.ID] {
-						agentScopedIssues = append(agentScopedIssues, iss)
-					}
+			if len(agentPlanJSON) > 0 {
+				if wErr := export.SafeWriteOutput(filepath.Join(*agentBrief, "plan.json"), agentPlanJSON, 0644); wErr == nil {
+					bundleFiles = append(bundleFiles, "plan.json")
+					fmt.Printf("  → plan.json (%d tracks)\n", agentPlanTrackCount)
 				}
 			}
-			if agentAn != nil {
-				planNotReady := resolveNotReadyLabels(phaseThreeRobotHandlerConfig{NotReadyLabels: robotNotReadyLabels})
-				plan := agentAn.GetExecutionPlanWithOptions(planNotReady)
-				annotatePlanItemsWithActions(&plan, agentExportCtx.GraphIssues(), agentExportCtx.claimsProven())
-				if *robotMaxResults > 0 {
-					capExecutionPlanTracks(&plan, *robotMaxResults)
-				}
-				planCtx := agentExportCtx
-				planCtx.Command = "robot-plan"
-				planEnvelope := struct {
-					RobotEnvelope
-					Plan analysis.ExecutionPlan `json:"plan"`
-				}{
-					RobotEnvelope: planCtx.EnvelopeWithHash(dataHash),
-					Plan:          plan,
-				}
-				if planJSON, pErr := json.MarshalIndent(planEnvelope, "", "  "); pErr == nil && len(planJSON) > 0 {
-					if wErr := export.SafeWriteOutput(filepath.Join(*agentBrief, "plan.json"), planJSON, 0644); wErr == nil {
-						bundleFiles = append(bundleFiles, "plan.json")
-						fmt.Printf("  → plan.json (%d tracks)\n", len(plan.Tracks))
-					}
-				}
-			}
+			wroteDrift := false
 			if agentDriftResult != nil {
 				driftCtx := agentExportCtx
 				driftCtx.Command = "robot-drift"
@@ -5393,56 +5527,80 @@ func main() {
 						if wErr := export.SafeWriteOutput(filepath.Join(*agentBrief, "drift.json"), driftJSON, 0644); wErr == nil {
 							bundleFiles = append(bundleFiles, "drift.json")
 							fmt.Printf("  → drift.json (%d alerts)\n", len(agentDriftResult.Alerts))
+							wroteDrift = true
 						}
 					}
 				}
 			}
+			if !wroteDrift {
+				pruneManagedDirFile(*agentBrief, "drift.json")
+			}
+			wroteSuggestions := false
 			if suggJSON, suggCnt, sErr := buildExportSuggestionsPayload(agentExportCtx, agentScopedIssues, dataHash, agentBriefNow); sErr == nil && suggCnt > 0 && len(suggJSON) > 0 {
 				if wErr := export.SafeWriteOutput(filepath.Join(*agentBrief, "suggestions.json"), suggJSON, 0644); wErr == nil {
 					bundleFiles = append(bundleFiles, "suggestions.json")
 					fmt.Printf("  → suggestions.json (%d suggestions)\n", suggCnt)
+					wroteSuggestions = true
 				}
 			}
+			if !wroteSuggestions {
+				pruneManagedDirFile(*agentBrief, "suggestions.json")
+			}
+			wroteLabels := false
 			if lblJSON, lblCnt, lErr := buildExportLabelsPayload(agentExportCtx, agentScopedIssues, agentFullStats, dataHash, agentBriefNow); lErr == nil && lblCnt > 0 && len(lblJSON) > 0 {
 				if wErr := export.SafeWriteOutput(filepath.Join(*agentBrief, "labels.json"), lblJSON, 0644); wErr == nil {
 					bundleFiles = append(bundleFiles, "labels.json")
 					fmt.Printf("  → labels.json (%d labels)\n", lblCnt)
+					wroteLabels = true
 				}
 			}
+			if !wroteLabels {
+				pruneManagedDirFile(*agentBrief, "labels.json")
+			}
+			wroteForecast := false
 			if fcJSON, _, fErr := buildExportForecastPayload(agentExportCtx, agentScopedIssues, agentFullStats, dataHash, *robotIncludeInactive, agentBriefNow); fErr == nil && len(fcJSON) > 0 {
 				if wErr := export.SafeWriteOutput(filepath.Join(*agentBrief, "forecast.json"), fcJSON, 0644); wErr == nil {
 					bundleFiles = append(bundleFiles, "forecast.json")
 					fmt.Println("  → forecast.json")
+					wroteForecast = true
 				}
 			}
+			if !wroteForecast {
+				pruneManagedDirFile(*agentBrief, "forecast.json")
+			}
+			wroteSprints := false
 			if spJSON, spCnt, spErr := buildExportSprintsPayload(agentExportCtx, projectDir, agentScopedIssues, agentFullStats, agentBriefNow); spErr == nil && spCnt > 0 && len(spJSON) > 0 {
 				if wErr := export.SafeWriteOutput(filepath.Join(*agentBrief, "sprints.json"), spJSON, 0644); wErr == nil {
 					bundleFiles = append(bundleFiles, "sprints.json")
 					fmt.Printf("  → sprints.json (%d sprints)\n", spCnt)
+					wroteSprints = true
 				}
 			}
-			if *pagesIncludeHistory {
-				agentHistCtx := agentExportCtx
-				if len(agentHistCtx.FullIssues) == 0 {
-					agentHistCtx.FullIssues = agentExportCtx.GraphIssues()
-				}
-				agentHistCtx.Issues = agentScopedIssues
-				if histRep, hErr := generateHistoryForExportContext(agentHistCtx); hErr == nil && histRep != nil {
-					if histJSON, mErr := json.MarshalIndent(histRep, "", "  "); mErr == nil && len(histJSON) > 0 {
-						if wErr := export.SafeWriteOutput(filepath.Join(*agentBrief, "history.json"), histJSON, 0644); wErr == nil {
-							bundleFiles = append(bundleFiles, "history.json")
-							fmt.Printf("  → history.json (%d commits)\n", len(histRep.Commits))
-						}
+			if !wroteSprints {
+				pruneManagedDirFile(*agentBrief, "sprints.json")
+			}
+			wroteHistory := false
+			if agentHistRep != nil {
+				if histJSON, mErr := json.Marshal(agentHistRep); mErr == nil && len(histJSON) > 0 {
+					if wErr := export.SafeWriteOutput(filepath.Join(*agentBrief, "history.json"), histJSON, 0644); wErr == nil {
+						bundleFiles = append(bundleFiles, "history.json")
+						fmt.Printf("  → history.json (%d commits)\n", len(agentHistRep.Commits))
+						wroteHistory = true
 					}
 				}
 			}
-			if agentDiffRes != nil {
-				if diffJSON, dErr := buildExportDiffPayload(agentExportCtx, *diffSince, agentDiffRes); dErr == nil && len(diffJSON) > 0 {
-					if wErr := export.SafeWriteOutput(filepath.Join(*agentBrief, "diff.json"), diffJSON, 0644); wErr == nil {
-						bundleFiles = append(bundleFiles, "diff.json")
-						fmt.Printf("  → diff.json (since %s)\n", *diffSince)
-					}
+			if !wroteHistory {
+				pruneManagedDirFile(*agentBrief, "history.json")
+			}
+			if agentDiffRes != nil && len(agentDiffJSON) > 0 {
+				if wErr := export.SafeWriteOutput(filepath.Join(*agentBrief, "diff.json"), agentDiffJSON, 0644); wErr != nil {
+					fmt.Fprintf(os.Stderr, "Error writing diff.json: %v\n", wErr)
+					exitCLI(1)
 				}
+				bundleFiles = append(bundleFiles, "diff.json")
+				fmt.Printf("  → diff.json (since %s)\n", *diffSince)
+			} else {
+				pruneManagedDirFile(*agentBrief, "diff.json")
 			}
 			bundleFiles = append(bundleFiles, "meta.json")
 
@@ -5596,8 +5754,10 @@ func main() {
 				CandidateIDs:        candidateIDs,
 				LabelFilter:         strings.TrimSpace(*labelScope),
 				RepoFilter:          strings.TrimSpace(*repoFilter),
+				GraphRoot:           strings.TrimSpace(*graphRoot),
 				AuthorityIncomplete: true,
 				ReferenceNow:        robotDispatchContext.ReferenceNow(),
+				ForceFullAnalysis:   *forceFullAnalysis,
 			})
 			if projectDir != "" {
 				m.SetWorkDir(projectDir)
@@ -5738,7 +5898,7 @@ func main() {
 			if len(graphIssuesForReport) == 0 {
 				graphIssuesForReport = issuesForSearch
 			}
-			if (needsReportStats || options.Format == "markdown" || options.Format == "html") && len(graphIssuesForReport) > 0 {
+			if (needsReportStats || options.Format == "markdown" || options.Format == "html" || options.Format == "json") && len(graphIssuesForReport) > 0 {
 				reportAnalyzer := analysis.NewAnalyzer(graphIssuesForReport)
 				reportAnalyzer.SetNow(options.GeneratedAt)
 				reportAnalyzer.SetReadinessScope(readiness, candidateIDs)
@@ -5785,10 +5945,74 @@ func main() {
 						etaStats = &s
 					}
 				}
-				if options.GraphStats == nil && (options.Format == "markdown" || options.Format == "html") {
+				if options.GraphStats == nil && (options.Format == "markdown" || options.Format == "html" || options.Format == "json") {
 					options.GraphStats = etaStats
 				}
 				options.ETAContext = analysis.NewETAContext(velIssues, etaStats, options.GeneratedAt.UTC())
+				if options.Format == "markdown" || options.Format == "html" || options.Format == "json" {
+					openReportIssues := make([]model.Issue, 0, len(reportIssues))
+					for _, iss := range reportIssues {
+						if !iss.Status.IsClosed() && !iss.Status.IsTombstone() && !iss.IsTemplate && !iss.Pinned && iss.Status != model.StatusPinned {
+							openReportIssues = append(openReportIssues, iss)
+						}
+					}
+					if len(openReportIssues) > 0 && etaStats != nil {
+						g1 := analysis.ComputeGrahamBounds(openReportIssues, velIssues, etaStats, 1, options.GeneratedAt.UTC())
+						if g1.TotalMinutes > 0 {
+							g2 := analysis.ComputeGrahamBounds(openReportIssues, velIssues, etaStats, 2, options.GeneratedAt.UTC())
+							g4 := analysis.ComputeGrahamBounds(openReportIssues, velIssues, etaStats, 4, options.GeneratedAt.UTC())
+							parPct := float64(max(0, g1.TotalMinutes-g1.CriticalPathMinutes)) / float64(g1.TotalMinutes) * 100.0
+							var critIDs []string
+							for _, id := range g1.CriticalPathIDs {
+								if visIDs[id] {
+									critIDs = append(critIDs, id)
+								}
+							}
+							options.GlobalCapacity = &export.PriorityBriefCapacity{
+								OpenCount:           len(openReportIssues),
+								TotalMinutes:        g1.TotalMinutes,
+								CriticalPathMinutes: g1.CriticalPathMinutes,
+								ParallelizablePct:   parPct,
+								Days1Agent:          g1.GrahamMinDays,
+								Days2AgentsMin:      g2.GrahamMinDays,
+								Days2AgentsMax:      g2.GrahamMaxDays,
+								Days4AgentsMin:      g4.GrahamMinDays,
+								Days4AgentsMax:      g4.GrahamMaxDays,
+								CriticalPathIDs:     critIDs,
+							}
+						}
+					}
+					sugCfg := analysis.DefaultSuggestAllConfig()
+					sugCfg.MinConfidence = 0.6
+					sugCfg.MaxSuggestions = 20
+					sugCfg.CandidateIDs = visIDs
+					if sugSet := analysis.GenerateAllSuggestionsAt(graphIssuesForReport, sugCfg, robotDispatchContext.DataHash, options.GeneratedAt.UTC()); len(sugSet.Suggestions) > 0 {
+						for _, sug := range sugSet.Suggestions {
+							if visIDs[sug.TargetBead] && (sug.RelatedBead == "" || visIDs[sug.RelatedBead]) {
+								options.Suggestions = append(options.Suggestions, sug)
+								if len(options.Suggestions) >= 5 {
+									break
+								}
+							}
+						}
+					}
+					// W33-4: Scoped Cross-Repo Flow, Active Sprint Burndown, Baseline Drift, and Cross-Label Cascades.
+					options.CrossRepoFlow = analysis.ComputeCrossRepoFlow(reportIssues, visIDs)
+					options.ActiveSprint = buildReportActiveSprintSummary(robotDispatchContext, projectDir, reportIssues, options.GeneratedAt.UTC())
+					options.LabelCascades = computeScopedLabelCascades(graphIssuesForReport, options.Readiness, robotDispatchContext.CandidateIDs, visIDs, options.GeneratedAt.UTC(), 5)
+					if baselinePath, bErr := robotDispatchContext.BaselinePathOrDefault(); bErr == nil && baselinePath != "" && baseline.Exists(baselinePath) {
+						driftAn, driftStats := resolveExportFullGraphStats(robotDispatchContext, reportIssues, reportAnalyzer, etaStats, *forceFullAnalysis)
+						if driftRes, scopeMismatchSkipped, dErr := computeDriftResultForContext(robotDispatchContext, driftAn, driftStats, robotDispatchContext.GraphIssues()); dErr == nil && driftRes != nil {
+							if scopeMismatchSkipped {
+								driftRes.SkippedChecks = append(driftRes.SkippedChecks, drift.SkippedCheck{
+									Type:   drift.AlertType("baseline_scope_mismatch"),
+									Reason: "saved baseline scope does not match active CLI scope; aggregate baseline deltas skipped",
+								})
+							}
+							options.BaselineDrift = buildReportBaselineDriftSummary(robotDispatchContext, driftRes, visIDs)
+						}
+					}
+				}
 			}
 			envelope := robotDispatchContext.Envelope()
 			options.SourceAuthority = envelope.SourceAuthority
@@ -5870,9 +6094,9 @@ func main() {
 			}
 		}
 
-		// Scoped single-repo sessions (--label / --repo) use sourceReload to
+		// Scoped single-repo sessions (--label / --repo / --graph-root) use sourceReload to
 		// recompute CLI CandidateIDs and full-source Readiness on every file change.
-		if workspaceInfo == nil && (*labelScope != "" || *repoFilter != "") {
+		if workspaceInfo == nil && (*labelScope != "" || *repoFilter != "" || strings.TrimSpace(*graphRoot) != "") {
 			_ = os.Setenv("BV_BACKGROUND_MODE", "0")
 		}
 
@@ -5892,10 +6116,12 @@ func main() {
 			CandidateIDs:        candidateIDs,
 			LabelFilter:         strings.TrimSpace(*labelScope),
 			RepoFilter:          strings.TrimSpace(*repoFilter),
+			GraphRoot:           strings.TrimSpace(*graphRoot),
 			AuthorityIncomplete: !robotDispatchContext.claimsProven() || *asOf != "",
 			SourceDegraded:      boundSourceDegraded,
 			ExplicitDB:          explicitDBPinned,
 			ReferenceNow:        liveTUIReferenceNow,
+			ForceFullAnalysis:   *forceFullAnalysis,
 		})
 		if projectDir != "" {
 			m.SetWorkDir(projectDir)
@@ -5930,7 +6156,7 @@ func main() {
 				m.SetSprints(sprints)
 			}
 			reloadPath, pathErr := filepath.Abs(*workspaceConfig)
-			reloadLabel, reloadRepo := *labelScope, *repoFilter
+			reloadLabel, reloadRepo, reloadGraphRoot := *labelScope, *repoFilter, strings.TrimSpace(*graphRoot)
 			wsWatchers := newTUIExternalWatcherSet()
 			wsWatchers.Sync(tuiWorkspaceWatchPaths(robotDispatchContext, *workspaceConfig), "")
 			externalReloadCh, stopExternalWatchers = wsWatchers.ChangeCh(), wsWatchers.Stop
@@ -5939,7 +6165,7 @@ func main() {
 				if pathErr != nil {
 					return ui.SourceReloadResult{}, fmt.Errorf("resolve workspace reload path: %w", pathErr)
 				}
-				res, watchPaths, err := reloadWorkspaceForUIWithPaths(ctx, reloadPath, reloadLabel, reloadRepo)
+				res, watchPaths, err := reloadWorkspaceForUIWithPaths(ctx, reloadPath, reloadLabel, reloadRepo, reloadGraphRoot)
 				if err == nil && len(watchPaths) > 0 {
 					wsWatchers.Sync(watchPaths, "")
 				}
@@ -5947,7 +6173,7 @@ func main() {
 			})
 		} else if beadsPath != "" {
 			boundSource := singleSourceLoad.Source
-			reloadLabel, reloadRepo := *labelScope, *repoFilter
+			reloadLabel, reloadRepo, reloadGraphRoot := *labelScope, *repoFilter, strings.TrimSpace(*graphRoot)
 			bgModeVal := strings.ToLower(strings.TrimSpace(env.BackgroundMode.Get()))
 			bgEnabled := bgModeVal == "1" || bgModeVal == "true" || bgModeVal == "yes" || bgModeVal == "on"
 			if !explicitDBPinned && !bgEnabled {
@@ -5955,7 +6181,7 @@ func main() {
 				extWatchers := newTUIExternalWatcherSet()
 				var syncMu sync.Mutex
 				m.SetSourceReload(func(ctx context.Context) (ui.SourceReloadResult, error) {
-					res, err := reloadSingleRepoAutoDiscoverForUI(ctx, reloadDir, boundSource, boundSourceDegraded, reloadLabel, reloadRepo)
+					res, err := reloadSingleRepoAutoDiscoverForUI(ctx, reloadDir, boundSource, boundSourceDegraded, reloadLabel, reloadRepo, reloadGraphRoot)
 					if err == nil && res.SourcePath != "" {
 						syncMu.Lock()
 						extWatchers.Sync(tuiSingleRepoSiblingWatchPaths(robotDispatchContext, res.SourcePath), m.InternalWatchedPath())
@@ -5963,7 +6189,7 @@ func main() {
 					}
 					return res, err
 				})
-				if *labelScope == "" && *repoFilter == "" {
+				if *labelScope == "" && *repoFilter == "" && reloadGraphRoot == "" {
 					m.SetBackgroundAutoPromote(true)
 				}
 				syncMu.Lock()
@@ -5981,10 +6207,10 @@ func main() {
 				watchPaths := []string{filepath.Join(filepath.Dir(beadsPath), loader.SprintsFileName)}
 				skipPath := ""
 				extWatchers := newTUIExternalWatcherSet()
-				if *labelScope != "" || *repoFilter != "" {
+				if *labelScope != "" || *repoFilter != "" || reloadGraphRoot != "" {
 					// Explicit --db + scoped filter (background mode is disabled for scoped sessions above).
 					m.SetSourceReload(func(ctx context.Context) (ui.SourceReloadResult, error) {
-						return reloadSingleRepoForUIWithDegraded(ctx, boundSource, boundSourceDegraded, reloadLabel, reloadRepo)
+						return reloadSingleRepoForUIWithDegraded(ctx, boundSource, boundSourceDegraded, reloadLabel, reloadRepo, reloadGraphRoot)
 					})
 				} else if bgEnabled && !explicitDBPinned {
 					// BackgroundWorker watches beadsPath itself; attach auto-discovery loader so
@@ -5993,7 +6219,7 @@ func main() {
 					reloadDir := projectDir
 					var syncMu sync.Mutex
 					m.SetBackgroundSourceReload(func(ctx context.Context) (ui.SourceReloadResult, error) {
-						res, err := reloadSingleRepoAutoDiscoverForUI(ctx, reloadDir, boundSource, boundSourceDegraded, reloadLabel, reloadRepo)
+						res, err := reloadSingleRepoAutoDiscoverForUI(ctx, reloadDir, boundSource, boundSourceDegraded, reloadLabel, reloadRepo, reloadGraphRoot)
 						if err == nil && res.SourcePath != "" {
 							syncMu.Lock()
 							extWatchers.Sync(tuiSingleRepoSiblingWatchPaths(robotDispatchContext, res.SourcePath), m.InternalWatchedPath())
@@ -6398,6 +6624,7 @@ func recipeStatusListAllowsNonClosed(statuses []string) bool {
 func scopeLoadedIssues(ctx RobotContext, r *recipe.Recipe) (RobotContext, error) {
 	fullSource := ctx.Issues
 	ctx.FullIssues = fullSource
+	ctx.PreRecipeIssues = nil
 	ctx.ActiveRecipe = r
 	ctx.CandidateIDs = nil
 	ctx.RecipeUnblockIDs = nil
@@ -6439,6 +6666,36 @@ func scopeLoadedIssues(ctx RobotContext, r *recipe.Recipe) (RobotContext, error)
 		}
 		ctx.DataHashMatchesIssues = false
 	}
+	// W36-5 / P28-A2: Extract --graph-root descendant subgraph BEFORE recipe.Apply so
+	// ctx.PreRecipeIssues is strictly scoped to the subgraph (preventing repo-wide leaks
+	// in ctx.GraphIssues()) and recipe View.MaxItems cannot be starved by out-of-epic issues.
+	if rootID := strings.TrimSpace(ctx.GraphRoot); rootID != "" {
+		rootSource := ctx.GraphRootSourceIssues()
+		subgraphIssues, found := extractScopedGraphRootIssues(ctx, rootSource, rootID)
+		if !found {
+			return RobotContext{}, fmt.Errorf("Root issue not found: %s", rootID)
+		}
+		subSet := make(map[string]bool, len(subgraphIssues))
+		for _, iss := range subgraphIssues {
+			subSet[iss.ID] = true
+		}
+		if ctx.CandidateIDs == nil {
+			ctx.CandidateIDs = subSet
+		} else {
+			intersected := make(map[string]bool, len(subSet))
+			for id := range subSet {
+				if ctx.CandidateIDs[id] {
+					intersected[id] = true
+				}
+			}
+			ctx.CandidateIDs = intersected
+		}
+		ctx.Issues = subgraphIssues
+		ctx.RecipeVelocityIssues = filterVelocityIssuesToSubgraph(ctx.VelocityIssues(), subgraphIssues, rootID)
+		ctx.HasRecipeVelocityScope = true
+		ctx.DataHash = analysis.ComputeDataHash(subgraphIssues)
+		ctx.DataHashMatchesIssues = false
+	}
 	ctx.PreRecipeIssues = append([]model.Issue(nil), ctx.Issues...)
 	if r != nil {
 		metrics := recipeMetricsForContext(ctx, fullSource, r)
@@ -6465,6 +6722,9 @@ func scopeLoadedIssues(ctx RobotContext, r *recipe.Recipe) (RobotContext, error)
 		unblockRecipe := recipe.Recipe{
 			Name: r.Name,
 			Filters: recipe.FilterConfig{
+				Type:        r.Filters.Type,
+				Assignee:    r.Filters.Assignee,
+				Repo:        r.Filters.Repo,
 				Tags:        r.Filters.Tags,
 				ExcludeTags: r.Filters.ExcludeTags,
 				IDPrefix:    r.Filters.IDPrefix,
@@ -6486,6 +6746,36 @@ func scopeLoadedIssues(ctx RobotContext, r *recipe.Recipe) (RobotContext, error)
 		}
 		for id := range nextCandidates {
 			unblockIDs[id] = true
+		}
+		// Preserve fail-closed [R2-D4] semantics while supporting status:closed (release-cut/closed)
+		// and domain-filtered (type/tags/assignee/id_prefix) recipes on epic roots whenever either
+		// descendants matched (len(nextCandidates) > 0), rootID is in unblockIDs, or rootID matches
+		// the recipe's status+domain scope (P29-2).
+		if rootID := strings.TrimSpace(ctx.GraphRoot); rootID != "" && len(nextCandidates) == 0 && !unblockIDs[rootID] {
+			rootScopeRecipe := recipe.Recipe{
+				Name: r.Name,
+				Filters: recipe.FilterConfig{
+					Status:      r.Filters.Status,
+					Type:        r.Filters.Type,
+					Assignee:    r.Filters.Assignee,
+					Repo:        r.Filters.Repo,
+					Tags:        r.Filters.Tags,
+					ExcludeTags: r.Filters.ExcludeTags,
+					IDPrefix:    r.Filters.IDPrefix,
+				},
+			}
+			rootMatched := false
+			if matched, mErr := recipe.Apply(recipeIssues, recipe.Metrics{}, &rootScopeRecipe, ctx.ReferenceNow()); mErr == nil {
+				for _, iss := range matched {
+					if iss.ID == rootID {
+						rootMatched = true
+						break
+					}
+				}
+			}
+			if !rootMatched {
+				return RobotContext{}, fmt.Errorf("Root issue not found: %s", rootID)
+			}
 		}
 
 		velFilters := r.Filters
@@ -6536,7 +6826,7 @@ func reloadWorkspaceForUI(ctx context.Context, configPath, label, repo string) (
 	return res, err
 }
 
-func reloadWorkspaceForUIWithPaths(ctx context.Context, configPath, label, repo string) (ui.SourceReloadResult, []string, error) {
+func reloadWorkspaceForUIWithPaths(ctx context.Context, configPath, label, repo string, graphRoot ...string) (ui.SourceReloadResult, []string, error) {
 	if err := ctx.Err(); err != nil {
 		return ui.SourceReloadResult{}, nil, err
 	}
@@ -6576,9 +6866,13 @@ func reloadWorkspaceForUIWithPaths(ctx context.Context, configPath, label, repo 
 			tombstoneIDs = append(tombstoneIDs, result.TombstoneIDs...)
 		}
 	}
+	rootScope := ""
+	if len(graphRoot) > 0 {
+		rootScope = strings.TrimSpace(graphRoot[0])
+	}
 	readiness := model.NewReadinessIndex(issuesWithTombstones(issues, tombstoneIDs))
 	scoped, err := scopeLoadedIssues(RobotContext{
-		Issues: issues, Readiness: readiness, LabelScope: label, Repo: repo,
+		Issues: issues, Readiness: readiness, LabelScope: label, Repo: repo, GraphRoot: rootScope,
 	}, nil)
 	if err != nil {
 		return ui.SourceReloadResult{}, watchPaths, err
@@ -6946,19 +7240,19 @@ func loadWorkspaceHistoricalFromAuthority(authority *RobotSourceAuthority, known
 	return allIssues, authIssues, resolvedSources, tombstoneIDs, firstRev, latestTime, nil
 }
 
-func reloadSingleRepoAutoDiscoverForUI(ctx context.Context, projectDir string, fallbackSource datasource.DataSource, fallbackDegraded bool, label, repo string) (ui.SourceReloadResult, error) {
+func reloadSingleRepoAutoDiscoverForUI(ctx context.Context, projectDir string, fallbackSource datasource.DataSource, fallbackDegraded bool, label, repo string, graphRoot ...string) (ui.SourceReloadResult, error) {
 	if err := ctx.Err(); err != nil {
 		return ui.SourceReloadResult{}, err
 	}
 	loaded, err := datasource.LoadIssuesSilent(projectDir)
 	if err != nil {
 		if fallbackSource.Path != "" {
-			return reloadSingleRepoForUIWithDegraded(ctx, fallbackSource, fallbackDegraded, label, repo)
+			return reloadSingleRepoForUIWithDegraded(ctx, fallbackSource, fallbackDegraded, label, repo, graphRoot...)
 		}
 		return ui.SourceReloadResult{}, fmt.Errorf("reload beads source: %w", err)
 	}
 	degraded := loaded.Report.Stale || len(loaded.Report.AuthorityWarnings) > 0
-	return buildSingleRepoReloadResult(ctx, loaded, degraded, label, repo)
+	return buildSingleRepoReloadResult(ctx, loaded, degraded, label, repo, graphRoot...)
 }
 
 func tuiWorkspaceWatchPaths(ctx RobotContext, workspaceConfigPath string) []string {
@@ -7148,7 +7442,7 @@ func reloadSingleRepoForUI(ctx context.Context, source datasource.DataSource, la
 	return reloadSingleRepoForUIWithDegraded(ctx, source, false, label, repo)
 }
 
-func reloadSingleRepoForUIWithDegraded(ctx context.Context, source datasource.DataSource, sourceDegraded bool, label, repo string) (ui.SourceReloadResult, error) {
+func reloadSingleRepoForUIWithDegraded(ctx context.Context, source datasource.DataSource, sourceDegraded bool, label, repo string, graphRoot ...string) (ui.SourceReloadResult, error) {
 	if err := ctx.Err(); err != nil {
 		return ui.SourceReloadResult{}, err
 	}
@@ -7161,10 +7455,10 @@ func reloadSingleRepoForUIWithDegraded(ctx context.Context, source datasource.Da
 	if err != nil {
 		return ui.SourceReloadResult{}, fmt.Errorf("reload beads source: %w", err)
 	}
-	return buildSingleRepoReloadResult(ctx, loaded, sourceDegraded, label, repo)
+	return buildSingleRepoReloadResult(ctx, loaded, sourceDegraded, label, repo, graphRoot...)
 }
 
-func buildSingleRepoReloadResult(ctx context.Context, loaded datasource.LoadResult, sourceDegraded bool, label, repo string) (ui.SourceReloadResult, error) {
+func buildSingleRepoReloadResult(ctx context.Context, loaded datasource.LoadResult, sourceDegraded bool, label, repo string, graphRoot ...string) (ui.SourceReloadResult, error) {
 	if err := ctx.Err(); err != nil {
 		return ui.SourceReloadResult{}, err
 	}
@@ -7186,9 +7480,13 @@ func buildSingleRepoReloadResult(ctx context.Context, loaded datasource.LoadResu
 			}
 		}
 	}
+	rootScope := ""
+	if len(graphRoot) > 0 {
+		rootScope = strings.TrimSpace(graphRoot[0])
+	}
 	readiness := model.NewReadinessIndex(issuesWithTombstones(loaded.Issues, loaded.Report.TombstoneIDs))
 	scoped, err := scopeLoadedIssues(RobotContext{
-		Issues: loaded.Issues, Readiness: readiness, LabelScope: label, Repo: repo,
+		Issues: loaded.Issues, Readiness: readiness, LabelScope: label, Repo: repo, GraphRoot: rootScope,
 	}, nil)
 	if err != nil {
 		return ui.SourceReloadResult{}, err
@@ -7229,7 +7527,16 @@ func recipeMetrics(issues []model.Issue, r *recipe.Recipe) recipe.Metrics {
 
 func recipeMetricsForContext(ctx RobotContext, issues []model.Issue, r *recipe.Recipe) recipe.Metrics {
 	var metrics recipe.Metrics
-	if r == nil || (!r.NeedsGraphMetrics() && !r.NeedsTriageScores()) {
+	if r == nil {
+		return metrics
+	}
+	needsGraph := r.NeedsGraphMetrics()
+	needsTriage := r.NeedsTriageScores()
+	needsRisk := r.NeedsRiskScores()
+	needsETA := r.NeedsETAScores()
+	needsSlack := r.NeedsSlackScores()
+	needsKCore := r.NeedsKCoreScores()
+	if !needsGraph && !needsTriage && !needsRisk && !needsETA && !needsSlack && !needsKCore {
 		return metrics
 	}
 	now := ctx.ReferenceNow()
@@ -7250,14 +7557,48 @@ func recipeMetricsForContext(ctx RobotContext, issues []model.Issue, r *recipe.R
 		stats = analyzer.AnalyzeAsync(context.Background())
 	}
 	stats.WaitForPhase2()
-	if r.NeedsGraphMetrics() {
+	if needsGraph {
 		metrics.Graph = stats
 	}
-	if r.NeedsTriageScores() {
+	if needsSlack {
+		metrics.Slack = stats.Slack()
+	}
+	if needsKCore {
+		if activeCore := stats.ActiveCoreNumber(); len(activeCore) > 0 {
+			metrics.KCore = activeCore
+		} else {
+			metrics.KCore = stats.CoreNumber()
+		}
+	}
+	if needsTriage {
 		scores := analysis.ComputeTriageScoresFromAnalyzer(analyzer, stats, analysis.ProductionTriageScoringOptions(), now)
 		metrics.Triage = make(map[string]float64, len(scores))
 		for _, score := range scores {
 			metrics.Triage[score.IssueID] = score.TriageScore
+		}
+	}
+	if needsRisk {
+		issueMap := make(map[string]model.Issue, len(issues))
+		for _, iss := range issues {
+			issueMap[iss.ID] = iss
+		}
+		riskMap := analysis.ComputeAllRiskSignalsWithReadiness(issueMap, stats, analyzer.Readiness(), now)
+		metrics.Risk = make(map[string]float64, len(riskMap))
+		for id, sig := range riskMap {
+			metrics.Risk[id] = sig.CompositeRisk
+		}
+	}
+	if needsETA {
+		etaCtx := analysis.NewETAContext(issues, stats, now)
+		metrics.ETA = make(map[string]float64, len(issues))
+		for _, iss := range issues {
+			if iss.Status.IsClosed() || iss.Status.IsTombstone() || iss.IsTemplate || iss.Pinned || iss.Status == model.StatusPinned {
+				continue
+			}
+			est := etaCtx.EstimateForIssue(iss, 1)
+			if est.IssueID != "" {
+				metrics.ETA[iss.ID] = est.EstimatedDays
+			}
 		}
 	}
 	return metrics
@@ -8162,7 +8503,7 @@ func runPreviewServer(dir string, liveReload bool) error {
 }
 
 // runPagesWizard runs the interactive deployment wizard (bv-10g).
-func runPagesWizard(beadsPath string, dispatchCtx RobotContext, activeRecipe *recipe.Recipe, includeInactive, forceFullAnalysis bool, notReadyLabels string, noHooks bool, hookOptions hooks.ExecutionOptions) error {
+func runPagesWizard(beadsPath string, dispatchCtx RobotContext, activeRecipe *recipe.Recipe, includeInactive, forceFullAnalysis bool, notReadyLabels string, noHooks bool, hookOptions hooks.ExecutionOptions, diffSinceSpec, workspaceConfigPath, repoFilterSpec, labelScopeSpec, recipeNameSpec, asOfResolved string, historyTimeoutMs int) error {
 	wizard := export.NewWizard(beadsPath)
 
 	// Run interactive wizard to collect configuration
@@ -8207,12 +8548,14 @@ func runPagesWizard(beadsPath string, dispatchCtx RobotContext, activeRecipe *re
 		SourceAuthority:   source.SourceAuthority,
 		SourcePath:        source.SourcePath,
 		SourceKind:        source.SourceKind,
+		BaselinePath:      dispatchCtx.BaselinePath,
 		AsOf:              dispatchCtx.AsOf,
 		AsOfCommit:        dispatchCtx.AsOfCommit,
 		AsOfCommitTime:    dispatchCtx.AsOfCommitTime,
 		LabelScope:        dispatchCtx.LabelScope,
 		Recipe:            dispatchCtx.Recipe,
 		Repo:              dispatchCtx.Repo,
+		GraphRoot:         dispatchCtx.GraphRoot,
 		ForceFullAnalysis: forceFullAnalysis,
 		HistoryLimit:      dispatchCtx.HistoryLimit,
 	}
@@ -8322,20 +8665,30 @@ func runPagesWizard(beadsPath string, dispatchCtx RobotContext, activeRecipe *re
 	driftCtx := scopedSourceCtx
 	driftCtx.ProjectDir = wizardProjectDir
 	driftCtx.WorkDir = wizardProjectDir
+	if wizardProjectDir != "" && wizardProjectDir != dispatchCtx.ProjectDir &&
+		driftCtx.BaselinePath == baseline.DefaultPath(dispatchCtx.ProjectDir) {
+		driftCtx.BaselinePath = baseline.DefaultPath(wizardProjectDir)
+	}
 	driftCtx.ForceFullAnalysis = forceFullAnalysis
 	if driftCtx.DataHash == "" {
 		driftCtx.DataHash = analysis.ComputeDataHash(source.Issues)
 	}
 	exportContext := driftCtx
 	exportContext.Issues = exportIssues
-	_, wizardFeedbackWeights := loadRobotFeedbackForContext(exportContext)
+	wizardFeedbackData, wizardFeedbackWeights := loadRobotFeedbackForContext(exportContext)
 	var wizardHistLimit *int
 	if exportContext.HistoryLimit > 0 {
 		hl := exportContext.HistoryLimit
 		wizardHistLimit = &hl
 	}
+	var wizardHistTimeout *int
+	if historyTimeoutMs >= 0 {
+		ht := historyTimeoutMs
+		wizardHistTimeout = &ht
+	}
 	wizardTriageHistory, wizardHistoryStatus := loadTriageHistoryForContext(exportContext, phaseThreeRobotHandlerConfig{
-		HistoryLimit: wizardHistLimit,
+		HistoryLimit:     wizardHistLimit,
+		HistoryTimeoutMs: wizardHistTimeout,
 	})
 	wizardTriageInput := exportIssues
 	wizardTriageCandidates := scopedSourceCtx.CandidateIDs
@@ -8367,10 +8720,11 @@ func runPagesWizard(beadsPath string, dispatchCtx RobotContext, activeRecipe *re
 		suppressUnprovenTriageClaims(&triage)
 	}
 	wizardFullAnalyzer, wizardFullStats := resolveExportFullGraphStats(driftCtx, exportIssues, analyzer, stats, forceFullAnalysis)
+	var wizardDriftResult *drift.Result
 	if !config.IncludeClosed || driftCtx.ActiveRecipe != nil || driftCtx.CandidateIDs != nil {
-		attachDriftAlertsToTriage(&triage, driftCtx, wizardFullAnalyzer, wizardFullStats, driftCtx.GraphIssues(), forceFullAnalysis)
+		wizardDriftResult = attachDriftAlertsToTriage(&triage, driftCtx, wizardFullAnalyzer, wizardFullStats, driftCtx.GraphIssues(), forceFullAnalysis)
 	} else {
-		attachDriftAlertsToTriage(&triage, driftCtx, analyzer, stats, exportIssues, forceFullAnalysis)
+		wizardDriftResult = attachDriftAlertsToTriage(&triage, driftCtx, analyzer, stats, exportIssues, forceFullAnalysis)
 	}
 
 	// Extract all dependencies (blocking + non-blocking such as parent-child, related, discovered-from)
@@ -8404,6 +8758,10 @@ func runPagesWizard(beadsPath string, dispatchCtx RobotContext, activeRecipe *re
 		return fmt.Errorf("encoding export source authority: %w", err)
 	}
 	exporter.Config.RobotEnvelope = envelope
+	if wizardFeedbackData != nil && len(wizardFeedbackData.Events) > 0 {
+		fb := wizardFeedbackData.ToJSON()
+		exporter.Config.Feedback = &fb
+	}
 	if config.Title != "" {
 		exporter.Config.Title = config.Title
 	}
@@ -8443,7 +8801,7 @@ func runPagesWizard(beadsPath string, dispatchCtx RobotContext, activeRecipe *re
 		}
 		wizardHistoryCtx.Issues = exportIssues
 		if historyReport, err := generateHistoryForExportContext(wizardHistoryCtx); err == nil && historyReport != nil {
-			if encoded, mErr := json.MarshalIndent(historyReport, "", "  "); mErr == nil {
+			if encoded, mErr := json.Marshal(historyReport); mErr == nil {
 				wizardHistoryJSON = encoded
 				wizardHistoryCommitCount = len(historyReport.Commits)
 			}
@@ -8451,58 +8809,49 @@ func runPagesWizard(beadsPath string, dispatchCtx RobotContext, activeRecipe *re
 			fmt.Printf("  -> Warning: failed to generate history: %v\n", err)
 		}
 	}
+	var wizardDiffJSON []byte
+	if strings.TrimSpace(diffSinceSpec) != "" {
+		fmt.Printf("  -> Computing changelog diff since %s...\n", diffSinceSpec)
+		// P24A-4: Pass unstripped driftCtx (retaining closed issues even when !config.IncludeClosed)
+		// so newly closed issues are reported as closed_issues rather than removed_issues.
+		diffAsOf := asOfResolved
+		if diffAsOf == "" {
+			diffAsOf = driftCtx.AsOfCommit
+		}
+		diffRes, diffErr := computeScopedDiffForCLI(driftCtx, diffSinceSpec, wizardProjectDir, workspaceConfigPath, repoFilterSpec, labelScopeSpec, recipeNameSpec, driftCtx.ActiveRecipe, diffAsOf, forceFullAnalysis)
+		if diffErr != nil {
+			return fmt.Errorf("computing diff since %s: %w", diffSinceSpec, diffErr)
+		}
+		encoded, mErr := buildExportDiffPayload(driftCtx, diffSinceSpec, diffRes)
+		if mErr != nil {
+			return fmt.Errorf("encoding diff data: %w", mErr)
+		}
+		wizardDiffJSON = encoded
+	}
+	wizardDriftJSON := buildExportDriftPayload(driftCtx, wizardDriftResult)
 	exporter.Config.ETAContext = wizardETACtx
-	exporter.Config.HasSprints = wizardSprintCount > 0 && len(wizardSprintsJSON) > 0
-	exporter.Config.HasSuggestions = wizardSuggestionCount > 0 && len(wizardSuggestionsJSON) > 0
-	exporter.Config.HasLabels = wizardLabelCount > 0 && len(wizardLabelsJSON) > 0
-	exporter.Config.HasForecast = len(wizardForecastJSON) > 0
-	exporter.Config.HasHistory = len(wizardHistoryJSON) > 0
 
-	// Prepare optional WASM scorer assets before ExportBundle so
-	// beads.sqlite3 and data/meta.json accurately record has_hybrid_wasm.
+	// Prepare optional WASM scorer assets and optional data/*.json companions BEFORE
+	// ExportBundle so beads.sqlite3 and data/meta.json accurately record has_* flags (P24A-5).
 	if err := prepareBundleWasmAssets(bundle, wizardProjectDir, noHooks); err != nil {
 		return fmt.Errorf("preparing hybrid wasm assets: %w", err)
 	}
+	exporter.Config.HasSprints = writeOrPruneBundleCompanion(bundle, "data/sprints.json", wizardSprintCount > 0 && len(wizardSprintsJSON) > 0, wizardSprintsJSON, fmt.Sprintf("sprints.json (%d sprints)", wizardSprintCount), "  -> ")
+	exporter.Config.HasSuggestions = writeOrPruneBundleCompanion(bundle, "data/suggestions.json", wizardSuggestionCount > 0 && len(wizardSuggestionsJSON) > 0, wizardSuggestionsJSON, fmt.Sprintf("suggestions.json (%d suggestions)", wizardSuggestionCount), "  -> ")
+	exporter.Config.HasLabels = writeOrPruneBundleCompanion(bundle, "data/labels.json", wizardLabelCount > 0 && len(wizardLabelsJSON) > 0, wizardLabelsJSON, fmt.Sprintf("labels.json (%d labels)", wizardLabelCount), "  -> ")
+	exporter.Config.HasForecast = writeOrPruneBundleCompanion(bundle, "data/forecast.json", len(wizardForecastJSON) > 0, wizardForecastJSON, "forecast.json", "  -> ")
+	exporter.Config.HasHistory = writeOrPruneBundleCompanion(bundle, "data/history.json", len(wizardHistoryJSON) > 0, wizardHistoryJSON, fmt.Sprintf("history.json (%d commits)", wizardHistoryCommitCount), "  -> ")
+	exporter.Config.HasDiff = writeOrPruneBundleCompanion(bundle, "data/diff.json", len(wizardDiffJSON) > 0, wizardDiffJSON, fmt.Sprintf("diff.json (since %s)", diffSinceSpec), "  -> ")
+	wizardDriftAlertCount := 0
+	if wizardDriftResult != nil {
+		wizardDriftAlertCount = len(wizardDriftResult.Alerts)
+	}
+	exporter.Config.HasDrift = writeOrPruneBundleCompanion(bundle, "data/drift.json", len(wizardDriftJSON) > 0, wizardDriftJSON, fmt.Sprintf("drift.json (%d alerts)", wizardDriftAlertCount), "  -> ")
 
 	// Export SQLite database
 	fmt.Println("  -> Writing database and JSON files...")
 	if err := exporter.ExportBundle(bundle); err != nil {
 		return fmt.Errorf("export failed: %w", err)
-	}
-	if exporter.Config.HasSprints {
-		if err := bundle.WriteFile("data/sprints.json", wizardSprintsJSON, 0644); err != nil {
-			fmt.Printf("  -> Warning: failed to write sprints.json: %v\n", err)
-		} else {
-			fmt.Printf("  -> sprints.json (%d sprints)\n", wizardSprintCount)
-		}
-	}
-	if exporter.Config.HasSuggestions {
-		if err := bundle.WriteFile("data/suggestions.json", wizardSuggestionsJSON, 0644); err != nil {
-			fmt.Printf("  -> Warning: failed to write suggestions.json: %v\n", err)
-		} else {
-			fmt.Printf("  -> suggestions.json (%d suggestions)\n", wizardSuggestionCount)
-		}
-	}
-	if exporter.Config.HasLabels {
-		if err := bundle.WriteFile("data/labels.json", wizardLabelsJSON, 0644); err != nil {
-			fmt.Printf("  -> Warning: failed to write labels.json: %v\n", err)
-		} else {
-			fmt.Printf("  -> labels.json (%d labels)\n", wizardLabelCount)
-		}
-	}
-	if exporter.Config.HasForecast {
-		if err := bundle.WriteFile("data/forecast.json", wizardForecastJSON, 0644); err != nil {
-			fmt.Printf("  -> Warning: failed to write forecast.json: %v\n", err)
-		} else {
-			fmt.Println("  -> forecast.json")
-		}
-	}
-	if exporter.Config.HasHistory {
-		if err := bundle.WriteFile("data/history.json", wizardHistoryJSON, 0644); err != nil {
-			fmt.Printf("  -> Warning: failed to write history.json: %v\n", err)
-		} else {
-			fmt.Printf("  -> history.json (%d commits)\n", wizardHistoryCommitCount)
-		}
 	}
 
 	// Generate README.md with project stats (for GitHub Pages)
@@ -9024,6 +9373,8 @@ type BurndownOutput struct {
 	// AtRisk lists sprint beads flagged by analysis.DetectAtRisk (blocked too
 	// long, no activity, critical blocked, blockers not closing).
 	AtRisk []analysis.AtRiskItem `json:"at_risk"`
+	// Capacity holds Graham multi-agent parallel scheduling bounds for open sprint beads (W37-3).
+	Capacity *analysis.PlanCapacity `json:"capacity,omitempty"`
 }
 
 // ScopeChangeEvent represents when issues were added/removed from sprint
@@ -9330,20 +9681,29 @@ func calculateBurndownAtWithThresholds(sprint *model.Sprint, issues []model.Issu
 		issueMap[iss.ID] = iss
 	}
 
-	// Collect sprint issues
+	// Collect sprint issues (deduplicating duplicate bead IDs in sprints.jsonl)
+	seenBead := make(map[string]bool, len(sprint.BeadIDs))
+	dedupedIDs := make([]string, 0, len(sprint.BeadIDs))
 	var sprintIssues []model.Issue
 	for _, beadID := range sprint.BeadIDs {
+		if seenBead[beadID] {
+			continue
+		}
+		seenBead[beadID] = true
+		dedupedIDs = append(dedupedIDs, beadID)
 		if iss, ok := issueMap[beadID]; ok {
 			sprintIssues = append(sprintIssues, iss)
 		}
 	}
+	dedupedSprint := *sprint
+	dedupedSprint.BeadIDs = dedupedIDs
 
-	bd := analysis.ComputeSprintBurndown(sprint, sprintIssues, now)
+	bd := analysis.ComputeSprintBurndown(&dedupedSprint, sprintIssues, now)
 	return BurndownOutput{
-		SprintID:          sprint.ID,
-		SprintName:        sprint.Name,
-		StartDate:         sprint.StartDate,
-		EndDate:           sprint.EndDate,
+		SprintID:          dedupedSprint.ID,
+		SprintName:        dedupedSprint.Name,
+		StartDate:         dedupedSprint.StartDate,
+		EndDate:           dedupedSprint.EndDate,
 		TotalDays:         bd.TotalDays,
 		ElapsedDays:       bd.ElapsedDays,
 		RemainingDays:     bd.RemainingDays,
@@ -9357,7 +9717,7 @@ func calculateBurndownAtWithThresholds(sprint *model.Sprint, issues []model.Issu
 		DailyPoints:       bd.DailyPoints,
 		IdealLine:         bd.IdealLine,
 		ScopeChanges:      nil,
-		AtRisk:            analysis.DetectAtRiskWithReadiness(issues, sprint, readiness, now, thresholds),
+		AtRisk:            analysis.DetectAtRiskWithReadiness(issues, &dedupedSprint, readiness, now, thresholds),
 	}
 }
 
@@ -9552,9 +9912,12 @@ jq '(.priority_recommendations // [])[] | {id: .issue_id, from: .current_priorit
 # Active sprints & burndown
 jq '(.sprints // [])[] | {id, name, on_track: .burndown.on_track, remaining: .burndown.remaining_issues}' sprints.json
 
-# Code hotspots & suspicious orphan commits (with --pages-include-history)
+# Code hotspots, suspicious orphan commits & hydrated per-bead history (with --pages-include-history)
 jq '(.file_hotspots // [])[:5] | .[] | {path, open_beads, co_changed}' history.json
 jq '(.orphans // [])[] | {short_sha, suspicion_score, probable_bead_id, confirm_command}' history.json
+# Hydrate compact commit_catalog / bead_catalog entries for a specific bead ID
+jq --arg id "bv-123" '. as $h | ($h.histories[$id].commits // []) | map(($h.commit_catalog[.sha] // {}) + .)' history.json
+jq --arg id "bv-123" '. as $h | ($h.histories[$id].related // []) | map(($h.bead_catalog[.bead_id] // {}) + .)' history.json
 
 # Snapshot changelog since a git ref (with --diff-since <ref>)
 jq '{since: .diff_since, from: .resolved_revision, summary: .diff.summary, added: [.diff.new_issues[].id], closed: [.diff.closed_issues[].id]}' diff.json
@@ -9571,24 +9934,46 @@ jq -r '.recommendations[] | [.id, .score, .action] | @csv' triage.json
 `
 }
 
+// TimeTravelCatalogCommit stores deduplicated git commit metadata once per SHA in
+// TimeTravelHistory.CommitCatalog so per-bead Histories entries do not repeat
+// short_sha, message, author, and timestamp across correlated beads.
+type TimeTravelCatalogCommit struct {
+	ShortSHA  string `json:"short_sha,omitempty"`
+	Message   string `json:"message,omitempty"`
+	Author    string `json:"author,omitempty"`
+	Timestamp string `json:"timestamp,omitempty"`
+}
+
 // TimeTravelBeadCommit is a compact per-bead correlated commit record attached
-// to history.json for Issue Detail Modal display.
+// to history.json for Issue Detail Modal display. When CommitCatalog is present,
+// shared commit metadata (short_sha, message, author, timestamp) is stored once
+// in CommitCatalog[sha] and omitted here unless overriding the catalog entry.
 type TimeTravelBeadCommit struct {
 	SHA        string  `json:"sha"`
-	ShortSHA   string  `json:"short_sha"`
-	Message    string  `json:"message"`
+	ShortSHA   string  `json:"short_sha,omitempty"`
+	Message    string  `json:"message,omitempty"`
 	Author     string  `json:"author,omitempty"`
 	Timestamp  string  `json:"timestamp,omitempty"`
 	Method     string  `json:"method,omitempty"`
 	Confidence float64 `json:"confidence,omitempty"`
 }
 
+// TimeTravelCatalogBead stores deduplicated bead title/status metadata once per bead ID
+// in TimeTravelHistory.BeadCatalog so per-bead Histories[].Related entries avoid repeating
+// long titles and statuses across correlated beads.
+type TimeTravelCatalogBead struct {
+	Title  string `json:"title,omitempty"`
+	Status string `json:"status,omitempty"`
+}
+
 // TimeTravelRelatedBead is a compact related-work link (file/commit overlap) attached
-// to a bead's history record in history.json for Issue Detail Modal display.
+// to a bead's history record in history.json for Issue Detail Modal display. When
+// BeadCatalog is present, title and status are stored once in BeadCatalog[bead_id]
+// and omitted here unless overriding the catalog entry.
 type TimeTravelRelatedBead struct {
 	BeadID        string   `json:"bead_id"`
-	Title         string   `json:"title"`
-	Status        string   `json:"status"`
+	Title         string   `json:"title,omitempty"`
+	Status        string   `json:"status,omitempty"`
 	RelationType  string   `json:"relation_type"`
 	Relevance     int      `json:"relevance"`
 	SharedFiles   []string `json:"shared_files,omitempty"`
@@ -9630,10 +10015,27 @@ type TimeTravelOrphan struct {
 	ConfirmCommand     string `json:"confirm_command,omitempty"`
 }
 
-// TimeTravelBeadHistory holds correlated commits and related work for one bead in history.json.
+// TimeTravelCycleTime holds per-bead lead/cycle-time durations in hours for history.json (W38-6).
+type TimeTravelCycleTime struct {
+	CreateToClaimHours *float64 `json:"create_to_claim_hours,omitempty"`
+	ClaimToCloseHours  *float64 `json:"claim_to_close_hours,omitempty"`
+	TotalHours         *float64 `json:"total_hours,omitempty"`
+}
+
+// TimeTravelMilestones captures canonical lifecycle milestone dates (YYYY-MM-DD UTC) for one bead in history.json (W38-6).
+type TimeTravelMilestones struct {
+	Created  string `json:"created,omitempty"`
+	Claimed  string `json:"claimed,omitempty"`
+	Closed   string `json:"closed,omitempty"`
+	Reopened string `json:"reopened,omitempty"`
+}
+
+// TimeTravelBeadHistory holds correlated commits, lifecycle telemetry, and related work for one bead in history.json.
 type TimeTravelBeadHistory struct {
-	Commits []TimeTravelBeadCommit  `json:"commits"`
-	Related []TimeTravelRelatedBead `json:"related,omitempty"`
+	Commits    []TimeTravelBeadCommit  `json:"commits,omitempty"`
+	Related    []TimeTravelRelatedBead `json:"related,omitempty"`
+	CycleTime  *TimeTravelCycleTime    `json:"cycle_time,omitempty"`
+	Milestones *TimeTravelMilestones   `json:"milestones,omitempty"`
 }
 
 // TimeTravelHistory represents the history data format for time-travel animation (bv-z38b)
@@ -9641,13 +10043,94 @@ type TimeTravelHistory struct {
 	GeneratedAt string             `json:"generated_at"`
 	Commits     []TimeTravelCommit `json:"commits"`
 	// InitialBeads were observed unresolved before their first retained event.
-	InitialBeads []string                          `json:"initial_beads,omitempty"`
-	Sprints      []model.Sprint                    `json:"sprints,omitempty"`
-	Histories    map[string]*TimeTravelBeadHistory `json:"histories,omitempty"`
-	FileHotspots []TimeTravelFileHotspot           `json:"file_hotspots,omitempty"`
-	Clusters     []TimeTravelCluster               `json:"clusters,omitempty"`
-	Orphans      []TimeTravelOrphan                `json:"orphans,omitempty"`
-	OrphanRatio  float64                           `json:"orphan_ratio,omitempty"`
+	InitialBeads  []string                           `json:"initial_beads,omitempty"`
+	Sprints       []model.Sprint                     `json:"sprints,omitempty"`
+	CommitCatalog map[string]TimeTravelCatalogCommit `json:"commit_catalog,omitempty"`
+	BeadCatalog   map[string]TimeTravelCatalogBead   `json:"bead_catalog,omitempty"`
+	Histories     map[string]*TimeTravelBeadHistory  `json:"histories,omitempty"`
+	FileHotspots  []TimeTravelFileHotspot            `json:"file_hotspots,omitempty"`
+	Clusters      []TimeTravelCluster                `json:"clusters,omitempty"`
+	Orphans       []TimeTravelOrphan                 `json:"orphans,omitempty"`
+	OrphanRatio   float64                            `json:"orphan_ratio,omitempty"`
+}
+
+// HydrateBeadCommit resolves shared commit metadata from CommitCatalog while
+// preserving any per-entry overrides and legacy flat payloads without CommitCatalog.
+func (h *TimeTravelHistory) HydrateBeadCommit(c TimeTravelBeadCommit) TimeTravelBeadCommit {
+	out := c
+	if h != nil && c.SHA != "" && len(h.CommitCatalog) > 0 {
+		if cat, ok := h.CommitCatalog[c.SHA]; ok {
+			if out.ShortSHA == "" {
+				out.ShortSHA = cat.ShortSHA
+			}
+			if out.Message == "" {
+				out.Message = cat.Message
+			}
+			if out.Author == "" {
+				out.Author = cat.Author
+			}
+			if out.Timestamp == "" {
+				out.Timestamp = cat.Timestamp
+			}
+		}
+	}
+	if out.ShortSHA == "" && out.SHA != "" {
+		if len(out.SHA) >= 7 {
+			out.ShortSHA = out.SHA[:7]
+		} else {
+			out.ShortSHA = out.SHA
+		}
+	}
+	return out
+}
+
+// HydrateBeadCommits returns the hydrated commit slice for beadID.
+func (h *TimeTravelHistory) HydrateBeadCommits(beadID string) []TimeTravelBeadCommit {
+	if h == nil || beadID == "" {
+		return nil
+	}
+	bh := h.Histories[beadID]
+	if bh == nil || len(bh.Commits) == 0 {
+		return nil
+	}
+	out := make([]TimeTravelBeadCommit, len(bh.Commits))
+	for i, c := range bh.Commits {
+		out[i] = h.HydrateBeadCommit(c)
+	}
+	return out
+}
+
+// HydrateRelatedBead resolves shared title/status metadata from BeadCatalog while
+// preserving any per-entry overrides and legacy flat payloads without BeadCatalog.
+func (h *TimeTravelHistory) HydrateRelatedBead(r TimeTravelRelatedBead) TimeTravelRelatedBead {
+	out := r
+	if h != nil && r.BeadID != "" && len(h.BeadCatalog) > 0 {
+		if cat, ok := h.BeadCatalog[r.BeadID]; ok {
+			if out.Title == "" {
+				out.Title = cat.Title
+			}
+			if out.Status == "" {
+				out.Status = cat.Status
+			}
+		}
+	}
+	return out
+}
+
+// HydrateBeadRelated returns the hydrated related-work slice for beadID.
+func (h *TimeTravelHistory) HydrateBeadRelated(beadID string) []TimeTravelRelatedBead {
+	if h == nil || beadID == "" {
+		return nil
+	}
+	bh := h.Histories[beadID]
+	if bh == nil || len(bh.Related) == 0 {
+		return nil
+	}
+	out := make([]TimeTravelRelatedBead, len(bh.Related))
+	for i, r := range bh.Related {
+		out[i] = h.HydrateRelatedBead(r)
+	}
+	return out
 }
 
 // TimeTravelCommit represents a single commit in the time-travel history
@@ -10162,7 +10645,21 @@ func generateHistoryForExportContext(ctx RobotContext) (*TimeTravelHistory, erro
 	}
 
 	beadHistories := make(map[string]*TimeTravelBeadHistory)
-	for beadID, history := range scopedHistories {
+	commitCatalog := make(map[string]TimeTravelCatalogCommit)
+	beadCatalog := make(map[string]TimeTravelCatalogBead)
+	rawCommitsByBead := make(map[string][]TimeTravelBeadCommit, len(scopedHistories))
+	rawRelatedByBead := make(map[string][]TimeTravelRelatedBead, len(scopedHistories))
+	scopedBeadIDs := make([]string, 0, len(scopedHistories))
+	for beadID := range scopedHistories {
+		scopedBeadIDs = append(scopedBeadIDs, beadID)
+	}
+	sort.Strings(scopedBeadIDs)
+
+	// Pass 1: Collect retained per-bead commits & related items in deterministic sorted
+	// bead order and seed commitCatalog / beadCatalog with the first non-empty canonical
+	// metadata observed for each SHA / bead ID (P26-A5).
+	for _, beadID := range scopedBeadIDs {
+		history := scopedHistories[beadID]
 		seenSHA := make(map[string]bool)
 		var list []TimeTravelBeadCommit
 		for _, c := range history.Commits {
@@ -10171,8 +10668,12 @@ func generateHistoryForExportContext(ctx RobotContext) (*TimeTravelHistory, erro
 			}
 			seenSHA[c.SHA] = true
 			short := c.ShortSHA
-			if short == "" && len(c.SHA) >= 7 {
-				short = c.SHA[:7]
+			if short == "" {
+				if len(c.SHA) >= 7 {
+					short = c.SHA[:7]
+				} else {
+					short = c.SHA
+				}
 			}
 			ts := ""
 			if !c.Timestamp.IsZero() {
@@ -10221,6 +10722,23 @@ func generateHistoryForExportContext(ctx RobotContext) (*TimeTravelHistory, erro
 			if len(list) > 20 {
 				list = list[:20]
 			}
+			for _, item := range list {
+				cat := commitCatalog[item.SHA]
+				if cat.ShortSHA == "" && item.ShortSHA != "" {
+					cat.ShortSHA = item.ShortSHA
+				}
+				if cat.Message == "" && item.Message != "" {
+					cat.Message = item.Message
+				}
+				if cat.Author == "" && item.Author != "" {
+					cat.Author = item.Author
+				}
+				if cat.Timestamp == "" && item.Timestamp != "" {
+					cat.Timestamp = item.Timestamp
+				}
+				commitCatalog[item.SHA] = cat
+			}
+			rawCommitsByBead[beadID] = list
 		}
 
 		var related []TimeTravelRelatedBead
@@ -10273,27 +10791,167 @@ func generateHistoryForExportContext(ctx RobotContext) (*TimeTravelHistory, erro
 				if len(related) > 5 {
 					related = related[:5]
 				}
-			}
-		}
-
-		if len(list) > 0 || len(related) > 0 {
-			beadHistories[beadID] = &TimeTravelBeadHistory{
-				Commits: list,
-				Related: related,
+				for _, item := range related {
+					cat := beadCatalog[item.BeadID]
+					if cat.Title == "" && item.Title != "" {
+						cat.Title = item.Title
+					}
+					if cat.Status == "" && item.Status != "" {
+						cat.Status = item.Status
+					}
+					beadCatalog[item.BeadID] = cat
+				}
+				rawRelatedByBead[beadID] = related
 			}
 		}
 	}
 
+	// Pass 2: Compact per-bead records against finalized canonical catalogs while
+	// preserving any non-empty per-entry overrides.
+	for _, beadID := range scopedBeadIDs {
+		rawCommits := rawCommitsByBead[beadID]
+		var compactCommits []TimeTravelBeadCommit
+		if len(rawCommits) > 0 {
+			compactCommits = make([]TimeTravelBeadCommit, 0, len(rawCommits))
+			for _, item := range rawCommits {
+				entry := TimeTravelBeadCommit{
+					SHA:        item.SHA,
+					Method:     item.Method,
+					Confidence: item.Confidence,
+				}
+				cat := commitCatalog[item.SHA]
+				if item.ShortSHA != "" && item.ShortSHA != cat.ShortSHA {
+					entry.ShortSHA = item.ShortSHA
+				}
+				if item.Message != "" && item.Message != cat.Message {
+					entry.Message = item.Message
+				}
+				if item.Author != "" && item.Author != cat.Author {
+					entry.Author = item.Author
+				}
+				if item.Timestamp != "" && item.Timestamp != cat.Timestamp {
+					entry.Timestamp = item.Timestamp
+				}
+				compactCommits = append(compactCommits, entry)
+			}
+		}
+
+		rawRelated := rawRelatedByBead[beadID]
+		var compactRelated []TimeTravelRelatedBead
+		if len(rawRelated) > 0 {
+			compactRelated = make([]TimeTravelRelatedBead, 0, len(rawRelated))
+			for _, item := range rawRelated {
+				entry := TimeTravelRelatedBead{
+					BeadID:        item.BeadID,
+					RelationType:  item.RelationType,
+					Relevance:     item.Relevance,
+					SharedFiles:   item.SharedFiles,
+					SharedCommits: item.SharedCommits,
+				}
+				cat := beadCatalog[item.BeadID]
+				if item.Title != "" && item.Title != cat.Title {
+					entry.Title = item.Title
+				}
+				if item.Status != "" && item.Status != cat.Status {
+					entry.Status = item.Status
+				}
+				compactRelated = append(compactRelated, entry)
+			}
+		}
+
+		var cycleTime *TimeTravelCycleTime
+		if history, ok := scopedHistories[beadID]; ok && history.CycleTime != nil {
+			var ct TimeTravelCycleTime
+			hasCT := false
+			if history.CycleTime.CreateToClaim != nil && *history.CycleTime.CreateToClaim >= 0 {
+				h := math.Round(history.CycleTime.CreateToClaim.Hours()*100) / 100
+				ct.CreateToClaimHours = &h
+				hasCT = true
+			}
+			if history.CycleTime.ClaimToClose != nil && *history.CycleTime.ClaimToClose >= 0 {
+				h := math.Round(history.CycleTime.ClaimToClose.Hours()*100) / 100
+				ct.ClaimToCloseHours = &h
+				hasCT = true
+			}
+			if history.CycleTime.CreateToClose != nil && *history.CycleTime.CreateToClose >= 0 {
+				h := math.Round(history.CycleTime.CreateToClose.Hours()*100) / 100
+				ct.TotalHours = &h
+				hasCT = true
+			}
+			if hasCT {
+				cycleTime = &ct
+			}
+		}
+		var milestones *TimeTravelMilestones
+		if history, ok := scopedHistories[beadID]; ok {
+			var ms TimeTravelMilestones
+			fmtDate := func(ev *correlation.BeadEvent) string {
+				if ev == nil || ev.Timestamp.IsZero() {
+					return ""
+				}
+				return ev.Timestamp.UTC().Format("2006-01-02")
+			}
+			ms.Created = fmtDate(history.Milestones.Created)
+			ms.Claimed = fmtDate(history.Milestones.Claimed)
+			ms.Closed = fmtDate(history.Milestones.Closed)
+			ms.Reopened = fmtDate(history.Milestones.Reopened)
+			if ms.Created == "" && ms.Claimed == "" && ms.Closed == "" && ms.Reopened == "" && len(history.Events) > 0 {
+				for _, ev := range history.Events {
+					if ev.Timestamp.IsZero() {
+						continue
+					}
+					day := ev.Timestamp.UTC().Format("2006-01-02")
+					switch ev.EventType {
+					case correlation.EventCreated:
+						if ms.Created == "" {
+							ms.Created = day
+						}
+					case correlation.EventClaimed:
+						if ms.Claimed == "" {
+							ms.Claimed = day
+						}
+					case correlation.EventClosed:
+						ms.Closed = day
+					case correlation.EventReopened:
+						ms.Reopened = day
+					}
+				}
+			}
+			if ms.Created != "" || ms.Claimed != "" || ms.Closed != "" || ms.Reopened != "" {
+				milestones = &ms
+			}
+		}
+
+		hasPostCreateMilestone := milestones != nil && (milestones.Claimed != "" || milestones.Closed != "" || milestones.Reopened != "")
+		if len(compactCommits) > 0 || len(compactRelated) > 0 || cycleTime != nil || hasPostCreateMilestone {
+			beadHistories[beadID] = &TimeTravelBeadHistory{
+				Commits:    compactCommits,
+				Related:    compactRelated,
+				CycleTime:  cycleTime,
+				Milestones: milestones,
+			}
+		}
+	}
+
+	if len(commitCatalog) == 0 {
+		commitCatalog = nil
+	}
+	if len(beadCatalog) == 0 {
+		beadCatalog = nil
+	}
+
 	return &TimeTravelHistory{
-		GeneratedAt:  robotNow().Format(time.RFC3339),
-		Commits:      commits,
-		InitialBeads: initialBeads,
-		Sprints:      sprints,
-		Histories:    beadHistories,
-		FileHotspots: fileHotspots,
-		Clusters:     exportClusters,
-		Orphans:      exportOrphans,
-		OrphanRatio:  orphanRatio,
+		GeneratedAt:   robotNow().Format(time.RFC3339),
+		Commits:       commits,
+		InitialBeads:  initialBeads,
+		Sprints:       sprints,
+		CommitCatalog: commitCatalog,
+		BeadCatalog:   beadCatalog,
+		Histories:     beadHistories,
+		FileHotspots:  fileHotspots,
+		Clusters:      exportClusters,
+		Orphans:       exportOrphans,
+		OrphanRatio:   orphanRatio,
 	}, nil
 }
 
@@ -10779,13 +11437,13 @@ func robotCommandDocs() map[string]robotCommandDoc {
 			NeedsIssues: true,
 		},
 		"robot-insights": {
-			Flag: "--robot-insights", Description: "Deep graph analysis: PageRank, betweenness, HITS, eigenvector, k-core, cycle detection.",
-			KeyFields:   []string{"full_stats", "Bottlenecks", "Keystones", "Influencers", "Hubs", "Authorities", "Cores", "Articulation", "Slack", "Cycles", "Velocity", "top_what_ifs"},
+			Flag: "--robot-insights", Description: "Deep graph analysis: PageRank, betweenness, HITS, eigenvector, k-core, cycle detection, operational risk, and cross-repo handoffs.",
+			KeyFields:   []string{"full_stats", "Bottlenecks", "Keystones", "Influencers", "Hubs", "Authorities", "Cores", "Articulation", "Slack", "Cycles", "Velocity", "top_what_ifs", "high_risk", "cross_repo_flow"},
 			Params:      []string{"--robot-include-inactive"},
 			NeedsIssues: true,
 		},
 		"robot-priority": {
-			Flag: "--robot-priority", Description: "Priority misalignment detection: items whose graph importance differs from assigned priority.",
+			Flag: "--robot-priority", Description: "Priority misalignment detection: items whose graph importance differs from assigned priority, with learned feedback weights and verified mutation commands.",
 			KeyFields:   []string{"recommendations", "summary", "filters", "field_descriptions"},
 			Params:      []string{"--robot-min-confidence 0.0-1.0", "--robot-max-results <n>", "--robot-by-label <label>", "--robot-by-assignee <user>", "--robot-include-inactive"},
 			NeedsIssues: true,
@@ -10980,9 +11638,9 @@ func robotCommandDocs() map[string]robotCommandDoc {
 			NeedsIssues: true,
 		},
 		"robot-check-dep": {
-			Flag:        "--robot-check-dep FROM_ID:TO_ID[,...]",
-			Description: "Pre-flight validator for proposed blocking dependency edge(s): checks cycles, readiness impact, and cross-repo links.",
-			KeyFields:   []string{"all_safe", "checked_count", "cycle_count", "results", "results[].from_id", "results[].to_id", "results[].can_add", "results[].would_cycle", "results[].would_block_actionable"},
+			Flag:        "--robot-check-dep [remove:]FROM_ID:TO_ID[,...]",
+			Description: "Pre-flight validator for proposed blocking dependency edge additions or removals (remove:FROM_ID:TO_ID): checks cycles, readiness impact, cross-repo links, and on removals reports operation, can_remove, exists, cycles_before, cycles_after, cycles_broken, would_break_all_cycles, and newly_unblocked.",
+			KeyFields:   []string{"all_safe", "checked_count", "cycle_count", "results", "results[].operation", "results[].from_id", "results[].to_id", "results[].can_add", "results[].can_remove", "results[].exists", "results[].would_cycle", "results[].would_block_actionable", "results[].cycles_before", "results[].cycles_after", "results[].cycles_broken", "results[].would_break_all_cycles", "results[].newly_unblocked"},
 			NeedsIssues: true,
 		},
 		"robot-cass": {
@@ -11014,7 +11672,8 @@ func robotCommandDocs() map[string]robotCommandDoc {
 		},
 		"robot-sprint-show": {
 			Flag:        "--robot-sprint-show <id>",
-			Description: "Show details for a specific sprint.",
+			Description: "Show enriched details, burndown summary, at-risk items, Graham capacity, mid-sprint scope changes, and bead breakdown for a specific sprint.",
+			KeyFields:   []string{"sprint", "status", "is_active", "summary", "at_risk", "beads"},
 			NeedsIssues: true,
 			NeedsSprint: true,
 		},
@@ -11728,8 +12387,32 @@ func generateRobotSchemas() RobotSchemas {
 								"type": "object",
 								"properties": map[string]interface{}{
 									"track_id": map[string]interface{}{"type": "string"},
-									"items":    map[string]interface{}{"type": "array"},
-									"reason":   map[string]interface{}{"type": "string"},
+									"items": map[string]interface{}{
+										"type": "array",
+										"items": map[string]interface{}{
+											"type": "object",
+											"properties": map[string]interface{}{
+												"id":                   map[string]interface{}{"type": "string"},
+												"title":                map[string]interface{}{"type": "string"},
+												"priority":             map[string]interface{}{"type": "integer"},
+												"status":               map[string]interface{}{"type": "string"},
+												"assignee":             map[string]interface{}{"type": "string"},
+												"claimable":            map[string]interface{}{"type": "boolean"},
+												"not_ready":            map[string]interface{}{"type": "boolean"},
+												"unblocks":             map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+												"transitive_unblocks":  map[string]interface{}{"type": "integer"},
+												"estimated_days_saved": map[string]interface{}{"type": "number"},
+												"eta_days":             map[string]interface{}{"type": "number"},
+												"eta_date":             map[string]interface{}{"type": "string", "format": "date-time"},
+												"eta_confidence":       map[string]interface{}{"type": "number"},
+												"risk_score":           map[string]interface{}{"type": "number"},
+												"risk_explanation":     map[string]interface{}{"type": "string"},
+												"actions":              map[string]interface{}{"type": "object"},
+											},
+											"required": []string{"id", "title", "priority", "status", "claimable", "unblocks"},
+										},
+									},
+									"reason": map[string]interface{}{"type": "string"},
 								},
 								"required": []string{"track_id", "items", "reason"},
 							},
@@ -11738,6 +12421,7 @@ func generateRobotSchemas() RobotSchemas {
 						"total_blocked":            map[string]interface{}{"type": "integer"},
 						"total_deferred_or_parked": map[string]interface{}{"type": "integer"},
 						"total_in_progress":        map[string]interface{}{"type": "integer"},
+						"capacity":                 robotPlanCapacitySchema(),
 						"summary":                  map[string]interface{}{"type": "object"},
 					},
 					"required": []string{"tracks", "total_actionable", "total_blocked", "summary"},
@@ -11777,6 +12461,7 @@ func generateRobotSchemas() RobotSchemas {
 				"top_what_ifs":      map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "object"}},
 				"high_risk":         map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "object"}},
 				"advanced_insights": map[string]interface{}{"type": "object"},
+				"cross_repo_flow":   map[string]interface{}{"type": []string{"object", "null"}},
 				"usage_hints":       map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
 			},
 			"required": []string{"generated_at", "data_hash", "output_format", "version", "analysis_config", "status", "full_stats", "usage_hints"},
@@ -11797,22 +12482,26 @@ func generateRobotSchemas() RobotSchemas {
 				"status":          map[string]interface{}{"type": "object"},
 				"label_scope":     map[string]interface{}{"type": "string"},
 				"label_context":   map[string]interface{}{"type": "object"},
+				"feedback":        map[string]interface{}{"type": "object"},
 				"recommendations": map[string]interface{}{
 					"type": "array",
 					"items": map[string]interface{}{
 						"type": "object",
 						"properties": map[string]interface{}{
-							"issue_id":           map[string]interface{}{"type": "string"},
-							"title":              map[string]interface{}{"type": "string"},
-							"labels":             map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
-							"current_priority":   map[string]interface{}{"type": "integer"},
-							"suggested_priority": map[string]interface{}{"type": "integer"},
-							"impact_score":       map[string]interface{}{"type": "number"},
-							"confidence":         map[string]interface{}{"type": "number"},
-							"direction":          map[string]interface{}{"type": "string", "enum": []string{"increase", "decrease", "none"}},
-							"reasoning":          map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
-							"what_if":            map[string]interface{}{"type": "object"},
-							"explanation":        map[string]interface{}{"type": "object"},
+							"issue_id":                  map[string]interface{}{"type": "string"},
+							"title":                     map[string]interface{}{"type": "string"},
+							"labels":                    map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+							"current_priority":          map[string]interface{}{"type": "integer"},
+							"suggested_priority":        map[string]interface{}{"type": "integer"},
+							"impact_score":              map[string]interface{}{"type": "number"},
+							"confidence":                map[string]interface{}{"type": "number"},
+							"direction":                 map[string]interface{}{"type": "string", "enum": []string{"increase", "decrease", "none"}},
+							"reasoning":                 map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+							"what_if":                   map[string]interface{}{"type": "object"},
+							"action":                    map[string]interface{}{"type": "object"},
+							"action_command":            map[string]interface{}{"type": "string"},
+							"action_unavailable_reason": map[string]interface{}{"type": "string"},
+							"explanation":               map[string]interface{}{"type": "object"},
 						},
 						"required": []string{"issue_id", "title", "labels", "current_priority", "suggested_priority", "impact_score", "confidence", "direction", "reasoning"},
 					},
@@ -12147,7 +12836,7 @@ func generateRobotSchemas() RobotSchemas {
 		"robot-sprint-show": {
 			"$schema":     "https://json-schema.org/draft/2020-12/schema",
 			"title":       "Robot Sprint Show Output",
-			"description": "A single configured sprint with the standard robot envelope",
+			"description": "A single configured sprint enriched with burndown summary, at-risk items, Graham capacity, scope changes, and per-bead state",
 			"type":        "object",
 			"properties": map[string]interface{}{
 				"generated_at":  map[string]interface{}{"type": "string", "format": "date-time"},
@@ -12155,8 +12844,67 @@ func generateRobotSchemas() RobotSchemas {
 				"output_format": map[string]interface{}{"type": "string", "enum": []string{"json", "toon"}},
 				"version":       map[string]interface{}{"type": "string"},
 				"sprint":        sprintSchema(),
+				"status":        map[string]interface{}{"type": "string", "enum": []string{"active", "upcoming", "completed"}},
+				"is_active":     map[string]interface{}{"type": "boolean"},
+				"summary": map[string]interface{}{
+					"type": "object",
+					"properties": map[string]interface{}{
+						"total_days":         map[string]interface{}{"type": "integer"},
+						"elapsed_days":       map[string]interface{}{"type": "integer"},
+						"remaining_days":     map[string]interface{}{"type": "integer"},
+						"total_issues":       map[string]interface{}{"type": "integer"},
+						"completed_issues":   map[string]interface{}{"type": "integer"},
+						"remaining_issues":   map[string]interface{}{"type": "integer"},
+						"percent_complete":   map[string]interface{}{"type": "number"},
+						"ideal_burn_rate":    map[string]interface{}{"type": "number"},
+						"actual_burn_rate":   map[string]interface{}{"type": "number"},
+						"projected_complete": map[string]interface{}{"type": "string", "format": "date-time"},
+						"on_track":           map[string]interface{}{"type": "boolean"},
+					},
+				},
+				"at_risk": map[string]interface{}{
+					"type": "array",
+					"items": map[string]interface{}{
+						"type": "object",
+						"properties": map[string]interface{}{
+							"id":       map[string]interface{}{"type": "string"},
+							"title":    map[string]interface{}{"type": "string"},
+							"reasons":  map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+							"severity": map[string]interface{}{"type": "string"},
+						},
+					},
+				},
+				"capacity": robotPlanCapacitySchema(),
+				"scope_changes": map[string]interface{}{
+					"type": "array",
+					"items": map[string]interface{}{
+						"type": "object",
+						"properties": map[string]interface{}{
+							"date":        map[string]interface{}{"type": "string", "format": "date-time"},
+							"action":      map[string]interface{}{"type": "string", "enum": []string{"added", "removed"}},
+							"issue_id":    map[string]interface{}{"type": "string"},
+							"issue_title": map[string]interface{}{"type": "string"},
+						},
+					},
+				},
+				"beads": map[string]interface{}{
+					"type": "array",
+					"items": map[string]interface{}{
+						"type": "object",
+						"properties": map[string]interface{}{
+							"id":                map[string]interface{}{"type": "string"},
+							"title":             map[string]interface{}{"type": "string"},
+							"status":            map[string]interface{}{"type": "string"},
+							"priority":          map[string]interface{}{"type": "integer"},
+							"issue_type":        map[string]interface{}{"type": "string"},
+							"assignee":          map[string]interface{}{"type": "string"},
+							"estimated_minutes": map[string]interface{}{"type": "integer"},
+							"is_blocked":        map[string]interface{}{"type": "boolean"},
+						},
+					},
+				},
 			},
-			"required": []string{"generated_at", "data_hash", "output_format", "version", "sprint"},
+			"required": []string{"generated_at", "data_hash", "output_format", "version", "sprint", "status", "is_active", "summary", "at_risk", "beads"},
 		},
 		"robot-capacity": {
 			"$schema":     "https://json-schema.org/draft/2020-12/schema",
@@ -12258,6 +13006,7 @@ func generateRobotSchemas() RobotSchemas {
 						"required": []string{"id", "status", "priority", "signals", "since", "detail"},
 					},
 				},
+				"capacity": robotPlanCapacitySchema(),
 			},
 			"required": []string{
 				"generated_at", "data_hash", "output_format", "version",
@@ -12288,11 +13037,18 @@ func generateRobotSchemas() RobotSchemas {
 				"summary": map[string]interface{}{
 					"type": "object",
 					"properties": map[string]interface{}{
-						"total_minutes":  map[string]interface{}{"type": "integer"},
-						"total_days":     map[string]interface{}{"type": "number"},
-						"avg_confidence": map[string]interface{}{"type": "number"},
-						"earliest_eta":   map[string]interface{}{"type": "string", "format": "date-time"},
-						"latest_eta":     map[string]interface{}{"type": "string", "format": "date-time"},
+						"total_minutes":            map[string]interface{}{"type": "integer"},
+						"total_days":               map[string]interface{}{"type": "number"},
+						"critical_path_minutes":    map[string]interface{}{"type": "integer"},
+						"critical_path_ids":        map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+						"velocity_minutes_per_day": map[string]interface{}{"type": "number"},
+						"parallelizable_pct":       map[string]interface{}{"type": "number"},
+						"graham_min_days":          map[string]interface{}{"type": "number"},
+						"graham_max_days":          map[string]interface{}{"type": "number"},
+						"estimated_days":           map[string]interface{}{"type": "number"},
+						"avg_confidence":           map[string]interface{}{"type": "number"},
+						"earliest_eta":             map[string]interface{}{"type": "string", "format": "date-time"},
+						"latest_eta":               map[string]interface{}{"type": "string", "format": "date-time"},
 					},
 				},
 			},
@@ -12322,6 +13078,30 @@ func burndownPointSchema() map[string]interface{} {
 			"completed": map[string]interface{}{"type": "integer"},
 		},
 		"required": []string{"date", "remaining", "completed"},
+	}
+}
+
+func robotPlanCapacitySchema() map[string]interface{} {
+	return map[string]interface{}{
+		"type": "object",
+		"properties": map[string]interface{}{
+			"open_count":            map[string]interface{}{"type": "integer"},
+			"total_minutes":         map[string]interface{}{"type": "integer"},
+			"critical_path_minutes": map[string]interface{}{"type": "integer"},
+			"parallelizable_pct":    map[string]interface{}{"type": "number"},
+			"days_1_agent":          map[string]interface{}{"type": "number"},
+			"days_2_agents_min":     map[string]interface{}{"type": "number"},
+			"days_2_agents_max":     map[string]interface{}{"type": "number"},
+			"days_4_agents_min":     map[string]interface{}{"type": "number"},
+			"days_4_agents_max":     map[string]interface{}{"type": "number"},
+			"critical_path_ids":     map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+		},
+		"required": []string{
+			"open_count", "total_minutes", "critical_path_minutes",
+			"parallelizable_pct", "days_1_agent",
+			"days_2_agents_min", "days_2_agents_max",
+			"days_4_agents_min", "days_4_agents_max",
+		},
 	}
 }
 
@@ -12802,6 +13582,16 @@ func robotSearchOutputSchema() map[string]interface{} {
 						"score":            map[string]interface{}{"type": "number"},
 						"text_score":       map[string]interface{}{"type": "number"},
 						"title":            map[string]interface{}{"type": "string"},
+						"status":           map[string]interface{}{"type": "string"},
+						"priority":         map[string]interface{}{"type": "integer"},
+						"issue_type":       map[string]interface{}{"type": "string"},
+						"labels":           map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+						"assignee":         map[string]interface{}{"type": "string"},
+						"source_repo":      map[string]interface{}{"type": "string"},
+						"is_actionable":    map[string]interface{}{"type": "boolean"},
+						"claimable":        map[string]interface{}{"type": "boolean"},
+						"not_ready":        map[string]interface{}{"type": "boolean"},
+						"actions":          map[string]interface{}{"type": "object"},
 						"component_scores": map[string]interface{}{"type": "object"},
 					},
 				},
@@ -13135,12 +13925,21 @@ func robotCheckDepOutputSchema() map[string]interface{} {
 			"items": map[string]interface{}{
 				"type": "object",
 				"properties": map[string]interface{}{
+					"operation":              map[string]interface{}{"type": "string", "enum": []string{"add", "remove"}},
 					"from_id":                map[string]interface{}{"type": "string"},
 					"to_id":                  map[string]interface{}{"type": "string"},
 					"can_add":                map[string]interface{}{"type": "boolean"},
+					"can_remove":             map[string]interface{}{"type": "boolean"},
+					"exists":                 map[string]interface{}{"type": "boolean"},
 					"already_exists":         map[string]interface{}{"type": "boolean"},
 					"would_cycle":            map[string]interface{}{"type": "boolean"},
 					"cycle_path":             map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
+					"cycles_before":          map[string]interface{}{"type": "integer"},
+					"cycles_after":           map[string]interface{}{"type": "integer"},
+					"cycles_broken":          map[string]interface{}{"type": "integer"},
+					"would_break_all_cycles": map[string]interface{}{"type": "boolean"},
+					"cycles_truncated":       map[string]interface{}{"type": "boolean"},
+					"newly_unblocked":        map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
 					"would_block_actionable": map[string]interface{}{"type": "boolean"},
 					"cross_repo":             map[string]interface{}{"type": "boolean"},
 					"missing_ids":            map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}},
@@ -13647,7 +14446,6 @@ func cliModifierFlagRules(isNonTUICLIInvocation bool) []modifierFlagRule {
 		{modifier: "suggest-confidence", requires: []string{"robot-suggest"}},
 		{modifier: "suggest-bead", requires: []string{"robot-suggest"}},
 		{modifier: "graph-format", requires: []string{"robot-graph"}},
-		{modifier: "graph-root", requires: []string{"robot-graph", "robot-triage", "robot-triage-by-track", "robot-triage-by-label", "robot-next"}},
 		{modifier: "graph-depth", requires: []string{"robot-graph"}},
 		{modifier: "graph-preset", requires: []string{"export-graph"}},
 		{modifier: "graph-title", requires: []string{"export-graph"}},
@@ -13686,10 +14484,11 @@ func cliModifierFlagRules(isNonTUICLIInvocation bool) []modifierFlagRule {
 		}},
 		{modifier: "robot-history-timeout-ms", requires: []string{
 			"robot-triage", "robot-triage-by-track", "robot-triage-by-label", "robot-next",
-			"export-pages", "emit-script", "priority-brief", "agent-brief",
+			"export-pages", "pages", "emit-script", "priority-brief", "agent-brief",
 		}},
 		{modifier: "robot-not-ready-labels", requires: []string{
 			"robot-triage", "robot-triage-by-track", "robot-triage-by-label", "robot-next", "robot-plan",
+			"search", "robot-search",
 			"emit-script", "priority-brief", "agent-brief", "export", "export-md", "export-pages", "pages", "export-graph",
 		}},
 		{modifier: "min-confidence", requires: []string{"robot-history", "bead-history", "robot-commit"}},
@@ -13724,6 +14523,19 @@ func cliModifierFlagRules(isNonTUICLIInvocation bool) []modifierFlagRule {
 	}
 	if isNonTUICLIInvocation {
 		modifierRules = append(modifierRules,
+			modifierFlagRule{modifier: "graph-root", requires: []string{
+				"robot-graph", "robot-triage", "robot-triage-by-track", "robot-triage-by-label", "robot-next",
+				"robot-plan", "robot-insights", "robot-priority", "robot-forecast", "robot-capacity", "robot-burndown", "robot-sprint-show",
+				"robot-alerts", "robot-suggest", "robot-label-health", "robot-label-flow", "robot-label-attention",
+				"robot-blocker-chain", "robot-whatif", "robot-check-dep",
+				"robot-history", "bead-history", "robot-orphans", "robot-file-hotspots",
+				"robot-file-beads", "robot-file-relations", "robot-related", "robot-commit",
+				"robot-impact", "robot-impact-network", "robot-causality", "robot-explain-correlation", "robot-cass",
+				"save-baseline", "check-drift", "robot-drift", "diff-since", "robot-diff",
+				"search", "robot-search",
+				"export", "export-md", "export-graph", "export-pages", "pages",
+				"priority-brief", "agent-brief", "emit-script", "debug-render",
+			}},
 			modifierFlagRule{modifier: "search-mode", requires: []string{"search"}},
 			modifierFlagRule{modifier: "search-preset", requires: []string{"search"}},
 			modifierFlagRule{modifier: "search-weights", requires: []string{"search"}},
@@ -13883,16 +14695,17 @@ type exportSprintCapacity struct {
 }
 
 type exportSprintEntry struct {
-	ID        string                  `json:"id"`
-	Name      string                  `json:"name"`
-	StartDate time.Time               `json:"start_date"`
-	EndDate   time.Time               `json:"end_date"`
-	Status    string                  `json:"status"`
-	IsActive  bool                    `json:"is_active"`
-	Burndown  analysis.SprintBurndown `json:"burndown"`
-	AtRisk    []analysis.AtRiskItem   `json:"at_risk"`
-	Capacity  *exportSprintCapacity   `json:"capacity,omitempty"`
-	Beads     []exportSprintBead      `json:"beads"`
+	ID           string                  `json:"id"`
+	Name         string                  `json:"name"`
+	StartDate    time.Time               `json:"start_date"`
+	EndDate      time.Time               `json:"end_date"`
+	Status       string                  `json:"status"`
+	IsActive     bool                    `json:"is_active"`
+	Burndown     analysis.SprintBurndown `json:"burndown"`
+	ScopeChanges []ScopeChangeEvent      `json:"scope_changes,omitempty"`
+	AtRisk       []analysis.AtRiskItem   `json:"at_risk"`
+	Capacity     *exportSprintCapacity   `json:"capacity,omitempty"`
+	Beads        []exportSprintBead      `json:"beads"`
 }
 
 type exportSprintsDocument struct {
@@ -13958,7 +14771,7 @@ func computeScopedDiffForCLI(
 		}
 		histCommitTime = histReport.CommitTime
 	}
-	historicalCtx, scopeErr := scopeLoadedIssues(RobotContext{
+	histBaseCtx := RobotContext{
 		Issues:            historicalIssues,
 		Readiness:         model.NewReadinessIndex(histAuthoritySlice),
 		AsOf:              diffSinceSpec,
@@ -13966,11 +14779,23 @@ func computeScopedDiffForCLI(
 		AsOfCommitTime:    histCommitTime,
 		Repo:              repoFilter,
 		LabelScope:        labelScope,
+		GraphRoot:         ctx.GraphRoot,
 		Recipe:            recipeName,
 		ForceFullAnalysis: forceFullAnalysis,
-	}, recipeForScope)
+	}
+	historicalCtx, scopeErr := scopeLoadedIssues(histBaseCtx, recipeForScope)
 	if scopeErr != nil {
-		return nil, scopeErr
+		// If --graph-root did not exist (or was out of scope) at diffSinceSpec, treat the
+		// historical subgraph as empty so current epic issues report cleanly as NewIssues.
+		if strings.TrimSpace(ctx.GraphRoot) != "" && strings.Contains(scopeErr.Error(), "Root issue not found") {
+			historicalCtx = histBaseCtx
+			historicalCtx.FullIssues = historicalIssues
+			historicalCtx.Issues = nil
+			historicalCtx.CandidateIDs = map[string]bool{}
+			scopeErr = nil
+		} else {
+			return nil, scopeErr
+		}
 	}
 
 	fromTime := histCommitTime.UTC()
@@ -14013,6 +14838,111 @@ func computeScopedDiffForCLI(
 	}, nil
 }
 
+// writeOrPruneBundleCompanion writes relPath into bundle when present && len(payload) > 0,
+// or removes any stale previously exported copy when !present (or write fails) so re-exports
+// and --watch-export never leave contradictory optional JSON files in coi-serviceworker.js OFFLINE_ASSETS (W33-1).
+// Returns true iff the companion file was written and is genuinely present on disk (P24A-5).
+func writeOrPruneBundleCompanion(bundle *export.Bundle, relPath string, present bool, payload []byte, successMsg, prefix string) bool {
+	if present && len(payload) > 0 {
+		if err := bundle.WriteFile(relPath, payload, 0644); err != nil {
+			fmt.Printf("%sWarning: failed to write %s: %v\n", prefix, filepath.Base(relPath), err)
+			_ = bundle.RemoveManagedFile(relPath)
+			return false
+		}
+		if successMsg != "" {
+			fmt.Printf("%s%s\n", prefix, successMsg)
+		}
+		return true
+	}
+	if err := bundle.RemoveManagedFile(relPath); err != nil {
+		fmt.Printf("%sWarning: failed to prune stale %s: %v\n", prefix, filepath.Base(relPath), err)
+	}
+	return false
+}
+
+// pruneManagedDirFile removes a single allowlisted stale optional artifact inside dir
+// via os.OpenRoot with Lstat regular-file verification (never deleting symlinks or dirs) (W33-1).
+func pruneManagedDirFile(dir, name string) {
+	if dir == "" || !filepath.IsLocal(name) {
+		return
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return
+	}
+	defer root.Close()
+	info, err := root.Lstat(name)
+	if err != nil || !info.Mode().IsRegular() {
+		return
+	}
+	_ = root.Remove(name)
+}
+
+// buildExportDriftPayload serializes baseline drift results + saved baseline metadata for
+// static-site bundles (data/drift.json). Returns nil when no saved baseline file exists so
+// projects without a baseline never emit unnecessary drift artifacts or trigger 404 fetches (W32-4).
+func buildExportDriftPayload(ctx RobotContext, res *drift.Result) []byte {
+	if res == nil {
+		return nil
+	}
+	baselinePath, err := ctx.BaselinePathOrDefault()
+	if err != nil || baselinePath == "" || !baseline.Exists(baselinePath) {
+		return nil
+	}
+	bl, loadErr := baseline.Load(baselinePath)
+	if loadErr != nil || bl == nil {
+		return nil
+	}
+	blCommit := bl.CommitSHA
+	blCreatedAt := ""
+	if !bl.CreatedAt.IsZero() {
+		blCreatedAt = bl.CreatedAt.UTC().Format(time.RFC3339)
+	}
+	blDesc := bl.Description
+	summaryLine := "No baseline drift detected"
+	if len(res.Alerts) > 0 {
+		parts := make([]string, 0, 3)
+		if res.CriticalCount > 0 {
+			parts = append(parts, fmt.Sprintf("%d critical", res.CriticalCount))
+		}
+		if res.WarningCount > 0 {
+			parts = append(parts, fmt.Sprintf("%d warning", res.WarningCount))
+		}
+		if res.InfoCount > 0 {
+			parts = append(parts, fmt.Sprintf("%d info", res.InfoCount))
+		}
+		if len(parts) > 0 {
+			summaryLine = fmt.Sprintf("%d drift alert(s) (%s)", len(res.Alerts), strings.Join(parts, ", "))
+		} else {
+			summaryLine = fmt.Sprintf("%d drift alert(s) detected", len(res.Alerts))
+		}
+	} else if res.HasDrift {
+		summaryLine = "Baseline drift detected"
+	}
+	driftCtx := ctx
+	driftCtx.Command = "robot-drift"
+	payload := struct {
+		RobotEnvelope
+		*drift.Result
+		BaselineCommit      string `json:"baseline_commit,omitempty"`
+		BaselineCreatedAt   string `json:"baseline_created_at,omitempty"`
+		BaselineDescription string `json:"baseline_description,omitempty"`
+		Summary             string `json:"summary,omitempty"`
+	}{
+		RobotEnvelope:       driftCtx.Envelope(),
+		Result:              res,
+		BaselineCommit:      blCommit,
+		BaselineCreatedAt:   blCreatedAt,
+		BaselineDescription: blDesc,
+		Summary:             summaryLine,
+	}
+	encoded, mErr := json.Marshal(payload)
+	if mErr != nil || len(encoded) == 0 {
+		return nil
+	}
+	return encoded
+}
+
 func buildExportDiffPayload(ctx RobotContext, diffSinceSpec string, res *cliScopedDiffResult) ([]byte, error) {
 	if res == nil || res.Diff == nil {
 		return nil, nil
@@ -14044,7 +14974,7 @@ func buildExportDiffPayload(ctx RobotContext, diffSinceSpec string, res *cliScop
 		ToDataHash:       ctx.DataHash,
 		Diff:             &diffCopy,
 	}
-	return json.MarshalIndent(payload, "", "  ")
+	return json.Marshal(payload)
 }
 
 func buildExportSprintsPayload(ctx RobotContext, workDir string, exportIssues []model.Issue, stats *analysis.GraphStats, now time.Time) ([]byte, int, error) {
@@ -14064,6 +14994,10 @@ func buildExportSprintsPayload(ctx RobotContext, workDir string, exportIssues []
 	graphIssues := ctx.GraphIssues()
 	if len(graphIssues) == 0 {
 		graphIssues = exportIssues
+	}
+	graphIssueMap := make(map[string]model.Issue, len(graphIssues))
+	for _, iss := range graphIssues {
+		graphIssueMap[iss.ID] = iss
 	}
 	velocityIssues := ctx.VelocityIssues()
 	if len(velocityIssues) == 0 {
@@ -14124,6 +15058,27 @@ func buildExportSprintsPayload(ctx RobotContext, workDir string, exportIssues []
 		scopedSprint := sp
 		scopedSprint.BeadIDs = scopedBeadIDs
 		burndown := analysis.ComputeSprintBurndown(&scopedSprint, sprintIssues, now)
+		// W38-3: Detect mid-sprint scope changes from git history and re-linearize IdealLine
+		// so data/sprints.json & agent-brief/sprints.json match --robot-burndown day-for-day.
+		var scopeChanges []ScopeChangeEvent
+		if changes, scErr := computeSprintScopeChangesForContext(ctx, workDir, &sp, graphIssueMap, now); scErr == nil && len(changes) > 0 {
+			filteredChanges := make([]ScopeChangeEvent, 0, len(changes))
+			for _, ev := range changes {
+				if ctx.CandidateIDs != nil && !ctx.CandidateIDs[ev.IssueID] {
+					continue
+				}
+				if scopeFiltered {
+					if _, visible := issueByID[ev.IssueID]; !visible {
+						continue
+					}
+				}
+				filteredChanges = append(filteredChanges, ev)
+			}
+			if len(filteredChanges) > 0 {
+				scopeChanges = filteredChanges
+				burndown.IdealLine = generateIdealLineScoped(&scopedSprint, burndown.TotalIssues, scopeChanges)
+			}
+		}
 		atRisk := analysis.DetectAtRiskWithReadiness(graphIssues, &scopedSprint, readiness, now, atRiskThresholds)
 		if atRisk == nil {
 			atRisk = []analysis.AtRiskItem{}
@@ -14167,16 +15122,17 @@ func buildExportSprintsPayload(ctx RobotContext, workDir string, exportIssues []
 			status = "completed"
 		}
 		entries = append(entries, exportSprintEntry{
-			ID:        sp.ID,
-			Name:      sp.Name,
-			StartDate: sp.StartDate,
-			EndDate:   sp.EndDate,
-			Status:    status,
-			IsActive:  isActive,
-			Burndown:  burndown,
-			AtRisk:    atRisk,
-			Capacity:  capInfo,
-			Beads:     beads,
+			ID:           sp.ID,
+			Name:         sp.Name,
+			StartDate:    sp.StartDate,
+			EndDate:      sp.EndDate,
+			Status:       status,
+			IsActive:     isActive,
+			Burndown:     burndown,
+			ScopeChanges: scopeChanges,
+			AtRisk:       atRisk,
+			Capacity:     capInfo,
+			Beads:        beads,
 		})
 	}
 	if len(entries) == 0 {
@@ -14198,7 +15154,7 @@ func buildExportSprintsPayload(ctx RobotContext, workDir string, exportIssues []
 	if err != nil {
 		return nil, 0, err
 	}
-	raw, err := json.MarshalIndent(wrapped, "", "  ")
+	raw, err := json.Marshal(wrapped)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -14244,7 +15200,7 @@ func buildExportSuggestionsPayload(ctx RobotContext, exportIssues []model.Issue,
 	if err != nil {
 		return nil, 0, err
 	}
-	raw, err := json.MarshalIndent(wrapped, "", "  ")
+	raw, err := json.Marshal(wrapped)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -14323,9 +15279,257 @@ func countUniqueIssueIDs(issues []model.Issue) int {
 	return len(seen)
 }
 
+// buildReportActiveSprintSummary builds a scoped executive summary for the active sprint
+// (if sprints.jsonl exists and an active sprint contains >=1 scoped issue) for Markdown/HTML
+// reports and priority/agent briefs (W33-4). Returns nil when no active sprint applies.
+func buildReportActiveSprintSummary(ctx RobotContext, workDir string, exportIssues []model.Issue, now time.Time) *export.ReportSprintSummary {
+	if len(exportIssues) == 0 {
+		return nil
+	}
+	sprints, err := loadSprintsForContext(ctx, workDir)
+	if err != nil || len(sprints) == 0 {
+		return nil
+	}
+	atRiskThresholds := analysis.DefaultAtRiskThresholds()
+	if driftCfg, cfgErr := drift.LoadConfig(workDir); cfgErr == nil && driftCfg != nil {
+		atRiskThresholds = driftCfg.AtRiskThresholds()
+	}
+	issueByID := make(map[string]model.Issue, len(exportIssues))
+	for _, iss := range exportIssues {
+		issueByID[iss.ID] = iss
+	}
+	graphIssues := ctx.GraphIssues()
+	if len(graphIssues) == 0 {
+		graphIssues = exportIssues
+	}
+	readiness := ctx.Readiness
+	if readiness == nil {
+		readiness = model.NewReadinessIndex(graphIssues)
+	}
+	for i := range sprints {
+		sp := sprints[i]
+		if !sp.IsActiveAt(now) {
+			continue
+		}
+		sprintIssues := make([]model.Issue, 0, len(sp.BeadIDs))
+		scopedBeadIDs := make([]string, 0, len(sp.BeadIDs))
+		seenID := make(map[string]bool, len(sp.BeadIDs))
+		for _, id := range sp.BeadIDs {
+			if seenID[id] {
+				continue
+			}
+			iss, ok := issueByID[id]
+			if !ok {
+				continue
+			}
+			seenID[id] = true
+			scopedBeadIDs = append(scopedBeadIDs, id)
+			sprintIssues = append(sprintIssues, iss)
+		}
+		if len(sprintIssues) == 0 {
+			continue
+		}
+		scopedSprint := sp
+		scopedSprint.BeadIDs = scopedBeadIDs
+		burndown := analysis.ComputeSprintBurndown(&scopedSprint, sprintIssues, now)
+		if burndown.TotalIssues == 0 {
+			continue
+		}
+		atRisk := analysis.DetectAtRiskWithReadiness(graphIssues, &scopedSprint, readiness, now, atRiskThresholds)
+		atRiskIDs := make([]string, 0, len(atRisk))
+		for _, ar := range atRisk {
+			if _, ok := issueByID[ar.ID]; ok {
+				atRiskIDs = append(atRiskIDs, ar.ID)
+			}
+		}
+		startStr := ""
+		if !sp.StartDate.IsZero() {
+			startStr = sp.StartDate.UTC().Format("2006-01-02")
+		}
+		endStr := ""
+		if !sp.EndDate.IsZero() {
+			endStr = sp.EndDate.UTC().Format("2006-01-02")
+		}
+		projStr := ""
+		if burndown.ProjectedComplete != nil && !burndown.ProjectedComplete.IsZero() {
+			projStr = burndown.ProjectedComplete.UTC().Format("2006-01-02")
+		}
+		pctComplete := 0.0
+		if burndown.TotalIssues > 0 {
+			pctComplete = float64(burndown.CompletedIssues) / float64(burndown.TotalIssues) * 100.0
+		}
+		name := strings.TrimSpace(sp.Name)
+		if name == "" {
+			name = sp.ID
+		}
+		return &export.ReportSprintSummary{
+			SprintID:        sp.ID,
+			Name:            name,
+			StartDate:       startStr,
+			EndDate:         endStr,
+			TotalIssues:     burndown.TotalIssues,
+			CompletedIssues: burndown.CompletedIssues,
+			RemainingIssues: burndown.RemainingIssues,
+			PercentComplete: pctComplete,
+			DaysRemaining:   burndown.RemainingDays,
+			OnTrack:         burndown.OnTrack,
+			ProjectedDate:   projStr,
+			AtRiskCount:     len(atRiskIDs),
+			AtRiskIssueIDs:  atRiskIDs,
+		}
+	}
+	return nil
+}
+
+// buildReportBaselineDriftSummary builds a saved-baseline drift summary for Markdown/HTML
+// reports and priority/agent briefs (W33-4). Returns nil when no valid saved baseline exists.
+func buildReportBaselineDriftSummary(ctx RobotContext, res *drift.Result, visibleIDs map[string]bool) *export.ReportDriftSummary {
+	if res == nil {
+		return nil
+	}
+	baselinePath, err := ctx.BaselinePathOrDefault()
+	if err != nil || baselinePath == "" || !baseline.Exists(baselinePath) {
+		return nil
+	}
+	bl, loadErr := baseline.Load(baselinePath)
+	if loadErr != nil || bl == nil {
+		return nil
+	}
+	createdAt := ""
+	if !bl.CreatedAt.IsZero() {
+		createdAt = bl.CreatedAt.UTC().Format("2006-01-02")
+	}
+	sevRank := func(s drift.Severity) int {
+		switch s {
+		case drift.SeverityCritical:
+			return 0
+		case drift.SeverityWarning:
+			return 1
+		default:
+			return 2
+		}
+	}
+	filtered := make([]drift.Alert, 0, len(res.Alerts))
+	for _, al := range res.Alerts {
+		if visibleIDs != nil {
+			if (al.IssueID != "" && !visibleIDs[al.IssueID]) ||
+				(al.RelatedIssueID != "" && !visibleIDs[al.RelatedIssueID]) {
+				continue
+			}
+		}
+		filtered = append(filtered, al)
+	}
+	sort.SliceStable(filtered, func(i, j int) bool {
+		return sevRank(filtered[i].Severity) < sevRank(filtered[j].Severity)
+	})
+	crit, warn, info := 0, 0, 0
+	topAlerts := make([]export.ReportDriftAlert, 0, min(len(filtered), 5))
+	for _, al := range filtered {
+		switch al.Severity {
+		case drift.SeverityCritical:
+			crit++
+		case drift.SeverityWarning:
+			warn++
+		default:
+			info++
+		}
+		if len(topAlerts) < 5 {
+			topAlerts = append(topAlerts, export.ReportDriftAlert{
+				Severity:       string(al.Severity),
+				Type:           string(al.Type),
+				IssueID:        al.IssueID,
+				RelatedIssueID: al.RelatedIssueID,
+				Message:        al.Message,
+			})
+		}
+	}
+	skippedReasons := make([]string, 0, len(res.SkippedChecks))
+	seenSkip := make(map[string]bool, len(res.SkippedChecks))
+	for _, sc := range res.SkippedChecks {
+		reason := strings.TrimSpace(sc.Reason)
+		if reason == "" {
+			reason = string(sc.Type)
+		}
+		if reason != "" && !seenSkip[reason] {
+			seenSkip[reason] = true
+			skippedReasons = append(skippedReasons, reason)
+		}
+	}
+	return &export.ReportDriftSummary{
+		BaselineCommit:      bl.CommitSHA,
+		BaselineCreatedAt:   createdAt,
+		HasDrift:            res.HasDrift && len(filtered) > 0,
+		CriticalCount:       crit,
+		WarningCount:        warn,
+		InfoCount:           info,
+		SkippedChecksCount:  len(res.SkippedChecks),
+		SkippedCheckReasons: skippedReasons,
+		TopAlerts:           topAlerts,
+	}
+}
+
+func computeScopedLabelCascades(graphIssues []model.Issue, readiness *model.ReadinessIndex, candidateIDs, visibleIDs map[string]bool, now time.Time, limit int) []analysis.BlockageCascadeResult {
+	if len(graphIssues) == 0 || limit <= 0 {
+		return nil
+	}
+	// P24A-1: Restrict cross-label flow inputs strictly to visible/candidate issues so
+	// hidden-repo or out-of-scope labels never leak into AffectedLabels or TotalImpact,
+	// while retaining the full-graph readiness index for authoritative blocker checks.
+	flowIssues := graphIssues
+	if visibleIDs != nil || candidateIDs != nil {
+		scoped := make([]model.Issue, 0, len(graphIssues))
+		for _, iss := range graphIssues {
+			if visibleIDs != nil && !visibleIDs[iss.ID] {
+				continue
+			}
+			if candidateIDs != nil && !candidateIDs[iss.ID] {
+				continue
+			}
+			scoped = append(scoped, iss)
+		}
+		flowIssues = scoped
+	}
+	if len(flowIssues) == 0 {
+		return nil
+	}
+	flowCfg := analysis.DefaultLabelHealthConfig()
+	crossFlow := analysis.ComputeCrossLabelFlowWithScope(flowIssues, flowCfg, nil)
+	cascadeRes := analysis.ComputeBlockageCascadeAtWithScope(flowIssues, crossFlow, flowCfg, now.UTC(), readiness, nil)
+	cascades := make([]analysis.BlockageCascadeResult, 0, len(cascadeRes.Cascades))
+	for _, cas := range cascadeRes.Cascades {
+		if cas.TotalImpact <= 0 || len(cas.AffectedLabels) == 0 {
+			continue
+		}
+		if len(cas.Recommendations) > 0 && visibleIDs != nil {
+			filtered := make([]analysis.UnblockRecommendation, 0, len(cas.Recommendations))
+			for _, u := range cas.Recommendations {
+				if visibleIDs[u.IssueID] {
+					filtered = append(filtered, u)
+				}
+			}
+			cas.Recommendations = filtered
+		}
+		cascades = append(cascades, cas)
+	}
+	sort.Slice(cascades, func(i, j int) bool {
+		if cascades[i].TotalImpact != cascades[j].TotalImpact {
+			return cascades[i].TotalImpact > cascades[j].TotalImpact
+		}
+		if cascades[i].BlockedCount != cascades[j].BlockedCount {
+			return cascades[i].BlockedCount > cascades[j].BlockedCount
+		}
+		return cascades[i].SourceLabel < cascades[j].SourceLabel
+	})
+	if len(cascades) > limit {
+		cascades = cascades[:limit]
+	}
+	return cascades
+}
+
 // populatePriorityBriefExecutiveData attaches scoped Global Backlog Capacity (Graham bounds),
-// Priority Misalignment Alerts, and Cycle Break Suggestions to priority/agent brief configs.
-func populatePriorityBriefExecutiveData(config *export.PriorityBriefConfig, ctx RobotContext, feedbackWeights *analysis.Weights, includeInactive, forceFullAnalysis bool, maxResults int, now time.Time) {
+// Priority Misalignment Alerts, Cycle Break Suggestions, Hygiene Suggestions, Cross-Label Cascades,
+// Active Sprint Progress, Baseline Drift, and Cross-Repo Flow to priority/agent brief configs.
+func populatePriorityBriefExecutiveData(config *export.PriorityBriefConfig, ctx RobotContext, workDir string, driftResult *drift.Result, feedbackWeights *analysis.Weights, includeInactive, forceFullAnalysis bool, maxResults int, now time.Time) {
 	if config == nil {
 		return
 	}
@@ -14396,6 +15600,8 @@ func populatePriorityBriefExecutiveData(config *export.PriorityBriefConfig, ctx 
 	}
 	config.MaxPriorityAlerts = limit
 	config.MaxCycleBreaks = limit
+	config.MaxSuggestions = limit
+	config.MaxLabelCascades = limit
 
 	selectionMode := analysis.SelectionReadyLeaf
 	if includeInactive {
@@ -14412,17 +15618,20 @@ func populatePriorityBriefExecutiveData(config *export.PriorityBriefConfig, ctx 
 		}
 	}
 
-	if cycles := stats.Cycles(); len(cycles) > 0 {
-		advCfg := analysis.DefaultAdvancedInsightsConfig()
-		advCfg.CycleBreakLimit = limit
-		if ctx.CandidateIDs != nil {
-			totalEdges := 0
-			for _, c := range cycles {
-				totalEdges += len(c)
-			}
-			advCfg.CycleBreakLimit = max(limit, totalEdges)
+	advCfg := analysis.DefaultAdvancedInsightsConfig()
+	advCfg.TopKSetLimit = limit
+	advCfg.ParallelCutLimit = limit
+	advCfg.KPathsLimit = limit
+	advCfg.CycleBreakLimit = limit
+	if cycles := stats.Cycles(); len(cycles) > 0 && ctx.CandidateIDs != nil {
+		totalEdges := 0
+		for _, c := range cycles {
+			totalEdges += len(c)
 		}
-		if adv := analyzer.GenerateAdvancedInsightsFromStats(&stats, advCfg); adv != nil && adv.CycleBreak != nil {
+		advCfg.CycleBreakLimit = max(limit, totalEdges)
+	}
+	if adv := analyzer.GenerateAdvancedInsightsFromStats(&stats, advCfg); adv != nil {
+		if adv.CycleBreak != nil {
 			for _, cb := range adv.CycleBreak.Suggestions {
 				if visibleIDs[cb.EdgeFrom] && visibleIDs[cb.EdgeTo] {
 					config.CycleBreaks = append(config.CycleBreaks, cb)
@@ -14432,6 +15641,109 @@ func populatePriorityBriefExecutiveData(config *export.PriorityBriefConfig, ctx 
 				}
 			}
 		}
+		if adv.TopKSet != nil && len(adv.TopKSet.Items) > 0 {
+			for _, item := range adv.TopKSet.Items {
+				if !visibleIDs[item.ID] {
+					continue
+				}
+				cloned := item
+				if len(item.Unblocks) > 0 {
+					kept := make([]string, 0, len(item.Unblocks))
+					for _, uid := range item.Unblocks {
+						if visibleIDs[uid] {
+							kept = append(kept, uid)
+						}
+					}
+					cloned.Unblocks = kept
+					if len(kept) != len(item.Unblocks) || ctx.CandidateIDs != nil {
+						cloned.MarginalGain = len(kept)
+					}
+				}
+				if cloned.MarginalGain <= 0 && len(cloned.Unblocks) == 0 {
+					continue
+				}
+				config.TopKItems = append(config.TopKItems, cloned)
+				config.TopKTotalGain += cloned.MarginalGain
+				if len(config.TopKItems) >= limit {
+					break
+				}
+			}
+		}
+		if adv.ParallelCut != nil && len(adv.ParallelCut.Suggestions) > 0 {
+			for _, pc := range adv.ParallelCut.Suggestions {
+				if !visibleIDs[pc.ID] {
+					continue
+				}
+				clonedPC := pc
+				if len(pc.EnabledTracks) > 0 {
+					keptTracks := make([]string, 0, len(pc.EnabledTracks))
+					for _, tid := range pc.EnabledTracks {
+						if visibleIDs[tid] {
+							keptTracks = append(keptTracks, tid)
+						}
+					}
+					clonedPC.EnabledTracks = keptTracks
+					if len(keptTracks) != len(pc.EnabledTracks) || ctx.CandidateIDs != nil {
+						clonedPC.ParallelGain = len(keptTracks) - 1
+					}
+				}
+				if clonedPC.ParallelGain <= 0 {
+					continue
+				}
+				config.ParallelCut = append(config.ParallelCut, clonedPC)
+				if len(config.ParallelCut) >= limit {
+					break
+				}
+			}
+		}
+		if adv.KPaths != nil && len(adv.KPaths.Paths) > 0 {
+			for _, p := range adv.KPaths.Paths {
+				if len(p.IssueIDs) < 2 {
+					continue
+				}
+				allVis := true
+				for _, id := range p.IssueIDs {
+					if !visibleIDs[id] {
+						allVis = false
+						break
+					}
+				}
+				if allVis {
+					config.KPaths = append(config.KPaths, p)
+					if len(config.KPaths) >= limit {
+						break
+					}
+				}
+			}
+		}
+	}
+
+	// W32-5: Scoped Hygiene Suggestions & Cross-Label Blockage Cascades for Priority/Agent Briefs.
+	scopedIssues := make([]model.Issue, 0, len(visibleIDs))
+	for _, iss := range graphIssues {
+		if visibleIDs[iss.ID] {
+			scopedIssues = append(scopedIssues, iss)
+		}
+	}
+	if len(scopedIssues) > 0 {
+		sugCfg := analysis.DefaultSuggestAllConfig()
+		sugCfg.MinConfidence = 0.6
+		sugCfg.MaxSuggestions = max(limit*3, 15)
+		sugCfg.CandidateIDs = visibleIDs
+		if sugSet := analysis.GenerateAllSuggestionsAt(graphIssues, sugCfg, ctx.DataHash, now.UTC()); len(sugSet.Suggestions) > 0 {
+			for _, sug := range sugSet.Suggestions {
+				if visibleIDs[sug.TargetBead] && (sug.RelatedBead == "" || visibleIDs[sug.RelatedBead]) {
+					config.Suggestions = append(config.Suggestions, sug)
+					if len(config.Suggestions) >= limit {
+						break
+					}
+				}
+			}
+		}
+		config.LabelCascades = computeScopedLabelCascades(graphIssues, analyzer.Readiness(), ctx.CandidateIDs, visibleIDs, now.UTC(), limit)
+		config.CrossRepoFlow = analysis.ComputeCrossRepoFlow(scopedIssues, visibleIDs)
+		config.ActiveSprint = buildReportActiveSprintSummary(ctx, workDir, scopedIssues, now.UTC())
+		config.BaselineDrift = buildReportBaselineDriftSummary(ctx, driftResult, visibleIDs)
 	}
 }
 
@@ -14793,6 +16105,8 @@ func buildExportLabelsPayload(ctx RobotContext, exportIssues []model.Issue, stat
 				}
 			}
 		}
+		exportVel := lh.Velocity
+		exportVel.Historical = nil
 		entries = append(entries, exportLabelIntelEntry{
 			Label:             lh.Label,
 			IssueCount:        lh.IssueCount,
@@ -14816,7 +16130,7 @@ func buildExportLabelsPayload(ctx RobotContext, exportIssues []model.Issue, stat
 			CooccurringLabels: coocList,
 			TopCoreIssueID:    topCoreID,
 			CriticalPathCount: lh.Criticality.CriticalPathCount,
-			Velocity:          lh.Velocity,
+			Velocity:          exportVel,
 			Freshness:         lh.Freshness,
 			Flow:              scopedFlow,
 			Criticality:       lh.Criticality,
@@ -14860,7 +16174,7 @@ func buildExportLabelsPayload(ctx RobotContext, exportIssues []model.Issue, stat
 	if err != nil {
 		return nil, 0, err
 	}
-	raw, err := json.MarshalIndent(wrapped, "", "  ")
+	raw, err := json.Marshal(wrapped)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -14973,12 +16287,18 @@ func buildExportForecastPayload(ctx RobotContext, exportIssues []model.Issue, st
 		selectionMode = analysis.SelectionAllScopedCandidates
 	}
 	eligibleRecIDs := recAnalyzer.CandidateIssueSet(selectionMode)
+	graphByID := make(map[string]model.Issue, len(graphIssues))
+	for _, iss := range graphIssues {
+		graphByID[iss.ID] = iss
+	}
 	recs := recAnalyzer.GenerateRecommendationsFromStats(capStats, analysis.DefaultThresholds())
 	filteredRecs := make([]analysis.PriorityRecommendation, 0, min(len(recs), 20))
 	for _, rec := range recs {
 		if !visibleIDs[rec.IssueID] || !eligibleRecIDs[rec.IssueID] || rec.CurrentPriority == rec.SuggestedPriority {
 			continue
 		}
+		iss, ok := graphByID[rec.IssueID]
+		attachPriorityRecommendationAction(&rec, iss, ok, ctx)
 		filteredRecs = append(filteredRecs, rec)
 		if len(filteredRecs) >= 20 {
 			break
@@ -15002,7 +16322,7 @@ func buildExportForecastPayload(ctx RobotContext, exportIssues []model.Issue, st
 	if err != nil {
 		return nil, etaCtx, err
 	}
-	raw, err := json.MarshalIndent(wrapped, "", "  ")
+	raw, err := json.Marshal(wrapped)
 	if err != nil {
 		return nil, etaCtx, err
 	}

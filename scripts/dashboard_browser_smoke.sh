@@ -119,11 +119,54 @@ issues = [
 ]
 pathlib.Path(sys.argv[1]).write_text(''.join(json.dumps(i) + '\n' for i in issues))
 PY
-  git add .beads/issues.jsonl
-  GIT_AUTHOR_DATE="2026-09-04T12:00:00Z" GIT_COMMITTER_DATE="2026-09-04T12:00:00Z" git commit -q -m "add cycles, telemetry hub, and close bootstrap"
+  printf 'package auth\n' > auth.go
+  git add auth.go .beads/issues.jsonl
+  GIT_AUTHOR_DATE="2026-09-04T12:00:00Z" GIT_COMMITTER_DATE="2026-09-04T12:00:00Z" git commit -q -m "cap-auth-root: add cycles, telemetry hub, and close bootstrap"
   "$bv" --export-pages "$tmp/capabilities-bundle" --pages-title "Capabilities <Title> & Gate" --pages-subtitle "Release <RC-C10> & Proof" >"$tmp/capabilities-export.log" 2>&1
   "$bv" --export-graph "$tmp/capabilities-bundle/standalone-graph.html" >>"$tmp/capabilities-export.log" 2>&1
+  "$bv" --export-graph "$tmp/capabilities-bundle/standalone-graph-diff.html" --diff-since HEAD~1 >>"$tmp/capabilities-export.log" 2>&1
 ) || { cat "$tmp/capabilities-export.log" 2>/dev/null || true; exit 1; }
+
+# Dedicated non-tautological diff fixture (P24B-6): 4 issues where 1 stays strictly UNCHANGED
+# and 3 change (added, modified priority, closed) so changed-only filters must strictly drop 4 -> 3.
+mkdir -p "$tmp/diff-fixture/.beads"
+(
+  unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE
+  cd "$tmp/diff-fixture" || exit 1
+  git init -q
+  git config user.name "Smoke Harness"
+  git config user.email "smoke@example.test"
+  python3 - ".beads/issues.jsonl" commit1 <<'PY'
+import json, pathlib, sys
+base = dict(created_at='2026-09-01T12:00:00Z', updated_at='2026-09-01T12:00:00Z')
+issues = [
+    dict(base, id='diff-unchanged', title='Stable baseline task', status='open', priority=2, issue_type='task', labels=['core']),
+    dict(base, id='diff-modified', title='API gateway rollout', status='open', priority=2, issue_type='feature', labels=['api']),
+    dict(base, id='diff-closed', title='Legacy cleanup item', status='open', priority=3, issue_type='chore', labels=['ops']),
+]
+pathlib.Path(sys.argv[1]).write_text(''.join(json.dumps(i) + '\n' for i in issues))
+PY
+  git add .beads/issues.jsonl
+  GIT_AUTHOR_DATE="2026-09-01T12:00:00Z" GIT_COMMITTER_DATE="2026-09-01T12:00:00Z" git commit -q -m "seed diff baseline"
+
+  python3 - ".beads/issues.jsonl" commit2 <<'PY'
+import json, pathlib, sys
+base1 = dict(created_at='2026-09-01T12:00:00Z', updated_at='2026-09-01T12:00:00Z')
+base2 = dict(created_at='2026-09-01T12:00:00Z', updated_at='2026-09-05T12:00:00Z')
+issues = [
+    dict(base1, id='diff-unchanged', title='Stable baseline task', status='open', priority=2, issue_type='task', labels=['core']),
+    dict(base2, id='diff-modified', title='API gateway rollout', status='open', priority=0, issue_type='feature', labels=['api']),
+    dict(base2, id='diff-closed', title='Legacy cleanup item', status='closed', priority=3, issue_type='chore', labels=['ops'], closed_at='2026-09-05T12:00:00Z'),
+    dict(created_at='2026-09-05T12:00:00Z', updated_at='2026-09-05T12:00:00Z', id='diff-added', title='New downstream consumer', status='open', priority=1, issue_type='task', labels=['web'],
+         dependencies=[dict(issue_id='diff-added', depends_on_id='diff-modified', type='blocks')]),
+]
+pathlib.Path(sys.argv[1]).write_text(''.join(json.dumps(i) + '\n' for i in issues))
+PY
+  git add .beads/issues.jsonl
+  GIT_AUTHOR_DATE="2026-09-05T12:00:00Z" GIT_COMMITTER_DATE="2026-09-05T12:00:00Z" git commit -q -m "modify priority, close legacy, add consumer"
+  "$bv" --export-pages "$tmp/capabilities-bundle-diff" --diff-since HEAD~1 --pages-title "Diff Overlay Gate" >"$tmp/diff-export.log" 2>&1
+  "$bv" --export-graph "$tmp/capabilities-bundle-diff/standalone-graph-diff.html" --diff-since HEAD~1 >>"$tmp/diff-export.log" 2>&1
+) || { cat "$tmp/diff-export.log" 2>/dev/null || true; exit 1; }
 
 mkdir -p "$tmp/multirepo-fixture/.beads"
 python3 - "$tmp/multirepo-fixture/.beads/issues.jsonl" "$tmp/multirepo-fixture/.beads/sprints.jsonl" <<'PY'
@@ -161,4 +204,4 @@ if [ -n "$target" ]; then
 else
   project_bundle=""
 fi
-node "$root/tests/scripts/dashboard_browser_test.mjs" "$browser" "$tmp/bundle" "$tmp/browser" journeys "$tmp/updated-bundle" "$project_bundle" "$tmp/capabilities-bundle" "$tmp/multirepo-bundle"
+node "$root/tests/scripts/dashboard_browser_test.mjs" "$browser" "$tmp/bundle" "$tmp/browser" journeys "$tmp/updated-bundle" "$project_bundle" "$tmp/capabilities-bundle" "$tmp/multirepo-bundle" "$tmp/capabilities-bundle-diff"

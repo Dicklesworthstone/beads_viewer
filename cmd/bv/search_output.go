@@ -12,15 +12,26 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/internal/env"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/search"
 )
 
 type robotSearchResult struct {
-	IssueID         string             `json:"issue_id"`
-	Score           float64            `json:"score"`
-	TextScore       float64            `json:"text_score,omitempty"`
-	Title           string             `json:"title,omitempty"`
-	ComponentScores map[string]float64 `json:"component_scores,omitempty"`
+	IssueID         string              `json:"issue_id"`
+	Score           float64             `json:"score"`
+	TextScore       float64             `json:"text_score,omitempty"`
+	Title           string              `json:"title,omitempty"`
+	Status          string              `json:"status,omitempty"`
+	Priority        int                 `json:"priority"`
+	IssueType       string              `json:"issue_type,omitempty"`
+	Labels          []string            `json:"labels,omitempty"`
+	Assignee        string              `json:"assignee,omitempty"`
+	SourceRepo      string              `json:"source_repo,omitempty"`
+	IsActionable    bool                `json:"is_actionable"`
+	Claimable       bool                `json:"claimable"`
+	NotReady        bool                `json:"not_ready,omitempty"`
+	Actions         *model.IssueActions `json:"actions,omitempty"`
+	ComponentScores map[string]float64  `json:"component_scores,omitempty"`
 }
 
 type robotSearchOutput struct {

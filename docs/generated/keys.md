@@ -64,8 +64,10 @@
 |  | `L` | Scroll right |
 |  | `J/K` | Scroll graph vertically |
 |  | `space` | Expand/collapse dependency paths |
+|  | `W` | Toggle issue in batch What-If |
 |  | `D` | Check add dependency (A → B) |
-|  | `c` | Copy checked dep command |
+|  | `X` | Preflight remove dep / cycle cut |
+|  | `c` | Copy checked dep / cycle-cut command |
 |  | `PgUp` | Page nodes (prev 10) |
 |  | `PgDn` | Page nodes (next 10) |
 | **board** | `h` | Previous column |
@@ -84,6 +86,7 @@
 |  | `s` | Cycle swimlane mode |
 |  | `e` | Toggle empty columns |
 |  | `d` | Expand/collapse card inline |
+|  | `W` | Toggle issue in batch What-If |
 |  | `tab` | Toggle detail |
 |  | `ctrl+j` | Scroll detail down |
 |  | `ctrl+k` | Scroll detail up |
@@ -99,8 +102,10 @@
 |  | `PgDn` | Page down |
 |  | `b` | Toggle hierarchy / blocking tree mode |
 |  | `m` | Toggle hierarchy / blocking tree mode |
+|  | `W` | Toggle issue in batch What-If |
 |  | `E` | Exit tree view |
-| **actionable** | `PgUp` | Page up |
+| **actionable** | `W` | Toggle issue in batch What-If |
+|  | `PgUp` | Page up |
 |  | `PgDn` | Page down |
 |  | `a` | Close actionable view |
 | **insights** | `g` | Go to top |
@@ -116,6 +121,8 @@
 |  | `H` | Heatmap toggle |
 |  | `<` | Widen detail panel |
 |  | `>` | Narrow detail panel |
+|  | `X` | Preflight cycle-cut removal |
+|  | `c` | Copy cycle-cut command |
 | **history** | `g` | Jump to graph view |
 |  | `v` | Toggle git/bead mode |
 |  | `/` | Search history |
@@ -131,6 +138,7 @@
 |  | `-` | Reject commit correlation |
 |  | `x` | Ignore commit correlation |
 |  | `O` | Toggle orphan commits audit |
+|  | `H` | Toggle code hotspots & co-change view |
 |  | `W` | Toggle causality & wait analysis |
 |  | `o` | Open in browser |
 |  | `h` | Close history view |

@@ -3249,8 +3249,10 @@ func TestExportPages_RecordsLoadSizes(t *testing.T) {
 		"first_render_ms": nil,
 		"note":            "first_render_ms is measured only when BV_HEADLESS_BROWSER names a browser; absent here",
 	}
-	if browser := os.Getenv("BV_HEADLESS_BROWSER"); browser != "" {
-		record["note"] = "BV_HEADLESS_BROWSER is set but timing is not implemented yet; sizes only"
+	if browser := strings.TrimSpace(os.Getenv("BV_HEADLESS_BROWSER")); browser != "" {
+		firstRenderMs, timingNote := measurePagesFirstRenderMS(t, repo, browser, out)
+		record["first_render_ms"] = firstRenderMs
+		record["note"] = timingNote
 	}
 	data, err := json.MarshalIndent(record, "", "  ")
 	if err != nil {
@@ -3342,6 +3344,55 @@ func bundleGrowthReport(recorded, current map[string]*int64) string {
 		}
 	}
 	return out.String()
+}
+
+func measurePagesFirstRenderMS(t *testing.T, repo, browser, bundleDir string) (float64, string) {
+	t.Helper()
+	browserPath, err := exec.LookPath(browser)
+	if err != nil {
+		t.Fatalf("BV_HEADLESS_BROWSER=%q not executable: %v", browser, err)
+	}
+	nodePath, err := exec.LookPath("node")
+	if err != nil {
+		t.Fatalf("BV_HEADLESS_BROWSER is set but node is not in PATH: %v", err)
+	}
+	scriptPath := filepath.Join(repo, "tests", "scripts", "dashboard_browser_test.mjs")
+	artifactsDir := filepath.Join(t.TempDir(), "first-render-timing")
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, nodePath, scriptPath, browserPath, bundleDir, artifactsDir, "first-render-timing")
+	cmd.Dir = repo
+	var stdoutBuf, stderrBuf bytes.Buffer
+	cmd.Stdout = &stdoutBuf
+	cmd.Stderr = &stderrBuf
+	if runErr := cmd.Run(); runErr != nil {
+		t.Fatalf("measurePagesFirstRenderMS failed (%v):\nstdout:\n%s\nstderr:\n%s", runErr, stdoutBuf.String(), stderrBuf.String())
+	}
+	const prefix = "FIRST_RENDER_TIMING_JSON="
+	for _, line := range strings.Split(stdoutBuf.String(), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, prefix) {
+			continue
+		}
+		var parsed struct {
+			FirstRenderMS float64 `json:"first_render_ms"`
+			PagePerfMS    float64 `json:"page_perf_ms"`
+			RenderedRows  int     `json:"rendered_rows"`
+			TotalIssues   int     `json:"total_issues"`
+			GraphReady    bool    `json:"graph_ready"`
+		}
+		if err := json.Unmarshal([]byte(strings.TrimPrefix(line, prefix)), &parsed); err != nil {
+			t.Fatalf("decode %s line %q: %v", prefix, line, err)
+		}
+		if parsed.FirstRenderMS <= 0 || !parsed.GraphReady {
+			t.Fatalf("invalid first-render timing measurement: %+v\nstdout:\n%s\nstderr:\n%s", parsed, stdoutBuf.String(), stderrBuf.String())
+		}
+		note := fmt.Sprintf("first_render_ms measured in headless Chromium (%s) from navigation start to rendered issue list (%d rows / %d issues) + graphReady",
+			filepath.Base(browserPath), parsed.RenderedRows, parsed.TotalIssues)
+		return parsed.FirstRenderMS, note
+	}
+	t.Fatalf("dashboard_browser_test.mjs first-render-timing did not emit %s:\nstdout:\n%s\nstderr:\n%s", prefix, stdoutBuf.String(), stderrBuf.String())
+	return 0, ""
 }
 
 func TestBundleGrowthReport_NamesEachMemberLargestGrowthFirst(t *testing.T) {

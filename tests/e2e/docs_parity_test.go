@@ -2608,3 +2608,266 @@ func TestDocsParity_SortModesRecipeMetricsAndPostV028Examples(t *testing.T) {
 		}
 	})
 }
+
+// TestDocsParity_Wave22_RC_C43_ContractAndArtifactParity adversarially proves RC-C43:
+//  1. Live `--robot-docs commands` and `--robot-capabilities` advertise `remove:` syntax and
+//     all 8 removal `key_fields` on `robot-check-dep`, plus `high_risk` and `cross_repo_flow`
+//     on `robot-insights` (with planted negative controls rejecting omission).
+//  2. `README.md`, `SKILL.md`, and `docs/generated/flags.md` agree on `--robot-check-dep`
+//     add + `remove:` syntax (with planted negative controls rejecting stale add-only text).
+//  3. `tests/artifacts/perf/pages_load.json` satisfies WS-25 size caps + positive Chromium
+//     `first_render_ms`, and `README.md` rejects stale `367 KB` / `20.6 MB` Nov 21 prose.
+//  4. `CHANGELOG.md` `Unreleased` records every post-`09f6df4e` commit plus Wave 22 work
+//     (with planted negative controls rejecting omission).
+//  5. Live `--robot-check-dep remove:C:A` returns exact removal semantics (`operation`,
+//     `can_remove`, `exists`).
+func TestDocsParity_Wave22_RC_C43_ContractAndArtifactParity(t *testing.T) {
+	bv := buildBvBinary(t)
+	readme := repoFile(t, "README.md")
+	skill := repoFile(t, "SKILL.md")
+	flagsMD := repoFile(t, filepath.Join("docs", "generated", "flags.md"))
+	changelog := repoFile(t, "CHANGELOG.md")
+	pagesLoadRaw := repoFile(t, filepath.Join("tests", "artifacts", "perf", "pages_load.json"))
+
+	// 1. Live --robot-docs commands & --robot-capabilities 4D contract check + negative controls.
+	t.Run("robot_docs_and_capabilities_4d_contract", func(t *testing.T) {
+		wantCheckDepFields := []string{
+			"results[].operation",
+			"results[].can_remove",
+			"results[].exists",
+			"results[].cycles_before",
+			"results[].cycles_after",
+			"results[].cycles_broken",
+			"results[].would_break_all_cycles",
+			"results[].newly_unblocked",
+		}
+		wantInsightsFields := []string{"high_risk", "cross_repo_flow"}
+
+		validateContract := func(checkDepFlag string, checkDepFields, insightsFields []string) error {
+			if !strings.Contains(checkDepFlag, "remove:") {
+				return fmt.Errorf("robot-check-dep flag %q missing remove: syntax", checkDepFlag)
+			}
+			cdSet := make(map[string]bool, len(checkDepFields))
+			for _, f := range checkDepFields {
+				cdSet[f] = true
+			}
+			for _, req := range wantCheckDepFields {
+				if !cdSet[req] {
+					return fmt.Errorf("robot-check-dep key_fields missing %q", req)
+				}
+			}
+			inSet := make(map[string]bool, len(insightsFields))
+			for _, f := range insightsFields {
+				inSet[f] = true
+			}
+			for _, req := range wantInsightsFields {
+				if !inSet[req] {
+					return fmt.Errorf("robot-insights key_fields missing %q", req)
+				}
+			}
+			return nil
+		}
+
+		// Live --robot-docs commands
+		docsCmd := exec.Command(bv, "--robot-docs", "commands")
+		docsCmd.Env = append(os.Environ(), "BV_NO_BROWSER=1", "BV_TEST_MODE=1")
+		docsOut, err := docsCmd.Output()
+		if err != nil {
+			t.Fatalf("--robot-docs commands failed: %v", err)
+		}
+		var docsPayload struct {
+			Commands map[string]struct {
+				Flag      string   `json:"flag"`
+				KeyFields []string `json:"key_fields"`
+			} `json:"commands"`
+		}
+		if err := json.Unmarshal(docsOut, &docsPayload); err != nil {
+			t.Fatalf("decode --robot-docs commands: %v", err)
+		}
+		cdDoc := docsPayload.Commands["robot-check-dep"]
+		inDoc := docsPayload.Commands["robot-insights"]
+		if err := validateContract(cdDoc.Flag, cdDoc.KeyFields, inDoc.KeyFields); err != nil {
+			t.Fatalf("--robot-docs commands 4D contract failed: %v", err)
+		}
+
+		// Live --robot-capabilities
+		capsCmd := exec.Command(bv, "--robot-capabilities")
+		capsCmd.Env = append(os.Environ(), "BV_NO_BROWSER=1", "BV_TEST_MODE=1")
+		capsOut, err := capsCmd.Output()
+		if err != nil {
+			t.Fatalf("--robot-capabilities failed: %v", err)
+		}
+		var capsPayload struct {
+			Commands []struct {
+				Name      string   `json:"name"`
+				Flag      string   `json:"flag"`
+				KeyFields []string `json:"key_fields"`
+			} `json:"commands"`
+		}
+		if err := json.Unmarshal(capsOut, &capsPayload); err != nil {
+			t.Fatalf("decode --robot-capabilities: %v", err)
+		}
+		var capCDFlag string
+		var capCDFields, capInFields []string
+		for _, c := range capsPayload.Commands {
+			switch c.Name {
+			case "robot-check-dep":
+				capCDFlag, capCDFields = c.Flag, c.KeyFields
+			case "robot-insights":
+				capInFields = c.KeyFields
+			}
+		}
+		if err := validateContract(capCDFlag, capCDFields, capInFields); err != nil {
+			t.Fatalf("--robot-capabilities 4D contract failed: %v", err)
+		}
+
+		// Planted negative controls: dropping removal fields or cross_repo_flow MUST fail.
+		if err := validateContract("--robot-check-dep FROM_ID:TO_ID[,...]", cdDoc.KeyFields, inDoc.KeyFields); err == nil {
+			t.Fatal("negative control failed: stale add-only robot-check-dep flag passed")
+		}
+		if err := validateContract(cdDoc.Flag, []string{"results[].can_add"}, inDoc.KeyFields); err == nil {
+			t.Fatal("negative control failed: robot-check-dep missing removal key_fields passed")
+		}
+		if err := validateContract(cdDoc.Flag, cdDoc.KeyFields, []string{"full_stats", "Cycles"}); err == nil {
+			t.Fatal("negative control failed: robot-insights missing high_risk/cross_repo_flow passed")
+		}
+	})
+
+	// 2. Cross-doc README/SKILL/flags.md check-dep remove: parity + planted negative controls.
+	t.Run("cross_doc_check_dep_remove_syntax", func(t *testing.T) {
+		checkDocs := func(r, s, f string) error {
+			start := strings.Index(r, "### Robot Protocol Commands")
+			end := strings.Index(r, "Issue-backed analysis commands support `--as-of <ref>`")
+			if start < 0 || end <= start {
+				return fmt.Errorf("missing README Robot Protocol Commands table")
+			}
+			summary := r[start:end]
+			if !strings.Contains(summary, "`--robot-check-dep <[remove:]from:to>[,...]`") {
+				return fmt.Errorf("README summary table missing [remove:]from:to syntax")
+			}
+			if !strings.Contains(s, "bv --robot-check-dep [remove:]<from:to>") {
+				return fmt.Errorf("SKILL.md missing [remove:]<from:to> syntax")
+			}
+			if !strings.Contains(f, "remove:fromID:toID") {
+				return fmt.Errorf("docs/generated/flags.md missing remove:fromID:toID")
+			}
+			return nil
+		}
+		if err := checkDocs(readme, skill, flagsMD); err != nil {
+			t.Fatal(err)
+		}
+		staleReadme := strings.Replace(readme, "`--robot-check-dep <[remove:]from:to>[,...]`", "`--robot-check-dep <from:to>[,...]`", 1)
+		if err := checkDocs(staleReadme, skill, flagsMD); err == nil {
+			t.Fatal("negative control failed: stale README check-dep syntax passed")
+		}
+		staleSkill := strings.Replace(skill, "bv --robot-check-dep [remove:]<from:to>", "bv --robot-check-dep <from:to>", 1)
+		if err := checkDocs(readme, staleSkill, flagsMD); err == nil {
+			t.Fatal("negative control failed: stale SKILL.md check-dep syntax passed")
+		}
+	})
+
+	// 3. Refreshed pages_load.json caps + real Chromium first_render_ms + stale Nov 21 negative control.
+	t.Run("pages_load_refreshed_and_rejects_stale_nov21", func(t *testing.T) {
+		var pl struct {
+			FirstRenderMS *float64 `json:"first_render_ms"`
+			Bytes         struct {
+				BundleTotal int64 `json:"bundle_total"`
+				HistoryJSON int64 `json:"history_json"`
+				LabelsJSON  int64 `json:"labels_json"`
+			} `json:"bytes"`
+		}
+		if err := json.Unmarshal([]byte(pagesLoadRaw), &pl); err != nil {
+			t.Fatalf("decode pages_load.json: %v", err)
+		}
+		if pl.FirstRenderMS == nil || *pl.FirstRenderMS <= 0 {
+			t.Fatalf("pages_load.json must record positive numeric Chromium first_render_ms, got %v", pl.FirstRenderMS)
+		}
+		if pl.Bytes.BundleTotal > 23_000_000 || pl.Bytes.HistoryJSON >= 1_200_000 || pl.Bytes.LabelsJSON > 650_000 {
+			t.Fatalf("pages_load.json violates WS-25 caps: %+v", pl.Bytes)
+		}
+		checkFreshReadme := func(r string) error {
+			for _, staleTok := range []string{"(367 KB)", "whole bundle 20.6 MB", "retained November 21, 2026 export"} {
+				if strings.Contains(r, staleTok) {
+					return fmt.Errorf("README retains stale Nov 21 pages_load token %q", staleTok)
+				}
+			}
+			if !strings.Contains(r, fmt.Sprintf("%.1f ms", *pl.FirstRenderMS)) {
+				return fmt.Errorf("README missing recorded first_render_ms %.1f ms", *pl.FirstRenderMS)
+			}
+			return nil
+		}
+		if err := checkFreshReadme(readme); err != nil {
+			t.Fatal(err)
+		}
+		if err := checkFreshReadme("whole bundle 20.6 MB (367 KB) retained November 21, 2026 export"); err == nil {
+			t.Fatal("negative control failed: stale Nov 21 README prose passed")
+		}
+	})
+
+	// 4. CHANGELOG.md Unreleased coverage of all 8 post-09f6df4e commits + Wave 22 + negative control.
+	t.Run("changelog_unreleased_post_09f6df4e_coverage", func(t *testing.T) {
+		start := strings.Index(changelog, "## Unreleased")
+		end := strings.Index(changelog, "## v0.28.0")
+		if start < 0 || end <= start {
+			t.Fatal("could not locate CHANGELOG.md Unreleased section")
+		}
+		unreleased := changelog[start:end]
+		required := []string{
+			"47d98f9a", "bc91ba87", "6eb74b23", "2c44321f",
+			"390fb2a1", "6bd8b659", "69c274e1", "938540a8",
+			"commit_catalog", "createDefaultFilters()", "bv-apal.92", "bv-oonu.26", "bv-oonu.28",
+		}
+		checkChangelog := func(sec string) error {
+			for _, tok := range required {
+				if !strings.Contains(sec, tok) {
+					return fmt.Errorf("CHANGELOG.md Unreleased missing %q", tok)
+				}
+			}
+			return nil
+		}
+		if err := checkChangelog(unreleased); err != nil {
+			t.Fatal(err)
+		}
+		staleCL := strings.ReplaceAll(unreleased, "69c274e1", "00000000")
+		if err := checkChangelog(staleCL); err == nil {
+			t.Fatal("negative control failed: CHANGELOG.md missing 69c274e1 passed")
+		}
+	})
+
+	// 5. Live --robot-check-dep remove:C:A end-to-end verification.
+	t.Run("live_robot_check_dep_remove", func(t *testing.T) {
+		dir := t.TempDir()
+		beadsDir := filepath.Join(dir, ".beads")
+		if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		fixture := strings.Join([]string{
+			`{"id":"A","title":"Root A","status":"open","priority":1,"issue_type":"task","created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-25T00:00:00Z"}`,
+			`{"id":"C","title":"Blocked child","status":"open","priority":1,"issue_type":"task","dependencies":[{"issue_id":"C","depends_on_id":"A","type":"blocks"}],"created_at":"2026-08-02T00:00:00Z","updated_at":"2026-08-25T00:00:00Z"}`,
+		}, "\n") + "\n"
+		if err := os.WriteFile(filepath.Join(beadsDir, "issues.jsonl"), []byte(fixture), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cmd := exec.Command(bv, "--robot-check-dep", "remove:C:A")
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(), "BV_NO_BROWSER=1", "BV_TEST_MODE=1")
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("--robot-check-dep remove:C:A failed: %v", err)
+		}
+		var payload struct {
+			Results []struct {
+				Operation      string   `json:"operation"`
+				Exists         bool     `json:"exists"`
+				CanRemove      bool     `json:"can_remove"`
+				NewlyUnblocked []string `json:"newly_unblocked"`
+			} `json:"results"`
+		}
+		if err := json.Unmarshal(out, &payload); err != nil {
+			t.Fatalf("decode --robot-check-dep remove:C:A: %v\n%s", err, string(out))
+		}
+		if len(payload.Results) != 1 || payload.Results[0].Operation != "remove" || !payload.Results[0].Exists || !payload.Results[0].CanRemove || len(payload.Results[0].NewlyUnblocked) != 1 || payload.Results[0].NewlyUnblocked[0] != "C" {
+			t.Fatalf("unexpected --robot-check-dep remove:C:A payload: %+v", payload)
+		}
+	})
+}

@@ -150,6 +150,7 @@ EOF
     "robot-blocker-chain|--robot-blocker-chain SMOKE-2|1"
     "robot-whatif|--robot-whatif SMOKE-1|1"
     "robot-check-dep|--robot-check-dep SMOKE-2:SMOKE-1|1"
+    "robot-check-dep|--robot-check-dep remove:SMOKE-2:SMOKE-1|1"
     "robot-burndown|--robot-burndown current|1"
     "robot-sprint-show|--robot-sprint-show sprint-smoke|1"
     "robot-related|--robot-related SMOKE-1|1"

@@ -55,7 +55,7 @@
 | `--baseline-info` | bool | `false` | Show information about the current baseline | History & Drift |
 | `--bead-history` | string | (empty) | Show history for specific bead ID | History & Drift |
 | `--check-drift` | bool | `false` | Check for drift from baseline (exit codes: 0=OK, 1=critical, 2=warning) | History & Drift |
-| `--diff-since` | string | (empty) | Show changes since historical point (commit SHA, branch, tag, or date; composable with --export, --export-md, --export-pages, --priority-brief, --agent-brief) | History & Drift |
+| `--diff-since` | string | (empty) | Show changes since historical point (commit SHA, branch, tag, or date; composable with --export, --export-md, --export-graph, --export-pages, --pages, --priority-brief, --agent-brief) | History & Drift |
 | `--history-limit` | int | `500` | Max commits to analyze (0 = unlimited) | History & Drift |
 | `--history-since` | string | (empty) | Limit history to commits after this date/ref (e.g., '30 days ago', '2024-01-01') | History & Drift |
 | `--id-pattern` | stringArray | `[]` | Custom bead ID regex for commit-message matching, e.g. 'bh-[a-z0-9]{5}' (repeatable; capture group 1 is the ID, else the whole match) (#188) | History & Drift |
@@ -78,7 +78,7 @@
 | `--forecast-sprint` | string | (empty) | Filter forecast by sprint ID | Robot & Planning Flags |
 | `--graph-depth` | int | `0` | Max depth for subgraph (0 = unlimited) | Robot & Planning Flags |
 | `--graph-format` | string | `json` | Graph output format: json, dot, mermaid | Robot & Planning Flags |
-| `--graph-root` | string | (empty) | Subgraph from specific root issue ID | Robot & Planning Flags |
+| `--graph-root` | string | (empty) | Scope to descendant subgraph from a specific root/epic issue ID (or neighborhood with --robot-graph/--graph-depth) | Robot & Planning Flags |
 | `--hotspots-limit` | int | `10` | Max hotspots to show (use with --robot-file-hotspots) | Robot & Planning Flags |
 | `--network-depth` | int | `2` | Depth of subnetwork when querying specific bead (1-3) | Robot & Planning Flags |
 | `--orphans-min-score` | int | `30` | Minimum suspicion score for orphan candidates (0-100) | Robot & Planning Flags |
@@ -94,7 +94,7 @@
 | `--robot-capacity` | bool | `false` | Output capacity simulation and completion projection as JSON | Robot & Planning Flags |
 | `--robot-cass` | string | (empty) | Output correlated coding-agent sessions (cass) for bead ID as JSON | Robot & Planning Flags |
 | `--robot-causality` | string | (empty) | Output causal chain analysis for bead ID as JSON | Robot & Planning Flags |
-| `--robot-check-dep` | string | (empty) | Validate proposed blocking dependency edge(s) for cycles and readiness impact before adding (format: fromID:toID[,from2:to2]) | Robot & Planning Flags |
+| `--robot-check-dep` | string | (empty) | Validate proposed blocking dependency additions (fromID:toID) or removals (remove:fromID:toID) for cycles and readiness impact | Robot & Planning Flags |
 | `--robot-commit` | string | (empty) | Output beads correlated with a git commit SHA or revision as JSON | Robot & Planning Flags |
 | `--robot-confirm-correlation` | string | (empty) | Confirm a correlation is correct (format: SHA:beadID) | Robot & Planning Flags |
 | `--robot-correlation-stats` | bool | `false` | Output correlation feedback statistics as JSON | Robot & Planning Flags |
@@ -135,7 +135,7 @@
 | `--robot-triage` | bool | `false` | Output unified triage as JSON (the mega-command for AI agents) | Robot & Planning Flags |
 | `--robot-triage-by-label` | bool | `false` | Group triage recommendations by label (bv-87) | Robot & Planning Flags |
 | `--robot-triage-by-track` | bool | `false` | Group triage recommendations by execution track (bv-87) | Robot & Planning Flags |
-| `--robot-whatif` | string | (empty) | Simulate completing issue ID(s) (comma-separated for batch) and output downstream unblock impact as JSON | Robot & Planning Flags |
+| `--robot-whatif` | string | (empty) | Simulate completing one or more comma-separated issue IDs and output downstream unblock impact (and joint synergy for batches) as JSON | Robot & Planning Flags |
 | `--schema-command` | string | (empty) | Output schema for specific command only (e.g., robot-triage) | Robot & Planning Flags |
 | `--suggest-bead` | string | (empty) | Filter suggestions for specific bead ID | Robot & Planning Flags |
 | `--suggest-confidence` | float64 | `0` | Minimum confidence for suggestions (0.0-1.0) | Robot & Planning Flags |

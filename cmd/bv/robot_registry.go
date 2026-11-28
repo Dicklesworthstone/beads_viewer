@@ -139,6 +139,7 @@ func baselineScopeForContext(ctx RobotContext) *baseline.BaselineScope {
 		Label:     strings.TrimSpace(ctx.LabelScope),
 		Recipe:    strings.TrimSpace(ctx.Recipe),
 		Repo:      strings.TrimSpace(ctx.Repo),
+		GraphRoot: strings.TrimSpace(ctx.GraphRoot),
 		Workspace: ctx.SourceKind == "workspace",
 	}
 	if scope == (baseline.BaselineScope{}) {
@@ -327,7 +328,7 @@ func isCorrelationTargetInScope(ctx RobotContext, beadID string) bool {
 	if ctx.CandidateIDs == nil || ctx.CandidateIDs[beadID] {
 		return true
 	}
-	if ctx.LabelScope != "" || ctx.ActiveRecipe != nil || strings.TrimSpace(ctx.Repo) == "" {
+	if ctx.LabelScope != "" || ctx.ActiveRecipe != nil || strings.TrimSpace(ctx.GraphRoot) != "" || strings.TrimSpace(ctx.Repo) == "" {
 		return false
 	}
 	for _, iss := range ctx.FullIssues {
@@ -528,7 +529,7 @@ func withEnvelope(env RobotEnvelope, payload any) (map[string]json.RawMessage, e
 // answering from the wrong point in time.
 func unsupportedScopeFor(command string, ctx RobotContext) []string {
 	switch normalizeRobotFlagName(command) {
-	case "robot-sprint-list", "robot-sprint-show":
+	case "robot-sprint-list":
 		var out []string
 		if ctx.AsOf != "" {
 			out = append(out, "as_of")
@@ -539,7 +540,15 @@ func unsupportedScopeFor(command string, ctx RobotContext) []string {
 		if ctx.Recipe != "" {
 			out = append(out, "recipe")
 		}
+		if strings.TrimSpace(ctx.GraphRoot) != "" {
+			out = append(out, "graph_root")
+		}
 		return out
+	case "robot-sprint-show":
+		if ctx.AsOf != "" {
+			return []string{"as_of"}
+		}
+		return nil
 	case "robot-forecast":
 		if ctx.AsOf != "" && strings.TrimSpace(ctx.ForecastSprint) != "" {
 			return []string{"as_of"}
@@ -1334,6 +1343,97 @@ func capExecutionPlanTracks(plan *analysis.ExecutionPlan, maxResults int) {
 	plan.Tracks = cappedTracks
 }
 
+func buildPlanCapacity(openIssues, velocityIssues []model.Issue, stats *analysis.GraphStats, visibleIDs map[string]bool, now time.Time) *analysis.PlanCapacity {
+	activeOpen := make([]model.Issue, 0, len(openIssues))
+	for _, iss := range openIssues {
+		if iss.Status.IsClosed() || iss.Status.IsTombstone() || iss.IsTemplate || iss.Pinned || iss.Status == model.StatusPinned {
+			continue
+		}
+		activeOpen = append(activeOpen, iss)
+	}
+	if len(activeOpen) == 0 {
+		return nil
+	}
+	g1 := analysis.ComputeGrahamBounds(activeOpen, velocityIssues, stats, 1, now)
+	if g1.TotalMinutes <= 0 {
+		return nil
+	}
+	g2 := analysis.ComputeGrahamBounds(activeOpen, velocityIssues, stats, 2, now)
+	g4 := analysis.ComputeGrahamBounds(activeOpen, velocityIssues, stats, 4, now)
+	parPct := float64(max(0, g1.TotalMinutes-g1.CriticalPathMinutes)) / float64(g1.TotalMinutes) * 100.0
+	var critIDs []string
+	for _, id := range g1.CriticalPathIDs {
+		if visibleIDs == nil || visibleIDs[id] {
+			critIDs = append(critIDs, id)
+		}
+	}
+	return &analysis.PlanCapacity{
+		OpenCount:           len(activeOpen),
+		TotalMinutes:        g1.TotalMinutes,
+		CriticalPathMinutes: g1.CriticalPathMinutes,
+		ParallelizablePct:   math.Round(parPct*10) / 10,
+		Days1Agent:          math.Round(g1.GrahamMinDays*100) / 100,
+		Days2AgentsMin:      math.Round(g2.GrahamMinDays*100) / 100,
+		Days2AgentsMax:      math.Round(g2.GrahamMaxDays*100) / 100,
+		Days4AgentsMin:      math.Round(g4.GrahamMinDays*100) / 100,
+		Days4AgentsMax:      math.Round(g4.GrahamMaxDays*100) / 100,
+		CriticalPathIDs:     critIDs,
+	}
+}
+
+func enrichExecutionPlan(plan *analysis.ExecutionPlan, ctx RobotContext, analyzer *analysis.Analyzer, stats *analysis.GraphStats, graphIssues []model.Issue) {
+	if plan == nil || analyzer == nil {
+		return
+	}
+	now := ctx.ReferenceNow().UTC()
+	issueByID := make(map[string]model.Issue, len(graphIssues))
+	openScoped := make([]model.Issue, 0, len(graphIssues))
+	for _, iss := range graphIssues {
+		issueByID[iss.ID] = iss
+		if analyzer.IsCandidate(iss.ID) && !iss.Status.IsClosed() && !iss.Status.IsTombstone() && !iss.IsTemplate && !iss.Pinned && iss.Status != model.StatusPinned {
+			openScoped = append(openScoped, iss)
+		}
+	}
+
+	velIssues := ctx.VelocityIssues()
+	plan.Capacity = buildPlanCapacity(openScoped, velIssues, stats, ctx.CandidateIDs, now)
+
+	etaCtx := analysis.NewETAContext(velIssues, stats, now)
+	riskWeights := analysis.DefaultRiskWeights()
+	readiness := analyzer.Readiness()
+
+	for ti := range plan.Tracks {
+		for ii := range plan.Tracks[ti].Items {
+			item := &plan.Tracks[ti].Items[ii]
+			iss, ok := issueByID[item.ID]
+			if !ok {
+				continue
+			}
+			est := etaCtx.EstimateForIssue(iss, 1)
+			if est.EstimatedMinutes > 0 && !est.ETADate.IsZero() {
+				days := math.Round(est.EstimatedDays*100) / 100
+				item.ETADays = &days
+				item.ETADate = est.ETADate.UTC().Format(time.RFC3339)
+				conf := math.Round(est.Confidence*100) / 100
+				item.ETAConfidence = &conf
+			}
+			rs := analysis.ComputeRiskSignalsWithReadiness(&iss, stats, issueByID, readiness, now, riskWeights)
+			if rs.CompositeRisk > 0 {
+				item.RiskScore = math.Round(rs.CompositeRisk*1000) / 1000
+				item.RiskExplanation = rs.Explanation
+			}
+			if delta, err := analyzer.ComputeWhatIfDeltaFromStats(item.ID, stats); err == nil && delta != nil {
+				if delta.TransitiveUnblocks > 0 {
+					item.TransitiveUnblocks = delta.TransitiveUnblocks
+				}
+				if delta.EstimatedDaysSaved > 0 {
+					item.EstimatedDaysSaved = math.Round(delta.EstimatedDaysSaved*100) / 100
+				}
+			}
+		}
+	}
+}
+
 func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHandlerConfig) {
 	if registry == nil {
 		panic("robot registry must not be nil")
@@ -1363,7 +1463,6 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 				config.ComputeHITS = false
 				config.HITSSkipReason = skipReason
 				config.ComputeEigenvector = false
-				config.ComputeCriticalPath = false
 				config.ComputeCycles = false
 				config.CyclesSkipReason = skipReason
 			}
@@ -1376,6 +1475,7 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 			}
 			stats := analyzer.AnalyzeAsyncWithConfig(context.Background(), config)
 			stats.WaitForPhase2()
+			enrichExecutionPlan(&plan, ctx, analyzer, stats, graphIssues)
 
 			output := struct {
 				RobotEnvelope
@@ -1395,8 +1495,9 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 				UsageHints: []string{
 					"jq '.plan.tracks | length' - Number of parallel execution tracks",
 					"jq '.plan.tracks[0].items | map(.id)' - First track item IDs",
-					"jq '.plan.tracks[].items[] | select(.claimable) | {id, title, claim: .actions.claim}' - Claimable track items",
-					"jq '.plan.tracks[].items[] | select(.unblocks | length > 0)' - Items that unblock others",
+					"jq '.plan.tracks[].items[] | select(.claimable) | {id, title, eta_days, risk_score, claim: .actions.claim}' - Claimable track items with ETA and risk",
+					"jq '.plan.tracks[].items[] | select(.unblocks | length > 0) | {id, unblocks, transitive_unblocks, estimated_days_saved}' - High-leverage unblocking items",
+					"jq '.plan.capacity' - Graham multi-agent parallel capacity bounds (1a/2a/4a)",
 					"jq '.plan.summary' - High-level execution summary",
 					"jq '[.plan.tracks[].items[]] | length' - Total items across all tracks",
 				},
@@ -1417,8 +1518,9 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 		Handler: func(ctx RobotContext) error {
 			graphIssues := ctx.GraphIssues()
 			analyzer := ctx.GraphAnalyzer()
-			if _, w := loadRobotFeedbackForContext(ctx); w != nil {
-				analyzer.SetWeights(*w)
+			feedbackData, feedbackWeights := loadRobotFeedbackForContext(ctx)
+			if feedbackWeights != nil {
+				analyzer.SetWeights(*feedbackWeights)
 			}
 			if ctx.DataHashMatchesIssues && len(graphIssues) == len(ctx.Issues) {
 				analyzer.SeedDataHash(ctx.DataHash)
@@ -1465,6 +1567,8 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 						continue
 					}
 				}
+				iss, ok := issueMap[rec.IssueID]
+				attachPriorityRecommendationAction(&rec.PriorityRecommendation, iss, ok, ctx)
 				filtered = append(filtered, rec)
 			}
 			recommendations = filtered
@@ -1487,12 +1591,19 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 				}
 			}
 
+			var feedbackInfo *analysis.FeedbackJSON
+			if feedbackData != nil && len(feedbackData.Events) > 0 {
+				info := feedbackData.ToJSON()
+				feedbackInfo = &info
+			}
+
 			output := struct {
 				RobotEnvelope
 				AnalysisConfig    analysis.AnalysisConfig                   `json:"analysis_config"`
 				Status            analysis.MetricStatus                     `json:"status"`
 				LabelScope        string                                    `json:"label_scope,omitempty"`
 				LabelContext      *analysis.LabelHealth                     `json:"label_context,omitempty"`
+				Feedback          *analysis.FeedbackJSON                    `json:"feedback,omitempty"`
 				Recommendations   []analysis.EnhancedPriorityRecommendation `json:"recommendations"`
 				FieldDescriptions map[string]string                         `json:"field_descriptions"`
 				Filters           struct {
@@ -1513,6 +1624,7 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 				Status:            stabilizeRobotMetricStatusForPinnedClock(stats.Status()),
 				LabelScope:        ctx.LabelScope,
 				LabelContext:      ctx.LabelContext,
+				Feedback:          feedbackInfo,
 				Recommendations:   recommendations,
 				FieldDescriptions: analysis.DefaultFieldDescriptions(),
 				Usage: []string{
@@ -1559,6 +1671,106 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 
 			exportIssues := ctx.Issues
 			if rootIssueID != "" {
+				if ctx.ActiveRecipe != nil && ctx.ActiveRecipe.View.MaxItems > 0 {
+					preIssues := ctx.GraphRootSourceIssues()
+					if ctx.LabelScope != "" {
+						labelFiltered := make([]model.Issue, 0, len(preIssues))
+						for _, iss := range preIssues {
+							for _, lbl := range iss.Labels {
+								if lbl == ctx.LabelScope {
+									labelFiltered = append(labelFiltered, iss)
+									break
+								}
+							}
+						}
+						preIssues = labelFiltered
+					}
+					if containsIssueID(preIssues, rootIssueID) {
+						// P32: Apply uncapped recipe BEFORE subgraph BFS so recipe-excluded nodes
+						// cannot act as bridges, then cap via connectivity-preserving frontier expansion.
+						subMetrics := recipeMetricsForContext(ctx, ctx.FullIssues, ctx.ActiveRecipe)
+						subMetrics.Readiness = ctx.Readiness
+						uncappedRecipe := *ctx.ActiveRecipe
+						uncappedRecipe.View.MaxItems = 0
+						if uncappedApplied, rErr := recipe.Apply(preIssues, subMetrics, &uncappedRecipe, ctx.ReferenceNow()); rErr == nil && containsIssueID(uncappedApplied, rootIssueID) {
+							subGraph := extractBidirectionalSubgraphIssues(uncappedApplied, rootIssueID, graphDepth)
+							maxItems := ctx.ActiveRecipe.View.MaxItems
+							reapplied := subGraph
+							if maxItems > 0 && len(subGraph) > maxItems {
+								rankByID := make(map[string]int, len(uncappedApplied))
+								for idx, iss := range uncappedApplied {
+									rankByID[iss.ID] = idx
+								}
+								subSet := make(map[string]bool, len(subGraph))
+								for _, iss := range subGraph {
+									subSet[iss.ID] = true
+								}
+								adj := make(map[string][]string, len(subGraph))
+								for _, iss := range subGraph {
+									for _, dep := range iss.Dependencies {
+										if dep == nil || !subSet[dep.DependsOnID] {
+											continue
+										}
+										adj[iss.ID] = append(adj[iss.ID], dep.DependsOnID)
+										adj[dep.DependsOnID] = append(adj[dep.DependsOnID], iss.ID)
+									}
+								}
+								selected := map[string]bool{rootIssueID: true}
+								frontier := make(map[string]bool)
+								for _, nb := range adj[rootIssueID] {
+									if !selected[nb] {
+										frontier[nb] = true
+									}
+								}
+								for len(selected) < maxItems && len(frontier) > 0 {
+									bestID := ""
+									bestRank := len(uncappedApplied) + 1
+									for cand := range frontier {
+										r := rankByID[cand]
+										if bestID == "" || r < bestRank || (r == bestRank && cand < bestID) {
+											bestID = cand
+											bestRank = r
+										}
+									}
+									if bestID == "" {
+										break
+									}
+									delete(frontier, bestID)
+									selected[bestID] = true
+									for _, nb := range adj[bestID] {
+										if !selected[nb] {
+											frontier[nb] = true
+										}
+									}
+								}
+								capped := make([]model.Issue, 0, len(selected))
+								for _, iss := range uncappedApplied {
+									if selected[iss.ID] {
+										capped = append(capped, iss)
+									}
+								}
+								reapplied = capped
+							}
+							nextCands := make(map[string]bool, len(reapplied))
+							for _, iss := range reapplied {
+								nextCands[iss.ID] = true
+							}
+							ctx.Issues = reapplied
+							ctx.CandidateIDs = nextCands
+							if ctx.RecipeUnblockIDs != nil {
+								nextUnblock := make(map[string]bool, len(ctx.RecipeUnblockIDs)+len(reapplied))
+								for id := range ctx.RecipeUnblockIDs {
+									nextUnblock[id] = true
+								}
+								for _, iss := range reapplied {
+									nextUnblock[iss.ID] = true
+								}
+								ctx.RecipeUnblockIDs = nextUnblock
+							}
+							exportIssues = reapplied
+						}
+					}
+				}
 				if !isGraphRootInActiveScope(ctx, rootIssueID) || !containsIssueID(ctx.Issues, rootIssueID) {
 					fmt.Fprintf(ctx.StderrOrDefault(), "Root issue not found: %s\n", rootIssueID)
 					return newReportedRobotHandlerExit(1)
@@ -1566,6 +1778,15 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 				exportIssues = extractBidirectionalSubgraphIssues(ctx.Issues, rootIssueID, graphDepth)
 				ctx.GraphRoot = rootIssueID
 				ctx.Issues = exportIssues
+				if ctx.CandidateIDs != nil {
+					scopedCands := make(map[string]bool, len(exportIssues))
+					for _, iss := range exportIssues {
+						if ctx.CandidateIDs[iss.ID] {
+							scopedCands[iss.ID] = true
+						}
+					}
+					ctx.CandidateIDs = scopedCands
+				}
 				ctx.DataHash = analysis.ComputeDataHash(exportIssues)
 				ctx.DataHashMatchesIssues = false
 			}
@@ -2146,6 +2367,42 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 				}
 			}
 
+			// Compute Graham parallel capacity bounds for open sprint beads (W37-3).
+			openSprintIssues := make([]model.Issue, 0, len(scopedSprint.BeadIDs))
+			seenSprintBead := make(map[string]bool, len(scopedSprint.BeadIDs))
+			for _, bid := range scopedSprint.BeadIDs {
+				if seenSprintBead[bid] {
+					continue
+				}
+				seenSprintBead[bid] = true
+				iss, ok := issueMap[bid]
+				if !ok || iss.Status.IsClosed() || iss.Status.IsTombstone() || iss.IsTemplate || iss.Pinned || iss.Status == model.StatusPinned {
+					continue
+				}
+				openSprintIssues = append(openSprintIssues, iss)
+			}
+			if len(openSprintIssues) > 0 {
+				var capStats *analysis.GraphStats
+				if capAnalyzer := ctx.GraphAnalyzer(); capAnalyzer != nil {
+					capIssues := ctx.GraphIssues()
+					capCfg := analysis.ConfigForSize(len(capIssues), countEdges(capIssues))
+					if cfg.ForceFullAnalysis != nil && *cfg.ForceFullAnalysis {
+						capCfg = analysis.FullAnalysisConfig()
+					} else {
+						capCfg.ComputePageRank = false
+						capCfg.ComputeBetweenness = false
+						capCfg.BetweennessMode = analysis.BetweennessSkip
+						capCfg.ComputeHITS = false
+						capCfg.ComputeEigenvector = false
+						capCfg.ComputeCycles = false
+					}
+					s := capAnalyzer.AnalyzeAsyncWithConfig(context.Background(), capCfg)
+					s.WaitForPhase2()
+					capStats = s
+				}
+				burndown.Capacity = buildPlanCapacity(openSprintIssues, ctx.VelocityIssues(), capStats, ctx.CandidateIDs, now)
+			}
+
 			if err := ctx.EncoderOrDefault().Encode(burndown); err != nil {
 				return fmt.Errorf("encoding burndown: %w", err)
 			}
@@ -2228,11 +2485,18 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 			}
 
 			type ForecastSummary struct {
-				TotalMinutes  int       `json:"total_minutes"`
-				TotalDays     float64   `json:"total_days"`
-				AvgConfidence float64   `json:"avg_confidence"`
-				EarliestETA   time.Time `json:"earliest_eta"`
-				LatestETA     time.Time `json:"latest_eta"`
+				TotalMinutes          int       `json:"total_minutes"`
+				TotalDays             float64   `json:"total_days"`
+				CriticalPathMinutes   int       `json:"critical_path_minutes,omitempty"`
+				CriticalPathIDs       []string  `json:"critical_path_ids,omitempty"`
+				VelocityMinutesPerDay float64   `json:"velocity_minutes_per_day,omitempty"`
+				ParallelizablePct     *float64  `json:"parallelizable_pct,omitempty"`
+				GrahamMinDays         float64   `json:"graham_min_days,omitempty"`
+				GrahamMaxDays         float64   `json:"graham_max_days,omitempty"`
+				EstimatedDays         float64   `json:"estimated_days,omitempty"`
+				AvgConfidence         float64   `json:"avg_confidence"`
+				EarliestETA           time.Time `json:"earliest_eta"`
+				LatestETA             time.Time `json:"latest_eta"`
 			}
 			type ForecastOutput struct {
 				RobotEnvelope
@@ -2246,7 +2510,9 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 			etaIssues := ctx.VelocityIssues()
 			includeInactive := cfg.IncludeInactive != nil && *cfg.IncludeInactive
 			forecasts := make([]analysis.ETAEstimate, 0)
+			issueByID := make(map[string]model.Issue, len(targetIssues))
 			if forecastTarget == "all" {
+				etaCtx := analysis.NewETAContext(etaIssues, &graphStats, now)
 				for _, issue := range targetIssues {
 					if issue.Status.IsClosed() || issue.Status.IsTombstone() {
 						continue
@@ -2254,11 +2520,8 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 					if !includeInactive && (issue.IsTemplate || issue.Pinned || issue.Status == model.StatusPinned) {
 						continue
 					}
-					eta, err := analysis.EstimateETAForIssue(etaIssues, &graphStats, issue.ID, agents, now)
-					if err != nil {
-						continue
-					}
-					forecasts = append(forecasts, eta)
+					issueByID[issue.ID] = issue
+					forecasts = append(forecasts, etaCtx.EstimateForIssue(issue, agents))
 				}
 				sort.Slice(forecasts, func(i, j int) bool {
 					if !forecasts[i].ETADate.Equal(forecasts[j].ETADate) {
@@ -2295,6 +2558,7 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 				totalConfidence := 0.0
 				earliest := forecasts[0].ETADate
 				latest := forecasts[0].ETADate
+				emittedOpenIssues := make([]model.Issue, 0, len(forecasts))
 				for _, forecast := range forecasts {
 					totalMinutes += forecast.EstimatedMinutes
 					totalConfidence += forecast.Confidence
@@ -2304,6 +2568,9 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 					if forecast.ETADate.After(latest) {
 						latest = forecast.ETADate
 					}
+					if iss, ok := issueByID[forecast.IssueID]; ok {
+						emittedOpenIssues = append(emittedOpenIssues, iss)
+					}
 				}
 				summary = &ForecastSummary{
 					TotalMinutes:  totalMinutes,
@@ -2311,6 +2578,27 @@ func registerPhaseTwoRobotHandlers(registry *RobotRegistry, cfg phaseTwoRobotHan
 					AvgConfidence: totalConfidence / float64(len(forecasts)),
 					EarliestETA:   earliest,
 					LatestETA:     latest,
+				}
+				// W38-2: Velocity-calibrated Graham parallel makespan bounds honoring --forecast-agents & blocking chains.
+				if len(emittedOpenIssues) > 0 {
+					graham := analysis.ComputeGrahamBounds(emittedOpenIssues, etaIssues, &graphStats, agents, now)
+					if graham.TotalMinutes > 0 {
+						parPct := float64(max(0, graham.TotalMinutes-graham.CriticalPathMinutes)) / float64(graham.TotalMinutes) * 100.0
+						var critIDs []string
+						for _, cid := range graham.CriticalPathIDs {
+							if ctx.CandidateIDs == nil || ctx.CandidateIDs[cid] {
+								critIDs = append(critIDs, cid)
+							}
+						}
+						summary.CriticalPathMinutes = graham.CriticalPathMinutes
+						summary.CriticalPathIDs = critIDs
+						summary.VelocityMinutesPerDay = math.Round(graham.VelocityMinutesPerDay*100) / 100
+						roundedParPct := math.Round(parPct*10) / 10
+						summary.ParallelizablePct = &roundedParPct
+						summary.GrahamMinDays = math.Round(graham.GrahamMinDays*100) / 100
+						summary.GrahamMaxDays = math.Round(graham.GrahamMaxDays*100) / 100
+						summary.EstimatedDays = summary.GrahamMaxDays
+					}
 				}
 			}
 
@@ -2483,7 +2771,7 @@ func registerPhaseThreeRobotHandlers(registry *RobotRegistry, cfg phaseThreeRobo
 	register("robot-whatif", cfg.RobotWhatIfFlag, "Simulate completing one or more comma-separated issues and output downstream unblock impact as JSON", func(ctx RobotContext) error {
 		return handleRobotWhatIf(ctx, cfg)
 	})
-	register("robot-check-dep", cfg.RobotCheckDepFlag, "Validate proposed blocking dependency edge(s) for cycles and readiness impact before adding", func(ctx RobotContext) error {
+	register("robot-check-dep", cfg.RobotCheckDepFlag, "Validate proposed blocking dependency edge addition(s) or removal(s) (remove:FROM:TO) for cycles and readiness impact", func(ctx RobotContext) error {
 		return handleRobotCheckDep(ctx, cfg)
 	})
 	register("robot-cass", cfg.RobotCassFlag, "Output correlated coding-agent sessions (cass) for a bead as JSON", func(ctx RobotContext) error {
@@ -3313,6 +3601,7 @@ func buildRobotInsightsPayload(ctx RobotContext, includeInactive, forceFull bool
 		FullStats        interface{}                `json:"full_stats"`
 		TopWhatIfs       []analysis.WhatIfEntry     `json:"top_what_ifs,omitempty"`
 		HighRisk         []robotInsightsRiskItem    `json:"high_risk,omitempty"`
+		CrossRepoFlow    *analysis.CrossRepoFlow    `json:"cross_repo_flow,omitempty"`
 		AdvancedInsights *analysis.AdvancedInsights `json:"advanced_insights,omitempty"`
 		UsageHints       []string                   `json:"usage_hints"`
 	}{
@@ -3325,6 +3614,7 @@ func buildRobotInsightsPayload(ctx RobotContext, includeInactive, forceFull bool
 		FullStats:        fullStats,
 		TopWhatIfs:       analyzer.TopWhatIfDeltasFromStats(&stats, whatIfLimit),
 		HighRisk:         highRisk,
+		CrossRepoFlow:    analysis.ComputeCrossRepoFlow(graphIssues, ctx.CandidateIDs),
 		AdvancedInsights: analyzer.GenerateAdvancedInsightsFromStats(&stats, analysis.DefaultAdvancedInsightsConfig()),
 		UsageHints: []string{
 			"jq '.Bottlenecks[:5] | map(.ID)' - Top 5 bottleneck IDs",
@@ -3607,17 +3897,33 @@ func handleRobotTriage(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error
 	now := ctx.ReferenceNow()
 	graphIssues := ctx.GraphIssues()
 	velocityIssues := ctx.VelocityIssues()
-	if rootIssueID != "" {
+	if rootIssueID != "" && ctx.GraphRoot != rootIssueID {
 		rootSource := ctx.GraphRootSourceIssues()
 		subgraphIssues, found := extractScopedGraphRootIssues(ctx, rootSource, rootIssueID)
 		if !found {
 			fmt.Fprintf(ctx.StderrOrDefault(), "Root issue not found: %s\n", rootIssueID)
 			return newReportedRobotHandlerExit(1)
 		}
+		subSet := make(map[string]bool, len(subgraphIssues))
+		for _, iss := range subgraphIssues {
+			subSet[iss.ID] = true
+		}
+		if ctx.CandidateIDs == nil {
+			ctx.CandidateIDs = subSet
+		} else {
+			intersected := make(map[string]bool, len(subSet))
+			for id := range subSet {
+				if ctx.CandidateIDs[id] {
+					intersected[id] = true
+				}
+			}
+			ctx.CandidateIDs = intersected
+		}
 		graphIssues = rootSource
 		velocityIssues = filterVelocityIssuesToSubgraph(velocityIssues, subgraphIssues, rootIssueID)
 		ctx.GraphRoot = rootIssueID
 		ctx.Issues = subgraphIssues
+		ctx.PreRecipeIssues = append([]model.Issue(nil), subgraphIssues...)
 		ctx.DataHash = analysis.ComputeDataHash(subgraphIssues)
 		ctx.DataHashMatchesIssues = false
 	}
@@ -3669,6 +3975,10 @@ func handleRobotTriage(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error
 	if cfg.RobotTriageBriefFlag != nil && *cfg.RobotTriageBriefFlag {
 		return encodeBriefTriage(ctx, triage, now)
 	}
+
+	// W37-1: Merge full proactive + saved-baseline drift alerts into --robot-triage
+	// (matching data/triage.json, agent-brief/triage.json, --robot-alerts, and TUI Alerts).
+	attachDriftAlertsToTriage(&triage, ctx, nil, nil, ctx.GraphIssues(), forceFull)
 
 	var feedbackInfo *analysis.FeedbackJSON
 	if feedbackData != nil && len(feedbackData.Events) > 0 {
@@ -4170,17 +4480,33 @@ func handleRobotNext(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
 	now := ctx.ReferenceNow()
 	graphIssues := ctx.GraphIssues()
 	velocityIssues := ctx.VelocityIssues()
-	if rootIssueID != "" {
+	if rootIssueID != "" && ctx.GraphRoot != rootIssueID {
 		rootSource := ctx.GraphRootSourceIssues()
 		subgraphIssues, found := extractScopedGraphRootIssues(ctx, rootSource, rootIssueID)
 		if !found {
 			fmt.Fprintf(ctx.StderrOrDefault(), "Root issue not found: %s\n", rootIssueID)
 			return newReportedRobotHandlerExit(1)
 		}
+		subSet := make(map[string]bool, len(subgraphIssues))
+		for _, iss := range subgraphIssues {
+			subSet[iss.ID] = true
+		}
+		if ctx.CandidateIDs == nil {
+			ctx.CandidateIDs = subSet
+		} else {
+			intersected := make(map[string]bool, len(subSet))
+			for id := range subSet {
+				if ctx.CandidateIDs[id] {
+					intersected[id] = true
+				}
+			}
+			ctx.CandidateIDs = intersected
+		}
 		graphIssues = rootSource
 		velocityIssues = filterVelocityIssuesToSubgraph(velocityIssues, subgraphIssues, rootIssueID)
 		ctx.GraphRoot = rootIssueID
 		ctx.Issues = subgraphIssues
+		ctx.PreRecipeIssues = append([]model.Issue(nil), subgraphIssues...)
 		ctx.DataHash = analysis.ComputeDataHash(subgraphIssues)
 		ctx.DataHashMatchesIssues = false
 	}
@@ -5471,6 +5797,25 @@ func detectWorkspaceOrphans(ctx RobotContext, limit int) (*correlation.OrphanRep
 			}
 		}
 
+		if ctx.CandidateIDs != nil {
+			anyScoped := false
+			for _, ws := range group {
+				rk := strings.ToLower(strings.TrimSpace(ws.source.SourceRepo))
+				for _, iss := range fullIssuesBySourceRepo[rk] {
+					if scopedIssueIDs[iss.ID] {
+						anyScoped = true
+						break
+					}
+				}
+				if anyScoped {
+					break
+				}
+			}
+			if !anyScoped {
+				continue
+			}
+		}
+
 		primary := group[0]
 		for _, ws := range group {
 			if ctx.Repo == "" || sourceMatchesRepoFilter(ws.source, ctx.Repo) {
@@ -5582,30 +5927,24 @@ func detectWorkspaceOrphans(ctx RobotContext, limit int) (*correlation.OrphanRep
 			}
 		}
 
-		scopedHistories := rootHistories
-		if len(scopedIssueIDs) < len(allWorkspaceIssues) {
-			scopedHistories = make(map[string]correlation.BeadHistory, len(scopedIssueIDs))
-			for qualID, hist := range rootHistories {
-				if scopedIssueIDs[qualID] {
-					scopedHistories[qualID] = hist
-				}
-			}
-		}
-
 		rootReport := &correlation.HistoryReport{
 			GeneratedAt: robotNow(),
 			DataHash:    ctx.DataHash,
 			GitRange:    rootGitRange,
 			Window:      rootWindow,
 			Stats:       correlation.HistoryStats{FeedbackApplied: rootFeedback},
-			Histories:   scopedHistories,
+			Histories:   rootHistories,
 			CommitIndex: correlation.BuildCommitIndex(rootHistories),
 		}
 		for _, prs := range partRejectSources {
 			rootReport.MergeRejectedPairs(prs.report, prs.qualify)
 		}
+		isWorkspaceScoped := len(scopedIssueIDs) < len(allWorkspaceIssues)
 		detector := correlation.NewOrphanDetectorAt(rootReport, cleanRoot, ctx.ReferenceNow()).
 			WithStoreDirs(sharedMeta.storeDirsByRoot[cleanRoot]...)
+		if isWorkspaceScoped {
+			detector.WithScopeFilter(scopedIssueIDs)
+		}
 		if ctx.Repo != "" && len(group) > 1 {
 			if matchedRootStore && len(unmatchedSubtrees) > 0 {
 				detector.WithSubtreeScope(nil, unmatchedSubtrees)
@@ -5631,15 +5970,38 @@ func detectWorkspaceOrphans(ctx RobotContext, limit int) (*correlation.OrphanRep
 
 		droppedScopedOrphans := 0
 		for _, cand := range partOrphans.Candidates {
-			if ctx.Repo != "" {
-				filteredProbable := make([]correlation.ProbableBead, 0, len(cand.ProbableBeads))
+			if isWorkspaceScoped {
+				if cand.ExcludedByScope {
+					droppedScopedOrphans++
+					continue
+				}
+				origProbableCount := len(cand.ProbableBeads)
+				filteredProbable := make([]correlation.ProbableBead, 0, origProbableCount)
 				for _, pb := range cand.ProbableBeads {
 					if scopedIssueIDs[pb.BeadID] {
 						filteredProbable = append(filteredProbable, pb)
 					}
 				}
+				// P30-8 / P31-4: Drop commits whose probable beads were exclusively outside the active scope.
+				if origProbableCount > 0 && len(filteredProbable) == 0 {
+					droppedScopedOrphans++
+					continue
+				}
 				cand.ProbableBeads = filteredProbable
-
+				// P31-4 / P32: Strip out-of-scope bead signals and recompute suspicion score with 35-pt message cap.
+				if len(cand.Signals) > 0 {
+					keptSignals := make([]correlation.OrphanSignalHit, 0, len(cand.Signals))
+					for _, sig := range cand.Signals {
+						if sig.BeadID != "" && !scopedIssueIDs[sig.BeadID] {
+							continue
+						}
+						keptSignals = append(keptSignals, sig)
+					}
+					cand.Signals = keptSignals
+					cand.SuspicionScore = correlation.ComputeOrphanSuspicionScore(keptSignals)
+				}
+			}
+			if ctx.Repo != "" {
 				if len(group) > 1 && len(cand.Files) > 0 {
 					touchesInScope := false
 					if matchedRootStore {
@@ -6572,9 +6934,12 @@ func handleRobotOrphans(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) erro
 				orphanStoreDirs = append(orphanStoreDirs, filepath.ToSlash(rel))
 			}
 		}
-		orphanReport, err = correlation.NewOrphanDetectorAt(report, orphanGitRoot, ctx.ReferenceNow()).
-			WithStoreDirs(orphanStoreDirs...).
-			DetectOrphans(correlation.ExtractOptions{Limit: limit, Revision: ctx.AsOfCommit})
+		detector := correlation.NewOrphanDetectorAt(report, orphanGitRoot, ctx.ReferenceNow()).
+			WithStoreDirs(orphanStoreDirs...)
+		if ctx.CandidateIDs != nil {
+			detector.WithScopeFilter(ctx.CandidateIDs)
+		}
+		orphanReport, err = detector.DetectOrphans(correlation.ExtractOptions{Limit: limit, Revision: ctx.AsOfCommit})
 		if err != nil {
 			return fmt.Errorf("detecting orphans: %w", err)
 		}
@@ -6625,26 +6990,67 @@ func filterOrphanReport(orphanReport *correlation.OrphanReport, minScore, maxRes
 
 func filterOrphanReportWithScope(orphanReport *correlation.OrphanReport, minScore, maxResults int, candidateIDs map[string]bool) {
 	filtered := make([]correlation.OrphanCandidate, 0, len(orphanReport.Candidates))
-	byBead := make(map[string][]string)
-	totalSuspicion := 0
 
 	for _, candidate := range orphanReport.Candidates {
-		if candidateIDs != nil && len(candidate.ProbableBeads) > 0 {
-			scopedProb := make([]correlation.ProbableBead, 0, len(candidate.ProbableBeads))
-			for _, pb := range candidate.ProbableBeads {
-				if candidateIDs[pb.BeadID] {
-					scopedProb = append(scopedProb, pb)
+		if candidateIDs != nil {
+			if candidate.ExcludedByScope {
+				if orphanReport.Stats.OrphanCount > 0 {
+					orphanReport.Stats.OrphanCount--
 				}
+				continue
 			}
-			candidate.ProbableBeads = scopedProb
+			if len(candidate.ProbableBeads) > 0 {
+				scopedProb := make([]correlation.ProbableBead, 0, len(candidate.ProbableBeads))
+				for _, pb := range candidate.ProbableBeads {
+					if candidateIDs[pb.BeadID] {
+						scopedProb = append(scopedProb, pb)
+					}
+				}
+				// P29-5: Drop commits whose probable beads were exclusively outside the active scope.
+				if len(scopedProb) == 0 {
+					if orphanReport.Stats.OrphanCount > 0 {
+						orphanReport.Stats.OrphanCount--
+					}
+					continue
+				}
+				candidate.ProbableBeads = scopedProb
+			}
+			// P31-4 / P32: Strip out-of-scope bead signals so hidden IDs never leak into signals[] or inflate suspicion_score.
+			if len(candidate.Signals) > 0 {
+				keptSignals := make([]correlation.OrphanSignalHit, 0, len(candidate.Signals))
+				for _, sig := range candidate.Signals {
+					if sig.BeadID != "" && !candidateIDs[sig.BeadID] {
+						continue
+					}
+					keptSignals = append(keptSignals, sig)
+				}
+				candidate.Signals = keptSignals
+				candidate.SuspicionScore = correlation.ComputeOrphanSuspicionScore(keptSignals)
+			}
 		}
 		if candidate.SuspicionScore < minScore {
 			continue
 		}
-		if maxResults > 0 && len(filtered) >= maxResults {
-			break
-		}
 		filtered = append(filtered, candidate)
+	}
+
+	// P32: Re-sort by post-scope SuspicionScore BEFORE applying maxResults and aggregating stats.
+	sort.Slice(filtered, func(i, j int) bool {
+		if filtered[i].SuspicionScore != filtered[j].SuspicionScore {
+			return filtered[i].SuspicionScore > filtered[j].SuspicionScore
+		}
+		if !filtered[i].Timestamp.Equal(filtered[j].Timestamp) {
+			return filtered[i].Timestamp.After(filtered[j].Timestamp)
+		}
+		return filtered[i].SHA < filtered[j].SHA
+	})
+	if maxResults > 0 && len(filtered) > maxResults {
+		filtered = filtered[:maxResults]
+	}
+
+	byBead := make(map[string][]string)
+	totalSuspicion := 0
+	for _, candidate := range filtered {
 		totalSuspicion += candidate.SuspicionScore
 		for _, bead := range candidate.ProbableBeads {
 			byBead[bead.BeadID] = append(byBead[bead.BeadID], candidate.ShortSHA)
@@ -6654,6 +7060,11 @@ func filterOrphanReportWithScope(orphanReport *correlation.OrphanReport, minScor
 	orphanReport.Candidates = filtered
 	orphanReport.ByBead = byBead
 	orphanReport.Stats.CandidateCount = len(filtered)
+	if orphanReport.Stats.TotalCommits > 0 {
+		orphanReport.Stats.OrphanRatio = float64(orphanReport.Stats.OrphanCount) / float64(orphanReport.Stats.TotalCommits)
+	} else {
+		orphanReport.Stats.OrphanRatio = 0
+	}
 	orphanReport.Stats.AvgSuspicion = 0
 	if len(filtered) > 0 {
 		orphanReport.Stats.AvgSuspicion = float64(totalSuspicion) / float64(len(filtered))
@@ -7024,17 +7435,38 @@ func handleRobotWhatIf(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error
 }
 
 type robotCheckDepEdgeResult struct {
+	Operation            string   `json:"operation,omitempty"`
 	FromID               string   `json:"from_id"`
 	ToID                 string   `json:"to_id"`
 	CanAdd               bool     `json:"can_add"`
+	CanRemove            *bool    `json:"can_remove,omitempty"`
+	Exists               *bool    `json:"exists,omitempty"`
 	AlreadyExists        bool     `json:"already_exists"`
 	WouldCycle           bool     `json:"would_cycle"`
 	CyclePath            []string `json:"cycle_path,omitempty"`
+	CyclesBefore         *int     `json:"cycles_before,omitempty"`
+	CyclesAfter          *int     `json:"cycles_after,omitempty"`
+	CyclesBroken         *int     `json:"cycles_broken,omitempty"`
+	WouldBreakAllCycles  *bool    `json:"would_break_all_cycles,omitempty"`
+	CyclesTruncated      *bool    `json:"cycles_truncated,omitempty"`
+	NewlyUnblocked       []string `json:"newly_unblocked,omitempty"`
 	WouldBlockActionable bool     `json:"would_block_actionable"`
 	CrossRepo            bool     `json:"cross_repo"`
 	MissingIDs           []string `json:"missing_ids,omitempty"`
 	Warning              string   `json:"warning,omitempty"`
 	Command              string   `json:"command,omitempty"`
+}
+
+func isSafeDepCLIArg(s string) bool {
+	if s == "" || strings.HasPrefix(s, "-") {
+		return false
+	}
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) {
+			return false
+		}
+	}
+	return true
 }
 
 func handleRobotCheckDep(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
@@ -7043,27 +7475,39 @@ func handleRobotCheckDep(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 		rawSpec = strings.TrimSpace(*cfg.RobotCheckDepFlag)
 	}
 	if rawSpec == "" {
-		return fmt.Errorf("--robot-check-dep requires one or more fromID:toID pairs")
+		return fmt.Errorf("--robot-check-dep requires one or more fromID:toID or remove:fromID:toID pairs")
 	}
 
 	rawPairs := strings.Split(rawSpec, ",")
-	type depPair struct{ from, to string }
+	type depPair struct {
+		from   string
+		to     string
+		remove bool
+	}
 	pairs := make([]depPair, 0, len(rawPairs))
 	for _, token := range rawPairs {
 		trimmed := strings.TrimSpace(token)
 		if trimmed == "" {
 			continue
 		}
-		fromID, toID, ok := strings.Cut(trimmed, ":")
+		isRemove := false
+		body := trimmed
+		if len(trimmed) > len("remove:") &&
+			strings.EqualFold(trimmed[:len("remove:")], "remove:") &&
+			strings.Contains(trimmed[len("remove:"):], ":") {
+			isRemove = true
+			body = strings.TrimSpace(trimmed[len("remove:"):])
+		}
+		fromID, toID, ok := strings.Cut(body, ":")
 		fromID = strings.TrimSpace(fromID)
 		toID = strings.TrimSpace(toID)
 		if !ok || fromID == "" || toID == "" {
-			return fmt.Errorf("invalid --robot-check-dep edge %q: expected fromID:toID", trimmed)
+			return fmt.Errorf("invalid --robot-check-dep edge %q: expected fromID:toID or remove:fromID:toID", trimmed)
 		}
-		pairs = append(pairs, depPair{from: fromID, to: toID})
+		pairs = append(pairs, depPair{from: fromID, to: toID, remove: isRemove})
 	}
 	if len(pairs) == 0 {
-		return fmt.Errorf("--robot-check-dep requires one or more fromID:toID pairs")
+		return fmt.Errorf("--robot-check-dep requires one or more fromID:toID or remove:fromID:toID pairs")
 	}
 
 	// P16A-2: Always validate cycles and readiness against the full issue graph so
@@ -7147,6 +7591,75 @@ func handleRobotCheckDep(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 		return false
 	}
 
+	buildVerifiedEdgeCommand := func(verb string, fromIss, toIss *model.Issue, rawFrom, rawTo string, crossRepo bool) string {
+		if !canEmitCommand {
+			return ""
+		}
+		if crossRepo && ctx.SourceKind == "workspace" {
+			return ""
+		}
+		cmdFrom, cmdTo := rawFrom, rawTo
+		trackerCLI := "br"
+		if fromIss.Origin != nil || toIss.Origin != nil {
+			o, pOrig := fromIss.Origin, toIss.Origin
+			if o == nil || pOrig == nil ||
+				strings.TrimSpace(o.ReadOnlyReason) != "" ||
+				strings.TrimSpace(pOrig.ReadOnlyReason) != "" {
+				return ""
+			}
+			sameTracker := o.Tracker == pOrig.Tracker &&
+				o.Database == pOrig.Database &&
+				o.WorkingDirectory == pOrig.WorkingDirectory &&
+				o.TrackerDirectory == pOrig.TrackerDirectory &&
+				o.Executable == pOrig.Executable
+			if !sameTracker {
+				return ""
+			}
+			if lid := strings.TrimSpace(o.LocalID); lid != "" {
+				cmdFrom = lid
+			}
+			if lid := strings.TrimSpace(pOrig.LocalID); lid != "" {
+				cmdTo = lid
+			}
+			if verb == "add" && cmdFrom == cmdTo {
+				return ""
+			}
+			if strings.EqualFold(strings.TrimSpace(o.Tracker), "bd") {
+				trackerCLI = "bd"
+			}
+		} else if ctx.SourceKind == "workspace" {
+			return ""
+		}
+		// P21-4: Block leading-'-' flag injection and ASCII/C1 control chars.
+		if !isSafeDepCLIArg(cmdFrom) || !isSafeDepCLIArg(cmdTo) {
+			return ""
+		}
+		if ctx.SourceKind == "workspace" {
+			if fromIss.Origin == nil || strings.TrimSpace(fromIss.Origin.WorkingDirectory) == "" {
+				return ""
+			}
+			return fmt.Sprintf("cd -- %s && %s dep %s %s %s",
+				shellQuoteWord(fromIss.Origin.WorkingDirectory),
+				trackerCLI,
+				verb,
+				shellQuoteWord(cmdFrom),
+				shellQuoteWord(cmdTo))
+		}
+		return fmt.Sprintf("%s dep %s %s %s", trackerCLI, verb, shellQuoteWord(cmdFrom), shellQuoteWord(cmdTo))
+	}
+
+	var scopedGraphIDs map[string]bool
+	if ctx.CandidateIDs != nil {
+		scopedGraph := ctx.GraphIssues()
+		scopedGraphIDs = make(map[string]bool, len(scopedGraph)+len(ctx.CandidateIDs))
+		for id := range ctx.CandidateIDs {
+			scopedGraphIDs[id] = true
+		}
+		for _, iss := range scopedGraph {
+			scopedGraphIDs[iss.ID] = true
+		}
+	}
+
 	results := make([]robotCheckDepEdgeResult, 0, len(pairs))
 	allSafe := true
 	cycleCount := 0
@@ -7155,17 +7668,48 @@ func handleRobotCheckDep(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 			FromID: p.from,
 			ToID:   p.to,
 		}
+		if p.remove {
+			res.Operation = "remove"
+		}
 		fromIdx, fromOK := idxByID[p.from]
 		toIdx, toOK := idxByID[p.to]
+		var outOfScopeIDs []string
 		if !fromOK {
 			res.MissingIDs = append(res.MissingIDs, p.from)
 		}
 		if !toOK && p.to != p.from {
 			res.MissingIDs = append(res.MissingIDs, p.to)
 		}
-		if len(res.MissingIDs) > 0 {
+		if len(res.MissingIDs) == 0 && ctx.CandidateIDs != nil {
+			// Require at least one endpoint to belong to the active candidate set AND
+			// both endpoints to stay inside the active scoped graph (allowing 1-hop
+			// boundary neighbors under --label while rejecting unrelated out-of-scope IDs).
+			if !scopedGraphIDs[p.from] {
+				outOfScopeIDs = append(outOfScopeIDs, p.from)
+			}
+			if p.to != p.from && !scopedGraphIDs[p.to] {
+				outOfScopeIDs = append(outOfScopeIDs, p.to)
+			}
+			if len(outOfScopeIDs) == 0 && !ctx.CandidateIDs[p.from] && !ctx.CandidateIDs[p.to] {
+				outOfScopeIDs = append(outOfScopeIDs, p.from)
+				if p.to != p.from {
+					outOfScopeIDs = append(outOfScopeIDs, p.to)
+				}
+			}
+		}
+		if len(res.MissingIDs) > 0 || len(outOfScopeIDs) > 0 {
 			res.CanAdd = false
-			res.Warning = fmt.Sprintf("Unknown issue ID(s): %s", strings.Join(res.MissingIDs, ", "))
+			if p.remove {
+				f := false
+				res.CanRemove = &f
+				res.Exists = &f
+			}
+			if len(res.MissingIDs) > 0 {
+				res.Warning = fmt.Sprintf("Unknown issue ID(s): %s", strings.Join(res.MissingIDs, ", "))
+			} else {
+				res.MissingIDs = append(res.MissingIDs, outOfScopeIDs...)
+				res.Warning = fmt.Sprintf("Issue ID(s) outside active scope: %s", strings.Join(outOfScopeIDs, ", "))
+			}
 			allSafe = false
 			results = append(results, res)
 			continue
@@ -7175,6 +7719,51 @@ func handleRobotCheckDep(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 		fromRepo := strings.TrimSpace(fromIss.SourceRepo)
 		toRepo := strings.TrimSpace(toIss.SourceRepo)
 		res.CrossRepo = fromRepo != "" && toRepo != "" && !strings.EqualFold(fromRepo, toRepo)
+
+		if p.remove {
+			remIssues := workingIssues
+			if len(resolvedStubs) > 0 {
+				remIssues = make([]model.Issue, 0, len(workingIssues)+len(resolvedStubs))
+				remIssues = append(remIssues, workingIssues...)
+				remIssues = append(remIssues, resolvedStubs...)
+			}
+			remCheck := analysis.CheckDependencyRemovalWithScope(remIssues, p.from, p.to, ctx.CandidateIDs, refNow)
+			existsVal := remCheck.Exists
+			canRemVal := remCheck.Exists
+			beforeVal := remCheck.CyclesBefore
+			afterVal := remCheck.CyclesAfter
+			brokenVal := remCheck.CyclesBroken
+			breakAllVal := remCheck.WouldBreakAllCycles
+			res.Exists = &existsVal
+			res.CanRemove = &canRemVal
+			res.Warning = remCheck.Warning
+			if remCheck.Exists {
+				res.CyclesBefore = &beforeVal
+				res.CyclesAfter = &afterVal
+				res.CyclesBroken = &brokenVal
+				res.WouldBreakAllCycles = &breakAllVal
+				if remCheck.CyclesTruncated {
+					truncVal := true
+					res.CyclesTruncated = &truncVal
+				}
+				res.NewlyUnblocked = remCheck.NewlyUnblocked
+				res.Command = buildVerifiedEdgeCommand("remove", fromIss, toIss, p.from, p.to, res.CrossRepo)
+				// Mutate workingIssues so sequential batches evaluate accurately.
+				filtered := make([]*model.Dependency, 0, len(fromIss.Dependencies))
+				for _, dep := range fromIss.Dependencies {
+					if dep != nil && dep.Type.IsBlocking() && dep.DependsOnID == p.to {
+						continue
+					}
+					filtered = append(filtered, dep)
+				}
+				fromIss.Dependencies = filtered
+				rebuildReadiness()
+			} else {
+				allSafe = false
+			}
+			results = append(results, res)
+			continue
+		}
 
 		if p.from == p.to {
 			res.CanAdd = false
@@ -7211,55 +7800,7 @@ func handleRobotCheckDep(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) err
 		res.CyclePath = cyclePath
 		res.Warning = warning
 		if canAdd {
-			// P17-8 / P18A-6: Gate br/bd dep add on cross-repo workspace isolation,
-			// endpoint writability, and strict shared tracker origin (matching Issue.MutationAction).
-			canEmitEdgeCmd := canEmitCommand
-			cmdFrom, cmdTo := p.from, p.to
-			trackerCLI := "br"
-			if canEmitEdgeCmd && res.CrossRepo && ctx.SourceKind == "workspace" {
-				canEmitEdgeCmd = false
-			}
-			if canEmitEdgeCmd && (fromIss.Origin != nil || toIss.Origin != nil) {
-				o, pOrig := fromIss.Origin, toIss.Origin
-				if o == nil || pOrig == nil ||
-					strings.TrimSpace(o.ReadOnlyReason) != "" ||
-					strings.TrimSpace(pOrig.ReadOnlyReason) != "" {
-					canEmitEdgeCmd = false
-				} else {
-					sameTracker := o.Tracker == pOrig.Tracker &&
-						o.Database == pOrig.Database &&
-						o.WorkingDirectory == pOrig.WorkingDirectory &&
-						o.TrackerDirectory == pOrig.TrackerDirectory &&
-						o.Executable == pOrig.Executable
-					if !sameTracker {
-						canEmitEdgeCmd = false
-					} else {
-						if lid := strings.TrimSpace(o.LocalID); lid != "" {
-							cmdFrom = lid
-						}
-						if lid := strings.TrimSpace(pOrig.LocalID); lid != "" {
-							cmdTo = lid
-						}
-						if cmdFrom == cmdTo {
-							canEmitEdgeCmd = false
-						}
-						if strings.EqualFold(strings.TrimSpace(o.Tracker), "bd") {
-							trackerCLI = "bd"
-						}
-					}
-				}
-			}
-			if canEmitEdgeCmd {
-				if ctx.SourceKind == "workspace" && fromIss.Origin != nil && strings.TrimSpace(fromIss.Origin.WorkingDirectory) != "" {
-					res.Command = fmt.Sprintf("cd -- %s && %s dep add %s %s",
-						shellQuoteWord(fromIss.Origin.WorkingDirectory),
-						trackerCLI,
-						shellQuoteWord(cmdFrom),
-						shellQuoteWord(cmdTo))
-				} else {
-					res.Command = fmt.Sprintf("%s dep add %s %s", trackerCLI, shellQuoteWord(cmdFrom), shellQuoteWord(cmdTo))
-				}
-			}
+			res.Command = buildVerifiedEdgeCommand("add", fromIss, toIss, p.from, p.to, res.CrossRepo)
 			// Accumulate safe edges so multi-edge batch requests detect compound cycles (e.g. A:B,B:C,C:A)
 			// and keep sequential readiness accurate (P16A-3).
 			fromIss.Dependencies = append(fromIss.Dependencies, &model.Dependency{
@@ -7651,6 +8192,36 @@ func handleRobotCausality(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) er
 	return nil
 }
 
+// attachPriorityRecommendationAction binds an authority-verified MutationSetPriority
+// command to a priority recommendation when SuggestedPriority != CurrentPriority (W38-7).
+func attachPriorityRecommendationAction(rec *analysis.PriorityRecommendation, iss model.Issue, ok bool, ctx RobotContext) {
+	if rec == nil || rec.SuggestedPriority == rec.CurrentPriority || !ok {
+		return
+	}
+	if ctx.AsOf != "" || ctx.AsOfCommit != "" {
+		rec.Action = nil
+		rec.ActionCommand = ""
+		rec.ActionUnavailableReason = "historical snapshot is read-only"
+		return
+	}
+	if !ctx.claimsProven() {
+		rec.Action = nil
+		rec.ActionCommand = ""
+		rec.ActionUnavailableReason = "source authority is incomplete or stale"
+		return
+	}
+	cmd, reason := iss.MutationAction(model.MutationSetPriority, nil, strconv.Itoa(rec.SuggestedPriority))
+	if cmd != nil {
+		rec.Action = cmd
+		rec.ActionCommand = cmd.Shell
+		rec.ActionUnavailableReason = ""
+	} else {
+		rec.Action = nil
+		rec.ActionCommand = ""
+		rec.ActionUnavailableReason = reason
+	}
+}
+
 func handleRobotSprintShow(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) error {
 	targetID := ""
 	if cfg.RobotSprintShowFlag != nil {
@@ -7674,12 +8245,163 @@ func handleRobotSprintShow(ctx RobotContext, cfg phaseThreeRobotHandlerConfig) e
 		return newReportedRobotHandlerExit(1)
 	}
 
+	// W38-4: Honor active CandidateIDs scope and enrich --robot-sprint-show with computed
+	// status, burndown summary, at-risk items, Graham capacity, scope changes, and per-bead state.
+	now := ctx.ReferenceNow()
+	scopedSprint := *found
+	if ctx.CandidateIDs != nil {
+		filteredBeads := make([]string, 0, len(scopedSprint.BeadIDs))
+		for _, bid := range scopedSprint.BeadIDs {
+			if ctx.CandidateIDs[bid] {
+				filteredBeads = append(filteredBeads, bid)
+			}
+		}
+		scopedSprint.BeadIDs = filteredBeads
+	}
+	sprintGraphIssues := ctx.GraphIssues()
+	if len(ctx.FullIssues) > 0 {
+		sprintGraphIssues = labelAnalysisIssuesForContext(ctx)
+	}
+	issueMap := make(map[string]model.Issue, len(sprintGraphIssues))
+	for _, iss := range sprintGraphIssues {
+		issueMap[iss.ID] = iss
+	}
+	readiness := ctx.Readiness
+	if readiness == nil {
+		readiness = model.NewReadinessIndex(sprintGraphIssues)
+	}
+	projectDir, _ := ctx.ProjectDirOrDefault()
+	driftCfg, cfgErr := drift.LoadConfig(projectDir)
+	if cfgErr != nil || driftCfg == nil {
+		driftCfg = drift.DefaultConfig()
+	}
+
+	openSprintIssues := make([]model.Issue, 0, len(scopedSprint.BeadIDs))
+	dedupedBeadIDs := make([]string, 0, len(scopedSprint.BeadIDs))
+	beads := make([]exportSprintBead, 0, len(scopedSprint.BeadIDs))
+	seenBead := make(map[string]bool, len(scopedSprint.BeadIDs))
+	for _, bid := range scopedSprint.BeadIDs {
+		if seenBead[bid] {
+			continue
+		}
+		seenBead[bid] = true
+		dedupedBeadIDs = append(dedupedBeadIDs, bid)
+		iss, ok := issueMap[bid]
+		if !ok {
+			continue
+		}
+		isClosed := iss.Status.IsClosed() || iss.Status.IsTombstone()
+		if !isClosed && !iss.IsTemplate && !iss.Pinned && iss.Status != model.StatusPinned {
+			openSprintIssues = append(openSprintIssues, iss)
+		}
+		isBlocked := !isClosed && (iss.Status == model.StatusBlocked || len(readiness.Blockers(iss.ID)) > 0)
+		beads = append(beads, exportSprintBead{
+			ID:               iss.ID,
+			Title:            iss.Title,
+			Status:           string(iss.Status),
+			Priority:         iss.Priority,
+			IssueType:        string(iss.IssueType),
+			Assignee:         iss.Assignee,
+			EstimatedMinutes: iss.EstimatedMinutes,
+			IsBlocked:        isBlocked,
+		})
+	}
+	scopedSprint.BeadIDs = dedupedBeadIDs
+	burndown := calculateBurndownAtWithThresholds(&scopedSprint, sprintGraphIssues, readiness, now, driftCfg.AtRiskThresholds())
+	var scopeChanges []ScopeChangeEvent
+	if changes, sErr := computeSprintScopeChangesForContext(ctx, workDir, found, issueMap, now); sErr == nil && len(changes) > 0 {
+		if ctx.CandidateIDs != nil {
+			filteredChanges := changes[:0]
+			for _, ev := range changes {
+				if ctx.CandidateIDs[ev.IssueID] {
+					filteredChanges = append(filteredChanges, ev)
+				}
+			}
+			changes = filteredChanges
+		}
+		if len(changes) > 0 {
+			scopeChanges = changes
+		}
+	}
+	var capInfo *analysis.PlanCapacity
+	if len(openSprintIssues) > 0 {
+		var capStats *analysis.GraphStats
+		if capAnalyzer := ctx.GraphAnalyzer(); capAnalyzer != nil {
+			capIssues := ctx.GraphIssues()
+			capCfg := analysis.ConfigForSize(len(capIssues), countEdges(capIssues))
+			if cfg.ForceFullAnalysis != nil && *cfg.ForceFullAnalysis {
+				capCfg = analysis.FullAnalysisConfig()
+			} else {
+				capCfg.ComputePageRank = false
+				capCfg.ComputeBetweenness = false
+				capCfg.BetweennessMode = analysis.BetweennessSkip
+				capCfg.ComputeHITS = false
+				capCfg.ComputeEigenvector = false
+				capCfg.ComputeCycles = false
+			}
+			s := capAnalyzer.AnalyzeAsyncWithConfig(context.Background(), capCfg)
+			s.WaitForPhase2()
+			capStats = s
+		}
+		capInfo = buildPlanCapacity(openSprintIssues, ctx.VelocityIssues(), capStats, ctx.CandidateIDs, now)
+	}
+	isActive := scopedSprint.IsActiveAt(now)
+	sprintStatus := "active"
+	if !scopedSprint.StartDate.IsZero() && now.Before(scopedSprint.StartDate) {
+		sprintStatus = "upcoming"
+	} else if !scopedSprint.EndDate.IsZero() && now.After(scopedSprint.EndDate) {
+		sprintStatus = "completed"
+	}
+	pctComplete := 0.0
+	if burndown.TotalIssues > 0 {
+		pctComplete = math.Round(float64(burndown.CompletedIssues)/float64(burndown.TotalIssues)*1000) / 10
+	}
+	type sprintShowSummary struct {
+		TotalDays         int        `json:"total_days"`
+		ElapsedDays       int        `json:"elapsed_days"`
+		RemainingDays     int        `json:"remaining_days"`
+		TotalIssues       int        `json:"total_issues"`
+		CompletedIssues   int        `json:"completed_issues"`
+		RemainingIssues   int        `json:"remaining_issues"`
+		PercentComplete   float64    `json:"percent_complete"`
+		IdealBurnRate     float64    `json:"ideal_burn_rate"`
+		ActualBurnRate    float64    `json:"actual_burn_rate"`
+		ProjectedComplete *time.Time `json:"projected_complete,omitempty"`
+		OnTrack           bool       `json:"on_track"`
+	}
+
 	output := struct {
 		RobotEnvelope
-		Sprint *model.Sprint `json:"sprint"`
+		Sprint       *model.Sprint          `json:"sprint"`
+		Status       string                 `json:"status"`
+		IsActive     bool                   `json:"is_active"`
+		Summary      sprintShowSummary      `json:"summary"`
+		AtRisk       []analysis.AtRiskItem  `json:"at_risk"`
+		Capacity     *analysis.PlanCapacity `json:"capacity,omitempty"`
+		ScopeChanges []ScopeChangeEvent     `json:"scope_changes,omitempty"`
+		Beads        []exportSprintBead     `json:"beads"`
 	}{
 		RobotEnvelope: ctx.Envelope(),
-		Sprint:        found,
+		Sprint:        &scopedSprint,
+		Status:        sprintStatus,
+		IsActive:      isActive,
+		Summary: sprintShowSummary{
+			TotalDays:         burndown.TotalDays,
+			ElapsedDays:       burndown.ElapsedDays,
+			RemainingDays:     burndown.RemainingDays,
+			TotalIssues:       burndown.TotalIssues,
+			CompletedIssues:   burndown.CompletedIssues,
+			RemainingIssues:   burndown.RemainingIssues,
+			PercentComplete:   pctComplete,
+			IdealBurnRate:     burndown.IdealBurnRate,
+			ActualBurnRate:    burndown.ActualBurnRate,
+			ProjectedComplete: burndown.ProjectedComplete,
+			OnTrack:           burndown.OnTrack,
+		},
+		AtRisk:       burndown.AtRisk,
+		Capacity:     capInfo,
+		ScopeChanges: scopeChanges,
+		Beads:        beads,
 	}
 	if err := ctx.EncoderOrDefault().Encode(output); err != nil {
 		return fmt.Errorf("encoding sprint: %w", err)

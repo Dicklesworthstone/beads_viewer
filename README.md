@@ -3024,15 +3024,17 @@ If the `wasm/` assets are missing, the viewer automatically falls back to the JS
 
 ```
 ./bv-pages/
-├── index.html              # Main dashboard with Alpine.js + Tailwind (367 KB)
+├── index.html              # Main dashboard with Alpine.js + Tailwind (522 KB)
 ├── .nojekyll               # Prevents Jekyll asset stripping on static hosts
 ├── .github/workflows/      # Optional static Pages bundle deployment template (static.yml)
-├── beads.sqlite3           # Full SQLite database (6.9 MB for this repository's 773 issues, plus 1 MiB chunk files above the 5 MiB threshold)
+├── beads.sqlite3           # Full SQLite database (7.1 MB for this repository's 781 issues, plus 1 MiB chunk files above the 5 MiB threshold)
 ├── data/
-│   ├── graph_layout.json   # Pre-computed positions + metrics (182 KB for 773 issues / 954 edges)
+│   ├── graph_layout.json   # Pre-computed positions + metrics (98 KB for 781 issues / 964 edges)
 │   ├── meta.json           # Export metadata
-│   ├── triage.json         # Triage recommendations (15 KB)
-│   └── history.json        # Recorded issue lifecycle for graph time travel (127 KB)
+│   ├── triage.json         # Triage recommendations (11 KB)
+│   ├── labels.json         # Label health, cross-label flow, and blockage cascades (375 KB)
+│   ├── suggestions.json    # Hygiene suggestions (139 KB)
+│   └── history.json        # Recorded issue lifecycle & deduplicated correlation catalogs for graph time travel (952 KB)
 └── vendor/
     ├── d3.v7.min.js        # Visualization library
     ├── force-graph.min.js  # Graph rendering
@@ -3067,14 +3069,14 @@ The export includes both graph-layout data and a SQLite database:
 
 | Component | Size | Purpose |
 |-----------|------|---------|
-| `graph_layout.json` | 182 KB for 773 issues / 954 edges | Pre-computed node positions + graph metrics |
-| `beads.sqlite3` | 6.9 MB for 773 issues | Full issue data for detail pane, search, tables |
+| `graph_layout.json` | 98 KB for 781 issues / 964 edges | Pre-computed node positions + graph metrics |
+| `beads.sqlite3` | 7.1 MB for 781 issues | Full issue data for detail pane, search, tables |
 
-Sizes are measured, not estimated: `tests/e2e/export_pages_test.go` re-exports this repository on every e2e run and checks the bundle against `tests/artifacts/perf/pages_load.json` (whole bundle 20.6 MB, of which 5.6 MB is the vendored viewer libraries; crossing the 5 MiB SQLite chunking threshold adds 1 MiB chunk files alongside `beads.sqlite3`); the record is rewritten only when the test runs with `BV_RECORD_PERF=1`, and a bundle that grows by more than a quarter fails the run.
+Sizes are measured, not estimated: `tests/e2e/export_pages_test.go` re-exports this repository on every e2e run and checks the bundle against `tests/artifacts/perf/pages_load.json` (whole bundle 22.6 MB, of which 5.6 MB is the vendored viewer libraries; crossing the 5 MiB SQLite chunking threshold adds 1 MiB chunk files alongside `beads.sqlite3`); the record is rewritten only when the test runs with `BV_RECORD_PERF=1`, and a bundle that grows by more than a quarter fails the run.
 
 **Current viewer behavior:** `viewer.js` waits for SQLite to load, then uses exported coordinates to seed live force simulation if every node and directed blocking edge matches the database. Missing, malformed, or mismatched layouts fall back to ordinary force initialization. Nodes remain movable, and the browser computes its own metrics, including critical path and cycles. The layout does not make the graph render before the database or bypass simulation.
 
-Load-time figures are not measured in the repository yet; the sizes above are from the retained November 21, 2026 export, not a live browser timing measurement.
+The sizes and `first_render_ms` (`4971.6 ms` from navigation start to rendered issue table plus `graphReady` in headless Chromium) above are from the retained November 25, 2026 export in `tests/artifacts/perf/pages_load.json` on the shared host; when `BV_HEADLESS_BROWSER` is unset, `TestExportPages_RecordsLoadSizes` records `first_render_ms: null`.
 
 ### Detail Pane
 
@@ -3268,7 +3270,7 @@ These commands output **structured JSON** designed for programmatic consumption:
 | `--robot-plan` | Actionable tracks + dependencies | Work queue generation |
 | `--robot-priority` | Priority recommendations | Automated priority fixing |
 | `--robot-whatif <id>[,id2,...]` | Counterfactual unblock delta for one issue (`result`) or joint batch synergy (`batch_result`) | Unblock & priority simulation |
-| `--robot-check-dep <from:to>[,...]` | Pre-flight cycle, readiness, and cross-repo check for proposed blocking edges | Safe dependency validation |
+| `--robot-check-dep <[remove:]from:to>[,...]` | Pre-flight cycle, readiness, and cross-repo check for proposed blocking edge additions or removals (`remove:from:to`) | Safe dependency validation & cycle cutting |
 | `--robot-search` | Hashed keyword or graph-weighted hybrid search (with `--search <query>`) | Issue discovery |
 | `--robot-history` | Bead-to-commit correlations | Code change tracking |
 | `--bead-history <id>` | Single-bead commit correlation history | Scoped code provenance |
@@ -3382,7 +3384,7 @@ bv --robot-triage --format toon --stats           # Show JSON vs TOON token esti
 | `--baseline-info` | bool | `false` | Show information about the current baseline | History & Drift |
 | `--bead-history` | string | (empty) | Show history for specific bead ID | History & Drift |
 | `--check-drift` | bool | `false` | Check for drift from baseline (exit codes: 0=OK, 1=critical, 2=warning) | History & Drift |
-| `--diff-since` | string | (empty) | Show changes since historical point (commit SHA, branch, tag, or date; composable with --export, --export-md, --export-pages, --priority-brief, --agent-brief) | History & Drift |
+| `--diff-since` | string | (empty) | Show changes since historical point (commit SHA, branch, tag, or date; composable with --export, --export-md, --export-graph, --export-pages, --pages, --priority-brief, --agent-brief) | History & Drift |
 | `--history-limit` | int | `500` | Max commits to analyze (0 = unlimited) | History & Drift |
 | `--history-since` | string | (empty) | Limit history to commits after this date/ref (e.g., '30 days ago', '2024-01-01') | History & Drift |
 | `--id-pattern` | stringArray | `[]` | Custom bead ID regex for commit-message matching, e.g. 'bh-[a-z0-9]{5}' (repeatable; capture group 1 is the ID, else the whole match) (#188) | History & Drift |
@@ -3405,7 +3407,7 @@ bv --robot-triage --format toon --stats           # Show JSON vs TOON token esti
 | `--forecast-sprint` | string | (empty) | Filter forecast by sprint ID | Robot & Planning Flags |
 | `--graph-depth` | int | `0` | Max depth for subgraph (0 = unlimited) | Robot & Planning Flags |
 | `--graph-format` | string | `json` | Graph output format: json, dot, mermaid | Robot & Planning Flags |
-| `--graph-root` | string | (empty) | Subgraph from specific root issue ID | Robot & Planning Flags |
+| `--graph-root` | string | (empty) | Scope to descendant subgraph from a specific root/epic issue ID (or neighborhood with --robot-graph/--graph-depth) | Robot & Planning Flags |
 | `--hotspots-limit` | int | `10` | Max hotspots to show (use with --robot-file-hotspots) | Robot & Planning Flags |
 | `--network-depth` | int | `2` | Depth of subnetwork when querying specific bead (1-3) | Robot & Planning Flags |
 | `--orphans-min-score` | int | `30` | Minimum suspicion score for orphan candidates (0-100) | Robot & Planning Flags |
@@ -3421,7 +3423,7 @@ bv --robot-triage --format toon --stats           # Show JSON vs TOON token esti
 | `--robot-capacity` | bool | `false` | Output capacity simulation and completion projection as JSON | Robot & Planning Flags |
 | `--robot-cass` | string | (empty) | Output correlated coding-agent sessions (cass) for bead ID as JSON | Robot & Planning Flags |
 | `--robot-causality` | string | (empty) | Output causal chain analysis for bead ID as JSON | Robot & Planning Flags |
-| `--robot-check-dep` | string | (empty) | Validate proposed blocking dependency edge(s) for cycles and readiness impact before adding (format: fromID:toID[,from2:to2]) | Robot & Planning Flags |
+| `--robot-check-dep` | string | (empty) | Validate proposed blocking dependency additions (fromID:toID) or removals (remove:fromID:toID) for cycles and readiness impact | Robot & Planning Flags |
 | `--robot-commit` | string | (empty) | Output beads correlated with a git commit SHA or revision as JSON | Robot & Planning Flags |
 | `--robot-confirm-correlation` | string | (empty) | Confirm a correlation is correct (format: SHA:beadID) | Robot & Planning Flags |
 | `--robot-correlation-stats` | bool | `false` | Output correlation feedback statistics as JSON | Robot & Planning Flags |
@@ -3462,7 +3464,7 @@ bv --robot-triage --format toon --stats           # Show JSON vs TOON token esti
 | `--robot-triage` | bool | `false` | Output unified triage as JSON (the mega-command for AI agents) | Robot & Planning Flags |
 | `--robot-triage-by-label` | bool | `false` | Group triage recommendations by label (bv-87) | Robot & Planning Flags |
 | `--robot-triage-by-track` | bool | `false` | Group triage recommendations by execution track (bv-87) | Robot & Planning Flags |
-| `--robot-whatif` | string | (empty) | Simulate completing issue ID(s) (comma-separated for batch) and output downstream unblock impact as JSON | Robot & Planning Flags |
+| `--robot-whatif` | string | (empty) | Simulate completing one or more comma-separated issue IDs and output downstream unblock impact (and joint synergy for batches) as JSON | Robot & Planning Flags |
 | `--schema-command` | string | (empty) | Output schema for specific command only (e.g., robot-triage) | Robot & Planning Flags |
 | `--suggest-bead` | string | (empty) | Filter suggestions for specific bead ID | Robot & Planning Flags |
 | `--suggest-confidence` | float64 | `0` | Minimum confidence for suggestions (0.0-1.0) | Robot & Planning Flags |
@@ -4344,8 +4346,10 @@ bv has a comprehensive built-in help system:
 |  | `L` | Scroll right |
 |  | `J/K` | Scroll graph vertically |
 |  | `space` | Expand/collapse dependency paths |
+|  | `W` | Toggle issue in batch What-If |
 |  | `D` | Check add dependency (A → B) |
-|  | `c` | Copy checked dep command |
+|  | `X` | Preflight remove dep / cycle cut |
+|  | `c` | Copy checked dep / cycle-cut command |
 |  | `PgUp` | Page nodes (prev 10) |
 |  | `PgDn` | Page nodes (next 10) |
 | **board** | `h` | Previous column |
@@ -4364,6 +4368,7 @@ bv has a comprehensive built-in help system:
 |  | `s` | Cycle swimlane mode |
 |  | `e` | Toggle empty columns |
 |  | `d` | Expand/collapse card inline |
+|  | `W` | Toggle issue in batch What-If |
 |  | `tab` | Toggle detail |
 |  | `ctrl+j` | Scroll detail down |
 |  | `ctrl+k` | Scroll detail up |
@@ -4379,8 +4384,10 @@ bv has a comprehensive built-in help system:
 |  | `PgDn` | Page down |
 |  | `b` | Toggle hierarchy / blocking tree mode |
 |  | `m` | Toggle hierarchy / blocking tree mode |
+|  | `W` | Toggle issue in batch What-If |
 |  | `E` | Exit tree view |
-| **actionable** | `PgUp` | Page up |
+| **actionable** | `W` | Toggle issue in batch What-If |
+|  | `PgUp` | Page up |
 |  | `PgDn` | Page down |
 |  | `a` | Close actionable view |
 | **insights** | `g` | Go to top |
@@ -4396,6 +4403,8 @@ bv has a comprehensive built-in help system:
 |  | `H` | Heatmap toggle |
 |  | `<` | Widen detail panel |
 |  | `>` | Narrow detail panel |
+|  | `X` | Preflight cycle-cut removal |
+|  | `c` | Copy cycle-cut command |
 | **history** | `g` | Jump to graph view |
 |  | `v` | Toggle git/bead mode |
 |  | `/` | Search history |
@@ -4411,6 +4420,7 @@ bv has a comprehensive built-in help system:
 |  | `-` | Reject commit correlation |
 |  | `x` | Ignore commit correlation |
 |  | `O` | Toggle orphan commits audit |
+|  | `H` | Toggle code hotspots & co-change view |
 |  | `W` | Toggle causality & wait analysis |
 |  | `o` | Open in browser |
 |  | `h` | Close history view |
