@@ -102,7 +102,7 @@ other hosts can run every other stage for diagnostics.
 | Python 3, Git | any current release | receipts, source digest, archive checks | the gate refuses to start |
 | `jq` | any | stages 7 and 9 | stage SKIPPED |
 | `sha256sum` | GNU coreutils or compatible | stages 7 and 8 | stage 7 SKIPPED, stage 8 FAILED |
-| `rustup` with `nightly-2026-08-31-x86_64-unknown-linux-gnu`, its `wasm32-unknown-unknown` target, and a populated Cargo registry cache | pinned in `scripts/build_graph_wasm.sh` | stage 7 (graph-WASM source rebuild), stage 10 (`graph_wasm_test.sh`) | stage SKIPPED |
+| `rustup` with `nightly-2026-08-31-x86_64-unknown-linux-gnu`, its `wasm32-unknown-unknown` target, its `rust-src` component, and a populated Cargo registry cache | pinned in `scripts/build_graph_wasm.sh`; `rust-src` is not checked, and the minimal profile in `bv-graph-wasm/rust-toolchain.toml` leaves it out, so add it with `rustup component add rust-src --toolchain nightly-2026-08-31` | stage 7 (graph-WASM source rebuild), stage 10 (`graph_wasm_test.sh`) | stage SKIPPED; without `rust-src`, stage 7 FAILED (the rebuilt WASM is 64 bytes shorter because standard-library panic paths differ) |
 | `wasm-bindgen` | 0.2.128, the exact executable whose SHA-256 is pinned in `scripts/build_graph_wasm.sh` (`WASM_BINDGEN` selects another path) | stages 7 and 10 | missing: SKIPPED; another version or build: FAILED |
 | `wasm-opt` (Binaryen) | version 132, the pinned executable (`WASM_OPT` selects another path) | stages 7 and 10 | missing: SKIPPED; another version or build: FAILED |
 | Node.js | with WebAssembly support | stage 10 (`graph_wasm_test.sh`) | stage SKIPPED |
@@ -115,7 +115,9 @@ other hosts can run every other stage for diagnostics.
 anything. It reads the graph-WASM pins from `scripts/build_graph_wasm.sh`,
 compares each tool's reported version and executable hash, and lists every
 missing or mismatched prerequisite in `missing_prerequisites`, on stderr, and
-in `release_eligible_if_run_now`. `scripts/release_gate.sh run` prints the same
+in `release_eligible_if_run_now`. It also names any Rust build override that
+the build script refuses (`RUSTFLAGS`, `RUSTC_WRAPPER`, `RUSTUP_TOOLCHAIN` and
+the others it lists); unset them for the gate. `scripts/release_gate.sh run` prints the same
 list before stage 1 and continues for diagnostics. A helper that reports
 `INCOMPLETE:` and exits 2 because a tool is absent is recorded as SKIPPED, so
 the summary separates "this host lacks the tooling" (`INCOMPLETE`, exit 2) from
@@ -294,7 +296,7 @@ Post-publication Linux amd64 verification checked:
 
 Physical `darwin/amd64` and `linux/arm64` hardware execution (as well as native
 `v0.28.0` execution on Windows, macOS arm64, and Nix) remain outside this Linux
-amd64 verification and stay explicitly tracked under `bv-oonu.9` / `bv-oonu.10`.
+amd64 verification and stay explicitly tracked as open native-platform follow-ups.
 
 ### v0.27.0 verification (2026-11-21)
 
@@ -306,7 +308,7 @@ updates.
 ### v0.25.2 verification (2026-10-01)
 
 Published at 04:07 UTC from `721353e7` after all ten gate stages passed
-without skips on vmi1149989 (Go 1.26.8, GoReleaser 2.18.1, PowerShell 7.6.5,
+without skips on the x86_64 Linux release host (Go 1.26.8, GoReleaser 2.18.1, PowerShell 7.6.5,
 br 0.6.0, wasm-bindgen 0.2.128, Binaryen 132). Packaging sealed and verified
 all five archives; DSR uploaded them with `checksums.txt`, the receipt and an
 SPDX SBOM of the packaged Linux amd64 binary as a draft without dispatch, and
@@ -324,7 +326,7 @@ v0.25.2. Native Windows, native macOS amd64 and Nix were not run.
 Gate-host notes: on hosts with git 2.54.0, `TestHistoryExportUsesRecordedLifecycle`
 failed in most runs (also at v0.25.1) because automatic maintenance ran in
 the middle of its 500-commit fixture; `721353e7` turns it off for that fixture.
-Hosts under I/O pressure (hz4, ~50% `some`) failed the timing-bound watch and
+Hosts under I/O pressure (one at ~50% `some`) failed the timing-bound watch and
 correlation e2e tests, and shared VPS hosts can fail stage 8 on benchmarks of
 unchanged code (one run reported +34% on `BenchmarkRealData_FullAnalysis`, the
 previous run on the same host -23%); a rerun on the same commit passed.
@@ -332,7 +334,7 @@ previous run on the same host -23%); a rerun on the same commit passed.
 ### v0.25.1 verification (2026-09-29)
 
 Published at 17:22 UTC from `4db2f8dc` after all ten gate stages passed
-without skips on vmi1152480 (Go 1.26.8, GoReleaser 2.18.1, PowerShell 7.6.5,
+without skips on the x86_64 Linux release host (Go 1.26.8, GoReleaser 2.18.1, PowerShell 7.6.5,
 br 0.6.0, the pinned wasm-bindgen 0.2.128 and Binaryen 132). Packaging sealed
 and verified all five archives. DSR uploaded the archives, `checksums.txt`,
 the sealed receipt and an SPDX SBOM of the packaged Linux amd64 binary as a
@@ -351,9 +353,10 @@ and Nix were not run for this release.
 Gate-host notes from this release: the default `br` 0.7.1 fails
 `TestRobotActionRoutesLiveTrackers/db` (a read-only `br --db … show` on a fresh
 tracker exits 2 with "database is busy (recovery in progress)"), so the gate
-used br 0.6.0 from a per-run tools directory. On trj the graph-WASM rebuild
-produced a `bv_graph_bg.wasm` 8 bytes shorter than the manifest with the same
-pinned tools; vmi1152480 and hz4 reproduce it exactly. On heavily loaded hosts
+used br 0.6.0 from a per-run tools directory. On one x86_64 Linux workstation
+the graph-WASM rebuild produced a `bv_graph_bg.wasm` 8 bytes shorter than the
+manifest with the same pinned tools; the release host and a second x86_64 Linux
+host reproduce it exactly. On heavily loaded hosts
 the timing-bound watch/correlation e2e tests and the benchmark stage can fail
 from contention alone. `install.sh` needs `python3` for binary installs; with
 only `jq` it falls back to a source build. (Fixed after v0.25.1: the installer
@@ -386,8 +389,8 @@ RCH's post-build source verification then exceeded its 180-second SSH timeout,
 so this run has no completed RCH source receipt. A separate independent readback
 matched all 5,084 tracked source files to `87cee258`, including executable modes.
 This proves the observed Linux amd64 Nix build and execution, not Nix profile installation or another
-platform. Bead `bv-oonu.9` retains the build log, smoke evidence and receipt
-failure separately.
+platform. The build log, smoke evidence and receipt failure are retained
+separately.
 
 On 2026-09-15, that existing store package was installed offline into a fresh,
 isolated Nix profile on Linux amd64. The active profile entry and executable
@@ -398,7 +401,7 @@ no live claim command was expected or emitted. The check changed neither the
 user's default profile nor PATH and performed no compilation. It establishes
 existing-store profile installation, not the public GitHub-flake download path,
 profile upgrades, another native platform, or a completed RCH source receipt.
-Bead `bv-oonu.9` retains the profile manifest and native command logs.
+The profile manifest and native command logs are retained.
 
 Run `tests/scripts/install_native_test.ps1` on native Windows x64 as part of
 release verification. It installs two real published releases into fresh temporary
@@ -495,7 +498,7 @@ are preserved. Linux live installation, readiness, update/no-update and all
 six archive/preservation scenarios also pass on a separate native host.
 The Windows optional-source rerun above is a separate failed result, not part
 of that default-suite pass. Raw release and verification evidence is retained
-under `/data/tmp/bv-release-v0.24.1-20260908`.
+on the release host.
 
 ### v0.26.0 verification and receipt qualification (2026-11-02)
 
@@ -511,7 +514,7 @@ executes all five pure-Go cross-builds and tamper negative controls before
 returning skip sentinel `200` (marking stage 10 `SKIPPED` and the receipt
 ineligible), and `scripts/release_gate.sh package` fails closed. Native macOS
 (`darwin/amd64`, `darwin/arm64`) and native `linux/arm64` smoke verification
-remain tracked separately under `bv-oonu.9` and `bv-oonu.10`.
+remain tracked separately as open native-platform follow-ups.
 
 ## Vendored dependency patches
 

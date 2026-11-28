@@ -24,7 +24,7 @@
         });
         buildGoModule = pkgs.buildGo126Module.override { inherit go; };
 
-        bvVersion = "0.28.0";
+        bvVersion = "0.29.1";
 
         # Build from the checked-in vendor tree. Regenerate that tree with
         # Go tooling when go.mod/go.sum change; do not fetch a second module

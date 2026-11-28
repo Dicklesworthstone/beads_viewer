@@ -5285,6 +5285,29 @@ func (m *Model) activeScopeAnalysis() (*analysis.Analyzer, *analysis.GraphStats,
 	return m.boardScopedAnalyzer, m.boardScopedAnalysis, m.boardScopedETACtx
 }
 
+// retainPriorityHintsForReload keeps the priority hints that are still valid
+// after a reload: the issue still exists, is not closed, and still has the
+// priority the hint was computed from. A reload delivers Phase 1 data first and
+// Phase 2 replaces the whole map when it finishes. Dropping every hint in
+// between made the "Priority Hint" line in the detail pane (and the hint badges)
+// vanish and reappear on each reload, shifting the text below it (#217).
+//
+// Stale hints are deleted in place, as the old clear() did, so the list
+// delegate and the insights panel, which hold this same map until their next
+// refresh, see the pruned hints too.
+func retainPriorityHintsForReload(hints map[string]*analysis.PriorityRecommendation, issueMap map[string]*model.Issue) map[string]*analysis.PriorityRecommendation {
+	if hints == nil {
+		return make(map[string]*analysis.PriorityRecommendation)
+	}
+	for id, hint := range hints {
+		issue := issueMap[id]
+		if hint == nil || issue == nil || isClosedLikeStatus(issue.Status) || issue.Priority != hint.CurrentPriority {
+			delete(hints, id)
+		}
+	}
+	return hints
+}
+
 func (m *Model) activeScopePriorityHints() map[string]*analysis.PriorityRecommendation {
 	if !m.workspaceMode || m.activeRepos == nil {
 		return m.priorityHints
@@ -6903,11 +6926,12 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.blockerSet = msg.Snapshot.BlockerSet
 		}
 
-		// Clear caches that need recomputation (P24A-7: nil out priorityHints instead of
-		// clearing in-place so BoardModel/GraphModel never alias a mutated map, at zero alloc).
+		// Clear caches that need recomputation. Priority hints are pruned in
+		// place (#217) so Board and Insights, which share the map, drop stale
+		// entries without the detail pane flashing empty until Phase 2.
 		m.labelHealthCached = false
 		m.attentionCached = false
-		m.priorityHints = nil
+		m.priorityHints = retainPriorityHintsForReload(m.priorityHints, m.issueMap)
 		m.scopedRiskCache = nil
 		if m.labelDrilldownCache == nil {
 			m.labelDrilldownCache = make(map[string][]model.Issue)
@@ -7566,8 +7590,8 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.syncBoardReadinessAndFullIssues()
 
-		// Clear stale priority hints (will be repopulated after Phase 2)
-		m.priorityHints = make(map[string]*analysis.PriorityRecommendation)
+		// Phase 2 replaces the hints; keep the ones still valid until then (#217).
+		m.priorityHints = retainPriorityHintsForReload(m.priorityHints, m.issueMap)
 
 		// Recompute stats
 		var statsStart time.Time

@@ -6231,7 +6231,7 @@ function beadsApp() {
     forecastData: null,
     hasForecast: false,
 
-    // Historical Snapshot Diff (data/diff.json, gated on meta.has_diff)
+    // Snapshot changelog card (data/diff.json from --diff-since, gated on meta.has_diff)
     diffData: null,
     hasDiff: false,
 
@@ -9977,6 +9977,17 @@ function beadsApp() {
         walk(rootId, 0);
       }
       this.issuesTreeParentIds = [...childrenOf.keys()];
+      // A node under a collapsed ancestor was skipped on purpose and stays hidden.
+      // parentOf is acyclic, so the ancestor walk ends.
+      const hiddenByCollapse = (id) => {
+        for (let cur = parentOf.get(id); cur; cur = parentOf.get(cur)) {
+          if (this.issuesTreeCollapsed[cur]) return true;
+        }
+        return false;
+      };
+      for (const iss of rows) {
+        if (!visited.has(iss.id) && !hiddenByCollapse(iss.id)) walk(iss.id, 0);
+      }
       this.issuesTreeFlatRows = flat;
     },
 

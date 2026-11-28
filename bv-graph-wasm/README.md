@@ -122,7 +122,9 @@ The build pipeline applies multiple optimizations:
    - `panic = "abort"` - Remove panic unwinding
 
 2. **Pinned release tools**:
-   - `nightly-2026-08-31` Rust with `wasm32-unknown-unknown`
+   - `nightly-2026-08-31` Rust with `wasm32-unknown-unknown` and the `rust-src`
+     component; without `rust-src` the standard-library panic paths differ and
+     the rebuilt WASM does not match the shipped bytes
    - wasm-bindgen 0.2.128 and Binaryen 132, with a required `wasm-opt -Os` pass
    - Locked, offline compilation in a fresh external directory
 
