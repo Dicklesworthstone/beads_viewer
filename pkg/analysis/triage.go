@@ -200,10 +200,11 @@ type BlockerItem struct {
 
 // ProjectHealth provides overall project status
 type ProjectHealth struct {
-	Counts    HealthCounts `json:"counts"`
-	Graph     GraphHealth  `json:"graph"`
-	Velocity  *Velocity    `json:"velocity,omitempty"`  // nil until labels view ready
-	Staleness *Staleness   `json:"staleness,omitempty"` // nil until history ready
+	Counts        HealthCounts   `json:"counts"`
+	Graph         GraphHealth    `json:"graph"`
+	Velocity      *Velocity      `json:"velocity,omitempty"`        // nil until labels view ready
+	Staleness     *Staleness     `json:"staleness,omitempty"`       // nil until history ready
+	CrossRepoFlow *CrossRepoFlow `json:"cross_repo_flow,omitempty"` // nil for single-repo projects (W32-6)
 }
 
 // HealthCounts is basic issue statistics.
@@ -929,10 +930,11 @@ func ComputeTriageFromAnalyzer(analyzer *Analyzer, stats *GraphStats, issues []m
 		AllScores:              allScores,
 		UnblocksMap:            scopedUnblocksMap,
 		ProjectHealth: ProjectHealth{
-			Counts:    counts,
-			Graph:     buildScopedGraphHealth(stats, analyzer),
-			Velocity:  projectVelocity,
-			Staleness: staleness,
+			Counts:        counts,
+			Graph:         buildScopedGraphHealth(stats, analyzer),
+			Velocity:      projectVelocity,
+			Staleness:     staleness,
+			CrossRepoFlow: ComputeCrossRepoFlow(candidateIssues, opts.CandidateIDs),
 		},
 		Alerts:   alerts,
 		Commands: buildCommands(analyzer.issueMap[topID].Actions(topID != "")),

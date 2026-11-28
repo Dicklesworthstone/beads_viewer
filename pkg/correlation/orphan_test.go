@@ -1,6 +1,7 @@
 package correlation
 
 import (
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -601,5 +602,95 @@ func TestOrphanDetector_SharesExplicitMatcherParityForBase36AndDotIDs(t *testing
 		if oc.SHA == shaBase36 || oc.SHA == shaDot {
 			t.Fatalf("FindOrphanCommits returned explicitly referenced commit %s", oc.SHA[:7])
 		}
+	}
+}
+
+func TestOrphanSignalHit_BeadIDPopulatedAndOmittedFromJSON(t *testing.T) {
+	now := time.Date(2026, 11, 28, 12, 0, 0, 0, time.UTC)
+	report := &HistoryReport{
+		Histories: map[string]BeadHistory{
+			"BEAD-A": {
+				BeadID:     "BEAD-A",
+				Title:      "Auth handler",
+				Status:     "closed",
+				LastAuthor: "Alice",
+				Milestones: BeadMilestones{
+					Claimed: &BeadEvent{Timestamp: now.Add(-6 * time.Hour)},
+					Closed:  &BeadEvent{Timestamp: now.Add(-1 * time.Hour)},
+				},
+				Commits: []CorrelatedCommit{{
+					SHA:         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+					ShortSHA:    "aaaaaaa",
+					BeadID:      "BEAD-A",
+					Author:      "Alice",
+					AuthorEmail: "alice@example.com",
+					Timestamp:   now.Add(-4 * time.Hour),
+					Files:       []FileChange{{Path: "pkg/auth.go", Action: "M"}},
+				}},
+			},
+		},
+	}
+	d := NewOrphanDetectorAt(report, "", now)
+	cand := &OrphanCandidate{
+		SHA:         "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+		Author:      "Alice",
+		AuthorEmail: "alice@example.com",
+		Timestamp:   now.Add(-3 * time.Hour),
+		Message:     "refactor helper",
+		Files:       []string{"pkg/auth.go"},
+	}
+	scores := make(map[string]*probableBeadBuilder)
+	d.checkTiming(cand, scores)
+	d.checkFiles(cand, scores)
+	d.checkAuthor(cand, scores)
+
+	seenSignals := map[OrphanSignal]bool{}
+	for _, sig := range cand.Signals {
+		if sig.BeadID != "BEAD-A" {
+			t.Fatalf("expected signal %+v to carry BeadID=BEAD-A", sig)
+		}
+		seenSignals[sig.Signal] = true
+		raw, err := json.Marshal(sig)
+		if err != nil {
+			t.Fatalf("marshal OrphanSignalHit: %v", err)
+		}
+		if strings.Contains(string(raw), "bead_id") || strings.Contains(string(raw), "BeadID") {
+			t.Fatalf("OrphanSignalHit.BeadID must remain json:\"-\", got %s", string(raw))
+		}
+	}
+	for _, want := range []OrphanSignal{SignalOrphanTiming, SignalOrphanFiles, SignalOrphanAuthor} {
+		if !seenSignals[want] {
+			t.Fatalf("expected signal type %s in %+v", want, cand.Signals)
+		}
+	}
+
+	// P32 A#2 + A#4: WithScopeFilter strips out-of-scope SignalOrphanMessage mentions,
+	// caps remaining SignalOrphanMessage hits at 35, and preserves the 4th in-scope bead
+	// even when 3 out-of-scope beads score higher before Top-3 truncation.
+	if got := ComputeOrphanSuspicionScore([]OrphanSignalHit{
+		{Signal: SignalOrphanMessage, Weight: 25, BeadID: "BEAD-A"},
+		{Signal: SignalOrphanMessage, Weight: 25, BeadID: "BEAD-B"},
+		{Signal: SignalOrphanFiles, Weight: 25, BeadID: "BEAD-A"},
+	}); got != 60 {
+		t.Fatalf("ComputeOrphanSuspicionScore expected 35(msg cap)+25(files)=60, got %d", got)
+	}
+
+	msgCand := &OrphanCandidate{
+		SHA:         "cccccccccccccccccccccccccccccccccccccccc",
+		Author:      "Alice",
+		AuthorEmail: "alice@example.com",
+		Timestamp:   now.Add(-3 * time.Hour),
+		Message:     "work on BEAD-A",
+	}
+	msgScores := make(map[string]*probableBeadBuilder)
+	d.checkMessage(msgCand, msgScores)
+	foundMsgBeadID := false
+	for _, sig := range msgCand.Signals {
+		if sig.Signal == SignalOrphanMessage && sig.BeadID == "BEAD-A" {
+			foundMsgBeadID = true
+		}
+	}
+	if !foundMsgBeadID {
+		t.Fatalf("P32 checkMessage expected BeadID=BEAD-A on SignalOrphanMessage, got %+v", msgCand.Signals)
 	}
 }

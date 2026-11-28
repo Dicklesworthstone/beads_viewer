@@ -32,6 +32,9 @@ type Recipe struct {
 type FilterConfig struct {
 	Status        []string `yaml:"status,omitempty" json:"status,omitempty"`                 // Keep issues whose status equals one of these (case-insensitive)
 	Priority      []int    `yaml:"priority,omitempty" json:"priority,omitempty"`             // Keep issues whose priority is one of these (0 = highest)
+	Type          []string `yaml:"type,omitempty" json:"type,omitempty"`                     // Keep issues whose issue_type equals one of these (case-insensitive)
+	Assignee      []string `yaml:"assignee,omitempty" json:"assignee,omitempty"`             // Keep issues whose assignee matches one of these (case-insensitive; "unassigned" or "" matches blank)
+	Repo          []string `yaml:"repo,omitempty" json:"repo,omitempty"`                     // Keep issues whose source_repo (or ID prefix) matches one of these (case-insensitive)
 	Tags          []string `yaml:"tags,omitempty" json:"tags,omitempty"`                     // Keep issues carrying ALL of these labels (case-insensitive)
 	ExcludeTags   []string `yaml:"exclude_tags,omitempty" json:"exclude_tags,omitempty"`     // Drop issues carrying ANY of these labels (case-insensitive)
 	CreatedAfter  string   `yaml:"created_after,omitempty" json:"created_after,omitempty"`   // Keep issues created at or after this; relative ("14d", "2w", "1m", "1y") or ISO date
@@ -130,12 +133,19 @@ const (
 	SortFieldBetweenness = "betweenness" // Metrics.Graph
 	SortFieldImpact      = "impact"      // Metrics.Graph (critical-path score)
 	SortFieldTriage      = "triage"      // Metrics.Triage
+	SortFieldRisk        = "risk"        // Metrics.Risk (composite operational risk)
+	SortFieldETA         = "eta"         // Metrics.ETA (estimated days to completion)
+	SortFieldSlack       = "slack"       // Metrics.Slack (schedule slack; 0 = critical path)
+	SortFieldKCore       = "kcore"       // Metrics.KCore (k-core membership number)
 )
 
 // sortFieldAliases maps accepted spellings to their canonical field.
 var sortFieldAliases = map[string]string{
 	"created_at": SortFieldCreated,
 	"updated_at": SortFieldUpdated,
+	"risk_score": SortFieldRisk,
+	"k_core":     SortFieldKCore,
+	"core":       SortFieldKCore,
 }
 
 // canonicalSortField normalises case and aliases; ok is false for unknown fields.
@@ -146,15 +156,17 @@ func canonicalSortField(field string) (string, bool) {
 	}
 	switch f {
 	case SortFieldPriority, SortFieldCreated, SortFieldUpdated, SortFieldTitle, SortFieldID, SortFieldStatus, SortFieldAssignee,
-		SortFieldPageRank, SortFieldBetweenness, SortFieldImpact, SortFieldTriage:
+		SortFieldPageRank, SortFieldBetweenness, SortFieldImpact, SortFieldTriage,
+		SortFieldRisk, SortFieldETA, SortFieldSlack, SortFieldKCore:
 		return f, true
 	}
 	return f, false
 }
 
-// isGraphMetricField reports whether field reads Metrics.Graph.
+// isGraphMetricField reports whether field reads Metrics.Graph (or GraphStats-derived Slack/KCore).
 func isGraphMetricField(field string) bool {
-	return field == SortFieldPageRank || field == SortFieldBetweenness || field == SortFieldImpact
+	return field == SortFieldPageRank || field == SortFieldBetweenness || field == SortFieldImpact ||
+		field == SortFieldSlack || field == SortFieldKCore
 }
 
 // SortChain returns the sort configs in tie-break order: primary, secondary,
@@ -187,6 +199,46 @@ func (r *Recipe) NeedsGraphMetrics() bool {
 func (r *Recipe) NeedsTriageScores() bool {
 	for _, s := range r.SortChain() {
 		if f, ok := canonicalSortField(s.Field); ok && f == SortFieldTriage {
+			return true
+		}
+	}
+	return false
+}
+
+// NeedsRiskScores reports whether the recipe sorts by composite operational risk.
+func (r *Recipe) NeedsRiskScores() bool {
+	for _, s := range r.SortChain() {
+		if f, ok := canonicalSortField(s.Field); ok && f == SortFieldRisk {
+			return true
+		}
+	}
+	return false
+}
+
+// NeedsETAScores reports whether the recipe sorts by ETA days.
+func (r *Recipe) NeedsETAScores() bool {
+	for _, s := range r.SortChain() {
+		if f, ok := canonicalSortField(s.Field); ok && f == SortFieldETA {
+			return true
+		}
+	}
+	return false
+}
+
+// NeedsSlackScores reports whether the recipe sorts by schedule slack.
+func (r *Recipe) NeedsSlackScores() bool {
+	for _, s := range r.SortChain() {
+		if f, ok := canonicalSortField(s.Field); ok && f == SortFieldSlack {
+			return true
+		}
+	}
+	return false
+}
+
+// NeedsKCoreScores reports whether the recipe sorts by k-core number.
+func (r *Recipe) NeedsKCoreScores() bool {
+	for _, s := range r.SortChain() {
+		if f, ok := canonicalSortField(s.Field); ok && f == SortFieldKCore {
 			return true
 		}
 	}
@@ -235,6 +287,16 @@ func (r *Recipe) Validate() error {
 	for _, s := range r.Filters.Status {
 		if !model.Status(strings.ToLower(strings.TrimSpace(s))).IsValid() {
 			problems = append(problems, fmt.Sprintf("filters.status %q must not be blank", s))
+		}
+	}
+	for _, t := range r.Filters.Type {
+		if strings.TrimSpace(t) == "" {
+			problems = append(problems, fmt.Sprintf("filters.type %q must not be blank", t))
+		}
+	}
+	for _, rp := range r.Filters.Repo {
+		if strings.TrimSpace(rp) == "" {
+			problems = append(problems, fmt.Sprintf("filters.repo %q must not be blank", rp))
 		}
 	}
 	if r.View.MaxItems < 0 {
@@ -299,7 +361,8 @@ func (r *Recipe) Validate() error {
 
 func knownSortFields() []string {
 	return []string{SortFieldPriority, SortFieldCreated, SortFieldUpdated, SortFieldTitle, SortFieldID, SortFieldStatus, SortFieldAssignee,
-		SortFieldPageRank, SortFieldBetweenness, SortFieldImpact, SortFieldTriage}
+		SortFieldPageRank, SortFieldBetweenness, SortFieldImpact, SortFieldTriage,
+		SortFieldRisk, SortFieldETA, SortFieldSlack, SortFieldKCore}
 }
 
 // relativeTimePattern matches relative time expressions like "14d", "2w", "1m", "1y"

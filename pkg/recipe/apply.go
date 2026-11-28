@@ -27,6 +27,10 @@ type GraphMetrics interface {
 type Metrics struct {
 	Graph     GraphMetrics
 	Triage    map[string]float64    // issue ID -> triage score
+	Risk      map[string]float64    // issue ID -> composite operational risk (0..1)
+	ETA       map[string]float64    // issue ID -> estimated days to completion
+	Slack     map[string]float64    // issue ID -> schedule slack (0 = critical path)
+	KCore     map[string]int        // issue ID -> k-core number
 	Readiness *model.ReadinessIndex // Full dependency authority before display scoping
 }
 
@@ -48,8 +52,37 @@ func (m Metrics) score(field, id string) float64 {
 		if m.Triage != nil {
 			return m.Triage[id]
 		}
+	case SortFieldRisk:
+		if m.Risk != nil {
+			return m.Risk[id]
+		}
+	case SortFieldKCore:
+		if m.KCore != nil {
+			return float64(m.KCore[id])
+		}
 	}
 	return 0
+}
+
+func (m Metrics) optionalScore(field, id string) (float64, bool) {
+	switch field {
+	case SortFieldETA:
+		if m.ETA != nil {
+			v, ok := m.ETA[id]
+			return v, ok
+		}
+	case SortFieldSlack:
+		if m.Slack != nil {
+			v, ok := m.Slack[id]
+			return v, ok
+		}
+	case SortFieldRisk:
+		if m.Risk != nil {
+			v, ok := m.Risk[id]
+			return v, ok
+		}
+	}
+	return 0, false
 }
 
 // Apply is the one recipe engine shared by the TUI and the robot path. It
@@ -103,6 +136,9 @@ func filter(issues []model.Issue, r *Recipe, now time.Time, readiness *model.Rea
 	for _, issue := range issues {
 		if !matchesStatus(issue, f.Status) ||
 			!matchesPriority(issue, f.Priority) ||
+			!matchesType(issue, f.Type) ||
+			!matchesAssignee(issue, f.Assignee) ||
+			!matchesRepo(issue, f.Repo) ||
 			!hasAllTags(issue, f.Tags) ||
 			hasAnyTag(issue, f.ExcludeTags) ||
 			!thresholds.matches(issue) {
@@ -201,6 +237,67 @@ func matchesPriority(issue model.Issue, priorities []int) bool {
 	return false
 }
 
+func matchesType(issue model.Issue, types []string) bool {
+	if len(types) == 0 {
+		return true
+	}
+	for _, t := range types {
+		if strings.EqualFold(string(issue.IssueType), strings.TrimSpace(t)) {
+			return true
+		}
+	}
+	return false
+}
+
+func matchesAssignee(issue model.Issue, assignees []string) bool {
+	if len(assignees) == 0 {
+		return true
+	}
+	actual := strings.TrimSpace(issue.Assignee)
+	for _, a := range assignees {
+		want := strings.TrimSpace(a)
+		if want == "" || strings.EqualFold(want, "unassigned") {
+			if actual == "" {
+				return true
+			}
+			continue
+		}
+		if actual != "" && strings.EqualFold(actual, want) {
+			return true
+		}
+	}
+	return false
+}
+
+func matchesRepo(issue model.Issue, repos []string) bool {
+	if len(repos) == 0 {
+		return true
+	}
+	norm := func(s string) string {
+		return strings.ToLower(strings.TrimRight(strings.TrimSpace(s), "-:_"))
+	}
+	actualRepo := norm(issue.SourceRepo)
+	idLower := strings.ToLower(strings.TrimSpace(issue.ID))
+	for _, r := range repos {
+		want := norm(r)
+		if want == "" {
+			continue
+		}
+		if actualRepo != "" {
+			if actualRepo == want {
+				return true
+			}
+			continue
+		}
+		if strings.HasPrefix(idLower, want+"-") ||
+			strings.HasPrefix(idLower, want+":") ||
+			strings.HasPrefix(idLower, want+"_") {
+			return true
+		}
+	}
+	return false
+}
+
 func hasLabel(issue model.Issue, tag string) bool {
 	for _, label := range issue.Labels {
 		if strings.EqualFold(label, tag) {
@@ -246,6 +343,25 @@ func SortIssues(issues []model.Issue, metrics Metrics, r *Recipe) {
 	}
 	sort.SliceStable(issues, func(i, j int) bool {
 		for _, lvl := range levels {
+			if lvl.field == SortFieldETA || lvl.field == SortFieldSlack || lvl.field == SortFieldRisk {
+				va, okA := metrics.optionalScore(lvl.field, issues[i].ID)
+				vb, okB := metrics.optionalScore(lvl.field, issues[j].ID)
+				if okA != okB {
+					// Issues with a real ETA/slack/risk score always rank ahead of missing/inapplicable rows.
+					return okA
+				}
+				if !okA {
+					continue
+				}
+				cmp := compareFloats(va, vb)
+				if cmp == 0 {
+					continue
+				}
+				if lvl.desc {
+					return cmp > 0
+				}
+				return cmp < 0
+			}
 			cmp := compareIssues(issues[i], issues[j], lvl.field, metrics)
 			if cmp == 0 {
 				continue
@@ -265,7 +381,7 @@ type sortLevel struct {
 }
 
 // sortDescending resolves an explicit direction, or the field's natural one:
-// newest-first for dates and highest-first for metrics, ascending otherwise.
+// newest-first for dates and highest-first for impact/risk/kcore metrics, ascending otherwise.
 func sortDescending(field, direction string) bool {
 	switch strings.ToLower(strings.TrimSpace(direction)) {
 	case "desc":
@@ -274,7 +390,8 @@ func sortDescending(field, direction string) bool {
 		return false
 	}
 	switch field {
-	case SortFieldCreated, SortFieldUpdated, SortFieldPageRank, SortFieldBetweenness, SortFieldImpact, SortFieldTriage:
+	case SortFieldCreated, SortFieldUpdated, SortFieldPageRank, SortFieldBetweenness, SortFieldImpact, SortFieldTriage,
+		SortFieldRisk, SortFieldKCore:
 		return true
 	}
 	return false
@@ -303,7 +420,7 @@ func compareIssues(a, b model.Issue, field string, metrics Metrics) int {
 		return strings.Compare(string(a.Status), string(b.Status))
 	case SortFieldAssignee:
 		return strings.Compare(strings.ToLower(strings.TrimSpace(a.Assignee)), strings.ToLower(strings.TrimSpace(b.Assignee)))
-	case SortFieldPageRank, SortFieldBetweenness, SortFieldImpact, SortFieldTriage:
+	case SortFieldPageRank, SortFieldBetweenness, SortFieldImpact, SortFieldTriage, SortFieldRisk, SortFieldKCore:
 		return compareFloats(metrics.score(field, a.ID), metrics.score(field, b.ID))
 	}
 	return 0

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
+	"gonum.org/v1/gonum/graph"
 )
 
 // ImpactScore represents the composite priority score for an issue
@@ -637,16 +638,19 @@ type WhatIfDelta struct {
 
 // PriorityRecommendation represents a suggested priority change
 type PriorityRecommendation struct {
-	IssueID           string       `json:"issue_id"`
-	Title             string       `json:"title"`
-	Labels            []string     `json:"labels"`
-	CurrentPriority   int          `json:"current_priority"`
-	SuggestedPriority int          `json:"suggested_priority"`
-	ImpactScore       float64      `json:"impact_score"`
-	Confidence        float64      `json:"confidence"`        // 0-1, higher when evidence is strong
-	Reasoning         []string     `json:"reasoning"`         // Human-readable explanations (top 3)
-	Direction         string       `json:"direction"`         // "increase" or "decrease"
-	WhatIf            *WhatIfDelta `json:"what_if,omitempty"` // Impact of completing this issue
+	IssueID                 string              `json:"issue_id"`
+	Title                   string              `json:"title"`
+	Labels                  []string            `json:"labels"`
+	CurrentPriority         int                 `json:"current_priority"`
+	SuggestedPriority       int                 `json:"suggested_priority"`
+	ImpactScore             float64             `json:"impact_score"`
+	Confidence              float64             `json:"confidence"`        // 0-1, higher when evidence is strong
+	Reasoning               []string            `json:"reasoning"`         // Human-readable explanations (top 3)
+	Direction               string              `json:"direction"`         // "increase" or "decrease"
+	WhatIf                  *WhatIfDelta        `json:"what_if,omitempty"` // Impact of completing this issue
+	Action                  *model.IssueCommand `json:"action,omitempty"`
+	ActionCommand           string              `json:"action_command,omitempty"`
+	ActionUnavailableReason string              `json:"action_unavailable_reason,omitempty"`
 }
 
 // RecommendationThresholds configure when to suggest priority changes
@@ -698,7 +702,7 @@ func (a *Analyzer) generateRecommendationsFromStatsAndScores(stats *GraphStats, 
 	}
 
 	_, coreMap, artPoints := a.activeSubgraphMetrics(stats)
-	_, slackMap, _, hasActiveSlack := a.activeDAGMetrics(stats)
+	activeCP, slackMap, hasActiveCP, hasActiveSlack := a.activeDAGMetrics(stats)
 	artSet := make(map[string]bool, len(artPoints))
 	for _, id := range artPoints {
 		artSet[id] = true
@@ -709,6 +713,15 @@ func (a *Analyzer) generateRecommendationsFromStatsAndScores(stats *GraphStats, 
 			maxCore = v
 		}
 	}
+	hasCriticalChain := false
+	if hasActiveCP {
+		for _, depth := range activeCP {
+			if depth > 1 {
+				hasCriticalChain = true
+				break
+			}
+		}
+	}
 
 	var recommendations []PriorityRecommendation
 
@@ -717,19 +730,47 @@ func (a *Analyzer) generateRecommendationsFromStatsAndScores(stats *GraphStats, 
 			continue
 		}
 		unblocks := a.computeUnblocks(score.IssueID)
+		openBlockerCount := a.OpenBlockerCount(score.IssueID)
 		iss := a.issueMap[score.IssueID]
 		slackVal := 0.0
 		hasSlack := false
 		if hasActiveSlack && slackMap != nil {
 			slackVal, hasSlack = slackMap[score.IssueID]
 		}
+		isConnected := false
+		if nodeID, ok := a.idToNode[score.IssueID]; ok {
+			for _, nb := range graph.NodesOf(a.g.From(nodeID)) {
+				if nbID, ok := a.nodeToID[nb.ID()]; ok {
+					if nbIss, exists := a.issueMap[nbID]; exists && !nbIss.Status.IsClosed() && !nbIss.Status.IsTombstone() {
+						isConnected = true
+						break
+					}
+				}
+			}
+			if !isConnected {
+				for _, nb := range graph.NodesOf(a.g.To(nodeID)) {
+					if nbID, ok := a.nodeToID[nb.ID()]; ok {
+						if nbIss, exists := a.issueMap[nbID]; exists && !nbIss.Status.IsClosed() && !nbIss.Status.IsTombstone() {
+							isConnected = true
+							break
+						}
+					}
+				}
+			}
+		}
+		// Only nodes supporting a multi-step active chain (depth > 1) are on a
+		// critical blocker chain; tail leaves (depth == 1) and isolated nodes are not.
+		supportsCriticalChain := hasCriticalChain && activeCP != nil && activeCP[score.IssueID] > 1
 		rec := generateRecommendation(
 			score,
 			len(unblocks),
+			openBlockerCount,
 			coreMap[score.IssueID],
 			artSet[score.IssueID],
 			slackVal,
 			hasSlack,
+			supportsCriticalChain,
+			isConnected,
 			maxCore,
 			thresholds,
 			iss.IsParkedForStalenessAt(now),
@@ -757,127 +798,167 @@ func (a *Analyzer) generateRecommendationsFromStatsAndScores(stats *GraphStats, 
 	return recommendations
 }
 
-// generateRecommendation creates a recommendation for a single issue
-func generateRecommendation(score ImpactScore, unblocksCount int, core int, isArt bool, slack float64, hasSlack bool, maxCore int, thresholds RecommendationThresholds, isParked bool) *PriorityRecommendation {
-	var reasoning []string
-	var signals int
-	var signalStrength float64
-
-	// Check PageRank (fundamental dependency)
-	if score.Breakdown.PageRankNorm > thresholds.HighPageRank {
-		reasoning = append(reasoning, "High centrality in dependency graph")
-		signals++
-		signalStrength += score.Breakdown.PageRankNorm
-	}
-
-	// Check Betweenness (bottleneck)
-	if score.Breakdown.BetweennessNorm > thresholds.HighBetweenness {
-		reasoning = append(reasoning, "Critical path bottleneck")
-		signals++
-		signalStrength += score.Breakdown.BetweennessNorm
-	}
-
-	// Check unblocks count
-	if unblocksCount >= 3 {
-		reasoning = append(reasoning, fmt.Sprintf("Blocks %d other items", unblocksCount))
-		signals++
-		signalStrength += 0.5 + float64(unblocksCount)/10.0
-	} else if unblocksCount == 2 {
-		reasoning = append(reasoning, "Blocks 2 other items")
-		signals++
-		signalStrength += 0.3
-	} else if unblocksCount == 1 {
-		reasoning = append(reasoning, "Blocks 1 other item")
-		signals++
-		signalStrength += 0.2
-	}
-
-	// Check staleness (never attribute staleness to parked beads)
-	if !isParked && score.Breakdown.StalenessNorm > 0 && score.Breakdown.StalenessNorm >= float64(thresholds.StalenessDays)/30.0 {
-		days := int(score.Breakdown.StalenessNorm * 30)
-		reasoning = append(reasoning, fmt.Sprintf("Stale for %d+ days", days))
-		signals++
-		signalStrength += 0.2
-	}
-
-	// Check time-to-impact signal
-	if score.Breakdown.TimeToImpactNorm > 0.5 {
-		if score.Breakdown.TimeToImpactExplanation != "" {
-			reasoning = append(reasoning, score.Breakdown.TimeToImpactExplanation)
-		} else {
-			reasoning = append(reasoning, "High time-to-impact score")
-		}
-		signals++
-		signalStrength += score.Breakdown.TimeToImpactNorm
-	}
-
-	// Check urgency signal
-	if score.Breakdown.UrgencyNorm > 0.3 {
-		if score.Breakdown.UrgencyExplanation != "" {
-			reasoning = append(reasoning, score.Breakdown.UrgencyExplanation)
-		} else {
-			reasoning = append(reasoning, "Elevated urgency")
-		}
-		signals++
-		signalStrength += score.Breakdown.UrgencyNorm
-	}
-
-	// Check risk signal (bv-82)
-	if score.Breakdown.RiskNorm > 0.4 {
-		if score.Breakdown.RiskExplanation != "" {
-			reasoning = append(reasoning, score.Breakdown.RiskExplanation)
-		} else {
-			reasoning = append(reasoning, "Elevated risk/volatility")
-		}
-		signals++
-		signalStrength += score.Breakdown.RiskNorm
-	}
-
-	// Structural signals (bv-85)
-	if isArt {
-		reasoning = append(reasoning, "Articulation point (disconnects graph)")
-		signals++
-		signalStrength += 0.35
-	}
-	if maxCore > 0 && core == maxCore {
-		reasoning = append(reasoning, fmt.Sprintf("High cohesion (k-core %d)", core))
-		signals++
-		signalStrength += 0.3
-	}
-	if hasSlack {
-		if slack == 0 {
-			reasoning = append(reasoning, "Zero slack on critical chain")
-			signals++
-			signalStrength += 0.25
-		} else if slack > 2 {
-			// Parallel-friendly; softer weight so it doesn't overshadow bottlenecks
-			reasoning = append(reasoning, "Parallel-friendly (slack available)")
-			signals++
-			signalStrength += 0.15
-		}
-	}
-
-	// No signals = no recommendation needed
-	if signals == 0 {
-		return nil
-	}
-
-	// Calculate suggested priority based on impact score
+// generateRecommendation creates a direction-consistent recommendation for a single issue.
+// Escalation ("increase") and demotion ("decrease") signals are strictly partitioned so
+// positive criticality signals (high centrality, blocking downstream work, critical chain,
+// urgency/risk) can never inflate confidence or serve as reasoning for demoting an issue.
+func generateRecommendation(score ImpactScore, unblocksCount int, openBlockerCount int, core int, isArt bool, slack float64, hasSlack bool, hasCriticalChain bool, isConnected bool, maxCore int, thresholds RecommendationThresholds, isParked bool) *PriorityRecommendation {
+	// Calculate suggested priority based on impact score first so evidence is aligned with direction.
 	suggestedPriority := scoreToPriority(score.Score)
-
-	// If no change suggested, skip
 	if suggestedPriority == score.Priority {
 		return nil
 	}
-
-	// Calculate confidence based on signals and delta
-	scoreDelta := abs(score.Score - priorityToScore(score.Priority))
-	confidence := calculateConfidence(signals, signalStrength, scoreDelta, thresholds)
 
 	direction := "increase"
 	if suggestedPriority > score.Priority {
 		direction = "decrease"
 	}
+
+	var incReasons []string
+	var incSignals int
+	var incStrength float64
+
+	// Escalation signals (support increasing priority)
+	highPR := isConnected && openBlockerCount > 0 && score.Breakdown.PageRankNorm > thresholds.HighPageRank
+	if highPR {
+		incReasons = append(incReasons, "High centrality in dependency graph")
+		incSignals++
+		incStrength += score.Breakdown.PageRankNorm
+	}
+
+	highBW := isConnected && score.Breakdown.BetweennessNorm > thresholds.HighBetweenness
+	if highBW {
+		incReasons = append(incReasons, "Critical path bottleneck")
+		incSignals++
+		incStrength += score.Breakdown.BetweennessNorm
+	}
+
+	if unblocksCount >= 3 {
+		incReasons = append(incReasons, fmt.Sprintf("Blocks %d other items", unblocksCount))
+		incSignals++
+		incStrength += 0.5 + float64(unblocksCount)/10.0
+	} else if unblocksCount == 2 {
+		incReasons = append(incReasons, "Blocks 2 other items")
+		incSignals++
+		incStrength += 0.3
+	} else if unblocksCount == 1 {
+		incReasons = append(incReasons, "Blocks 1 other item")
+		incSignals++
+		incStrength += 0.2
+	}
+
+	// Staleness (never attribute staleness to parked beads)
+	if !isParked && score.Breakdown.StalenessNorm > 0 && score.Breakdown.StalenessNorm >= float64(thresholds.StalenessDays)/30.0 {
+		days := int(score.Breakdown.StalenessNorm * 30)
+		incReasons = append(incReasons, fmt.Sprintf("Stale for %d+ days", days))
+		incSignals++
+		incStrength += 0.2
+	}
+
+	if score.Breakdown.TimeToImpactNorm > 0.5 {
+		if score.Breakdown.TimeToImpactExplanation != "" {
+			incReasons = append(incReasons, score.Breakdown.TimeToImpactExplanation)
+		} else {
+			incReasons = append(incReasons, "High time-to-impact score")
+		}
+		incSignals++
+		incStrength += score.Breakdown.TimeToImpactNorm
+	}
+
+	highUrgency := score.Breakdown.UrgencyNorm > 0.3
+	if highUrgency {
+		if score.Breakdown.UrgencyExplanation != "" {
+			incReasons = append(incReasons, score.Breakdown.UrgencyExplanation)
+		} else {
+			incReasons = append(incReasons, "Elevated urgency")
+		}
+		incSignals++
+		incStrength += score.Breakdown.UrgencyNorm
+	}
+
+	highRisk := score.Breakdown.RiskNorm > 0.4
+	if highRisk {
+		if score.Breakdown.RiskExplanation != "" {
+			incReasons = append(incReasons, score.Breakdown.RiskExplanation)
+		} else {
+			incReasons = append(incReasons, "Elevated risk/volatility")
+		}
+		incSignals++
+		incStrength += score.Breakdown.RiskNorm
+	}
+
+	if isArt {
+		incReasons = append(incReasons, "Articulation point (disconnects graph)")
+		incSignals++
+		incStrength += 0.35
+	}
+	if isConnected && maxCore > 0 && core == maxCore {
+		incReasons = append(incReasons, fmt.Sprintf("High cohesion (k-core %d)", core))
+		incSignals++
+		incStrength += 0.3
+	}
+
+	onCriticalChain := hasSlack && slack == 0 && hasCriticalChain && isConnected
+	if onCriticalChain {
+		incReasons = append(incReasons, "Zero slack on critical chain")
+		incSignals++
+		incStrength += 0.25
+	}
+
+	// Demotion signals (support decreasing priority)
+	var decReasons []string
+	var decSignals int
+	var decStrength float64
+
+	if hasSlack && slack > 2 {
+		decReasons = append(decReasons, "Parallel-friendly (slack available)")
+		decSignals++
+		decStrength += 0.25
+	}
+	if unblocksCount == 0 && openBlockerCount == 0 {
+		decReasons = append(decReasons, "Leaf item (blocks no downstream work)")
+		decSignals++
+		decStrength += 0.25
+	}
+	if !isConnected || (score.Breakdown.PageRankNorm <= thresholds.HighPageRank/2 && score.Breakdown.BetweennessNorm <= thresholds.HighBetweenness/2) {
+		decReasons = append(decReasons, "Low graph centrality")
+		decSignals++
+		decStrength += 0.20
+	}
+	if score.Breakdown.UrgencyNorm <= 0.1 && score.Breakdown.RiskNorm <= 0.2 {
+		decReasons = append(decReasons, "Low urgency and risk signals")
+		decSignals++
+		decStrength += 0.15
+	}
+
+	var reasoning []string
+	var signals int
+	var signalStrength float64
+
+	if direction == "decrease" {
+		// Never recommend demoting active work under direct/joint blocking, critical-chain,
+		// high time-to-impact, urgency, or risk escalation pressure.
+		if unblocksCount > 0 || openBlockerCount > 0 || onCriticalChain || isArt || highPR || highBW || highUrgency || highRisk || score.Breakdown.TimeToImpactNorm > 0.5 {
+			return nil
+		}
+		if decSignals == 0 {
+			return nil
+		}
+		reasoning = decReasons
+		signals = decSignals
+		signalStrength = decStrength
+	} else {
+		if incSignals == 0 {
+			return nil
+		}
+		reasoning = incReasons
+		signals = incSignals
+		signalStrength = incStrength
+	}
+
+	// Calculate confidence strictly from direction-aligned signals and delta
+	scoreDelta := abs(score.Score - priorityToScore(score.Priority))
+	confidence := calculateConfidence(signals, signalStrength, scoreDelta, thresholds)
 
 	// Cap reasoning at top 3 for conciseness (bv-83)
 	if len(reasoning) > 3 {

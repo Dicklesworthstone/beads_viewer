@@ -9,15 +9,36 @@ import (
 
 // PlanItem represents a single actionable item in the execution plan
 type PlanItem struct {
-	ID          string              `json:"id"`
-	Title       string              `json:"title"`
-	Priority    int                 `json:"priority"`
-	Status      string              `json:"status"`
-	Assignee    string              `json:"assignee,omitempty"`
-	Claimable   bool                `json:"claimable"`
-	NotReady    bool                `json:"not_ready,omitempty"`
-	UnblocksIDs []string            `json:"unblocks"` // Issues that become actionable when this is done
-	Actions     *model.IssueActions `json:"actions,omitempty"`
+	ID                 string              `json:"id"`
+	Title              string              `json:"title"`
+	Priority           int                 `json:"priority"`
+	Status             string              `json:"status"`
+	Assignee           string              `json:"assignee,omitempty"`
+	Claimable          bool                `json:"claimable"`
+	NotReady           bool                `json:"not_ready,omitempty"`
+	UnblocksIDs        []string            `json:"unblocks"` // Issues that become actionable when this is done
+	TransitiveUnblocks int                 `json:"transitive_unblocks,omitempty"`
+	EstimatedDaysSaved float64             `json:"estimated_days_saved,omitempty"`
+	ETADays            *float64            `json:"eta_days,omitempty"`
+	ETADate            string              `json:"eta_date,omitempty"`
+	ETAConfidence      *float64            `json:"eta_confidence,omitempty"`
+	RiskScore          float64             `json:"risk_score,omitempty"`
+	RiskExplanation    string              `json:"risk_explanation,omitempty"`
+	Actions            *model.IssueActions `json:"actions,omitempty"`
+}
+
+// PlanCapacity summarizes Graham multi-agent scheduling bounds over a scoped open issue set (W37-3/W37-4).
+type PlanCapacity struct {
+	OpenCount           int      `json:"open_count"`
+	TotalMinutes        int      `json:"total_minutes"`
+	CriticalPathMinutes int      `json:"critical_path_minutes"`
+	ParallelizablePct   float64  `json:"parallelizable_pct"`
+	Days1Agent          float64  `json:"days_1_agent"`
+	Days2AgentsMin      float64  `json:"days_2_agents_min"`
+	Days2AgentsMax      float64  `json:"days_2_agents_max"`
+	Days4AgentsMin      float64  `json:"days_4_agents_min"`
+	Days4AgentsMax      float64  `json:"days_4_agents_max"`
+	CriticalPathIDs     []string `json:"critical_path_ids,omitempty"`
 }
 
 // ExecutionTrack represents a group of related actionable items
@@ -170,6 +191,7 @@ type ExecutionPlan struct {
 	TotalBlocked          int              `json:"total_blocked"`
 	TotalDeferredOrParked int              `json:"total_deferred_or_parked,omitempty"`
 	TotalInProgress       int              `json:"total_in_progress,omitempty"`
+	Capacity              *PlanCapacity    `json:"capacity,omitempty"`
 	Summary               PlanSummary      `json:"summary"`
 }
 

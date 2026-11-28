@@ -496,14 +496,15 @@ func uniqueSortedStrings(values []string) []string {
 }
 
 // detectClusters uses connected components to find clusters of related beads.
-// Only considers edges with weight >= minWeight.
+// Considers strong shared-file/commit edges (weight >= minWeight) as well as
+// explicit blocking dependency edges (EdgeDependency).
 func (nb *NetworkBuilder) detectClusters(network *ImpactNetwork) {
-	const minWeight = 2 // Minimum edge weight to be considered for clustering
+	const minWeight = 2 // Minimum shared-file/commit edge weight for clustering
 
-	// Build adjacency list with only strong edges
+	// Build adjacency list with strong edges and explicit blocking dependencies
 	adj := make(map[string][]string)
 	for _, edge := range network.Edges {
-		if edge.Weight >= minWeight {
+		if edge.Weight >= minWeight || (edge.EdgeType == EdgeDependency && edge.Weight > 0) {
 			adj[edge.FromBead] = append(adj[edge.FromBead], edge.ToBead)
 			adj[edge.ToBead] = append(adj[edge.ToBead], edge.FromBead)
 		}

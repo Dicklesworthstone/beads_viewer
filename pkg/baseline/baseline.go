@@ -56,6 +56,7 @@ type BaselineScope struct {
 	Label     string `json:"label,omitempty"`
 	Recipe    string `json:"recipe,omitempty"`
 	Repo      string `json:"repo,omitempty"`
+	GraphRoot string `json:"graph_root,omitempty"`
 	Workspace bool   `json:"workspace,omitempty"`
 }
 
@@ -63,6 +64,7 @@ func scopesEqual(a, b BaselineScope) bool {
 	return strings.TrimSpace(a.Label) == strings.TrimSpace(b.Label) &&
 		strings.EqualFold(strings.TrimSpace(a.Recipe), strings.TrimSpace(b.Recipe)) &&
 		strings.EqualFold(strings.TrimSpace(a.Repo), strings.TrimSpace(b.Repo)) &&
+		strings.TrimSpace(a.GraphRoot) == strings.TrimSpace(b.GraphRoot) &&
 		a.Workspace == b.Workspace
 }
 

@@ -399,19 +399,30 @@ func (a *Analyzer) generateCycleBreakSuggestionsFromStats(stats *GraphStats, lim
 		}
 	}
 
-	// Rank edges by frequency (breaking highest-frequency edges affects most cycles)
+	// Rank edges by cycle frequency descending, then active collateral ascending
+	// (matching Standalone HTML cycle-break ranking so all surfaces agree on the
+	// highest-impact, lowest-collateral cut edge).
 	type edgeRank struct {
-		key    edgeKey
-		cycles []int
-		count  int
+		key        edgeKey
+		cycles     []int
+		count      int
+		collateral int
 	}
 	var ranked []edgeRank
 	for k, cycs := range edgeFreq {
-		ranked = append(ranked, edgeRank{key: k, cycles: cycs, count: len(cycs)})
+		ranked = append(ranked, edgeRank{
+			key:        k,
+			cycles:     cycs,
+			count:      len(cycs),
+			collateral: a.countDependents(k.to),
+		})
 	}
 	sort.Slice(ranked, func(i, j int) bool {
 		if ranked[i].count != ranked[j].count {
 			return ranked[i].count > ranked[j].count
+		}
+		if ranked[i].collateral != ranked[j].collateral {
+			return ranked[i].collateral < ranked[j].collateral
 		}
 		// Deterministic tie-break by edge lexicographically
 		if ranked[i].key.from != ranked[j].key.from {
@@ -430,9 +441,9 @@ func (a *Analyzer) generateCycleBreakSuggestionsFromStats(stats *GraphStats, lim
 			EdgeFrom:   r.key.from,
 			EdgeTo:     r.key.to,
 			Impact:     r.count,
-			Collateral: a.countDependents(r.key.to),
+			Collateral: r.collateral,
 			InCycles:   r.cycles,
-			Rationale:  "Appears in the most stored cycle records; review collateral before removing this dependency.",
+			Rationale:  "Breaks the most stored cycles with lowest active collateral; review dependents before removing this dependency.",
 		})
 	}
 

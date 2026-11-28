@@ -1697,3 +1697,46 @@ func TestNewReadinessIndexFromMap_ParityOverrideAndEmpty(t *testing.T) {
 		}
 	}
 }
+
+func TestIssue_MutationAction_SetPriority(t *testing.T) {
+	liveOrigin := &IssueOrigin{
+		LocalID:          "local-7",
+		WorkingDirectory: "/repo",
+		TrackerDirectory: "/repo/.beads",
+		Database:         "/repo/.beads/beads.db",
+		Tracker:          "br",
+		Executable:       "/usr/bin/br",
+		SupportsClaim:    true,
+	}
+	iss := Issue{ID: "api-local-7", Title: "Priority target", Status: StatusOpen, Priority: 2, Origin: liveOrigin}
+
+	for _, prio := range []string{"0", "1", "2", "3", "4"} {
+		cmd, reason := iss.MutationAction(MutationSetPriority, nil, prio)
+		if cmd == nil || reason != "" {
+			t.Fatalf("expected valid MutationSetPriority for %q, got cmd=%+v reason=%q", prio, cmd, reason)
+		}
+		wantFlag := "--priority=" + prio
+		if !strings.Contains(cmd.Shell, wantFlag) || !strings.Contains(cmd.Shell, "local-7") || strings.Contains(cmd.Shell, "api-local-7") {
+			t.Fatalf("unexpected shell command for priority %q: %q", prio, cmd.Shell)
+		}
+	}
+
+	for _, bad := range []string{"", "-1", "5", "10", "high", "P1"} {
+		cmd, reason := iss.MutationAction(MutationSetPriority, nil, bad)
+		if cmd != nil || reason == "" {
+			t.Fatalf("expected MutationSetPriority to reject %q, got cmd=%+v reason=%q", bad, cmd, reason)
+		}
+	}
+
+	roOrigin := *liveOrigin
+	roOrigin.ReadOnlyReason = "historical snapshot is read-only"
+	roIss := Issue{ID: "api-local-7", Status: StatusOpen, Origin: &roOrigin}
+	if cmd, reason := roIss.MutationAction(MutationSetPriority, nil, "1"); cmd != nil || !strings.Contains(reason, "read-only") {
+		t.Fatalf("expected read-only origin rejection, got cmd=%+v reason=%q", cmd, reason)
+	}
+
+	noOriginIss := Issue{ID: "api-local-7", Status: StatusOpen}
+	if cmd, reason := noOriginIss.MutationAction(MutationSetPriority, nil, "1"); cmd != nil || reason == "" {
+		t.Fatalf("expected missing origin rejection, got cmd=%+v reason=%q", cmd, reason)
+	}
+}

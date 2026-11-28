@@ -109,13 +109,40 @@ func DetectCycleWarnings(issues []model.Issue, config CycleWarningConfig) []Sugg
 		).WithMetadata("cycle_length", cycleLen).
 			WithMetadata("cycle_path", cycle[:len(cycle)-1]) // Store path without closing node
 
-		// Add action command to break the cycle
+		// Add action command to break the cycle using the lowest-collateral edge.
+		// Start from the closing edge (cycle[len-1] -> cycle[0]) so equal-collateral
+		// cycles preserve the existing closing-edge mutation routing contract, while
+		// strictly lower-collateral edges always win (breaking ties lexicographically).
 		if cycleLen >= 2 {
-			// Suggest removing the last edge in the cycle
-			from := cycle[cycleLen-1]
-			to := cycle[0]
-			peer := byID[to]
-			sug = sug.withMutationAction(byID[from], model.MutationRemoveDependency, &peer, "")
+			bestFrom := cycle[cycleLen-1]
+			bestTo := cycle[0]
+			bestCollateral := analyzer.countDependents(bestTo)
+			improvedFromClosing := false
+			for j := 0; j < cycleLen; j++ {
+				candFrom := cycle[j]
+				candTo := cycle[j+1]
+				if candFrom == "" || candTo == "" {
+					continue
+				}
+				candCol := analyzer.countDependents(candTo)
+				if candCol < bestCollateral {
+					bestFrom = candFrom
+					bestTo = candTo
+					bestCollateral = candCol
+					improvedFromClosing = true
+				} else if improvedFromClosing && candCol == bestCollateral &&
+					(candFrom < bestFrom || (candFrom == bestFrom && candTo < bestTo)) {
+					bestFrom = candFrom
+					bestTo = candTo
+				}
+			}
+			peer := byID[bestTo]
+			sug = sug.withMutationAction(byID[bestFrom], model.MutationRemoveDependency, &peer, "").
+				WithMetadata("recommended_cut", map[string]any{
+					"from":       bestFrom,
+					"to":         bestTo,
+					"collateral": bestCollateral,
+				})
 		}
 
 		// If there's a second issue, mark it as related
@@ -204,6 +231,194 @@ func CheckDependencyAddition(issues []model.Issue, fromID, toID string) (bool, [
 		return false, path, warning
 	}
 	return true, nil, ""
+}
+
+// DependencyRemovalCheck reports the pre-flight impact of removing blocking edge fromID -> toID.
+type DependencyRemovalCheck struct {
+	FromID              string   `json:"from_id"`
+	ToID                string   `json:"to_id"`
+	Exists              bool     `json:"exists"`
+	CyclesBefore        int      `json:"cycles_before"`
+	CyclesAfter         int      `json:"cycles_after"`
+	CyclesBroken        int      `json:"cycles_broken"`
+	CyclesTruncated     bool     `json:"cycles_truncated,omitempty"`
+	WouldBreakAllCycles bool     `json:"would_break_all_cycles"`
+	NewlyUnblocked      []string `json:"newly_unblocked,omitempty"`
+	RemainingCycles     int      `json:"remaining_cycles"`
+	Warning             string   `json:"warning,omitempty"`
+}
+
+// CheckDependencyRemoval simulates removing the blocking dependency fromID -> toID
+// and reports cycle reduction and newly actionable issues (W32-2).
+func CheckDependencyRemoval(issues []model.Issue, fromID, toID string, now time.Time) DependencyRemovalCheck {
+	return CheckDependencyRemovalWithScope(issues, fromID, toID, nil, now)
+}
+
+// CheckDependencyRemovalWithScope simulates removing the blocking dependency fromID -> toID
+// while preserving full-graph readiness authority and scoping reported cycles and newly unblocked
+// issues strictly to candidateIDs when non-nil (P24A-3).
+func CheckDependencyRemovalWithScope(issues []model.Issue, fromID, toID string, candidateIDs map[string]bool, now time.Time) DependencyRemovalCheck {
+	res := DependencyRemovalCheck{
+		FromID: fromID,
+		ToID:   toID,
+	}
+	if fromID == "" || toID == "" || len(issues) == 0 {
+		res.Warning = fmt.Sprintf("Blocking dependency %s → %s does not exist", fromID, toID)
+		return res
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+
+	// Collapse append-only duplicate records with last-record-wins semantics matching
+	// NewAnalyzer / NewReadinessIndex so superseded edges never trigger false positives
+	// or emit duplicate IDs into NewlyUnblocked (P22A-3).
+	deduped := make([]model.Issue, 0, len(issues))
+	dedupIdx := make(map[string]int, len(issues))
+	for _, iss := range issues {
+		if prev, ok := dedupIdx[iss.ID]; ok {
+			deduped[prev] = iss
+		} else {
+			dedupIdx[iss.ID] = len(deduped)
+			deduped = append(deduped, iss)
+		}
+	}
+
+	exists := false
+	modified := make([]model.Issue, len(deduped))
+	for i, iss := range deduped {
+		cloned := iss
+		if len(iss.Dependencies) > 0 {
+			if iss.ID == fromID {
+				filtered := make([]*model.Dependency, 0, len(iss.Dependencies))
+				for _, dep := range iss.Dependencies {
+					if dep == nil {
+						continue
+					}
+					if dep.Type.IsBlocking() && dep.DependsOnID == toID {
+						exists = true
+						continue
+					}
+					dc := *dep
+					filtered = append(filtered, &dc)
+				}
+				cloned.Dependencies = filtered
+			} else {
+				depsCopy := make([]*model.Dependency, len(iss.Dependencies))
+				for j, dep := range iss.Dependencies {
+					if dep != nil {
+						dc := *dep
+						depsCopy[j] = &dc
+					}
+				}
+				cloned.Dependencies = depsCopy
+			}
+		}
+		modified[i] = cloned
+	}
+	if !exists {
+		res.Warning = fmt.Sprintf("Blocking dependency %s → %s does not exist", fromID, toID)
+		return res
+	}
+	res.Exists = true
+
+	const maxCycles = 100
+	cycleCfg := ApplyEnvOverrides(AnalysisConfig{
+		ComputeCycles:    true,
+		CyclesTimeout:    500 * time.Millisecond,
+		MaxCyclesToStore: maxCycles,
+	})
+	beforeAn := NewAnalyzer(deduped)
+	beforeAn.SetNow(now)
+	beforeStats := beforeAn.AnalyzeWithConfig(cycleCfg)
+	beforeReady := beforeAn.Readiness()
+
+	afterAn := NewAnalyzer(modified)
+	afterAn.SetNow(now)
+	afterStats := afterAn.AnalyzeWithConfig(cycleCfg)
+	afterReady := afterAn.Readiness()
+
+	beforeStatus := beforeStats.Status().Cycles
+	afterStatus := afterStats.Status().Cycles
+	beforeState := beforeStatus.State
+	afterState := afterStatus.State
+	beforeTimedOut := beforeState == "timeout"
+	afterTimedOut := afterState == "timeout"
+	beforeSkipped := beforeState == "skipped"
+	afterSkipped := afterState == "skipped"
+	beforeTruncated := strings.Contains(strings.ToLower(beforeStatus.Reason), "truncated")
+	afterTruncated := strings.Contains(strings.ToLower(afterStatus.Reason), "truncated")
+	countScopedCycles := func(cycles [][]string) int {
+		if candidateIDs == nil {
+			return len(cycles)
+		}
+		count := 0
+		for _, cyc := range cycles {
+			if len(cyc) == 0 {
+				continue
+			}
+			inScope := true
+			for _, id := range cyc {
+				if !candidateIDs[id] {
+					inScope = false
+					break
+				}
+			}
+			if inScope {
+				count++
+			}
+		}
+		return count
+	}
+	res.CyclesBefore = countScopedCycles(beforeStats.Cycles())
+	res.CyclesAfter = countScopedCycles(afterStats.Cycles())
+	res.RemainingCycles = res.CyclesAfter
+	res.CyclesTruncated = beforeTruncated || afterTruncated
+	if beforeTimedOut || afterTimedOut {
+		res.Warning = "Cycle detection timed out during dependency removal preflight; cycle counts are inconclusive"
+		res.CyclesBroken = 0
+		res.WouldBreakAllCycles = false
+	} else if beforeSkipped || afterSkipped {
+		res.Warning = "Cycle detection was skipped during dependency removal preflight; cycle counts are inconclusive"
+		res.CyclesBroken = 0
+		res.WouldBreakAllCycles = false
+	} else if res.CyclesTruncated {
+		if !afterTruncated && res.CyclesAfter == 0 && res.CyclesBefore > 0 {
+			res.CyclesBroken = res.CyclesBefore
+			res.WouldBreakAllCycles = true
+			if len(afterStats.Cycles()) == 0 {
+				res.Warning = fmt.Sprintf("Cycle enumeration reached cap (%d) before removal; removal leaves 0 active cycles (acyclic)", maxCycles)
+			} else {
+				res.Warning = fmt.Sprintf("Cycle enumeration reached cap (%d) before removal; removal leaves 0 active cycles in scope", maxCycles)
+			}
+		} else if afterTruncated || res.CyclesBefore == 0 || res.CyclesAfter >= res.CyclesBefore {
+			res.CyclesBroken = 0
+			res.WouldBreakAllCycles = false
+			res.Warning = fmt.Sprintf("Cycle enumeration reached cap (%d); exact cycle reduction is inconclusive", maxCycles)
+		} else {
+			res.CyclesBroken = res.CyclesBefore - res.CyclesAfter
+			res.WouldBreakAllCycles = false
+			res.Warning = fmt.Sprintf("Cycle enumeration reached cap (%d); exact cycle reduction is approximate (>= %d broken, %d remaining)", maxCycles, res.CyclesBroken, res.CyclesAfter)
+		}
+	} else {
+		if res.CyclesBefore > res.CyclesAfter {
+			res.CyclesBroken = res.CyclesBefore - res.CyclesAfter
+		}
+		res.WouldBreakAllCycles = res.CyclesBefore > 0 && res.CyclesAfter == 0
+	}
+
+	var newly []string
+	for _, iss := range deduped {
+		if candidateIDs != nil && !candidateIDs[iss.ID] {
+			continue
+		}
+		if !beforeReady.Ready(iss.ID, now) && afterReady.Ready(iss.ID, now) {
+			newly = append(newly, iss.ID)
+		}
+	}
+	sort.Strings(newly)
+	res.NewlyUnblocked = newly
+	return res
 }
 
 // CycleWarningDetector provides stateful cycle warning detection

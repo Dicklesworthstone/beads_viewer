@@ -847,22 +847,26 @@ func TestEnhancedPriorityBatchRegression(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Verify exact numerical parity with pre-reuse 52853c6a plus the three
+	// Verify exact numerical parity with pre-reuse 52853c6a plus the
 	// bv-apal.21 contract upgrades (non-null labels [], populated
-	// explanation.status.data_hash, deterministic IssueID tie-breaking) and the
+	// explanation.status.data_hash, deterministic IssueID tie-breaking), the
 	// bv-apal.44 dependency-blocked StatusRisk fix (+0.012 = (0.7-0.1)*0.20*0.10
 	// on DEPENDENT-* which depend on open ROOT via DepBlocks, while unblocked
-	// ROOT stays at 0.41725).
+	// ROOT stays at 0.41725), and the bv-apal.92 direction-aligned evidence fix
+	// (P0->P3 leaf decreases DEPENDENT-005..045 now report decrease-aligned
+	// reasons ["Leaf item (blocks no downstream work)", "Low graph centrality",
+	// "Low urgency and risk signals"] at confidence 0.8 instead of escalation
+	// reasons ["Stale...", "High cohesion...", "Zero slack..."]).
 	if len(got) != 10 {
 		t.Fatalf("len(got)=%d want 10", len(got))
 	}
-	if got[0].IssueID != "ROOT" || got[0].ImpactScore != 0.41725 || got[0].WhatIf == nil || got[0].WhatIf.DirectUnblocks != 539 || got[0].WhatIf.EstimatedDaysSaved != 67.375 {
+	if got[0].IssueID != "ROOT" || got[0].Direction != "increase" || got[0].ImpactScore != 0.41725 || got[0].WhatIf == nil || got[0].WhatIf.DirectUnblocks != 539 || got[0].WhatIf.EstimatedDaysSaved != 67.375 {
 		t.Fatalf("ROOT recommendation drifted: %+v", got[0])
 	}
 	for i := 1; i < len(got); i++ {
 		wantID := fmt.Sprintf("DEPENDENT-%03d", i*5)
-		if got[i].IssueID != wantID || got[i].ImpactScore != 0.17272914549252844 {
-			t.Fatalf("got[%d]=(%s, %v) want (%s, 0.17272914549252844)", i, got[i].IssueID, got[i].ImpactScore, wantID)
+		if got[i].IssueID != wantID || got[i].Direction != "decrease" || got[i].ImpactScore != 0.17272914549252844 {
+			t.Fatalf("got[%d]=(%s, %s, %v) want (%s, decrease, 0.17272914549252844)", i, got[i].IssueID, got[i].Direction, got[i].ImpactScore, wantID)
 		}
 	}
 	for i, rec := range got {
@@ -873,7 +877,7 @@ func TestEnhancedPriorityBatchRegression(t *testing.T) {
 			t.Fatalf("got[%d].Explanation.Status=%+v want non-empty data_hash and phase2_ready=true", i, rec.Explanation.Status)
 		}
 	}
-	const wantSHA = "1b367ec1460f1f2a784432cdca6667370be36b3a63164d4656bbb018ed9f8b48"
+	const wantSHA = "f358c6a1a1b1a1bb03d12c7a4751d129e7c27e0ea354f4810e19d897b236f938"
 	if gotSHA := fmt.Sprintf("%x", sha256.Sum256(encoded)); gotSHA != wantSHA {
 		t.Fatalf("complete enhanced output SHA256=%s want %s\n%s", gotSHA, wantSHA, encoded)
 	}

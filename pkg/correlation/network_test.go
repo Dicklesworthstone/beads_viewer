@@ -895,3 +895,64 @@ func TestEmptyHistoryReport(t *testing.T) {
 		t.Errorf("Expected 0 total nodes in stats, got %d", network.Stats.TotalNodes)
 	}
 }
+
+func TestNetworkBuilder_EdgeDependencyClustersDisjointBeads(t *testing.T) {
+	now := time.Date(2026, 11, 28, 12, 0, 0, 0, time.UTC)
+	report := &HistoryReport{
+		GeneratedAt: now,
+		DataHash:    "dep-cluster-test",
+		Histories: map[string]BeadHistory{
+			"DEP-A": {
+				BeadID: "DEP-A", Title: "Core auth", Status: "open",
+				Commits: []CorrelatedCommit{{
+					SHA: "1111111111111111111111111111111111111111", ShortSHA: "1111111", BeadID: "DEP-A",
+					Message: "feat(DEP-A): core", Author: "alice", Timestamp: now.Add(-48 * time.Hour),
+					Files: []FileChange{{Path: "auth/core.go", Action: "M"}},
+				}},
+			},
+			"DEP-B": {
+				BeadID: "DEP-B", Title: "Web consumer", Status: "open",
+				Commits: []CorrelatedCommit{{
+					SHA: "2222222222222222222222222222222222222222", ShortSHA: "2222222", BeadID: "DEP-B",
+					Message: "feat(DEP-B): web", Author: "bob", Timestamp: now.Add(-2 * time.Hour),
+					Files: []FileChange{{Path: "web/login.go", Action: "M"}},
+				}},
+			},
+		},
+		CommitIndex: CommitIndex{
+			"1111111111111111111111111111111111111111": {"DEP-A"},
+			"2222222222222222222222222222222222222222": {"DEP-B"},
+		},
+	}
+
+	// Negative control: without issue dependencies, disjoint commits form 0 clusters.
+	withoutDeps := NewNetworkBuilder(report).Build()
+	if len(withoutDeps.Clusters) != 0 {
+		t.Fatalf("expected 0 clusters without dependencies, got %+v", withoutDeps.Clusters)
+	}
+
+	// Positive observable: a single weight-1 DepBlocks edge clusters both beads.
+	issues := []model.Issue{
+		{ID: "DEP-A", Title: "Core auth", Status: model.StatusOpen},
+		{
+			ID: "DEP-B", Title: "Web consumer", Status: model.StatusOpen,
+			Dependencies: []*model.Dependency{{IssueID: "DEP-B", DependsOnID: "DEP-A", Type: model.DepBlocks}},
+		},
+	}
+	withDeps := NewNetworkBuilderWithIssues(report, issues).Build()
+	if len(withDeps.Clusters) != 1 {
+		t.Fatalf("expected 1 dependency-linked cluster, got %+v", withDeps.Clusters)
+	}
+	if len(withDeps.Clusters[0].BeadIDs) != 2 {
+		t.Fatalf("expected cluster with 2 beads, got %+v", withDeps.Clusters[0].BeadIDs)
+	}
+	foundDepEdge := false
+	for _, e := range withDeps.Edges {
+		if e.EdgeType == EdgeDependency && e.Weight == 1 {
+			foundDepEdge = true
+		}
+	}
+	if !foundDepEdge {
+		t.Fatalf("expected weight-1 EdgeDependency in network edges, got %+v", withDeps.Edges)
+	}
+}

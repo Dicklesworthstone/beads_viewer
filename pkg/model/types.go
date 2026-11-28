@@ -117,6 +117,7 @@ const (
 	MutationRelate           MutationKind = "relate"
 	MutationRemoveDependency MutationKind = "remove_dependency"
 	MutationAddLabel         MutationKind = "add_label"
+	MutationSetPriority      MutationKind = "set_priority"
 )
 
 // MutationAction binds a hygiene suggestion to live local IDs. Dependencies
@@ -135,6 +136,13 @@ func (i Issue) MutationAction(kind MutationKind, peer *Issue, value string) (*Is
 			return nil, "suggested label is empty or contains a NUL byte"
 		}
 		return o.command(true, "update", "--json", "--add-label="+value, "--", o.LocalID), ""
+	}
+	if kind == MutationSetPriority {
+		v := strings.TrimSpace(value)
+		if len(v) != 1 || v[0] < '0' || v[0] > '4' {
+			return nil, "suggested priority must be an integer between 0 and 4"
+		}
+		return o.command(true, "update", "--json", "--priority="+v, "--", o.LocalID), ""
 	}
 	if kind != MutationAddDependency && kind != MutationRelate && kind != MutationRemoveDependency {
 		return nil, "unsupported tracker mutation"

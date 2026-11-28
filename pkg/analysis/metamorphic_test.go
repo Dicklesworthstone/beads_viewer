@@ -1319,7 +1319,7 @@ func checkMR8SlackAbsenceAndClosedArchiveInvariance(rt *rapid.T, mutantNilSlackZ
 	if mutantNilSlackZero && len(scoresNoSlack) > 0 {
 		// Simulate pre-fix 20da81c7 priority.go:837 where missing map entry read as 0.0 -> "Zero slack"
 		for _, sc := range scoresNoSlack {
-			if rec := generateRecommendation(sc, 0, 0, false, 0, true, 0, DefaultThresholds(), false); rec != nil {
+			if rec := generateRecommendation(sc, 0, 0, 0, false, 0, true, true, true, 0, DefaultThresholds(), false); rec != nil {
 				recsNoSlack = append(recsNoSlack, *rec)
 			}
 		}
@@ -1484,4 +1484,212 @@ func TestMetamorphic_MR9_InheritedParentChildGrahamBounds(t *testing.T) {
 	rapid.Check(t, func(rt *rapid.T) {
 		checkMR9InheritedParentChildGrahamBounds(rt, false)
 	})
+}
+
+var mr13EscalationOnlyReasons = []string{
+	"High centrality",
+	"Critical path bottleneck",
+	"Blocks ",
+	"Deep in critical path",
+	"Zero slack on critical chain",
+	"Articulation point",
+	"Elevated urgency",
+	"Elevated risk",
+}
+
+var mr13DecreaseOnlyReasons = []string{
+	"Parallel-friendly (slack available)",
+	"Leaf item (blocks no downstream work)",
+	"Low graph centrality",
+	"Low urgency and risk signals",
+}
+
+// preFixGenerateRecommendationMutant faithfully reproduces the pre-bv-apal.92
+// sign-inverted generateRecommendation bug where escalation signals drove
+// high-confidence "decrease" recommendations.
+func preFixGenerateRecommendationMutant(score ImpactScore, unblocksCount int, isArt bool, slack float64, hasSlack bool, thresholds RecommendationThresholds) *PriorityRecommendation {
+	var reasoning []string
+	var signals int
+	var signalStrength float64
+	if score.Breakdown.PageRankNorm > thresholds.HighPageRank {
+		reasoning = append(reasoning, "High centrality in dependency graph")
+		signals++
+		signalStrength += score.Breakdown.PageRankNorm
+	}
+	if unblocksCount >= 1 {
+		reasoning = append(reasoning, fmt.Sprintf("Blocks %d other item", unblocksCount))
+		signals++
+		signalStrength += 0.2
+	}
+	if score.Breakdown.TimeToImpactNorm > 0.5 {
+		reasoning = append(reasoning, "Deep in critical path")
+		signals++
+		signalStrength += score.Breakdown.TimeToImpactNorm
+	}
+	if isArt {
+		reasoning = append(reasoning, "Articulation point (disconnects graph)")
+		signals++
+		signalStrength += 0.35
+	}
+	if hasSlack && slack == 0 {
+		reasoning = append(reasoning, "Zero slack on critical chain")
+		signals++
+		signalStrength += 0.25
+	}
+	if signals == 0 {
+		return nil
+	}
+	suggestedPriority := scoreToPriority(score.Score)
+	if suggestedPriority == score.Priority {
+		return nil
+	}
+	direction := "increase"
+	if suggestedPriority > score.Priority {
+		direction = "decrease"
+	}
+	scoreDelta := abs(score.Score - priorityToScore(score.Priority))
+	return &PriorityRecommendation{
+		IssueID:           score.IssueID,
+		CurrentPriority:   score.Priority,
+		SuggestedPriority: suggestedPriority,
+		ImpactScore:       score.Score,
+		Confidence:        calculateConfidence(signals, signalStrength, scoreDelta, thresholds),
+		Reasoning:         reasoning,
+		Direction:         direction,
+	}
+}
+
+func checkMR13PriorityDirectionEvidencePolarity(rt *rapid.T, mutantSignInverted bool) {
+	issues := drawMetamorphicGraph(rt, 3, 12, true, true)
+	for i := range issues {
+		if isClosedLikeStatus(issues[i].Status) {
+			issues[i].Status = model.StatusOpen
+			issues[i].ClosedAt = nil
+		}
+	}
+
+	an := NewAnalyzer(issues)
+	an.SetNow(metamorphicFixedNow)
+	stats := an.AnalyzeWithConfig(DefaultConfig())
+	scores := an.ComputeImpactScoresFromStats(&stats, metamorphicFixedNow)
+	thresholds := DefaultThresholds()
+	recs := an.generateRecommendationsFromStatsAndScores(&stats, scores, metamorphicFixedNow, thresholds)
+
+	if mutantSignInverted && len(scores) > 0 {
+		_, slackMap, _, hasActiveSlack := an.activeDAGMetrics(&stats)
+		_, _, artPoints := an.activeSubgraphMetrics(&stats)
+		artSet := make(map[string]bool, len(artPoints))
+		for _, id := range artPoints {
+			artSet[id] = true
+		}
+		for _, sc := range scores {
+			slackVal, hasSlack := 0.0, false
+			if hasActiveSlack && slackMap != nil {
+				slackVal, hasSlack = slackMap[sc.IssueID]
+			}
+			if rec := preFixGenerateRecommendationMutant(sc, len(an.computeUnblocks(sc.IssueID)), artSet[sc.IssueID], slackVal, hasSlack, thresholds); rec != nil {
+				recs = append(recs, *rec)
+			}
+		}
+	}
+
+	// 1. Strict directional polarity on every emitted recommendation.
+	decreaseConfByID := make(map[string]float64)
+	for _, rec := range recs {
+		switch rec.Direction {
+		case "decrease":
+			decreaseConfByID[rec.IssueID] = rec.Confidence
+			for _, reason := range rec.Reasoning {
+				for _, forbidden := range mr13EscalationOnlyReasons {
+					if strings.Contains(reason, forbidden) {
+						failMetamorphic(rt, "MR-13", issues, nil,
+							"Decrease recommendation must never cite escalation-only reasoning",
+							fmt.Sprintf("issue=%s dir=%s conf=%.3f reason=%q all=%v", rec.IssueID, rec.Direction, rec.Confidence, reason, rec.Reasoning), nil)
+					}
+				}
+			}
+		case "increase":
+			for _, reason := range rec.Reasoning {
+				for _, forbidden := range mr13DecreaseOnlyReasons {
+					if strings.Contains(reason, forbidden) {
+						failMetamorphic(rt, "MR-13", issues, nil,
+							"Increase recommendation must never cite decrease-only reasoning",
+							fmt.Sprintf("issue=%s dir=%s conf=%.3f reason=%q all=%v", rec.IssueID, rec.Direction, rec.Confidence, reason, rec.Reasoning), nil)
+					}
+				}
+			}
+		}
+	}
+
+	// 2. Monotonicity under added escalation pressure: attaching a fresh blocked dependent
+	// chain to any currently demoted issue MUST NEVER increase its decrease confidence.
+	for targetID, baseDecreaseConf := range decreaseConfByID {
+		augmented := make([]model.Issue, len(issues), len(issues)+3)
+		copy(augmented, issues)
+		prev := targetID
+		for k := 0; k < 3; k++ {
+			cid := fmt.Sprintf("MR13-ESC-%s-%d", targetID, k)
+			augmented = append(augmented, model.Issue{
+				ID:           cid,
+				Title:        "Escalated dependent " + cid,
+				Status:       model.StatusOpen,
+				Priority:     1,
+				IssueType:    model.TypeTask,
+				CreatedAt:    metamorphicFixedNow,
+				UpdatedAt:    metamorphicFixedNow,
+				Dependencies: []*model.Dependency{{IssueID: cid, DependsOnID: prev, Type: model.DepBlocks}},
+			})
+			prev = cid
+		}
+		anAug := NewAnalyzer(augmented)
+		anAug.SetNow(metamorphicFixedNow)
+		statsAug := anAug.AnalyzeWithConfig(DefaultConfig())
+		scoresAug := anAug.ComputeImpactScoresFromStats(&statsAug, metamorphicFixedNow)
+		recsAug := anAug.generateRecommendationsFromStatsAndScores(&statsAug, scoresAug, metamorphicFixedNow, thresholds)
+		for _, rec := range recsAug {
+			if rec.IssueID == targetID && rec.Direction == "decrease" && rec.Confidence > baseDecreaseConf+1e-9 {
+				failMetamorphic(rt, "MR-13", augmented, nil,
+					"Adding downstream blocked chain must never increase decrease recommendation confidence",
+					fmt.Sprintf("target=%s baseConf=%.4f augConf=%.4f reasons=%v", targetID, baseDecreaseConf, rec.Confidence, rec.Reasoning), nil)
+			}
+		}
+	}
+}
+
+// TestMetamorphic_MR13_PriorityDirectionEvidencePolarity verifies Score 25.0 directional
+// polarity, escalation monotonicity, exact live depth-6 keystone non-demotion, and
+// pre-fix mutant rejection (bv-apal.93).
+func TestMetamorphic_MR13_PriorityDirectionEvidencePolarity(t *testing.T) {
+	rapid.Check(t, func(rt *rapid.T) {
+		checkMR13PriorityDirectionEvidencePolarity(rt, false)
+	})
+
+	// Planted negative control: pre-fix sign-inverted logic MUST trigger a false P1->P2
+	// demotion on the exact live depth-6 keystone topology (bv-oonu.26 / bv-oonu.28).
+	est180 := 180
+	chain := []model.Issue{
+		{ID: "LIVE-KS", Title: "Depth-6 P1 keystone", Status: model.StatusOpen, Priority: 1, EstimatedMinutes: &est180, CreatedAt: metamorphicFixedNow, UpdatedAt: metamorphicFixedNow},
+		{ID: "LIVE-2", Title: "Step 2", Status: model.StatusOpen, Priority: 1, CreatedAt: metamorphicFixedNow, UpdatedAt: metamorphicFixedNow, Dependencies: []*model.Dependency{{IssueID: "LIVE-2", DependsOnID: "LIVE-KS", Type: model.DepBlocks}}},
+		{ID: "LIVE-3", Title: "Step 3", Status: model.StatusOpen, Priority: 1, CreatedAt: metamorphicFixedNow, UpdatedAt: metamorphicFixedNow, Dependencies: []*model.Dependency{{IssueID: "LIVE-3", DependsOnID: "LIVE-2", Type: model.DepBlocks}}},
+		{ID: "LIVE-4", Title: "Step 4", Status: model.StatusOpen, Priority: 1, CreatedAt: metamorphicFixedNow, UpdatedAt: metamorphicFixedNow, Dependencies: []*model.Dependency{{IssueID: "LIVE-4", DependsOnID: "LIVE-3", Type: model.DepBlocks}}},
+		{ID: "LIVE-5", Title: "Step 5", Status: model.StatusOpen, Priority: 2, CreatedAt: metamorphicFixedNow, UpdatedAt: metamorphicFixedNow, Dependencies: []*model.Dependency{{IssueID: "LIVE-5", DependsOnID: "LIVE-4", Type: model.DepBlocks}}},
+		{ID: "LIVE-6", Title: "Step 6", Status: model.StatusOpen, Priority: 1, CreatedAt: metamorphicFixedNow, UpdatedAt: metamorphicFixedNow, Dependencies: []*model.Dependency{{IssueID: "LIVE-6", DependsOnID: "LIVE-5", Type: model.DepBlocks}}},
+	}
+	an := NewAnalyzer(chain)
+	an.SetNow(metamorphicFixedNow)
+	stats := an.AnalyzeWithConfig(DefaultConfig())
+	scores := an.ComputeImpactScoresFromStats(&stats, metamorphicFixedNow)
+	var ksScore ImpactScore
+	for _, sc := range scores {
+		if sc.IssueID == "LIVE-KS" {
+			ksScore = sc
+		}
+	}
+	mutantRec := preFixGenerateRecommendationMutant(ksScore, len(an.computeUnblocks("LIVE-KS")), false, 0, true, DefaultThresholds())
+	if mutantRec == nil || mutantRec.Direction != "decrease" {
+		t.Fatalf("negative control failed: expected pre-fix mutant to erroneously demote LIVE-KS, got %+v (score=%+v)", mutantRec, ksScore)
+	}
+	if fixedRec := generateRecommendation(ksScore, len(an.computeUnblocks("LIVE-KS")), an.OpenBlockerCount("LIVE-KS"), 1, false, 0, true, true, true, 1, DefaultThresholds(), false); fixedRec != nil && fixedRec.Direction == "decrease" {
+		t.Fatalf("fixed generateRecommendation erroneously demoted LIVE-KS: %+v", fixedRec)
+	}
 }

@@ -211,24 +211,3 @@ func commitAgentReplacement(locked *lockedAgentFile, _ *os.File, replacementPath
 	}
 	return true, nil
 }
-
-// openAgentFileForMutation, lockAgentFile, and unlockAgentFile are the
-// decomposed remote locking API. Production mutation uses
-// openAndLockAgentFileForMutation (O_NOFOLLOW, non-blocking flock with
-// timeout). These names remain so callers and tests can open/lock separately
-// while still refusing to follow a final-component symlink.
-func openAgentFileForMutation(path string) (*os.File, error) {
-	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
-	if err != nil {
-		return nil, err
-	}
-	return os.NewFile(uintptr(fd), path), nil
-}
-
-func lockAgentFile(file *os.File) error {
-	return unix.Flock(int(file.Fd()), unix.LOCK_EX)
-}
-
-func unlockAgentFile(file *os.File) error {
-	return unix.Flock(int(file.Fd()), unix.LOCK_UN)
-}

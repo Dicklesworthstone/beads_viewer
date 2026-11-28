@@ -50,9 +50,10 @@ type OrphanCandidate struct {
 	Files       []string  `json:"files,omitempty"` // Files changed in this commit
 
 	// Detection results
-	SuspicionScore int               `json:"suspicion_score"` // 0-100
-	ProbableBeads  []ProbableBead    `json:"probable_beads"`  // Beads this might belong to
-	Signals        []OrphanSignalHit `json:"signals"`         // Why we think it's orphaned
+	SuspicionScore  int               `json:"suspicion_score"` // 0-100
+	ProbableBeads   []ProbableBead    `json:"probable_beads"`  // Beads this might belong to
+	Signals         []OrphanSignalHit `json:"signals"`         // Why we think it's orphaned
+	ExcludedByScope bool              `json:"-"`               // True when probable beads were exclusively out-of-scope (P32)
 }
 
 // ProbableBead is a bead that an orphan commit might belong to.
@@ -69,6 +70,7 @@ type OrphanSignalHit struct {
 	Signal  OrphanSignal `json:"signal"`
 	Details string       `json:"details"`
 	Weight  int          `json:"weight"` // Contribution to score
+	BeadID  string       `json:"-"`      // Associated bead ID (internal, used for scoped filtering)
 }
 
 // OrphanReport is the JSON output for --robot-orphans.
@@ -115,7 +117,34 @@ type OrphanDetector struct {
 	beadWindows map[string]TemporalWindow // BeadID -> active time window
 	authorBeads map[string][]string       // Author email -> BeadIDs they worked on
 	now         time.Time
-	window      *HistoryWindow // The correlation index's commit window, when the report carries one
+	window      *HistoryWindow  // The correlation index's commit window, when the report carries one
+	scopeFilter map[string]bool // Optional active bead scope applied before Top-3 truncation (P32)
+}
+
+// WithScopeFilter restricts probable-bead ranking and signal scoring to the active
+// bead scope BEFORE Top-3 truncation while retaining the full CommitIndex so correlated
+// commits are never misclassified as orphans.
+func (od *OrphanDetector) WithScopeFilter(inScope map[string]bool) *OrphanDetector {
+	if od != nil && inScope != nil {
+		od.scopeFilter = inScope
+	}
+	return od
+}
+
+// ComputeOrphanSuspicionScore totals signal weights with the 35-point SignalOrphanMessage
+// cap and 100-point overall cap matching OrphanDetector.analyzeCommit.
+func ComputeOrphanSuspicionScore(signals []OrphanSignalHit) int {
+	total := 0
+	msgWeight := 0
+	for _, sig := range signals {
+		if sig.Signal == SignalOrphanMessage {
+			msgWeight += sig.Weight
+		} else {
+			total += sig.Weight
+		}
+	}
+	total += minInt(msgWeight, 35)
+	return minInt(total, 100)
 }
 
 // WithExplicitMatcher configures OrphanDetector and its underlying ReverseLookup
@@ -409,8 +438,12 @@ func (od *OrphanDetector) analyzeOrphan(orphan OrphanCommit) (OrphanCandidate, e
 	// Heuristic 4: Author - has linked commits nearby
 	od.checkAuthor(&candidate, beadScores)
 
-	// Build probable beads list
+	// Build probable beads list, applying optional scope filter BEFORE Top-3 truncation (P32).
+	hadAnyProbable := len(beadScores) > 0
 	for beadID, builder := range beadScores {
+		if od.scopeFilter != nil && !od.scopeFilter[beadID] {
+			continue
+		}
 		if builder.score > 0 {
 			candidate.ProbableBeads = append(candidate.ProbableBeads, ProbableBead{
 				BeadID:     beadID,
@@ -419,6 +452,21 @@ func (od *OrphanDetector) analyzeOrphan(orphan OrphanCommit) (OrphanCandidate, e
 				Confidence: minInt(builder.score, 100),
 				Reasons:    builder.reasons,
 			})
+		}
+	}
+	if od.scopeFilter != nil {
+		if hadAnyProbable && len(candidate.ProbableBeads) == 0 {
+			candidate.ExcludedByScope = true
+		}
+		if len(candidate.Signals) > 0 {
+			kept := make([]OrphanSignalHit, 0, len(candidate.Signals))
+			for _, sig := range candidate.Signals {
+				if sig.BeadID != "" && !od.scopeFilter[sig.BeadID] {
+					continue
+				}
+				kept = append(kept, sig)
+			}
+			candidate.Signals = kept
 		}
 	}
 
@@ -447,11 +495,8 @@ func (od *OrphanDetector) analyzeOrphan(orphan OrphanCommit) (OrphanCandidate, e
 		candidate.ProbableBeads = candidate.ProbableBeads[:3]
 	}
 
-	// Calculate total suspicion score
-	for _, signal := range candidate.Signals {
-		candidate.SuspicionScore += signal.Weight
-	}
-	candidate.SuspicionScore = minInt(candidate.SuspicionScore, 100)
+	// Calculate total suspicion score (preserving 35-pt SignalOrphanMessage cap and 100-pt total cap)
+	candidate.SuspicionScore = ComputeOrphanSuspicionScore(candidate.Signals)
 
 	return candidate, nil
 }
@@ -475,6 +520,7 @@ func (od *OrphanDetector) checkTiming(candidate *OrphanCandidate, beadScores map
 				Signal:  SignalOrphanTiming,
 				Details: fmt.Sprintf("Commit during %s active period", beadID),
 				Weight:  weight,
+				BeadID:  beadID,
 			})
 
 			if _, ok := beadScores[beadID]; !ok {
@@ -515,6 +561,7 @@ func (od *OrphanDetector) checkFiles(candidate *OrphanCandidate, beadScores map[
 				Signal:  SignalOrphanFiles,
 				Details: fmt.Sprintf("Touches %s (linked to %s)", file, ref.BeadID),
 				Weight:  weight,
+				BeadID:  ref.BeadID,
 			})
 
 			if _, ok := beadScores[ref.BeadID]; !ok {
@@ -535,16 +582,23 @@ func (od *OrphanDetector) checkFiles(candidate *OrphanCandidate, beadScores map[
 func (od *OrphanDetector) checkMessage(candidate *OrphanCandidate, beadScores map[string]*probableBeadBuilder) {
 	msg := strings.ToLower(candidate.Message)
 
-	// Look for generic action-verb / issue-number patterns
-	totalWeight := 0
-	var matchDetails []string
+	// Look for generic action-verb / issue-number patterns (bead-agnostic)
+	genericWeight := 0
+	var genericDetails []string
 
 	for _, p := range orphanMessagePatterns {
 		if p.re.MatchString(msg) {
-			totalWeight += p.weight
+			genericWeight += p.weight
 			match := p.re.FindString(msg)
-			matchDetails = append(matchDetails, match)
+			genericDetails = append(genericDetails, match)
 		}
+	}
+	if genericWeight > 0 {
+		candidate.Signals = append(candidate.Signals, OrphanSignalHit{
+			Signal:  SignalOrphanMessage,
+			Details: fmt.Sprintf("Message patterns: %s", strings.Join(genericDetails, ", ")),
+			Weight:  minInt(genericWeight, 35),
+		})
 	}
 
 	matcher := od.explicit
@@ -553,29 +607,26 @@ func (od *OrphanDetector) checkMessage(candidate *OrphanCandidate, beadScores ma
 	}
 	idMatches := matcher.ExtractIDsFromMessage(candidate.Message)
 	for _, idMatch := range idMatches {
-		totalWeight += 25
-		if idMatch.RawMatch != "" {
-			matchDetails = append(matchDetails, idMatch.RawMatch)
-		} else {
-			matchDetails = append(matchDetails, idMatch.ID)
+		rawLabel := idMatch.RawMatch
+		if rawLabel == "" {
+			rawLabel = idMatch.ID
 		}
-		od.scoreMentionedBead(beadScores, idMatch.ID)
-	}
-
-	if totalWeight > 0 {
+		canonicalID := od.scoreMentionedBead(beadScores, idMatch.ID)
 		candidate.Signals = append(candidate.Signals, OrphanSignalHit{
 			Signal:  SignalOrphanMessage,
-			Details: fmt.Sprintf("Message patterns: %s", strings.Join(matchDetails, ", ")),
-			Weight:  minInt(totalWeight, 35),
+			Details: fmt.Sprintf("Message patterns: %s", rawLabel),
+			Weight:  25,
+			BeadID:  canonicalID,
 		})
 	}
 }
 
-// scoreMentionedBead credits a bead whose ID appears in a commit message.
+// scoreMentionedBead credits a bead whose ID appears in a commit message and returns its
+// canonical bead ID when uniquely matched (or "" for unknown/ambiguous IDs).
 // Lookup is case-insensitive; unknown IDs and ambiguous case-colliding IDs are
 // ignored. Even an exact-case key is rejected when another key is EqualFold:
 // callers such as checkMessage intentionally perform case-insensitive matching.
-func (od *OrphanDetector) scoreMentionedBead(beadScores map[string]*probableBeadBuilder, beadID string) {
+func (od *OrphanDetector) scoreMentionedBead(beadScores map[string]*probableBeadBuilder, beadID string) string {
 	matches := make([]string, 0, 1)
 	for id := range od.lookup.beads {
 		if strings.EqualFold(id, beadID) {
@@ -583,7 +634,7 @@ func (od *OrphanDetector) scoreMentionedBead(beadScores map[string]*probableBead
 		}
 	}
 	if len(matches) != 1 {
-		return
+		return ""
 	}
 	beadID = matches[0]
 	history := od.lookup.beads[beadID]
@@ -596,6 +647,7 @@ func (od *OrphanDetector) scoreMentionedBead(beadScores map[string]*probableBead
 	beadScores[beadID].score += 35
 	beadScores[beadID].reasons = append(beadScores[beadID].reasons,
 		"bead ID mentioned in commit message")
+	return beadID
 }
 
 // checkAuthor checks if author has linked commits nearby.
@@ -628,6 +680,7 @@ func (od *OrphanDetector) checkAuthor(candidate *OrphanCandidate, beadScores map
 				Signal:  SignalOrphanAuthor,
 				Details: fmt.Sprintf("Author worked on %s around this time", beadID),
 				Weight:  weight,
+				BeadID:  beadID,
 			})
 
 			if _, ok := beadScores[beadID]; !ok {

@@ -733,9 +733,10 @@ func TestMedianEstimatedMinutes(t *testing.T) {
 func TestWhatIfDeltaDirectUnblocks(t *testing.T) {
 	// Create a chain: A blocks B, B blocks C
 	// B and C are open work gated by dependencies, not parked by status.
-	// Completing A should unblock B directly.
+	// A is under-prioritized (P4) so priority triage legitimately recommends escalating it
+	// and attaches WhatIf impact; completing A should unblock B directly.
 	issues := []model.Issue{
-		{ID: "A", Title: "Root Blocker", Status: model.StatusOpen, Priority: 0},
+		{ID: "A", Title: "Root Blocker", Status: model.StatusOpen, Priority: 4},
 		{
 			ID: "B", Title: "Middle", Status: model.StatusOpen, Priority: 1,
 			Dependencies: []*model.Dependency{{IssueID: "B", DependsOnID: "A", Type: model.DepBlocks}},
@@ -800,10 +801,10 @@ func TestWhatIfDeltaNoDownstream(t *testing.T) {
 }
 
 func TestWhatIfDeltaEstimatedDays(t *testing.T) {
-	// Issue B has estimated 480 minutes (1 day), A blocks B
+	// Issue B has estimated 480 minutes (1 day), under-prioritized A (P4) blocks B
 	est := 480
 	issues := []model.Issue{
-		{ID: "A", Title: "Blocker", Status: model.StatusOpen, Priority: 0},
+		{ID: "A", Title: "Blocker", Status: model.StatusOpen, Priority: 4},
 		{
 			ID: "B", Title: "Dependency gated", Status: model.StatusOpen, Priority: 1,
 			EstimatedMinutes: &est,
@@ -922,10 +923,10 @@ func TestWhatIfExplanationText(t *testing.T) {
 
 // TestParallelizationGain verifies the parallelization gain metric (bv-129)
 func TestParallelizationGain(t *testing.T) {
-	// Scenario: A blocks B, C, and D
+	// Scenario: under-prioritized A (P4) blocks B, C, and D
 	// Completing A unblocks 3 items, so parallelization gain = 3 - 1 = 2
 	issues := []model.Issue{
-		{ID: "A", Title: "Root Blocker", Status: model.StatusOpen, Priority: 0},
+		{ID: "A", Title: "Root Blocker", Status: model.StatusOpen, Priority: 4},
 		{
 			ID: "B", Title: "Dependency gated 1", Status: model.StatusOpen, Priority: 1,
 			Dependencies: []*model.Dependency{{IssueID: "B", DependsOnID: "A", Type: model.DepBlocks}},
@@ -1002,10 +1003,10 @@ func TestParallelizationGainNegative(t *testing.T) {
 
 // TestParallelizationGainZero verifies zero parallelization gain (bv-129)
 func TestParallelizationGainZero(t *testing.T) {
-	// Scenario: A blocks exactly 1 item B
+	// Scenario: under-prioritized A (P4) blocks exactly 1 item B
 	// Completing A unblocks 1 item, so parallelization gain = 1 - 1 = 0
 	issues := []model.Issue{
-		{ID: "A", Title: "Single Blocker", Status: model.StatusOpen, Priority: 0},
+		{ID: "A", Title: "Single Blocker", Status: model.StatusOpen, Priority: 4},
 		{
 			ID: "B", Title: "Dependency gated", Status: model.StatusOpen, Priority: 1,
 			Dependencies: []*model.Dependency{{IssueID: "B", DependsOnID: "A", Type: model.DepBlocks}},
@@ -1249,7 +1250,7 @@ func TestParkedBeads_NoStalenessUrgencyOrStaleRecommendation(t *testing.T) {
 
 func TestCountTransitiveUnblocks_UnscopedParentPropagatesToScopedChildren(t *testing.T) {
 	issues := []model.Issue{
-		{ID: "ROOT", Title: "Scoped root", Status: model.StatusOpen, Labels: []string{"lane"}, Priority: 1},
+		{ID: "ROOT", Title: "Scoped root", Status: model.StatusOpen, Labels: []string{"lane"}, Priority: 4},
 		// Intermediate parent P has NO "lane" label, so SetUnblockScope excludes P itself!
 		{
 			ID: "P", Title: "Unscoped parent epic", Status: model.StatusOpen, IssueType: model.TypeEpic, Priority: 2,
@@ -1378,5 +1379,153 @@ func TestWhatIfDelta_OneHopParentChildDirectTwoHopCascadeAndReadyEpic(t *testing
 	readyWhatIf := an.ComputeWhatIf("READY-EPIC", &stats)
 	if readyWhatIf == nil || readyWhatIf.Delta.DirectUnblocks != 0 || readyWhatIf.Delta.TransitiveUnblocks != 0 || len(readyWhatIf.Delta.UnblockedIssueIDs) != 0 {
 		t.Fatalf("ready container READY-EPIC WhatIf = %+v, want 0 direct/transitive unblocks", readyWhatIf)
+	}
+}
+
+func TestGenerateRecommendations_Depth6P1KeystoneNotDemotedAndLeafDemotesCleanly(t *testing.T) {
+	now := time.Date(2026, 11, 25, 15, 0, 0, 0, time.UTC)
+	est180 := 180
+	est120 := 120
+	est90 := 90
+
+	// Reproduce the exact 6-node active critical chain (bv-oonu.26 -> bv-oonu.27 -> bv-apal.90 -> bv-apal.91 -> bv-apal.4 -> bv-oonu.11)
+	// plus an isolated over-prioritized P0 leaf with slack > 2 and 0 dependents.
+	issues := []model.Issue{
+		{ID: "KEYSTONE-1", Title: "Fresh P1 depth-6 keystone", Status: model.StatusOpen, Priority: 1, EstimatedMinutes: &est180, CreatedAt: now, UpdatedAt: now},
+		{ID: "STEP-2", Title: "Step 2", Status: model.StatusOpen, Priority: 1, EstimatedMinutes: &est120, CreatedAt: now, UpdatedAt: now, Dependencies: []*model.Dependency{{IssueID: "STEP-2", DependsOnID: "KEYSTONE-1", Type: model.DepBlocks}}},
+		{ID: "STEP-3", Title: "Step 3", Status: model.StatusOpen, Priority: 1, EstimatedMinutes: &est120, CreatedAt: now, UpdatedAt: now, Dependencies: []*model.Dependency{{IssueID: "STEP-3", DependsOnID: "STEP-2", Type: model.DepBlocks}}},
+		{ID: "STEP-4", Title: "Step 4", Status: model.StatusOpen, Priority: 1, EstimatedMinutes: &est90, CreatedAt: now, UpdatedAt: now, Dependencies: []*model.Dependency{{IssueID: "STEP-4", DependsOnID: "STEP-3", Type: model.DepBlocks}}},
+		{ID: "STEP-5", Title: "Step 5", Status: model.StatusOpen, Priority: 2, EstimatedMinutes: &est90, CreatedAt: now, UpdatedAt: now, Dependencies: []*model.Dependency{{IssueID: "STEP-5", DependsOnID: "STEP-4", Type: model.DepBlocks}}},
+		{ID: "STEP-6", Title: "Final release gate", Status: model.StatusOpen, Priority: 1, EstimatedMinutes: &est180, CreatedAt: now, UpdatedAt: now, Dependencies: []*model.Dependency{{IssueID: "STEP-6", DependsOnID: "STEP-5", Type: model.DepBlocks}}},
+		{ID: "ISOLATED-P0-LEAF", Title: "Over-prioritized standalone leaf", Status: model.StatusOpen, Priority: 0, CreatedAt: now, UpdatedAt: now},
+	}
+
+	an := analysis.NewAnalyzer(issues)
+	an.SetNow(now)
+	recs := an.GenerateRecommendations()
+
+	var leafRec *analysis.PriorityRecommendation
+	for i := range recs {
+		rec := &recs[i]
+		if rec.IssueID == "KEYSTONE-1" && rec.Direction == "decrease" {
+			t.Fatalf("depth-6 / slack-0 / P1 keystone KEYSTONE-1 must NEVER be demoted: %+v", *rec)
+		}
+		if rec.Direction == "decrease" {
+			for _, r := range rec.Reasoning {
+				for _, forbidden := range []string{"High centrality", "Critical path bottleneck", "Blocks ", "Deep in critical path", "Zero slack", "Articulation point", "Elevated urgency", "Elevated risk"} {
+					if strings.Contains(r, forbidden) {
+						t.Fatalf("decrease recommendation for %s contains escalation reason %q: %+v", rec.IssueID, r, *rec)
+					}
+				}
+			}
+		}
+		if rec.IssueID == "ISOLATED-P0-LEAF" {
+			leafRec = rec
+		}
+	}
+
+	if leafRec == nil || leafRec.Direction != "decrease" || leafRec.SuggestedPriority <= leafRec.CurrentPriority {
+		t.Fatalf("expected valid decrease recommendation for ISOLATED-P0-LEAF, got %+v", leafRec)
+	}
+	if len(leafRec.Reasoning) == 0 {
+		t.Fatalf("expected decrease-aligned reasoning for ISOLATED-P0-LEAF, got %+v", leafRec)
+	}
+}
+
+func TestGenerateRecommendations_Pass26_JointBlockerClosedNeighborAnd3NodeLeafGuards(t *testing.T) {
+	now := time.Date(2026, 11, 25, 16, 0, 0, 0, time.UTC)
+	closedAt := now.Add(-24 * time.Hour)
+
+	// 1. Joint blockers JB-1 & JB-2 jointly block JOINT-DEP (so single-close unblocksCount == 0,
+	//    but OpenBlockerCount == 1). Neither may be misclassified as a leaf or demoted.
+	jointIssues := []model.Issue{
+		{ID: "JB-1", Title: "Joint blocker 1", Status: model.StatusOpen, Priority: 1, CreatedAt: now, UpdatedAt: now},
+		{ID: "JB-2", Title: "Joint blocker 2", Status: model.StatusOpen, Priority: 1, CreatedAt: now, UpdatedAt: now},
+		{
+			ID: "JOINT-DEP", Title: "Blocked by both JB-1 and JB-2", Status: model.StatusOpen, Priority: 1,
+			CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{
+				{IssueID: "JOINT-DEP", DependsOnID: "JB-1", Type: model.DepBlocks},
+				{IssueID: "JOINT-DEP", DependsOnID: "JB-2", Type: model.DepBlocks},
+			},
+		},
+	}
+	anJoint := analysis.NewAnalyzer(jointIssues)
+	anJoint.SetNow(now)
+	for _, rec := range anJoint.GenerateRecommendations() {
+		if (rec.IssueID == "JB-1" || rec.IssueID == "JB-2") && rec.Direction == "decrease" {
+			t.Fatalf("P26-A3 regression: joint blocker %s must not be demoted: %+v", rec.IssueID, rec)
+		}
+		if rec.IssueID == "JB-1" || rec.IssueID == "JB-2" {
+			for _, r := range rec.Reasoning {
+				if strings.Contains(r, "Leaf item") {
+					t.Fatalf("P26-A3 regression: joint blocker %s misclassified as leaf: %+v", rec.IssueID, rec)
+				}
+			}
+		}
+	}
+
+	// 2. Active P0 leaf whose ONLY neighbor is a closed historical issue must NOT be treated
+	//    as connected in the active graph (isConnected ignores closed neighbors, P26-A4).
+	closedNeighborIssues := []model.Issue{
+		{ID: "HIST-CLOSED", Title: "Historical closed dep", Status: model.StatusClosed, Priority: 2, CreatedAt: now.Add(-48 * time.Hour), UpdatedAt: closedAt, ClosedAt: &closedAt},
+		{
+			ID: "ACTIVE-LEAF-P0", Title: "Active P0 leaf with closed-only neighbor", Status: model.StatusOpen, Priority: 0,
+			CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{
+				{IssueID: "ACTIVE-LEAF-P0", DependsOnID: "HIST-CLOSED", Type: model.DepBlocks},
+			},
+		},
+	}
+	anClosedNb := analysis.NewAnalyzer(closedNeighborIssues)
+	anClosedNb.SetNow(now)
+	closedNbRecs := anClosedNb.GenerateRecommendations()
+	var closedNbRec *analysis.PriorityRecommendation
+	for i := range closedNbRecs {
+		if closedNbRecs[i].IssueID == "ACTIVE-LEAF-P0" {
+			closedNbRec = &closedNbRecs[i]
+			break
+		}
+	}
+	if closedNbRec == nil || closedNbRec.Direction != "decrease" {
+		t.Fatalf("P26-A4 expected active P0 leaf with only closed neighbor to demote cleanly, got %+v", closedNbRec)
+	}
+	foundLowCentrality := false
+	for _, r := range closedNbRec.Reasoning {
+		if strings.Contains(r, "Low graph centrality") {
+			foundLowCentrality = true
+		}
+	}
+	if !foundLowCentrality {
+		t.Fatalf("P26-A4 expected 'Low graph centrality' (proving active-only isConnected=false despite closed neighbor), got %+v", closedNbRec.Reasoning)
+	}
+
+	// 3. 3-node chain ROOT -> MID -> TAIL: TAIL is over-prioritized at P0 with 0 dependents
+	//    (OpenBlockerCount == 0). Pre-fix highPR fired on TAIL because PRNorm > 0.35 in a 3-node
+	//    chain, vetoing demotion; post-fix requires openBlockerCount > 0 so TAIL demotes cleanly.
+	chainIssues := []model.Issue{
+		{ID: "CH-ROOT", Title: "Root", Status: model.StatusOpen, Priority: 2, CreatedAt: now, UpdatedAt: now},
+		{ID: "CH-MID", Title: "Mid", Status: model.StatusOpen, Priority: 2, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "CH-MID", DependsOnID: "CH-ROOT", Type: model.DepBlocks}}},
+		{ID: "CH-TAIL", Title: "Over-prioritized tail leaf", Status: model.StatusOpen, Priority: 0, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "CH-TAIL", DependsOnID: "CH-MID", Type: model.DepBlocks}}},
+	}
+	anChain := analysis.NewAnalyzer(chainIssues)
+	anChain.SetNow(now)
+	var tailRec *analysis.PriorityRecommendation
+	chainRecs := anChain.GenerateRecommendations()
+	for i := range chainRecs {
+		if chainRecs[i].IssueID == "CH-TAIL" {
+			tailRec = &chainRecs[i]
+			break
+		}
+	}
+	if tailRec == nil || tailRec.Direction != "decrease" {
+		t.Fatalf("P26-A4 expected 0-dependent P0 tail leaf CH-TAIL to demote (not vetoed by highPR), got %+v", tailRec)
+	}
+	for _, r := range tailRec.Reasoning {
+		if strings.Contains(r, "High centrality") {
+			t.Fatalf("P26-A4 regression: 0-dependent tail leaf CH-TAIL falsely triggered highPR: %+v", *tailRec)
+		}
 	}
 }

@@ -514,3 +514,110 @@ func TestApply_NaturalOrderStrictTotalOrderOnZeroPaddedIDs(t *testing.T) {
 	requireIDs(t, gotFwd, "bv-001", "bv-01", "bv-1", "bv-2", "bv-10")
 	requireIDs(t, gotRev, "bv-001", "bv-01", "bv-1", "bv-2", "bv-10")
 }
+
+func TestWave36_RecipeRiskETASlackKCoreSortAndTypeAssigneeRepoFilters(t *testing.T) {
+	now := time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC)
+	issues := []model.Issue{
+		{ID: "api-1", Title: "API bug", Status: model.StatusOpen, IssueType: model.TypeBug, Assignee: "alice", SourceRepo: "api", Priority: 2, CreatedAt: now},
+		{ID: "api-2", Title: "API task", Status: model.StatusOpen, IssueType: model.TypeTask, Assignee: "", SourceRepo: "api", Priority: 1, CreatedAt: now},
+		{ID: "web-1", Title: "Web feature", Status: model.StatusOpen, IssueType: model.TypeFeature, Assignee: "Bob", Priority: 0, CreatedAt: now},
+		{ID: "web-2", Title: "Web bug", Status: model.StatusClosed, IssueType: model.TypeBug, Assignee: "alice", Priority: 3, CreatedAt: now},
+	}
+	metrics := recipe.Metrics{
+		Risk:  map[string]float64{"api-1": 0.9, "api-2": 0.3, "web-1": 0.7},
+		ETA:   map[string]float64{"api-1": 4.0, "api-2": 1.5, "web-1": 2.5}, // web-2 missing -> must sort LAST even in asc!
+		Slack: map[string]float64{"api-1": 0, "api-2": 3, "web-1": 1},       // web-2 missing -> must sort LAST in asc!
+		KCore: map[string]int{"api-1": 3, "api-2": 1, "web-1": 2},
+	}
+
+	// 1. Sort by risk (alias risk_score) desc AND asc (P28-A13: missing/closed row web-2 ALWAYS sorts LAST!)
+	riskRec := &recipe.Recipe{Name: "by-risk", Sort: recipe.SortConfig{Field: "risk_score", Direction: "desc"}}
+	if !riskRec.NeedsRiskScores() {
+		t.Fatalf("expected NeedsRiskScores()=true for risk_score")
+	}
+	gotRisk := mustApply(t, issues, metrics, riskRec, now)
+	requireIDs(t, gotRisk, "api-1", "web-1", "api-2", "web-2")
+
+	riskAscRec := &recipe.Recipe{Name: "by-risk-asc", Sort: recipe.SortConfig{Field: "risk", Direction: "asc"}}
+	gotRiskAsc := mustApply(t, issues, metrics, riskAscRec, now)
+	requireIDs(t, gotRiskAsc, "api-2", "web-1", "api-1", "web-2")
+
+	// 2. Sort by eta asc (missing ETA sorts last!)
+	etaRec := &recipe.Recipe{Name: "by-eta", Sort: recipe.SortConfig{Field: "eta", Direction: "asc"}}
+	if !etaRec.NeedsETAScores() {
+		t.Fatalf("expected NeedsETAScores()=true for eta")
+	}
+	gotETA := mustApply(t, issues, metrics, etaRec, now)
+	requireIDs(t, gotETA, "api-2", "web-1", "api-1", "web-2")
+
+	// 3. Sort by slack asc (zero slack first, missing slack last!)
+	slackRec := &recipe.Recipe{Name: "by-slack", Sort: recipe.SortConfig{Field: "slack", Direction: "asc"}}
+	if !slackRec.NeedsSlackScores() {
+		t.Fatalf("expected NeedsSlackScores()=true for slack")
+	}
+	gotSlack := mustApply(t, issues, metrics, slackRec, now)
+	requireIDs(t, gotSlack, "api-1", "web-1", "api-2", "web-2")
+
+	// 4. Sort by kcore (alias k_core) desc
+	kcoreRec := &recipe.Recipe{Name: "by-kcore", Sort: recipe.SortConfig{Field: "k_core", Direction: "desc"}}
+	if !kcoreRec.NeedsKCoreScores() {
+		t.Fatalf("expected NeedsKCoreScores()=true for k_core")
+	}
+	gotKCore := mustApply(t, issues, metrics, kcoreRec, now)
+	requireIDs(t, gotKCore, "api-1", "web-1", "api-2", "web-2")
+
+	// 5. Filters: type, assignee (case-insensitive + unassigned), repo (SourceRepo + ID prefix)
+	gotBugs := mustApply(t, issues, metrics, &recipe.Recipe{Name: "bugs", Filters: recipe.FilterConfig{Type: []string{"BUG"}}}, now)
+	requireIDs(t, gotBugs, "api-1", "web-2")
+
+	gotUnassigned := mustApply(t, issues, metrics, &recipe.Recipe{Name: "unassigned", Filters: recipe.FilterConfig{Assignee: []string{"unassigned"}}}, now)
+	requireIDs(t, gotUnassigned, "api-2")
+
+	gotBob := mustApply(t, issues, metrics, &recipe.Recipe{Name: "bob", Filters: recipe.FilterConfig{Assignee: []string{"bob"}}}, now)
+	requireIDs(t, gotBob, "web-1")
+
+	gotWebRepo := mustApply(t, issues, metrics, &recipe.Recipe{Name: "web-repo", Filters: recipe.FilterConfig{Repo: []string{"web"}}}, now)
+	requireIDs(t, gotWebRepo, "web-1", "web-2")
+
+	// P28-A13: Hyphenated and underscored repo prefixes match cleanly when SourceRepo is empty.
+	hyphenIssues := []model.Issue{
+		{ID: "my-app-101", Title: "Hyphenated repo", Status: model.StatusOpen, CreatedAt: now},
+		{ID: "core_202", Title: "Underscored repo", Status: model.StatusOpen, CreatedAt: now},
+		{ID: "my-other-303", Title: "Other hyphenated", Status: model.StatusOpen, CreatedAt: now},
+	}
+	gotHyphen := mustApply(t, hyphenIssues, recipe.Metrics{}, &recipe.Recipe{Name: "my-app-repo", Filters: recipe.FilterConfig{Repo: []string{"my-app", "core"}}}, now)
+	requireIDs(t, gotHyphen, "my-app-101", "core_202")
+
+	// 6. Validation rejects blank type/repo entries and accepts canonical aliases
+	badType := recipe.Recipe{Name: "bad-type", Filters: recipe.FilterConfig{Type: []string{"  "}}}
+	if err := badType.Validate(); err == nil {
+		t.Fatalf("expected blank filters.type to fail validation")
+	}
+	badRepo := recipe.Recipe{Name: "bad-repo", Filters: recipe.FilterConfig{Repo: []string{""}}}
+	if err := badRepo.Validate(); err == nil {
+		t.Fatalf("expected blank filters.repo to fail validation")
+	}
+	// Empty string in assignee is explicitly allowed to mean unassigned!
+	emptyAssignee := recipe.Recipe{Name: "empty-assignee", Filters: recipe.FilterConfig{Assignee: []string{""}}}
+	if err := emptyAssignee.Validate(); err != nil {
+		t.Fatalf("expected empty assignee filter (unassigned) to validate, got %v", err)
+	}
+	gotEmptyAssignee := mustApply(t, issues, metrics, &emptyAssignee, now)
+	requireIDs(t, gotEmptyAssignee, "api-2")
+}
+
+func TestPass29_MatchesRepoAuthoritativeSourceRepo(t *testing.T) {
+	now := time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC)
+	issues := []model.Issue{
+		{ID: "my-app-101", Title: "Authoritative my-app", SourceRepo: "my-app", Status: model.StatusOpen, CreatedAt: now},
+		{ID: "my-fallback-102", Title: "No SourceRepo fallback", SourceRepo: "", Status: model.StatusOpen, CreatedAt: now},
+		{ID: "my-103", Title: "Authoritative my", SourceRepo: "my", Status: model.StatusOpen, CreatedAt: now},
+	}
+
+	// When SourceRepo is explicitly populated ("my-app"), repo: ["my"] must NOT fall back to ID prefix matching!
+	gotMy := mustApply(t, issues, recipe.Metrics{}, &recipe.Recipe{Name: "repo-my", Filters: recipe.FilterConfig{Repo: []string{"my"}}}, now)
+	requireIDs(t, gotMy, "my-fallback-102", "my-103")
+
+	gotMyApp := mustApply(t, issues, recipe.Metrics{}, &recipe.Recipe{Name: "repo-my-app", Filters: recipe.FilterConfig{Repo: []string{"my-app"}}}, now)
+	requireIDs(t, gotMyApp, "my-app-101")
+}
