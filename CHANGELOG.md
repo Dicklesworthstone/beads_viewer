@@ -44,7 +44,9 @@ the latest tag, including installer changes usable with already released binarie
 
 ## Unreleased
 
-No changes since `v0.29.1` yet.
+### Tests
+
+- The CLI test for `--check-drift --robot-drift` source-inconsistency alerts no longer depends on the date it runs. It now pins the robot clock with `SOURCE_DATE_EPOCH` to six days after its fixtures. Its issues were last updated on 2026-11-14, so on the wall clock drift's stale rule added warnings from 2026-11-28, which also masked a downgraded source-inconsistency severity. From 2026-12-14 those warnings would have turned critical and changed the expected exit code from 2 to 1. Test-only; no product change.
 
 ---
 

@@ -6226,6 +6226,12 @@ func TestExportMdHonorsExplicitExportFormatAndPriorityBriefMaxResults(t *testing
 
 func TestRobotAlertsSourceInconsistencyAndScopedLabelReadiness(t *testing.T) {
 	exe := buildTestBinary(t)
+	// The fixtures were last updated on 2026-11-14, and drift's default stale rule warns at
+	// 14 days and goes critical at 30. On the wall clock, stale_issue alerts join the drift
+	// result from 2026-11-28 and turn critical on 2026-12-14, which changes --robot-drift's
+	// exit code from 2 to 1. Pin the robot clock six days after the fixtures so the exit
+	// code comes from the source_inconsistency warning alone.
+	t.Setenv("SOURCE_DATE_EPOCH", strconv.FormatInt(time.Date(2026, 11, 20, 0, 0, 0, 0, time.UTC).Unix(), 10))
 
 	// 1. Live SQLite vs JSONL source_inconsistency in --robot-alerts and --check-drift --robot-drift
 	driftDir := t.TempDir()
