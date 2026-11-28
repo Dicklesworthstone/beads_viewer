@@ -303,7 +303,8 @@ class GraphStore {
             kcore: 1,
             hitsHub: 1,
             hitsAuth: 1,
-            slack: 1
+            slack: 1,
+            risk: 1
         };
 
         // Filters
@@ -313,8 +314,12 @@ class GraphStore {
             labels: [],
             repo: null,
             search: '',
-            showClosed: true  // Default to showing all issues in static export
+            showClosed: true, // Default to showing all issues in static export
+            changedOnly: false,
+            highRiskOnly: false
         };
+        // Optional historical diff status map (id -> 'added'|'modified'|'reopened'|'closed', W33-3)
+        this.diffStatusMap = new Map();
 
         // Config
         this.config = {
@@ -339,6 +344,7 @@ class GraphStore {
     reset() {
         this.issues = [];
         this.dependencies = [];
+        this.whatIfModel = null;
         this.nodeMap.clear();
         this.nodeIndexMap.clear();
         this.nodeIdByIndex = [];
@@ -359,8 +365,11 @@ class GraphStore {
             labels: [],
             repo: null,
             search: '',
-            showClosed: true
+            showClosed: true,
+            changedOnly: false,
+            highRiskOnly: false
         };
+        this.diffStatusMap.clear();
     }
 }
 
@@ -401,7 +410,8 @@ const SUPPORTED_SIZE_METRICS = [
     'kcore',
     'hitsHub',
     'hitsAuth',
-    'slack'
+    'slack',
+    'risk'
 ];
 
 function normalizeMetricKey(metric) {
@@ -436,6 +446,7 @@ function computeMaxMetrics(nodesArg = null) {
     store.maxMetrics.hitsHub = Math.max(...nodes.map(n => finiteMetricValue(n.hitsHub)), 0.001);
     store.maxMetrics.hitsAuth = Math.max(...nodes.map(n => finiteMetricValue(n.hitsAuth)), 0.001);
     store.maxMetrics.slack = Math.max(...nodes.map(n => finiteMetricValue(n.slack)), 1);
+    store.maxMetrics.risk = Math.max(...nodes.map(n => isResolvedIssue(n) ? 0 : finiteMetricValue(n.risk_score)), 0.001);
 }
 
 function getMetricRatio(node, metric = store.sizeMetric, forHeatmap = false) {
@@ -488,6 +499,11 @@ function getMetricRatio(node, metric = store.sizeMetric, forHeatmap = false) {
             // In heatmap mode, 0 slack (critical path) is hottest (1.0 -> red)
             return forHeatmap ? (1 - slackRatio) : slackRatio;
         }
+        case 'risk':
+            if (isResolvedIssue(node)) return 0;
+            val = finiteMetricValue(node.risk_score);
+            max = store.maxMetrics.risk || 0.001;
+            break;
         default:
             val = finiteMetricValue(node.pagerank);
             max = store.maxMetrics.pagerank || 0.001;
@@ -981,6 +997,14 @@ function buildCompanionWhatIfWasmGraph(DiGraph, resolvedIds) {
         }
     }
 
+    const nodeIdByIdx = new Array(realCount);
+    const nodeIdxById = new Map();
+    for (let i = 0; i < realCount; i++) {
+        const id = baseGraph.nodeId(i);
+        nodeIdByIdx[i] = id;
+        if (id) nodeIdxById.set(id, i);
+    }
+
     store.whatIfModel = {
         realCount,
         hasParentChild,
@@ -991,9 +1015,119 @@ function buildCompanionWhatIfWasmGraph(DiGraph, resolvedIds) {
         directDependents,
         openParents,
         openChildren,
+        nodeIdByIdx,
+        nodeIdxById,
     };
 
     return wg;
+}
+
+/**
+ * Pure-JS fallback what-if model builder (W35-4) so performWhatIf / performBatchWhatIf
+ * work cleanly even when WASM graph engine is unavailable.
+ */
+function ensureGraphWhatIfModel() {
+    if (store.whatIfModel && store.whatIfModel.nodeIdxById) {
+        return store.whatIfModel;
+    }
+    if (!Array.isArray(store.issues) || store.issues.length === 0) {
+        return null;
+    }
+    const resolvedIds = new Set(window.beadsViewer?.getResolvedIssueIDs?.() || []);
+    const nodeIdxById = new Map();
+    const nodeIdByIdx = [];
+    const ensureNode = id => {
+        if (!id) return undefined;
+        let idx = nodeIdxById.get(id);
+        if (idx === undefined) {
+            idx = nodeIdByIdx.length;
+            nodeIdxById.set(id, idx);
+            nodeIdByIdx.push(id);
+        }
+        return idx;
+    };
+    const knownIssues = new Map();
+    for (const issue of store.issues) {
+        if (!issue || !issue.id) continue;
+        knownIssues.set(issue.id, issue);
+        ensureNode(issue.id);
+        if (isResolvedIssue(issue)) resolvedIds.add(issue.id);
+    }
+    for (const d of (store.dependencies || [])) {
+        if (!d || !d.issue_id || !d.depends_on_id) continue;
+        if (isBlockingDependency(d)) {
+            ensureNode(d.issue_id);
+            ensureNode(d.depends_on_id);
+        }
+    }
+    const realCount = nodeIdByIdx.length;
+    const directBlockers = Array.from({ length: realCount }, () => []);
+    const directDependents = Array.from({ length: realCount }, () => []);
+    const openParents = Array.from({ length: realCount }, () => []);
+    const openChildren = Array.from({ length: realCount }, () => []);
+    const hasDirectMissingParent = new Uint8Array(realCount);
+    const baseClosed = new Uint8Array(realCount);
+    const lifecycleReady = new Uint8Array(realCount);
+    let hasParentChild = false;
+
+    for (const d of (store.dependencies || [])) {
+        if (!d || !d.issue_id || !d.depends_on_id) continue;
+        if (isBlockingDependency(d)) {
+            const fromIdx = nodeIdxById.get(d.issue_id);
+            const toIdx = nodeIdxById.get(d.depends_on_id);
+            if (fromIdx !== undefined && toIdx !== undefined) {
+                directBlockers[fromIdx].push(toIdx);
+                directDependents[toIdx].push(fromIdx);
+            }
+        } else if (d.type === 'parent-child') {
+            const childId = d.issue_id;
+            const parentId = d.depends_on_id;
+            if (resolvedIds.has(childId) || !knownIssues.has(childId) || resolvedIds.has(parentId)) continue;
+            const childIdx = nodeIdxById.get(childId);
+            if (!knownIssues.has(parentId)) {
+                if (childIdx !== undefined) {
+                    hasDirectMissingParent[childIdx] = 1;
+                    hasParentChild = true;
+                }
+                continue;
+            }
+            const parentIdx = nodeIdxById.get(parentId);
+            if (childIdx !== undefined && parentIdx !== undefined) {
+                hasParentChild = true;
+                openParents[childIdx].push(parentIdx);
+                openChildren[parentIdx].push(childIdx);
+            }
+        }
+    }
+
+    const refNowMs = resolveGraphReferenceNowMs();
+    for (let idx = 0; idx < realCount; idx++) {
+        const id = nodeIdByIdx[idx];
+        if (resolvedIds.has(id)) {
+            baseClosed[idx] = 1;
+            continue;
+        }
+        const issue = knownIssues.get(id);
+        if (!issue) continue;
+        if (!isGraphIssueLifecycleWithheld(issue, refNowMs)) {
+            lifecycleReady[idx] = 1;
+        }
+    }
+
+    store.whatIfModel = {
+        realCount,
+        hasParentChild,
+        baseClosed,
+        lifecycleReady,
+        hasDirectMissingParent,
+        directBlockers,
+        directDependents,
+        openParents,
+        openChildren,
+        nodeIdByIdx,
+        nodeIdxById,
+    };
+    return store.whatIfModel;
 }
 
 function createGraphWhatIfDepsEvaluator(model, closedMask) {
@@ -1074,6 +1208,9 @@ function simulateGraphWhatIfCloseIndices(model, targetIndices) {
             transitive_unblocks: 0,
             unblocked_ids: [],
             cascade_ids: [],
+            synergy_ids: [],
+            synergy_unblocks: 0,
+            active_count: 0,
             parallel_gain: 0,
         };
     }
@@ -1139,12 +1276,31 @@ function simulateGraphWhatIfCloseIndices(model, targetIndices) {
         }
     }
 
+    let synergyIds = [];
+    if (uniqueTargets.length >= 2 && unblockedIds.length > 0) {
+        const singleDirectUnion = new Set();
+        for (const tIdx of uniqueTargets) {
+            const singleClosed = new Uint8Array(model.baseClosed);
+            singleClosed[tIdx] = 1;
+            const singleReady = evaluateGraphWhatIfReadyMask(model, singleClosed);
+            for (let u = 0; u < realCount; u++) {
+                if (!singleClosed[u] && !beforeReady[u] && singleReady[u]) {
+                    singleDirectUnion.add(u);
+                }
+            }
+        }
+        synergyIds = unblockedIds.filter(u => !singleDirectUnion.has(u));
+    }
+
     return {
         direct_unblocks: unblockedIds.length,
         transitive_unblocks: cascadeIds.length,
         unblocked_ids: unblockedIds,
         cascade_ids: cascadeIds,
-        parallel_gain: Math.max(0, unblockedIds.length - 1),
+        synergy_ids: synergyIds,
+        synergy_unblocks: synergyIds.length,
+        active_count: uniqueTargets.length,
+        parallel_gain: unblockedIds.length - uniqueTargets.length,
     };
 }
 
@@ -1411,6 +1567,26 @@ function computeMetrics(layout = null) {
                 const maxBreakCandidates = Math.max(100, typeof activeGraph.edgeCount === 'function' ? activeGraph.edgeCount() : 100);
                 const rawBreak = activeGraph.cycleBreakSuggestions(maxBreakCandidates, 100);
                 const list = rawBreak?.suggestions || rawBreak?.top_suggestions || [];
+                const isValidCollateral = v => (typeof v === 'number' && Number.isFinite(v)) || (typeof v === 'string' && v.trim() !== '' && Number.isFinite(Number(v)));
+                const needsCollateralFallback = Array.isArray(list) && list.some(item => item && !isValidCollateral(item.collateral));
+                const activeInDegree = new Map();
+                if (needsCollateralFallback) {
+                    const resolvedIds = (typeof window !== 'undefined' && typeof window.beadsViewer?.getResolvedIssueIDs === 'function')
+                        ? new Set(window.beadsViewer.getResolvedIssueIDs() || [])
+                        : null;
+                    const seenEdges = new Set();
+                    for (const d of store.dependencies) {
+                        if (!isBlockingDependency(d) || !d.issue_id || !d.depends_on_id) continue;
+                        const srcNode = store.nodeMap.get(d.issue_id);
+                        const tgtNode = store.nodeMap.get(d.depends_on_id);
+                        if ((srcNode && isResolvedIssue(srcNode)) || (tgtNode && isResolvedIssue(tgtNode))) continue;
+                        if (resolvedIds && (resolvedIds.has(d.issue_id) || resolvedIds.has(d.depends_on_id))) continue;
+                        const ek = `${d.issue_id}\0${d.depends_on_id}`;
+                        if (seenEdges.has(ek)) continue;
+                        seenEdges.add(ek);
+                        activeInDegree.set(d.depends_on_id, (activeInDegree.get(d.depends_on_id) || 0) + 1);
+                    }
+                }
                 const resolved = [];
                 if (Array.isArray(list)) {
                     for (const item of list) {
@@ -1418,15 +1594,27 @@ function computeMetrics(layout = null) {
                         const from = item.from_id || (typeof item.from === 'number' ? activeGraph.nodeId(item.from) : item.from);
                         const to = item.to_id || (typeof item.to === 'number' ? activeGraph.nodeId(item.to) : item.to);
                         if (from && to) {
+                            const toStr = String(to);
+                            const rawCollateral = item.collateral;
+                            const collateral = isValidCollateral(rawCollateral)
+                                ? Number(rawCollateral)
+                                : (activeInDegree.get(toStr) ?? 0);
                             resolved.push({
                                 from: String(from),
-                                to: String(to),
-                                edgeKey: edgeKey(String(from), String(to)),
-                                cyclesBroken: Number(item.cycles_broken ?? item.cyclesBroken ?? 1) || 1
+                                to: toStr,
+                                edgeKey: edgeKey(String(from), toStr),
+                                cyclesBroken: Number(item.cycles_broken ?? item.cyclesBroken ?? 1) || 1,
+                                collateral
                             });
                         }
                     }
                 }
+                resolved.sort((a, b) =>
+                    (b.cyclesBroken - a.cyclesBroken) ||
+                    (a.collateral - b.collateral) ||
+                    a.from.localeCompare(b.from) ||
+                    a.to.localeCompare(b.to)
+                );
                 store.metrics.cycleBreakSuggestions = resolved;
             } catch (e) {
                 console.warn('[bv-graph] Cycle break suggestions skipped:', e);
@@ -2066,6 +2254,12 @@ function prepareGraphData(layout = null) {
         // Source repo filter
         if (filters.repo && (issue.source_repo || '') !== filters.repo) return false;
 
+        // Historical diff changed-only filter (W33-3)
+        if (filters.changedOnly && !store.diffStatusMap.has(issue.id)) return false;
+
+        // High operational risk filter (active issues with composite risk_score >= 0.50, W35-2)
+        if (filters.highRiskOnly && (isResolvedIssue(issue) || (Number(issue.risk_score) || 0) < 0.5)) return false;
+
         // Search filter
         const term = String(filters.search || '').trim().toLowerCase();
         if (term) {
@@ -2330,6 +2524,36 @@ function drawNode(node, ctx, globalScale) {
                       THEME.bgSecondary;
     ctx.lineWidth = isSelected ? 3 : isHovered ? 2 : 1;
     ctx.stroke();
+
+    // Historical diff halo ring (--diff-since overlay, W33-3 + P24B-8; hidden during Time-Travel)
+    const diffStatus = store.diffStatusMap.get(node.id);
+    if (diffStatus && !timeTravelState.active) {
+        let diffColor = null;
+        let diffWidth = 0;
+        let diffDash = null;
+        if (diffStatus === 'added') {
+            diffColor = '#22c55e';
+            diffWidth = 2.4 / Math.max(0.5, globalScale);
+        } else if (diffStatus === 'reopened' || diffStatus === 'modified') {
+            diffColor = '#f59e0b';
+            diffWidth = 2.1 / Math.max(0.5, globalScale);
+        } else if (diffStatus === 'closed') {
+            diffColor = '#94a3b8';
+            diffWidth = 1.9 / Math.max(0.5, globalScale);
+            diffDash = [3 / Math.max(0.5, globalScale), 2 / Math.max(0.5, globalScale)];
+        }
+        if (diffColor) {
+            ctx.save();
+            ctx.shadowBlur = 0;
+            ctx.beginPath();
+            ctx.arc(node.x, node.y, size + 5, 0, Math.PI * 2);
+            ctx.strokeStyle = diffColor;
+            ctx.lineWidth = diffWidth;
+            if (diffDash) ctx.setLineDash(diffDash);
+            ctx.stroke();
+            ctx.restore();
+        }
+    }
 
     // Articulation-point (cut-vertex) halo ring on active subgraph
     if (node.isArticulationPoint) {
@@ -2815,8 +3039,7 @@ function clampGraphWhatIfResult(result, realCount) {
  */
 export function performWhatIf(nodeInput) {
     const node = resolveGraphNodeObject(nodeInput);
-    if (!node || !store.wasmReady || !store.wasmGraph) {
-        console.warn('[bv-graph] What-if: WASM not ready');
+    if (!node) {
         return null;
     }
 
@@ -2826,17 +3049,19 @@ export function performWhatIf(nodeInput) {
         return null;
     }
 
-    const idx = store.wasmGraph.nodeIdx(node.id);
+    const useWasm = Boolean(store.wasmReady && store.wasmGraph);
+    const model = ensureGraphWhatIfModel();
+    const idx = useWasm ? store.wasmGraph.nodeIdx(node.id) : model?.nodeIdxById?.get(node.id);
     if (idx === undefined) return null;
 
-    const whatIfGraph = store.whatIfWasmGraph || store.wasmGraph;
-    const realCount = store.wasmGraph.nodeCount();
+    const whatIfGraph = useWasm ? (store.whatIfWasmGraph || store.wasmGraph) : null;
+    const realCount = useWasm ? store.wasmGraph.nodeCount() : (model?.realCount || 0);
 
-    // Call what-if (dynamic parent-stopping model when parent-child edges exist, else WASM)
+    // Call what-if (pure-JS parent-child / fallback model when parent-child exists or WASM unavailable, else WASM)
     let result;
     try {
-        if (store.whatIfModel?.hasParentChild) {
-            result = simulateGraphWhatIfCloseIndices(store.whatIfModel, [idx]);
+        if (!useWasm || model?.hasParentChild) {
+            result = simulateGraphWhatIfCloseIndices(model, [idx]);
         } else {
             const closedSet = buildClosedSet();
             result = whatIfGraph.whatIfClose(idx, closedSet);
@@ -2844,11 +3069,20 @@ export function performWhatIf(nodeInput) {
                 result = JSON.parse(result);
             }
             result = clampGraphWhatIfResult(result, realCount);
+            result.synergy_ids = [];
+            result.synergy_unblocks = 0;
+            result.active_count = 1;
+            result.parallel_gain = (result.direct_unblocks || 0) - 1;
         }
     } catch (e) {
         console.error('[bv-graph] What-if computation failed:', e);
         return null;
     }
+
+    const resolveIdx = i => (useWasm ? store.wasmGraph.nodeId(i) : model?.nodeIdByIdx?.[i]) || null;
+    result.unblocked_issue_ids = (result.unblocked_ids || []).map(resolveIdx).filter(Boolean);
+    result.cascade_issue_ids = (result.cascade_ids || []).map(resolveIdx).filter(Boolean);
+    result.synergy_issue_ids = (result.synergy_ids || []).map(resolveIdx).filter(Boolean);
 
     // Clear competing overlays and animate the cascade
     resetCycleNavigator();
@@ -2860,11 +3094,11 @@ export function performWhatIf(nodeInput) {
 }
 
 /**
- * Perform multi-node batch what-if simulation using WASM whatIfCloseBatch
+ * Perform multi-node batch what-if simulation using WASM whatIfCloseBatch or pure-JS fallback (W35-4)
  * @param {Array<Object|string>} nodesInput - Array of nodes or node IDs to simulate closing together
  */
 export function performBatchWhatIf(nodesInput) {
-    if (!Array.isArray(nodesInput) || nodesInput.length === 0 || !store.wasmReady || !store.wasmGraph) {
+    if (!Array.isArray(nodesInput) || nodesInput.length === 0) {
         return null;
     }
 
@@ -2884,17 +3118,19 @@ export function performBatchWhatIf(nodesInput) {
     if (uniqueNodes.length === 0) return null;
     if (uniqueNodes.length === 1) return performWhatIf(uniqueNodes[0]);
 
+    const useWasm = Boolean(store.wasmReady && store.wasmGraph);
+    const model = ensureGraphWhatIfModel();
     const indices = uniqueNodes
-        .map(n => store.wasmGraph.nodeIdx(n.id))
+        .map(n => useWasm ? store.wasmGraph.nodeIdx(n.id) : model?.nodeIdxById?.get(n.id))
         .filter(idx => idx !== undefined);
     if (indices.length === 0) return null;
 
-    const whatIfGraph = store.whatIfWasmGraph || store.wasmGraph;
-    const realCount = store.wasmGraph.nodeCount();
+    const whatIfGraph = useWasm ? (store.whatIfWasmGraph || store.wasmGraph) : null;
+    const realCount = useWasm ? store.wasmGraph.nodeCount() : (model?.realCount || 0);
     let result;
     try {
-        if (store.whatIfModel?.hasParentChild) {
-            result = simulateGraphWhatIfCloseIndices(store.whatIfModel, indices);
+        if (!useWasm || model?.hasParentChild) {
+            result = simulateGraphWhatIfCloseIndices(model, indices);
         } else {
             const closedSet = buildClosedSet();
             result = whatIfGraph.whatIfCloseBatch(new Uint32Array(indices), closedSet);
@@ -2902,11 +3138,30 @@ export function performBatchWhatIf(nodesInput) {
                 result = JSON.parse(result);
             }
             result = clampGraphWhatIfResult(result, realCount);
+            const singleUnion = new Set();
+            for (const idx of indices) {
+                let single = whatIfGraph.whatIfClose(idx, closedSet);
+                if (typeof single === 'string') single = JSON.parse(single);
+                single = clampGraphWhatIfResult(single, realCount);
+                for (const u of (single?.unblocked_ids || [])) {
+                    singleUnion.add(u);
+                }
+            }
+            const synergyIds = (result.unblocked_ids || []).filter(u => !singleUnion.has(u));
+            result.synergy_ids = synergyIds;
+            result.synergy_unblocks = synergyIds.length;
+            result.active_count = indices.length;
+            result.parallel_gain = (result.direct_unblocks || 0) - indices.length;
         }
     } catch (e) {
         console.error('[bv-graph] Batch what-if computation failed:', e);
         return null;
     }
+
+    const resolveIdx = i => (useWasm ? store.wasmGraph.nodeId(i) : model?.nodeIdByIdx?.[i]) || null;
+    result.unblocked_issue_ids = (result.unblocked_ids || []).map(resolveIdx).filter(Boolean);
+    result.cascade_issue_ids = (result.cascade_ids || []).map(resolveIdx).filter(Boolean);
+    result.synergy_issue_ids = (result.synergy_ids || []).map(resolveIdx).filter(Boolean);
 
     resetCycleNavigator();
     resetCriticalPath();
@@ -2957,13 +3212,15 @@ function animateWhatIfCascade(sourceNodesInput, result) {
     whatIfState.sourceNodes = sourceNodes;
     whatIfState.unblockedNodes.clear();
 
-    const realCount = store.wasmGraph ? store.wasmGraph.nodeCount() : 0;
+    const realCount = store.wasmGraph ? store.wasmGraph.nodeCount() : (store.whatIfModel?.realCount || 0);
 
-    // Get unblocked node IDs
-    const unblockedIds = (result.unblocked_ids || [])
-        .filter(idx => idx < realCount)
-        .map(idx => store.wasmGraph.nodeId(idx))
-        .filter(Boolean);
+    // Get unblocked node IDs (works in both WASM and pure-JS fallback modes)
+    const unblockedIds = Array.isArray(result.unblocked_issue_ids)
+        ? result.unblocked_issue_ids.filter(Boolean)
+        : (result.unblocked_ids || [])
+            .filter(idx => idx < realCount)
+            .map(idx => store.wasmGraph ? store.wasmGraph.nodeId(idx) : store.whatIfModel?.nodeIdByIdx?.[idx])
+            .filter(Boolean);
 
     // Phase 1: Highlight the source node(s) (pulse green, "closing")
     store.highlightedNodes.clear();
@@ -3033,7 +3290,9 @@ function showWhatIfSummary(sourceNodesInput, result, unblockedIds) {
         : (sourceNode?.id || 'issue');
     const directCount = result.direct_unblocks || unblockedIds.length;
     const transitiveCount = result.transitive_unblocks || directCount;
-    const parallelGain = result.parallel_gain || 0;
+    const parallelGain = Number.isFinite(Number(result.parallel_gain)) ? Number(result.parallel_gain) : (directCount - sourceNodes.length);
+    const synergyIssueIds = Array.isArray(result.synergy_issue_ids) ? result.synergy_issue_ids : [];
+    const synergyUnblocks = Number(result.synergy_unblocks ?? synergyIssueIds.length) || 0;
 
     dispatchEvent('whatIfComplete', {
         node: sourceNode,
@@ -3041,14 +3300,18 @@ function showWhatIfSummary(sourceNodesInput, result, unblockedIds) {
         directUnblocks: directCount,
         transitiveUnblocks: transitiveCount,
         parallelGain: parallelGain,
+        synergyUnblocks: synergyUnblocks,
+        synergyIssueIds: synergyIssueIds,
         unblockedIds: unblockedIds
     });
 
     // Create summary toast
     if (directCount > 0) {
+        const synergySuffix = synergyUnblocks > 0 ? ` (${synergyUnblocks} joint synergy)` : '';
         showToast(
             `Closing ${label} would unblock ${directCount} issue${directCount > 1 ? 's' : ''} directly` +
-            (transitiveCount > directCount ? `, ${transitiveCount} total in cascade` : ''),
+            (transitiveCount > directCount ? `, ${transitiveCount} total in cascade` : '') +
+            synergySuffix,
             'success'
         );
     } else {
@@ -4292,6 +4555,27 @@ export function setFilter(key, value) {
     dispatchEvent('filterChange', { filters: { ...store.filters }, ...countVisibleGraphNodes(graphData) });
 }
 
+export function setDiffStatusMap(statusMap) {
+    store.diffStatusMap.clear();
+    if (statusMap instanceof Map) {
+        for (const [k, v] of statusMap.entries()) {
+            if (k && v) store.diffStatusMap.set(String(k), String(v));
+        }
+    } else if (statusMap && typeof statusMap === 'object') {
+        for (const [k, v] of Object.entries(statusMap)) {
+            if (k && v) store.diffStatusMap.set(String(k), String(v));
+        }
+    }
+    if (store.filters.changedOnly && store.graph) {
+        const graphData = prepareGraphData();
+        store.graph.graphData(graphData);
+        syncOverlaysAfterGraphRebuild(graphData);
+        dispatchEvent('filterChange', { filters: { ...store.filters }, ...countVisibleGraphNodes(graphData) });
+    } else {
+        refreshGraph();
+    }
+}
+
 export function clearFilters() {
     if (timeTravelState.active) {
         stopTimeTravel();
@@ -4302,7 +4586,9 @@ export function clearFilters() {
         labels: [],
         repo: null,
         search: '',
-        showClosed: true  // Reset to showing all issues
+        showClosed: true, // Reset to showing all issues
+        changedOnly: false,
+        highRiskOnly: false
     };
     labelClusterState.activeLabel = null;
     const graphData = prepareGraphData();

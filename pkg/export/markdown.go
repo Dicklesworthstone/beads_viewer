@@ -30,6 +30,46 @@ type ReportOverrides struct {
 	GroupBy        *string
 }
 
+// ReportSprintSummary summarizes the active sprint's burndown and at-risk health
+// for Markdown/HTML/JSON reports and priority briefs (W33-4).
+type ReportSprintSummary struct {
+	SprintID        string   `json:"sprint_id"`
+	Name            string   `json:"name"`
+	StartDate       string   `json:"start_date,omitempty"`
+	EndDate         string   `json:"end_date,omitempty"`
+	TotalIssues     int      `json:"total_issues"`
+	CompletedIssues int      `json:"completed_issues"`
+	RemainingIssues int      `json:"remaining_issues"`
+	PercentComplete float64  `json:"percent_complete"`
+	DaysRemaining   int      `json:"days_remaining"`
+	OnTrack         bool     `json:"on_track"`
+	ProjectedDate   string   `json:"projected_date,omitempty"`
+	AtRiskCount     int      `json:"at_risk_count"`
+	AtRiskIssueIDs  []string `json:"at_risk_issue_ids,omitempty"`
+}
+
+// ReportDriftAlert summarizes one baseline drift alert for Markdown/HTML/JSON reports and priority briefs (W33-4).
+type ReportDriftAlert struct {
+	Severity       string `json:"severity"`
+	Type           string `json:"type"`
+	IssueID        string `json:"issue_id,omitempty"`
+	RelatedIssueID string `json:"related_issue_id,omitempty"`
+	Message        string `json:"message"`
+}
+
+// ReportDriftSummary summarizes saved-baseline drift status for Markdown/HTML/JSON reports and priority briefs (W33-4).
+type ReportDriftSummary struct {
+	BaselineCommit      string             `json:"baseline_commit,omitempty"`
+	BaselineCreatedAt   string             `json:"baseline_created_at,omitempty"`
+	HasDrift            bool               `json:"has_drift"`
+	CriticalCount       int                `json:"critical_count"`
+	WarningCount        int                `json:"warning_count"`
+	InfoCount           int                `json:"info_count"`
+	SkippedChecksCount  int                `json:"skipped_checks_count,omitempty"`
+	SkippedCheckReasons []string           `json:"skipped_check_reasons,omitempty"`
+	TopAlerts           []ReportDriftAlert `json:"top_alerts,omitempty"`
+}
+
 type ReportOptions struct {
 	Format            string
 	IncludeGraph      bool
@@ -61,6 +101,12 @@ type ReportOptions struct {
 	IncludeInactive   bool
 	Diff              *analysis.SnapshotDiff
 	DiffSince         string
+	GlobalCapacity    *PriorityBriefCapacity
+	Suggestions       []analysis.Suggestion
+	CrossRepoFlow     *analysis.CrossRepoFlow
+	ActiveSprint      *ReportSprintSummary
+	BaselineDrift     *ReportDriftSummary
+	LabelCascades     []analysis.BlockageCascadeResult
 }
 
 // DefaultReportOptions returns initialized report defaults with actionPlanSet
@@ -628,13 +674,23 @@ func GenerateReport(selected, context []model.Issue, opts ReportOptions) ([]byte
 		opts.GeneratedAt = time.Now().UTC()
 	}
 	hadCallerReadiness := opts.Readiness != nil
-	if opts.IncludeGraph && opts.Readiness == nil {
+	if (opts.IncludeGraph || len(context) > 0) && opts.Readiness == nil {
 		opts.Readiness = model.NewReadinessIndex(combineReportIssues(selected, context))
 	}
 	if opts.IncludeGraph || len(context) > 0 {
 		opts.GraphIssues = reportGraphContext(selected, context)
 	}
 	reportOpts := opts
+	if len(context) > 0 && reportOpts.VisibleIDs == nil {
+		combined := combineReportIssues(selected, context)
+		if len(selected) < len(combined) {
+			vis := make(map[string]bool, len(selected))
+			for _, iss := range selected {
+				vis[iss.ID] = true
+			}
+			reportOpts.VisibleIDs = vis
+		}
+	}
 	if !hadCallerReadiness {
 		reportOpts.AuthorityComplete = false
 	}
@@ -681,21 +737,84 @@ func GenerateReport(selected, context []model.Issue, opts ReportOptions) ([]byte
 				return nil, err
 			}
 		}
+		type jsonDecisionIntel struct {
+			HighRisk      []reportHighRiskItem              `json:"high_risk,omitempty"`
+			PriorityHints []analysis.PriorityRecommendation `json:"priority_hints,omitempty"`
+			CycleBreaks   []analysis.CycleBreakItem         `json:"cycle_breaks,omitempty"`
+			TopKItems     []analysis.TopKSetItem            `json:"top_k_items,omitempty"`
+			TopKTotalGain int                               `json:"top_k_total_gain,omitempty"`
+			ParallelCut   []analysis.ParallelCutItem        `json:"parallel_cut,omitempty"`
+			KPaths        []analysis.CriticalPath           `json:"k_paths,omitempty"`
+		}
+		var decIntel *jsonDecisionIntel
+		var globalCap *PriorityBriefCapacity
+		var sugList []analysis.Suggestion
+		var crossRepo *analysis.CrossRepoFlow
+		var activeSprint *ReportSprintSummary
+		var baselineDrift *ReportDriftSummary
+		var labelCascades []analysis.BlockageCascadeResult
+		if di := buildReportDecisionIntel(selected, reportOpts); di != nil {
+			if len(di.highRisk) > 0 || len(di.priorityHints) > 0 || len(di.cycleBreaks) > 0 || len(di.topKItems) > 0 || len(di.parallelCut) > 0 || len(di.kPaths) > 0 {
+				decIntel = &jsonDecisionIntel{
+					HighRisk:      di.highRisk,
+					PriorityHints: di.priorityHints,
+					CycleBreaks:   di.cycleBreaks,
+					TopKItems:     di.topKItems,
+					TopKTotalGain: di.topKTotalGain,
+					ParallelCut:   di.parallelCut,
+					KPaths:        di.kPaths,
+				}
+			}
+			globalCap = di.capacity
+			sugList = di.suggestions
+			crossRepo = di.crossRepoFlow
+			activeSprint = di.activeSprint
+			baselineDrift = di.baselineDrift
+			labelCascades = di.labelCascades
+		}
 		return json.MarshalIndent(struct {
-			Title           string                 `json:"title"`
-			GeneratedAt     time.Time              `json:"generated_at"`
-			SourceAuthority any                    `json:"source_authority"`
-			AuthorityHash   string                 `json:"authority_hash,omitempty"`
-			DataHash        string                 `json:"data_hash,omitempty"`
-			SourcePath      string                 `json:"source_path,omitempty"`
-			SourceKind      string                 `json:"source_kind,omitempty"`
-			AsOf            string                 `json:"as_of,omitempty"`
-			AsOfCommit      string                 `json:"as_of_commit,omitempty"`
-			DiffSince       string                 `json:"diff_since,omitempty"`
-			Diff            *analysis.SnapshotDiff `json:"diff,omitempty"`
-			Issues          []row                  `json:"issues"`
-			Graph           *GraphExportResult     `json:"graph,omitempty"`
-		}{opts.Title, opts.GeneratedAt, opts.SourceAuthority, opts.AuthorityHash, opts.DataHash, opts.SourcePath, opts.SourceKind, opts.AsOf, opts.AsOfCommit, opts.DiffSince, opts.Diff, rows, graph}, "", "  ")
+			Title           string                           `json:"title"`
+			GeneratedAt     time.Time                        `json:"generated_at"`
+			SourceAuthority any                              `json:"source_authority"`
+			AuthorityHash   string                           `json:"authority_hash,omitempty"`
+			DataHash        string                           `json:"data_hash,omitempty"`
+			SourcePath      string                           `json:"source_path,omitempty"`
+			SourceKind      string                           `json:"source_kind,omitempty"`
+			AsOf            string                           `json:"as_of,omitempty"`
+			AsOfCommit      string                           `json:"as_of_commit,omitempty"`
+			DiffSince       string                           `json:"diff_since,omitempty"`
+			Diff            *analysis.SnapshotDiff           `json:"diff,omitempty"`
+			DecisionIntel   *jsonDecisionIntel               `json:"decision_intel,omitempty"`
+			GlobalCapacity  *PriorityBriefCapacity           `json:"global_capacity,omitempty"`
+			Suggestions     []analysis.Suggestion            `json:"suggestions,omitempty"`
+			CrossRepoFlow   *analysis.CrossRepoFlow          `json:"cross_repo_flow,omitempty"`
+			ActiveSprint    *ReportSprintSummary             `json:"active_sprint,omitempty"`
+			BaselineDrift   *ReportDriftSummary              `json:"baseline_drift,omitempty"`
+			LabelCascades   []analysis.BlockageCascadeResult `json:"label_cascades,omitempty"`
+			Issues          []row                            `json:"issues"`
+			Graph           *GraphExportResult               `json:"graph,omitempty"`
+		}{
+			Title:           opts.Title,
+			GeneratedAt:     opts.GeneratedAt,
+			SourceAuthority: opts.SourceAuthority,
+			AuthorityHash:   opts.AuthorityHash,
+			DataHash:        opts.DataHash,
+			SourcePath:      opts.SourcePath,
+			SourceKind:      opts.SourceKind,
+			AsOf:            opts.AsOf,
+			AsOfCommit:      opts.AsOfCommit,
+			DiffSince:       opts.DiffSince,
+			Diff:            opts.Diff,
+			DecisionIntel:   decIntel,
+			GlobalCapacity:  globalCap,
+			Suggestions:     sugList,
+			CrossRepoFlow:   crossRepo,
+			ActiveSprint:    activeSprint,
+			BaselineDrift:   baselineDrift,
+			LabelCascades:   labelCascades,
+			Issues:          rows,
+			Graph:           graph,
+		}, "", "  ")
 	case "csv":
 		return writeCSVReport(selected, context, opts, metricsAcc)
 	case "mermaid":
@@ -1165,9 +1284,9 @@ func sanitizeMermaidText(text string) string {
 }
 
 type reportHighRiskItem struct {
-	IssueID     string
-	RiskScore   float64
-	Explanation string
+	IssueID     string  `json:"issue_id"`
+	RiskScore   float64 `json:"risk_score"`
+	Explanation string  `json:"explanation,omitempty"`
 }
 
 type reportDecisionIntel struct {
@@ -1177,10 +1296,26 @@ type reportDecisionIntel struct {
 	highRisk      []reportHighRiskItem
 	priorityHints []analysis.PriorityRecommendation
 	cycleBreaks   []analysis.CycleBreakItem
+	topKItems     []analysis.TopKSetItem
+	topKTotalGain int
+	parallelCut   []analysis.ParallelCutItem
+	kPaths        []analysis.CriticalPath
+	capacity      *PriorityBriefCapacity
+	suggestions   []analysis.Suggestion
+	crossRepoFlow *analysis.CrossRepoFlow
+	activeSprint  *ReportSprintSummary
+	baselineDrift *ReportDriftSummary
+	labelCascades []analysis.BlockageCascadeResult
 }
 
 func buildReportDecisionIntel(issues []model.Issue, opts ReportOptions) *reportDecisionIntel {
-	if (opts.Analyzer == nil && opts.GraphStats == nil) || len(issues) == 0 {
+	hasExternal := (opts.GlobalCapacity != nil && opts.GlobalCapacity.TotalMinutes > 0) ||
+		len(opts.Suggestions) > 0 ||
+		(opts.CrossRepoFlow != nil && opts.CrossRepoFlow.TotalCrossRepoDeps > 0) ||
+		(opts.ActiveSprint != nil && opts.ActiveSprint.TotalIssues > 0) ||
+		opts.BaselineDrift != nil ||
+		len(opts.LabelCascades) > 0
+	if (opts.Analyzer == nil && opts.GraphStats == nil && !hasExternal) || len(issues) == 0 {
 		return nil
 	}
 	visibleSet := opts.VisibleIDs
@@ -1202,6 +1337,7 @@ func buildReportDecisionIntel(issues []model.Issue, opts ReportOptions) *reportD
 		whatIfByID:   make(map[string]*analysis.WhatIfResult),
 		priorityByID: make(map[string]analysis.PriorityRecommendation),
 	}
+	di.attachExternalIntel(issues, opts, visibleSet)
 
 	issueMap := make(map[string]model.Issue, len(opts.GraphIssues)+len(issues))
 	for _, iss := range opts.GraphIssues {
@@ -1290,7 +1426,8 @@ func buildReportDecisionIntel(issues []model.Issue, opts ReportOptions) *reportD
 					cleanVisible[id] = true
 				}
 			}
-			needsScopedAnalyzer := opts.VisibleIDs != nil || len(cleanVisible) < len(issueMap)
+			needsScopedAnalyzer := opts.VisibleIDs != nil || len(cleanVisible) < len(issueMap) ||
+				(opts.GraphStats != nil && opts.GraphStats.NodeCount > len(cleanVisible))
 			whatIfAnalyzer := opts.Analyzer
 			if needsScopedAnalyzer {
 				allGraph := make([]model.Issue, 0, len(issueMap))
@@ -1318,15 +1455,103 @@ func buildReportDecisionIntel(issues []model.Issue, opts ReportOptions) *reportD
 				di.whatIfByID[iss.ID] = wi
 			}
 
-			adv := opts.Analyzer.GenerateAdvancedInsightsFromStats(opts.GraphStats, analysis.DefaultAdvancedInsightsConfig())
-			if adv != nil && adv.CycleBreak != nil {
-				for _, cb := range adv.CycleBreak.Suggestions {
-					if !visibleSet[cb.EdgeFrom] || !visibleSet[cb.EdgeTo] {
-						continue
+			advCfg := analysis.DefaultAdvancedInsightsConfig()
+			if needsScopedAnalyzer {
+				if cycles := opts.GraphStats.Cycles(); len(cycles) > 0 {
+					totalEdges := 0
+					for _, c := range cycles {
+						totalEdges += len(c)
 					}
-					di.cycleBreaks = append(di.cycleBreaks, cb)
-					if len(di.cycleBreaks) >= 5 {
-						break
+					advCfg.CycleBreakLimit = max(5, totalEdges)
+				}
+			}
+			adv := whatIfAnalyzer.GenerateAdvancedInsightsFromStats(opts.GraphStats, advCfg)
+			if adv != nil {
+				if adv.CycleBreak != nil {
+					for _, cb := range adv.CycleBreak.Suggestions {
+						if !visibleSet[cb.EdgeFrom] || !visibleSet[cb.EdgeTo] {
+							continue
+						}
+						di.cycleBreaks = append(di.cycleBreaks, cb)
+						if len(di.cycleBreaks) >= 5 {
+							break
+						}
+					}
+				}
+				if adv.TopKSet != nil && len(adv.TopKSet.Items) > 0 {
+					for _, item := range adv.TopKSet.Items {
+						if !visibleSet[item.ID] {
+							continue
+						}
+						cloned := item
+						if len(item.Unblocks) > 0 {
+							kept := make([]string, 0, len(item.Unblocks))
+							for _, uid := range item.Unblocks {
+								if visibleSet[uid] {
+									kept = append(kept, uid)
+								}
+							}
+							cloned.Unblocks = kept
+							if len(kept) != len(item.Unblocks) || opts.VisibleIDs != nil {
+								cloned.MarginalGain = len(kept)
+							}
+						}
+						if cloned.MarginalGain <= 0 && len(cloned.Unblocks) == 0 {
+							continue
+						}
+						di.topKItems = append(di.topKItems, cloned)
+						di.topKTotalGain += cloned.MarginalGain
+						if len(di.topKItems) >= 5 {
+							break
+						}
+					}
+				}
+				if adv.ParallelCut != nil && len(adv.ParallelCut.Suggestions) > 0 {
+					for _, pc := range adv.ParallelCut.Suggestions {
+						if !visibleSet[pc.ID] {
+							continue
+						}
+						clonedPC := pc
+						if len(pc.EnabledTracks) > 0 {
+							keptTracks := make([]string, 0, len(pc.EnabledTracks))
+							for _, tid := range pc.EnabledTracks {
+								if visibleSet[tid] {
+									keptTracks = append(keptTracks, tid)
+								}
+							}
+							clonedPC.EnabledTracks = keptTracks
+							if len(keptTracks) != len(pc.EnabledTracks) || opts.VisibleIDs != nil {
+								clonedPC.ParallelGain = len(keptTracks) - 1
+							}
+						}
+						if clonedPC.ParallelGain <= 0 {
+							continue
+						}
+						di.parallelCut = append(di.parallelCut, clonedPC)
+						if len(di.parallelCut) >= 5 {
+							break
+						}
+					}
+				}
+				if adv.KPaths != nil && len(adv.KPaths.Paths) > 0 {
+					for _, p := range adv.KPaths.Paths {
+						if len(p.IssueIDs) < 2 {
+							continue
+						}
+						allVis := true
+						for _, id := range p.IssueIDs {
+							if !visibleSet[id] {
+								allVis = false
+								break
+							}
+						}
+						if !allVis {
+							continue
+						}
+						di.kPaths = append(di.kPaths, p)
+						if len(di.kPaths) >= 5 {
+							break
+						}
 					}
 				}
 			}
@@ -1336,8 +1561,279 @@ func buildReportDecisionIntel(issues []model.Issue, opts ReportOptions) *reportD
 	return di
 }
 
+func (di *reportDecisionIntel) attachExternalIntel(issues []model.Issue, opts ReportOptions, visibleSet map[string]bool) {
+	if di == nil {
+		return
+	}
+	if opts.GlobalCapacity != nil && opts.GlobalCapacity.TotalMinutes > 0 {
+		capCopy := *opts.GlobalCapacity
+		if len(capCopy.CriticalPathIDs) > 0 {
+			filtered := make([]string, 0, len(capCopy.CriticalPathIDs))
+			for _, id := range capCopy.CriticalPathIDs {
+				if visibleSet[id] {
+					filtered = append(filtered, id)
+				}
+			}
+			capCopy.CriticalPathIDs = filtered
+		}
+		di.capacity = &capCopy
+	}
+	if len(opts.Suggestions) > 0 {
+		for _, sug := range opts.Suggestions {
+			if sug.TargetBead == "" || !visibleSet[sug.TargetBead] {
+				continue
+			}
+			if sug.RelatedBead != "" && !visibleSet[sug.RelatedBead] {
+				continue
+			}
+			di.suggestions = append(di.suggestions, sug)
+			if len(di.suggestions) >= 5 {
+				break
+			}
+		}
+	}
+	if opts.CrossRepoFlow != nil && opts.CrossRepoFlow.TotalCrossRepoDeps > 0 {
+		filteredDeps := make([]analysis.RepoDependency, 0, len(opts.CrossRepoFlow.Dependencies))
+		filteredTotal := 0
+		for _, dep := range opts.CrossRepoFlow.Dependencies {
+			depCopy := dep
+			if len(dep.IssueIDs) > 0 {
+				visIssues := make([]string, 0, len(dep.IssueIDs))
+				for _, id := range dep.IssueIDs {
+					if visibleSet[id] {
+						visIssues = append(visIssues, id)
+					}
+				}
+				depCopy.IssueIDs = visIssues
+			}
+			if len(dep.BlockerIDs) > 0 {
+				visBlockers := make([]string, 0, len(dep.BlockerIDs))
+				for _, id := range dep.BlockerIDs {
+					if visibleSet[id] {
+						visBlockers = append(visBlockers, id)
+					}
+				}
+				depCopy.BlockerIDs = visBlockers
+			}
+			if (len(dep.IssueIDs) > 0 && len(depCopy.IssueIDs) == 0) ||
+				(len(dep.BlockerIDs) > 0 && len(depCopy.BlockerIDs) == 0) {
+				continue
+			}
+			if len(dep.IssueIDs) > 0 && len(dep.BlockerIDs) > 0 &&
+				(len(depCopy.IssueIDs) < len(dep.IssueIDs) || len(depCopy.BlockerIDs) < len(dep.BlockerIDs)) {
+				maxEdges := len(depCopy.IssueIDs) * len(depCopy.BlockerIDs)
+				if depCopy.IssueCount > maxEdges {
+					depCopy.IssueCount = maxEdges
+				}
+			}
+			if depCopy.IssueCount <= 0 {
+				continue
+			}
+			filteredTotal += depCopy.IssueCount
+			filteredDeps = append(filteredDeps, depCopy)
+		}
+		if len(filteredDeps) > 0 && filteredTotal > 0 {
+			repoSet := make(map[string]bool)
+			outByFromRepo := make(map[string]int)
+			targetsByBlocker := make(map[string]map[string]bool)
+			for _, dep := range filteredDeps {
+				if dep.FromRepo != "" {
+					repoSet[dep.FromRepo] = true
+					outByFromRepo[dep.FromRepo] += dep.IssueCount
+				}
+				if dep.ToRepo != "" {
+					repoSet[dep.ToRepo] = true
+					for _, bid := range dep.BlockerIDs {
+						if targetsByBlocker[bid] == nil {
+							targetsByBlocker[bid] = make(map[string]bool)
+						}
+						targetsByBlocker[bid][dep.ToRepo] = true
+					}
+				}
+			}
+			filteredRepos := make([]string, 0, len(repoSet))
+			for r := range repoSet {
+				filteredRepos = append(filteredRepos, r)
+			}
+			sort.Strings(filteredRepos)
+
+			filteredBottlenecks := make([]string, 0, len(outByFromRepo))
+			for r := range outByFromRepo {
+				filteredBottlenecks = append(filteredBottlenecks, r)
+			}
+			sort.Slice(filteredBottlenecks, func(i, j int) bool {
+				if outByFromRepo[filteredBottlenecks[i]] != outByFromRepo[filteredBottlenecks[j]] {
+					return outByFromRepo[filteredBottlenecks[i]] > outByFromRepo[filteredBottlenecks[j]]
+				}
+				return filteredBottlenecks[i] < filteredBottlenecks[j]
+			})
+			if len(filteredBottlenecks) > 5 {
+				filteredBottlenecks = filteredBottlenecks[:5]
+			}
+
+			repoByIssueID := make(map[string]string, len(opts.GraphIssues)+len(issues))
+			for _, iss := range opts.GraphIssues {
+				if r := strings.ToLower(strings.TrimRight(strings.TrimSpace(iss.SourceRepo), "-:_")); r != "" && r != "." {
+					repoByIssueID[iss.ID] = r
+				}
+			}
+			for _, iss := range issues {
+				if _, exists := repoByIssueID[iss.ID]; exists {
+					continue
+				}
+				if r := strings.ToLower(strings.TrimRight(strings.TrimSpace(iss.SourceRepo), "-:_")); r != "" && r != "." {
+					repoByIssueID[iss.ID] = r
+				}
+			}
+			filteredBlockers := make([]analysis.RepoHandoffBlocker, 0, len(opts.CrossRepoFlow.TopHandoffBlockers))
+			for _, hb := range opts.CrossRepoFlow.TopHandoffBlockers {
+				if !visibleSet[hb.IssueID] {
+					continue
+				}
+				hbCopy := hb
+				if len(hb.BlockedIDs) > 0 {
+					visBlocked := make([]string, 0, len(hb.BlockedIDs))
+					for _, bid := range hb.BlockedIDs {
+						if visibleSet[bid] {
+							visBlocked = append(visBlocked, bid)
+						}
+					}
+					if len(visBlocked) == 0 {
+						continue
+					}
+					hbCopy.BlockedIDs = visBlocked
+					hbCopy.BlockedCount = len(visBlocked)
+				}
+				allowedTargets := targetsByBlocker[hb.IssueID]
+				if len(hbCopy.BlockedIDs) > 0 {
+					derivedFromIDs := make(map[string]bool)
+					for _, bid := range hbCopy.BlockedIDs {
+						if r := repoByIssueID[bid]; r != "" && r != hbCopy.SourceRepo {
+							derivedFromIDs[r] = true
+						}
+					}
+					if len(derivedFromIDs) > 0 {
+						allowedTargets = derivedFromIDs
+					}
+				}
+				if len(hb.BlockedRepos) > 0 {
+					visRepos := make([]string, 0, len(hb.BlockedRepos))
+					for _, tr := range hb.BlockedRepos {
+						if allowedTargets[tr] {
+							visRepos = append(visRepos, tr)
+						}
+					}
+					if len(visRepos) == 0 {
+						continue
+					}
+					hbCopy.BlockedRepos = visRepos
+				} else if len(allowedTargets) > 0 {
+					visRepos := make([]string, 0, len(allowedTargets))
+					for tr := range allowedTargets {
+						visRepos = append(visRepos, tr)
+					}
+					sort.Strings(visRepos)
+					hbCopy.BlockedRepos = visRepos
+				}
+				filteredBlockers = append(filteredBlockers, hbCopy)
+			}
+			sort.Slice(filteredBlockers, func(i, j int) bool {
+				if filteredBlockers[i].BlockedCount != filteredBlockers[j].BlockedCount {
+					return filteredBlockers[i].BlockedCount > filteredBlockers[j].BlockedCount
+				}
+				return filteredBlockers[i].IssueID < filteredBlockers[j].IssueID
+			})
+			flowCopy := *opts.CrossRepoFlow
+			flowCopy.Repos = filteredRepos
+			flowCopy.BottleneckRepos = filteredBottlenecks
+			flowCopy.Dependencies = filteredDeps
+			flowCopy.TotalCrossRepoDeps = filteredTotal
+			flowCopy.TopHandoffBlockers = filteredBlockers
+			di.crossRepoFlow = &flowCopy
+		}
+	}
+	if opts.ActiveSprint != nil && opts.ActiveSprint.TotalIssues > 0 {
+		spCopy := *opts.ActiveSprint
+		if len(spCopy.AtRiskIssueIDs) > 0 {
+			visRisk := make([]string, 0, len(spCopy.AtRiskIssueIDs))
+			for _, id := range spCopy.AtRiskIssueIDs {
+				if visibleSet[id] {
+					visRisk = append(visRisk, id)
+				}
+			}
+			spCopy.AtRiskIssueIDs = visRisk
+			spCopy.AtRiskCount = len(visRisk)
+		}
+		di.activeSprint = &spCopy
+	}
+	if opts.BaselineDrift != nil {
+		drCopy := *opts.BaselineDrift
+		if len(drCopy.TopAlerts) > 0 {
+			visAlerts := make([]ReportDriftAlert, 0, min(len(drCopy.TopAlerts), 5))
+			for _, al := range drCopy.TopAlerts {
+				if (al.IssueID != "" && !visibleSet[al.IssueID]) ||
+					(al.RelatedIssueID != "" && !visibleSet[al.RelatedIssueID]) {
+					switch strings.ToLower(strings.TrimSpace(al.Severity)) {
+					case "critical":
+						if drCopy.CriticalCount > 0 {
+							drCopy.CriticalCount--
+						}
+					case "warning":
+						if drCopy.WarningCount > 0 {
+							drCopy.WarningCount--
+						}
+					default:
+						if drCopy.InfoCount > 0 {
+							drCopy.InfoCount--
+						}
+					}
+					continue
+				}
+				if len(visAlerts) < 5 {
+					visAlerts = append(visAlerts, al)
+				}
+			}
+			drCopy.TopAlerts = visAlerts
+			drCopy.HasDrift = drCopy.HasDrift && (drCopy.CriticalCount+drCopy.WarningCount+drCopy.InfoCount > 0)
+		}
+		di.baselineDrift = &drCopy
+	}
+	if len(opts.LabelCascades) > 0 {
+		for _, cas := range opts.LabelCascades {
+			if cas.TotalImpact <= 0 || len(cas.AffectedLabels) == 0 {
+				continue
+			}
+			casCopy := cas
+			if len(cas.Recommendations) > 0 {
+				visRecs := make([]analysis.UnblockRecommendation, 0, len(cas.Recommendations))
+				for _, u := range cas.Recommendations {
+					if visibleSet[u.IssueID] {
+						visRecs = append(visRecs, u)
+					}
+				}
+				casCopy.Recommendations = visRecs
+			}
+			di.labelCascades = append(di.labelCascades, casCopy)
+			if len(di.labelCascades) >= 5 {
+				break
+			}
+		}
+	}
+}
+
 func (di *reportDecisionIntel) hasExecutiveSummary() bool {
-	return di != nil && (len(di.priorityHints) > 0 || len(di.cycleBreaks) > 0 || len(di.highRisk) > 0)
+	return di != nil && (len(di.priorityHints) > 0 ||
+		len(di.cycleBreaks) > 0 ||
+		len(di.topKItems) > 0 ||
+		len(di.parallelCut) > 0 ||
+		len(di.kPaths) > 0 ||
+		len(di.highRisk) > 0 ||
+		(di.capacity != nil && di.capacity.TotalMinutes > 0) ||
+		len(di.suggestions) > 0 ||
+		(di.crossRepoFlow != nil && di.crossRepoFlow.TotalCrossRepoDeps > 0) ||
+		(di.activeSprint != nil && di.activeSprint.TotalIssues > 0) ||
+		di.baselineDrift != nil ||
+		len(di.labelCascades) > 0)
 }
 
 func writeMarkdownDecisionIntel(sb *strings.Builder, di *reportDecisionIntel) {
@@ -1345,6 +1841,35 @@ func writeMarkdownDecisionIntel(sb *strings.Builder, di *reportDecisionIntel) {
 		return
 	}
 	sb.WriteString("## Decision Intelligence\n\n")
+	if di.capacity != nil && di.capacity.TotalMinutes > 0 {
+		cap := di.capacity
+		critPathDur := formatEstimatedDuration(cap.CriticalPathMinutes)
+		if critPathDur == "" {
+			critPathDur = "0m"
+		}
+		sb.WriteString("### Global Backlog Capacity (Graham Bounds)\n\n")
+		sb.WriteString("| Open | Total Work | Critical Path | Parallelizable | 1 Agent | 2 Agents | 4 Agents |\n")
+		sb.WriteString("|:----:|:----------:|:-------------:|:--------------:|:-------:|:--------:|:--------:|\n")
+		sb.WriteString(fmt.Sprintf("| %d | %s | %s | %.0f%% | %.1fd | %.1f–%.1fd | %.1f–%.1fd |\n\n",
+			cap.OpenCount,
+			formatEstimatedDuration(cap.TotalMinutes),
+			critPathDur,
+			cap.ParallelizablePct,
+			cap.Days1Agent,
+			cap.Days2AgentsMin, cap.Days2AgentsMax,
+			cap.Days4AgentsMin, cap.Days4AgentsMax,
+		))
+		if len(cap.CriticalPathIDs) > 0 {
+			escapedCP := make([]string, 0, min(len(cap.CriticalPathIDs), 6))
+			for _, id := range cap.CriticalPathIDs {
+				if len(escapedCP) >= 6 {
+					break
+				}
+				escapedCP = append(escapedCP, "`"+escapeTableCodeSpan(id)+"`")
+			}
+			sb.WriteString(fmt.Sprintf("**Critical Chain:** %s\n\n", strings.Join(escapedCP, " → ")))
+		}
+	}
 	if len(di.highRisk) > 0 {
 		sb.WriteString("### High Operational Risk\n\n")
 		sb.WriteString("| Issue | Risk | Rationale |\n|-------|------|-----------|\n")
@@ -1380,6 +1905,228 @@ func writeMarkdownDecisionIntel(sb *strings.Builder, di *reportDecisionIntel) {
 		}
 		sb.WriteString("\n")
 	}
+	if len(di.topKItems) > 0 {
+		sb.WriteString(fmt.Sprintf("### Top-K Unlock Sequence (Total +%d unblocked)\n\n", di.topKTotalGain))
+		sb.WriteString("| Step | Issue | Marginal Gain | Unblocks |\n|:----:|-------|:-------------:|----------|\n")
+		for i, item := range di.topKItems {
+			unblocks := "-"
+			if len(item.Unblocks) > 0 {
+				shown := make([]string, 0, min(len(item.Unblocks), 4))
+				for _, uid := range item.Unblocks[:min(len(item.Unblocks), 4)] {
+					shown = append(shown, "`"+escapeTableCodeSpan(uid)+"`")
+				}
+				unblocks = strings.Join(shown, ", ")
+				if len(item.Unblocks) > 4 {
+					unblocks += fmt.Sprintf(" (+%d more)", len(item.Unblocks)-4)
+				}
+			}
+			sb.WriteString(fmt.Sprintf("| %d | `%s` | +%d | %s |\n", i+1, escapeTableCodeSpan(item.ID), item.MarginalGain, unblocks))
+		}
+		sb.WriteString("\n")
+	}
+	if len(di.parallelCut) > 0 {
+		sb.WriteString("### Parallelism Unlockers\n\n")
+		sb.WriteString("| Issue | Parallel Gain | Title |\n|-------|:-------------:|-------|\n")
+		for _, pc := range di.parallelCut {
+			sb.WriteString(fmt.Sprintf("| `%s` | +%d | %s |\n",
+				escapeTableCodeSpan(pc.ID), pc.ParallelGain, escapeTableText(truncateString(pc.Title, 56))))
+		}
+		sb.WriteString("\n")
+	}
+	if len(di.kPaths) > 0 {
+		sb.WriteString("### Critical Dependency Chains (K-Paths)\n\n")
+		sb.WriteString("| Rank | Length | Chain |\n|:----:|:------:|-------|\n")
+		for i, p := range di.kPaths {
+			parts := make([]string, 0, min(len(p.IssueIDs), 6))
+			for _, id := range p.IssueIDs[:min(len(p.IssueIDs), 6)] {
+				parts = append(parts, "`"+escapeTableCodeSpan(id)+"`")
+			}
+			chain := strings.Join(parts, " → ")
+			if len(p.IssueIDs) > 6 {
+				chain += fmt.Sprintf(" → … (+%d)", len(p.IssueIDs)-6)
+			}
+			sb.WriteString(fmt.Sprintf("| #%d | %d | %s |\n", i+1, p.Length, chain))
+		}
+		sb.WriteString("\n")
+	}
+	if len(di.suggestions) > 0 {
+		sb.WriteString("### Hygiene Suggestions\n\n")
+		sb.WriteString("| Type | Target | Confidence | Summary |\n|------|--------|------------|---------|\n")
+		for _, sug := range di.suggestions {
+			target := "`" + escapeTableCodeSpan(sug.TargetBead) + "`"
+			if sug.RelatedBead != "" {
+				target += " ↔ `" + escapeTableCodeSpan(sug.RelatedBead) + "`"
+			}
+			sb.WriteString(fmt.Sprintf("| %s | %s | %.0f%% | %s |\n",
+				escapeTableText(string(sug.Type)), target, sug.Confidence*100, escapeTableText(sug.Summary)))
+		}
+		sb.WriteString("\n")
+	}
+	if di.activeSprint != nil && di.activeSprint.TotalIssues > 0 {
+		sp := di.activeSprint
+		sb.WriteString("### Active Sprint Progress\n\n")
+		sb.WriteString("| Sprint | Window | Progress | Remaining | Days Left | Pace | At-Risk |\n")
+		sb.WriteString("|--------|--------|:--------:|:---------:|:---------:|:----:|:-------:|\n")
+		window := "-"
+		if sp.StartDate != "" || sp.EndDate != "" {
+			window = fmt.Sprintf("%s → %s", sp.StartDate, sp.EndDate)
+		}
+		pace := "Behind"
+		if sp.OnTrack {
+			pace = "On Track"
+		}
+		atRiskStr := fmt.Sprintf("%d", sp.AtRiskCount)
+		if len(sp.AtRiskIssueIDs) > 0 {
+			parts := make([]string, 0, min(len(sp.AtRiskIssueIDs), 3))
+			for i, id := range sp.AtRiskIssueIDs {
+				if i >= 3 {
+					break
+				}
+				parts = append(parts, "`"+escapeTableCodeSpan(id)+"`")
+			}
+			if len(sp.AtRiskIssueIDs) > 3 {
+				atRiskStr = fmt.Sprintf("%d (%s +%d)", sp.AtRiskCount, strings.Join(parts, ", "), len(sp.AtRiskIssueIDs)-3)
+			} else {
+				atRiskStr = fmt.Sprintf("%d (%s)", sp.AtRiskCount, strings.Join(parts, ", "))
+			}
+		}
+		sb.WriteString(fmt.Sprintf("| %s | %s | %d/%d (%.0f%%) | %d | %d | %s | %s |\n\n",
+			escapeTableText(sp.Name),
+			escapeTableText(window),
+			sp.CompletedIssues, sp.TotalIssues, sp.PercentComplete,
+			sp.RemainingIssues,
+			sp.DaysRemaining,
+			pace,
+			atRiskStr,
+		))
+	}
+	if di.baselineDrift != nil {
+		dr := di.baselineDrift
+		sb.WriteString("### Baseline Drift\n\n")
+		status := "Clean (no drift)"
+		hasAlerts := dr.HasDrift || dr.CriticalCount+dr.WarningCount+dr.InfoCount > 0
+		if hasAlerts && dr.SkippedChecksCount > 0 {
+			status = fmt.Sprintf("Drift detected (%d check(s) skipped)", dr.SkippedChecksCount)
+		} else if hasAlerts {
+			status = "Drift detected"
+		} else if dr.SkippedChecksCount > 0 {
+			status = fmt.Sprintf("Partial (%d check(s) skipped)", dr.SkippedChecksCount)
+		}
+		commitLabel := "-"
+		if dr.BaselineCommit != "" {
+			commitLabel = "`" + escapeTableCodeSpan(dr.BaselineCommit) + "`"
+		}
+		sb.WriteString("| Baseline Commit | Status | Critical | Warning | Info |\n")
+		sb.WriteString("|-----------------|:------:|:--------:|:-------:|:----:|\n")
+		sb.WriteString(fmt.Sprintf("| %s | %s | %d | %d | %d |\n\n",
+			commitLabel, status, dr.CriticalCount, dr.WarningCount, dr.InfoCount))
+		if len(dr.SkippedCheckReasons) > 0 {
+			reasons := make([]string, 0, min(len(dr.SkippedCheckReasons), 3))
+			for i, r := range dr.SkippedCheckReasons {
+				if i >= 3 {
+					break
+				}
+				reasons = append(reasons, sanitizeInlineMarkdown(truncateString(r, 110)))
+			}
+			sb.WriteString(fmt.Sprintf("*Skipped checks (%d):* %s\n\n", dr.SkippedChecksCount, strings.Join(reasons, "; ")))
+		}
+		if len(dr.TopAlerts) > 0 {
+			for _, al := range dr.TopAlerts {
+				target := ""
+				if al.IssueID != "" {
+					target = fmt.Sprintf(" (`%s`)", sanitizeInlineCodeSpan(al.IssueID))
+				}
+				sb.WriteString(fmt.Sprintf("- **%s** `%s`%s: %s\n",
+					sanitizeInlineMarkdown(strings.ToUpper(al.Severity)),
+					sanitizeInlineCodeSpan(al.Type),
+					target,
+					sanitizeInlineMarkdown(truncateString(al.Message, 110)),
+				))
+			}
+			sb.WriteString("\n")
+		}
+	}
+	if di.crossRepoFlow != nil && di.crossRepoFlow.TotalCrossRepoDeps > 0 {
+		crf := di.crossRepoFlow
+		sb.WriteString("### Cross-Repo Dependency Flow\n\n")
+		sb.WriteString("| Blocker Repo | Blocked Repo | Active Edges | Top Blockers |\n")
+		sb.WriteString("|--------------|--------------|:------------:|--------------|\n")
+		limit := min(len(crf.Dependencies), 6)
+		for i := 0; i < limit; i++ {
+			dep := crf.Dependencies[i]
+			blockerParts := make([]string, 0, min(len(dep.BlockerIDs), 3))
+			for j, id := range dep.BlockerIDs {
+				if j >= 3 {
+					break
+				}
+				blockerParts = append(blockerParts, "`"+escapeTableCodeSpan(id)+"`")
+			}
+			blockersCell := "-"
+			if len(blockerParts) > 0 {
+				blockersCell = strings.Join(blockerParts, ", ")
+				if len(dep.BlockerIDs) > len(blockerParts) {
+					blockersCell += fmt.Sprintf(" (+%d)", len(dep.BlockerIDs)-len(blockerParts))
+				}
+			}
+			sb.WriteString(fmt.Sprintf("| `%s` | `%s` | %d | %s |\n",
+				escapeTableCodeSpan(dep.FromRepo),
+				escapeTableCodeSpan(dep.ToRepo),
+				dep.IssueCount,
+				blockersCell,
+			))
+		}
+		sb.WriteString("\n")
+		if len(crf.TopHandoffBlockers) > 0 {
+			hbParts := make([]string, 0, min(len(crf.TopHandoffBlockers), 4))
+			for i, hb := range crf.TopHandoffBlockers {
+				if i >= 4 {
+					break
+				}
+				hbParts = append(hbParts, fmt.Sprintf("`%s` (`%s` → %d blocked)", sanitizeInlineCodeSpan(hb.IssueID), sanitizeInlineCodeSpan(hb.SourceRepo), hb.BlockedCount))
+			}
+			sb.WriteString("**Top Cross-Repo Handoff Blockers:** " + strings.Join(hbParts, ", ") + "\n\n")
+		}
+	}
+	if len(di.labelCascades) > 0 {
+		sb.WriteString("### Cross-Label Blockage Cascades\n\n")
+		sb.WriteString("| Source Label | Blocked | Downstream Impact | Affected Labels | Top Unblockers |\n")
+		sb.WriteString("|--------------|:-------:|:-----------------:|-----------------|----------------|\n")
+		for _, cas := range di.labelCascades {
+			affParts := make([]string, 0, min(len(cas.AffectedLabels), 4))
+			for j, lbl := range cas.AffectedLabels {
+				if j >= 4 {
+					break
+				}
+				affParts = append(affParts, "`"+escapeTableCodeSpan(lbl)+"`")
+			}
+			affStr := "-"
+			if len(affParts) > 0 {
+				affStr = strings.Join(affParts, ", ")
+				if len(cas.AffectedLabels) > len(affParts) {
+					affStr += fmt.Sprintf(" (+%d)", len(cas.AffectedLabels)-len(affParts))
+				}
+			}
+			topParts := make([]string, 0, min(len(cas.Recommendations), 3))
+			for j, u := range cas.Recommendations {
+				if j >= 3 {
+					break
+				}
+				topParts = append(topParts, fmt.Sprintf("`%s` (%d)", escapeTableCodeSpan(u.IssueID), u.UnblocksCount))
+			}
+			topStr := "-"
+			if len(topParts) > 0 {
+				topStr = strings.Join(topParts, ", ")
+			}
+			sb.WriteString(fmt.Sprintf("| `%s` | %d | %d | %s | %s |\n",
+				escapeTableCodeSpan(cas.SourceLabel),
+				cas.BlockedCount,
+				cas.TotalImpact,
+				affStr,
+				topStr,
+			))
+		}
+		sb.WriteString("\n")
+	}
 }
 
 func writeHTMLDecisionIntel(sb *strings.Builder, di *reportDecisionIntel) {
@@ -1387,6 +2134,34 @@ func writeHTMLDecisionIntel(sb *strings.Builder, di *reportDecisionIntel) {
 		return
 	}
 	sb.WriteString("<section class=\"decision-intelligence\">\n<h2>Decision Intelligence</h2>\n")
+	if di.capacity != nil && di.capacity.TotalMinutes > 0 {
+		cap := di.capacity
+		critPathDur := formatEstimatedDuration(cap.CriticalPathMinutes)
+		if critPathDur == "" {
+			critPathDur = "0m"
+		}
+		sb.WriteString("<h3>Global Backlog Capacity (Graham Bounds)</h3>\n<table><thead><tr><th>Open</th><th>Total Work</th><th>Critical Path</th><th>Parallelizable</th><th>1 Agent</th><th>2 Agents</th><th>4 Agents</th></tr></thead><tbody>\n")
+		sb.WriteString(fmt.Sprintf("<tr><td>%d</td><td>%s</td><td>%s</td><td>%.0f%%</td><td>%.1fd</td><td>%.1f–%.1fd</td><td>%.1f–%.1fd</td></tr>\n",
+			cap.OpenCount,
+			html.EscapeString(formatEstimatedDuration(cap.TotalMinutes)),
+			html.EscapeString(critPathDur),
+			cap.ParallelizablePct,
+			cap.Days1Agent,
+			cap.Days2AgentsMin, cap.Days2AgentsMax,
+			cap.Days4AgentsMin, cap.Days4AgentsMax,
+		))
+		sb.WriteString("</tbody></table>\n")
+		if len(cap.CriticalPathIDs) > 0 {
+			parts := make([]string, 0, min(len(cap.CriticalPathIDs), 6))
+			for _, id := range cap.CriticalPathIDs {
+				if len(parts) >= 6 {
+					break
+				}
+				parts = append(parts, "<code>"+html.EscapeString(id)+"</code>")
+			}
+			sb.WriteString("<p><strong>Critical Chain:</strong> " + strings.Join(parts, " → ") + "</p>\n")
+		}
+	}
 	if len(di.highRisk) > 0 {
 		sb.WriteString("<h3>High Operational Risk</h3>\n<table><thead><tr><th>Issue</th><th>Risk</th><th>Rationale</th></tr></thead><tbody>\n")
 		for _, hr := range di.highRisk {
@@ -1419,21 +2194,240 @@ func writeHTMLDecisionIntel(sb *strings.Builder, di *reportDecisionIntel) {
 		}
 		sb.WriteString("</tbody></table>\n")
 	}
+	if len(di.topKItems) > 0 {
+		sb.WriteString(fmt.Sprintf("<h3>Top-K Unlock Sequence (Total +%d unblocked)</h3>\n<table><thead><tr><th>Step</th><th>Issue</th><th>Marginal Gain</th><th>Unblocks</th></tr></thead><tbody>\n", di.topKTotalGain))
+		for i, item := range di.topKItems {
+			unblocks := "-"
+			if len(item.Unblocks) > 0 {
+				shown := make([]string, 0, min(len(item.Unblocks), 4))
+				for _, uid := range item.Unblocks[:min(len(item.Unblocks), 4)] {
+					shown = append(shown, "<code>"+html.EscapeString(uid)+"</code>")
+				}
+				unblocks = strings.Join(shown, ", ")
+				if len(item.Unblocks) > 4 {
+					unblocks += fmt.Sprintf(" (+%d more)", len(item.Unblocks)-4)
+				}
+			}
+			sb.WriteString(fmt.Sprintf("<tr><td>%d</td><td><code>%s</code></td><td>+%d</td><td>%s</td></tr>\n",
+				i+1, html.EscapeString(item.ID), item.MarginalGain, unblocks))
+		}
+		sb.WriteString("</tbody></table>\n")
+	}
+	if len(di.parallelCut) > 0 {
+		sb.WriteString("<h3>Parallelism Unlockers</h3>\n<table><thead><tr><th>Issue</th><th>Parallel Gain</th><th>Title</th></tr></thead><tbody>\n")
+		for _, pc := range di.parallelCut {
+			sb.WriteString(fmt.Sprintf("<tr><td><code>%s</code></td><td>+%d</td><td>%s</td></tr>\n",
+				html.EscapeString(pc.ID), pc.ParallelGain, html.EscapeString(truncateString(pc.Title, 56))))
+		}
+		sb.WriteString("</tbody></table>\n")
+	}
+	if len(di.kPaths) > 0 {
+		sb.WriteString("<h3>Critical Dependency Chains (K-Paths)</h3>\n<table><thead><tr><th>Rank</th><th>Length</th><th>Chain</th></tr></thead><tbody>\n")
+		for i, p := range di.kPaths {
+			parts := make([]string, 0, min(len(p.IssueIDs), 6))
+			for _, id := range p.IssueIDs[:min(len(p.IssueIDs), 6)] {
+				parts = append(parts, "<code>"+html.EscapeString(id)+"</code>")
+			}
+			chain := strings.Join(parts, " → ")
+			if len(p.IssueIDs) > 6 {
+				chain += fmt.Sprintf(" → … (+%d)", len(p.IssueIDs)-6)
+			}
+			sb.WriteString(fmt.Sprintf("<tr><td>#%d</td><td>%d</td><td>%s</td></tr>\n", i+1, p.Length, chain))
+		}
+		sb.WriteString("</tbody></table>\n")
+	}
+	if len(di.suggestions) > 0 {
+		sb.WriteString("<h3>Hygiene Suggestions</h3>\n<table><thead><tr><th>Type</th><th>Target</th><th>Confidence</th><th>Summary</th></tr></thead><tbody>\n")
+		for _, sug := range di.suggestions {
+			target := "<code>" + html.EscapeString(sug.TargetBead) + "</code>"
+			if sug.RelatedBead != "" {
+				target += " ↔ <code>" + html.EscapeString(sug.RelatedBead) + "</code>"
+			}
+			sb.WriteString(fmt.Sprintf("<tr><td>%s</td><td>%s</td><td>%.0f%%</td><td>%s</td></tr>\n",
+				html.EscapeString(string(sug.Type)), target, sug.Confidence*100, html.EscapeString(sug.Summary)))
+		}
+		sb.WriteString("</tbody></table>\n")
+	}
+	if di.activeSprint != nil && di.activeSprint.TotalIssues > 0 {
+		sp := di.activeSprint
+		window := "-"
+		if sp.StartDate != "" || sp.EndDate != "" {
+			window = fmt.Sprintf("%s → %s", sp.StartDate, sp.EndDate)
+		}
+		pace := "Behind"
+		if sp.OnTrack {
+			pace = "On Track"
+		}
+		atRiskCell := fmt.Sprintf("%d", sp.AtRiskCount)
+		if len(sp.AtRiskIssueIDs) > 0 {
+			parts := make([]string, 0, min(len(sp.AtRiskIssueIDs), 3))
+			for i, id := range sp.AtRiskIssueIDs {
+				if i >= 3 {
+					break
+				}
+				parts = append(parts, "<code>"+html.EscapeString(id)+"</code>")
+			}
+			if len(sp.AtRiskIssueIDs) > 3 {
+				atRiskCell = fmt.Sprintf("%d (%s +%d)", sp.AtRiskCount, strings.Join(parts, ", "), len(sp.AtRiskIssueIDs)-3)
+			} else {
+				atRiskCell = fmt.Sprintf("%d (%s)", sp.AtRiskCount, strings.Join(parts, ", "))
+			}
+		}
+		sb.WriteString("<h3>Active Sprint Progress</h3>\n<table><thead><tr><th>Sprint</th><th>Window</th><th>Progress</th><th>Remaining</th><th>Days Left</th><th>Pace</th><th>At-Risk</th></tr></thead><tbody>\n")
+		sb.WriteString(fmt.Sprintf("<tr><td>%s</td><td>%s</td><td>%d/%d (%.0f%%)</td><td>%d</td><td>%d</td><td>%s</td><td>%s</td></tr>\n",
+			html.EscapeString(sp.Name),
+			html.EscapeString(window),
+			sp.CompletedIssues, sp.TotalIssues, sp.PercentComplete,
+			sp.RemainingIssues,
+			sp.DaysRemaining,
+			pace,
+			atRiskCell,
+		))
+		sb.WriteString("</tbody></table>\n")
+	}
+	if di.baselineDrift != nil {
+		dr := di.baselineDrift
+		status := "Clean (no drift)"
+		hasAlerts := dr.HasDrift || dr.CriticalCount+dr.WarningCount+dr.InfoCount > 0
+		if hasAlerts && dr.SkippedChecksCount > 0 {
+			status = fmt.Sprintf("Drift detected (%d check(s) skipped)", dr.SkippedChecksCount)
+		} else if hasAlerts {
+			status = "Drift detected"
+		} else if dr.SkippedChecksCount > 0 {
+			status = fmt.Sprintf("Partial (%d check(s) skipped)", dr.SkippedChecksCount)
+		}
+		commitCell := "-"
+		if dr.BaselineCommit != "" {
+			commitCell = "<code>" + html.EscapeString(dr.BaselineCommit) + "</code>"
+		}
+		sb.WriteString("<h3>Baseline Drift</h3>\n<table><thead><tr><th>Baseline Commit</th><th>Status</th><th>Critical</th><th>Warning</th><th>Info</th></tr></thead><tbody>\n")
+		sb.WriteString(fmt.Sprintf("<tr><td>%s</td><td>%s</td><td>%d</td><td>%d</td><td>%d</td></tr>\n",
+			commitCell, html.EscapeString(status), dr.CriticalCount, dr.WarningCount, dr.InfoCount))
+		sb.WriteString("</tbody></table>\n")
+		if len(dr.SkippedCheckReasons) > 0 {
+			reasons := make([]string, 0, min(len(dr.SkippedCheckReasons), 3))
+			for i, r := range dr.SkippedCheckReasons {
+				if i >= 3 {
+					break
+				}
+				reasons = append(reasons, html.EscapeString(truncateString(r, 110)))
+			}
+			sb.WriteString(fmt.Sprintf("<p><em>Skipped checks (%d):</em> %s</p>\n", dr.SkippedChecksCount, strings.Join(reasons, "; ")))
+		}
+		if len(dr.TopAlerts) > 0 {
+			sb.WriteString("<ul>\n")
+			for _, al := range dr.TopAlerts {
+				target := ""
+				if al.IssueID != "" {
+					target = " (<code>" + html.EscapeString(al.IssueID) + "</code>)"
+				}
+				sb.WriteString(fmt.Sprintf("<li><strong>%s</strong> <code>%s</code>%s: %s</li>\n",
+					html.EscapeString(strings.ToUpper(al.Severity)),
+					html.EscapeString(al.Type),
+					target,
+					html.EscapeString(truncateString(al.Message, 110)),
+				))
+			}
+			sb.WriteString("</ul>\n")
+		}
+	}
+	if di.crossRepoFlow != nil && di.crossRepoFlow.TotalCrossRepoDeps > 0 {
+		crf := di.crossRepoFlow
+		sb.WriteString("<h3>Cross-Repo Dependency Flow</h3>\n<table><thead><tr><th>Blocker Repo</th><th>Blocked Repo</th><th>Active Edges</th><th>Top Blockers</th></tr></thead><tbody>\n")
+		limit := min(len(crf.Dependencies), 6)
+		for i := 0; i < limit; i++ {
+			dep := crf.Dependencies[i]
+			blockerParts := make([]string, 0, min(len(dep.BlockerIDs), 3))
+			for j, id := range dep.BlockerIDs {
+				if j >= 3 {
+					break
+				}
+				blockerParts = append(blockerParts, "<code>"+html.EscapeString(id)+"</code>")
+			}
+			blockersCell := "-"
+			if len(blockerParts) > 0 {
+				blockersCell = strings.Join(blockerParts, ", ")
+				if len(dep.BlockerIDs) > len(blockerParts) {
+					blockersCell += fmt.Sprintf(" (+%d)", len(dep.BlockerIDs)-len(blockerParts))
+				}
+			}
+			sb.WriteString(fmt.Sprintf("<tr><td><code>%s</code></td><td><code>%s</code></td><td>%d</td><td>%s</td></tr>\n",
+				html.EscapeString(dep.FromRepo),
+				html.EscapeString(dep.ToRepo),
+				dep.IssueCount,
+				blockersCell,
+			))
+		}
+		sb.WriteString("</tbody></table>\n")
+		if len(crf.TopHandoffBlockers) > 0 {
+			hbParts := make([]string, 0, min(len(crf.TopHandoffBlockers), 4))
+			for i, hb := range crf.TopHandoffBlockers {
+				if i >= 4 {
+					break
+				}
+				hbParts = append(hbParts, fmt.Sprintf("<code>%s</code> (<code>%s</code> → %d blocked)", html.EscapeString(hb.IssueID), html.EscapeString(hb.SourceRepo), hb.BlockedCount))
+			}
+			sb.WriteString("<p><strong>Top Cross-Repo Handoff Blockers:</strong> " + strings.Join(hbParts, ", ") + "</p>\n")
+		}
+	}
+	if len(di.labelCascades) > 0 {
+		sb.WriteString("<h3>Cross-Label Blockage Cascades</h3>\n<table><thead><tr><th>Source Label</th><th>Blocked</th><th>Downstream Impact</th><th>Affected Labels</th><th>Top Unblockers</th></tr></thead><tbody>\n")
+		for _, cas := range di.labelCascades {
+			affParts := make([]string, 0, min(len(cas.AffectedLabels), 4))
+			for j, lbl := range cas.AffectedLabels {
+				if j >= 4 {
+					break
+				}
+				affParts = append(affParts, "<code>"+html.EscapeString(lbl)+"</code>")
+			}
+			affCell := "-"
+			if len(affParts) > 0 {
+				affCell = strings.Join(affParts, ", ")
+				if len(cas.AffectedLabels) > len(affParts) {
+					affCell += fmt.Sprintf(" (+%d)", len(cas.AffectedLabels)-len(affParts))
+				}
+			}
+			topParts := make([]string, 0, min(len(cas.Recommendations), 3))
+			for j, u := range cas.Recommendations {
+				if j >= 3 {
+					break
+				}
+				topParts = append(topParts, fmt.Sprintf("<code>%s</code> (%d)", html.EscapeString(u.IssueID), u.UnblocksCount))
+			}
+			topCell := "-"
+			if len(topParts) > 0 {
+				topCell = strings.Join(topParts, ", ")
+			}
+			sb.WriteString(fmt.Sprintf("<tr><td><code>%s</code></td><td>%d</td><td>%d</td><td>%s</td><td>%s</td></tr>\n",
+				html.EscapeString(cas.SourceLabel),
+				cas.BlockedCount,
+				cas.TotalImpact,
+				affCell,
+				topCell,
+			))
+		}
+		sb.WriteString("</tbody></table>\n")
+	}
 	sb.WriteString("</section>\n")
+}
+
+func sanitizeDiffRefLabel(diffSince, fromRevision string) string {
+	ref := sanitizeInlineCodeSpan(strings.TrimSpace(diffSince))
+	if ref == "" {
+		ref = sanitizeInlineCodeSpan(strings.TrimSpace(fromRevision))
+	}
+	if ref == "" {
+		ref = "baseline"
+	}
+	return ref
 }
 
 func writeMarkdownDiffSummary(sb *strings.Builder, diff *analysis.SnapshotDiff, diffSince string) {
 	if diff == nil {
 		return
 	}
-	ref := strings.TrimSpace(diffSince)
-	if ref == "" {
-		ref = strings.TrimSpace(diff.FromRevision)
-	}
-	if ref == "" {
-		ref = "baseline"
-	}
-	sb.WriteString(fmt.Sprintf("## Changes Since `%s`\n\n", sanitizeInlineCodeSpan(ref)))
+	ref := sanitizeDiffRefLabel(diffSince, diff.FromRevision)
+	sb.WriteString(fmt.Sprintf("## Changes Since `%s`\n\n", ref))
 	sb.WriteString("| New | Closed | Reopened | Removed | Modified | Δ Cycles | Trend |\n")
 	sb.WriteString("|:---:|:------:|:--------:|:-------:|:--------:|:--------:|:-----:|\n")
 	trend := strings.TrimSpace(diff.Summary.HealthTrend)
@@ -1477,7 +2471,9 @@ func writeMarkdownDiffSummary(sb *strings.Builder, diff *analysis.SnapshotDiff, 
 			mi := diff.ModifiedIssues[i]
 			fields := make([]string, 0, len(mi.Changes))
 			for _, ch := range mi.Changes {
-				fields = append(fields, sanitizeInlineMarkdown(ch.Field))
+				if f := strings.TrimSpace(sanitizeInlineMarkdown(ch.Field)); f != "" {
+					fields = append(fields, f)
+				}
 			}
 			if len(fields) > 0 {
 				parts = append(parts, fmt.Sprintf("`%s` (%s)", sanitizeInlineCodeSpan(mi.IssueID), strings.Join(fields, ", ")))
@@ -1497,13 +2493,7 @@ func writeHTMLDiffSummary(sb *strings.Builder, diff *analysis.SnapshotDiff, diff
 	if diff == nil {
 		return
 	}
-	ref := strings.TrimSpace(diffSince)
-	if ref == "" {
-		ref = strings.TrimSpace(diff.FromRevision)
-	}
-	if ref == "" {
-		ref = "baseline"
-	}
+	ref := sanitizeDiffRefLabel(diffSince, diff.FromRevision)
 	trend := strings.TrimSpace(diff.Summary.HealthTrend)
 	if trend == "" {
 		trend = "stable"
@@ -1545,7 +2535,17 @@ func writeHTMLDiffSummary(sb *strings.Builder, diff *analysis.SnapshotDiff, diff
 		parts := make([]string, 0, limit)
 		for i := 0; i < limit; i++ {
 			mi := diff.ModifiedIssues[i]
-			parts = append(parts, fmt.Sprintf("<code>%s</code>", html.EscapeString(mi.IssueID)))
+			fields := make([]string, 0, len(mi.Changes))
+			for _, ch := range mi.Changes {
+				if f := strings.TrimSpace(ch.Field); f != "" {
+					fields = append(fields, html.EscapeString(f))
+				}
+			}
+			if len(fields) > 0 {
+				parts = append(parts, fmt.Sprintf("<code>%s</code> (%s)", html.EscapeString(mi.IssueID), strings.Join(fields, ", ")))
+			} else {
+				parts = append(parts, fmt.Sprintf("<code>%s</code>", html.EscapeString(mi.IssueID)))
+			}
 		}
 		more := ""
 		if len(diff.ModifiedIssues) > limit {
@@ -2914,16 +3914,32 @@ func isShellSafeChar(r rune) bool {
 // PriorityBriefCapacity holds optional Graham-bound parallel capacity metrics
 // rendered into priority/agent briefs when non-nil.
 type PriorityBriefCapacity struct {
-	OpenCount           int
-	TotalMinutes        int
-	CriticalPathMinutes int
-	ParallelizablePct   float64
-	Days1Agent          float64
-	Days2AgentsMin      float64
-	Days2AgentsMax      float64
-	Days4AgentsMin      float64
-	Days4AgentsMax      float64
-	CriticalPathIDs     []string
+	OpenCount           int      `json:"open_count"`
+	TotalMinutes        int      `json:"total_minutes"`
+	CriticalPathMinutes int      `json:"critical_path_minutes"`
+	ParallelizablePct   float64  `json:"parallelizable_pct"`
+	Days1Agent          float64  `json:"days_1_agent"`
+	Days2AgentsMin      float64  `json:"days_2_agents_min"`
+	Days2AgentsMax      float64  `json:"days_2_agents_max"`
+	Days4AgentsMin      float64  `json:"days_4_agents_min"`
+	Days4AgentsMax      float64  `json:"days_4_agents_max"`
+	CriticalPathIDs     []string `json:"critical_path_ids,omitempty"`
+}
+
+// PriorityBriefTrackSummary summarizes one parallel execution track for agent briefs (W36-4).
+type PriorityBriefTrackSummary struct {
+	TrackID       string
+	ItemCount     int
+	TopIssueID    string
+	TopIssueTitle string
+	Reason        string
+}
+
+// PriorityBriefHotspotSummary summarizes one correlated high-churn file hotspot for agent briefs (W36-4).
+type PriorityBriefHotspotSummary struct {
+	Path       string
+	TotalBeads int
+	OpenBeads  int
 }
 
 // PriorityBriefConfig configures the priority brief generation
@@ -2933,12 +3949,26 @@ type PriorityBriefConfig struct {
 	MaxBlockers             int                               // Max blockers to include (default: 3)
 	MaxPriorityAlerts       int                               // Max priority misalignment alerts (default: 5)
 	MaxCycleBreaks          int                               // Max cycle-break suggestions (default: 5)
+	MaxSuggestions          int                               // Max hygiene suggestions (default: 5)
+	MaxLabelCascades        int                               // Max cross-label blockage cascades (default: 5)
 	IncludeWhatIf           bool                              // Include what-if deltas
 	IncludeLegend           bool                              // Include metric legend
 	DataHash                string                            // Optional data hash for verification
 	GlobalCapacity          *PriorityBriefCapacity            // Optional global Graham-bound capacity summary
 	PriorityRecommendations []analysis.PriorityRecommendation // Optional priority misalignment alerts
 	CycleBreaks             []analysis.CycleBreakItem         // Optional cycle-break edge suggestions
+	TopKItems               []analysis.TopKSetItem            // Optional greedy Top-K unlock sequence (W36-4)
+	TopKTotalGain           int                               // Total unlocks for TopKItems
+	ParallelCut             []analysis.ParallelCutItem        // Optional parallelism unlockers (W36-4)
+	KPaths                  []analysis.CriticalPath           // Optional longest critical dependency chains (W36-4)
+	ExecutionTracks         []PriorityBriefTrackSummary       // Optional parallel execution tracks (W36-4)
+	FileHotspots            []PriorityBriefHotspotSummary     // Optional correlated code hotspots (W36-4)
+	OrphanCommitCount       int                               // Optional orphan commit count from history (W36-4)
+	Suggestions             []analysis.Suggestion             // Optional scoped hygiene suggestions (W32-5)
+	LabelCascades           []analysis.BlockageCascadeResult  // Optional cross-label blockage cascades (W32-5)
+	CrossRepoFlow           *analysis.CrossRepoFlow           // Optional cross-repo handoff bottlenecks (multi-repo only, W33-4)
+	ActiveSprint            *ReportSprintSummary              // Optional active sprint burndown & at-risk summary (W33-4)
+	BaselineDrift           *ReportDriftSummary               // Optional saved-baseline drift summary (W33-4)
 	Diff                    *analysis.SnapshotDiff            // Optional historical snapshot diff (--diff-since)
 	DiffSince               string                            // Optional ref label passed to --diff-since
 }
@@ -3357,6 +4387,299 @@ func GeneratePriorityBriefFromTriageJSON(triageJSON []byte, config PriorityBrief
 			))
 		}
 		sb.WriteString("\n")
+	}
+
+	// Structural Unlock Plan: Top-K Set, Parallelism Unlockers, and K-Paths (W36-4)
+	if len(config.TopKItems) > 0 || len(config.ParallelCut) > 0 || len(config.KPaths) > 0 {
+		sb.WriteString("## 🔓 Structural Unlock Plan\n\n")
+		if len(config.TopKItems) > 0 {
+			displayedGain := 0
+			for _, item := range config.TopKItems {
+				displayedGain += item.MarginalGain
+			}
+			if displayedGain == 0 && config.TopKTotalGain > 0 {
+				displayedGain = config.TopKTotalGain
+			}
+			sb.WriteString(fmt.Sprintf("**Top-K Unlock Sequence** (total `+%d` unblocked):\n\n", displayedGain))
+			sb.WriteString("| Step | Issue | Gain | Unblocks |\n|:----:|-------|:----:|----------|\n")
+			for i, item := range config.TopKItems {
+				unblocks := "-"
+				if len(item.Unblocks) > 0 {
+					shown := make([]string, 0, min(len(item.Unblocks), 4))
+					for _, uid := range item.Unblocks[:min(len(item.Unblocks), 4)] {
+						shown = append(shown, "`"+escapeTableCodeSpan(uid)+"`")
+					}
+					unblocks = strings.Join(shown, ", ")
+					if len(item.Unblocks) > 4 {
+						unblocks += fmt.Sprintf(" (+%d)", len(item.Unblocks)-4)
+					}
+				}
+				sb.WriteString(fmt.Sprintf("| %d | `%s` | +%d | %s |\n", i+1, escapeTableCodeSpan(item.ID), item.MarginalGain, unblocks))
+			}
+			sb.WriteString("\n")
+		}
+		if len(config.ParallelCut) > 0 {
+			sb.WriteString("**Parallelism Unlockers:**\n\n")
+			sb.WriteString("| Issue | Parallel Gain | Title |\n|-------|:-------------:|-------|\n")
+			for _, pc := range config.ParallelCut {
+				sb.WriteString(fmt.Sprintf("| `%s` | +%d | %s |\n",
+					escapeTableCodeSpan(pc.ID), pc.ParallelGain, escapeTableText(truncateString(pc.Title, 45))))
+			}
+			sb.WriteString("\n")
+		}
+		if len(config.KPaths) > 0 {
+			sb.WriteString("**Critical Chains (K-Paths):**\n\n")
+			for i, p := range config.KPaths {
+				parts := make([]string, 0, min(len(p.IssueIDs), 6))
+				for _, id := range p.IssueIDs[:min(len(p.IssueIDs), 6)] {
+					parts = append(parts, "`"+escapeTableCodeSpan(id)+"`")
+				}
+				chain := strings.Join(parts, " → ")
+				if len(p.IssueIDs) > 6 {
+					chain += fmt.Sprintf(" → … (+%d)", len(p.IssueIDs)-6)
+				}
+				sb.WriteString(fmt.Sprintf("- **#%d** (%d nodes): %s\n", i+1, p.Length, chain))
+			}
+			sb.WriteString("\n")
+		}
+	}
+
+	// Parallel Execution Tracks (W36-4: populated in --agent-brief from plan.json)
+	if len(config.ExecutionTracks) > 0 {
+		sb.WriteString("## 🛤️ Parallel Execution Tracks\n\n")
+		sb.WriteString("| Track | Items | Lead Actionable Issue | Rationale |\n|-------|:-----:|-----------------------|-----------|\n")
+		for _, tr := range config.ExecutionTracks {
+			lead := "-"
+			if tr.TopIssueID != "" {
+				lead = fmt.Sprintf("`%s` %s", escapeTableCodeSpan(tr.TopIssueID), escapeTableText(truncateString(tr.TopIssueTitle, 32)))
+			}
+			sb.WriteString(fmt.Sprintf("| %s | %d | %s | %s |\n",
+				escapeTableText(tr.TrackID), tr.ItemCount, lead, escapeTableText(truncateString(tr.Reason, 40))))
+		}
+		sb.WriteString("\n")
+	}
+
+	// Code Hotspots & Correlation (W36-4: populated in --agent-brief from history.json)
+	if len(config.FileHotspots) > 0 || config.OrphanCommitCount > 0 {
+		sb.WriteString("## 🔥 Code Hotspots & Correlation\n\n")
+		if config.OrphanCommitCount > 0 {
+			sb.WriteString(fmt.Sprintf("- **Orphan Commits:** %d commit(s) without linked beads\n\n", config.OrphanCommitCount))
+		}
+		if len(config.FileHotspots) > 0 {
+			sb.WriteString("| File | Linked Beads | Open Beads |\n|------|:------------:|:----------:|\n")
+			for _, fh := range config.FileHotspots {
+				sb.WriteString(fmt.Sprintf("| `%s` | %d | %d |\n",
+					escapeTableCodeSpan(fh.Path), fh.TotalBeads, fh.OpenBeads))
+			}
+			sb.WriteString("\n")
+		}
+	}
+
+	// Hygiene Suggestions (W32-5)
+	if len(config.Suggestions) > 0 {
+		sb.WriteString("## 🧹 Hygiene Suggestions\n\n")
+		sb.WriteString("| Type | Target | Confidence | Summary |\n")
+		sb.WriteString("|------|--------|:----------:|---------|\n")
+		maxSug := config.MaxSuggestions
+		if maxSug <= 0 {
+			maxSug = 5
+		}
+		limit := min(len(config.Suggestions), maxSug)
+		for i := 0; i < limit; i++ {
+			sug := config.Suggestions[i]
+			target := "`" + escapeTableCodeSpan(sug.TargetBead) + "`"
+			if sug.RelatedBead != "" {
+				target += " ↔ `" + escapeTableCodeSpan(sug.RelatedBead) + "`"
+			}
+			sb.WriteString(fmt.Sprintf("| %s | %s | %.0f%% | %s |\n",
+				escapeTableText(string(sug.Type)),
+				target,
+				sug.Confidence*100,
+				escapeTableText(truncateString(sug.Summary, 55)),
+			))
+		}
+		sb.WriteString("\n")
+	}
+
+	// Cross-Label Blockage Cascades (W32-5)
+	if len(config.LabelCascades) > 0 {
+		sb.WriteString("## 🏷️ Cross-Label Blockage Cascades\n\n")
+		sb.WriteString("| Source Label | Blocked | Downstream Impact | Affected Labels | Top Unblockers |\n")
+		sb.WriteString("|--------------|:-------:|:-----------------:|-----------------|----------------|\n")
+		maxCas := config.MaxLabelCascades
+		if maxCas <= 0 {
+			maxCas = 5
+		}
+		limit := min(len(config.LabelCascades), maxCas)
+		for i := 0; i < limit; i++ {
+			cas := config.LabelCascades[i]
+			affParts := make([]string, 0, min(len(cas.AffectedLabels), 4))
+			for j, lbl := range cas.AffectedLabels {
+				if j >= 4 {
+					break
+				}
+				affParts = append(affParts, "`"+escapeTableCodeSpan(lbl)+"`")
+			}
+			affStr := "-"
+			if len(affParts) > 0 {
+				affStr = strings.Join(affParts, ", ")
+				if len(cas.AffectedLabels) > len(affParts) {
+					affStr += fmt.Sprintf(" (+%d)", len(cas.AffectedLabels)-len(affParts))
+				}
+			}
+			topParts := make([]string, 0, min(len(cas.Recommendations), 3))
+			for j, u := range cas.Recommendations {
+				if j >= 3 {
+					break
+				}
+				topParts = append(topParts, fmt.Sprintf("`%s` (%d)", escapeTableCodeSpan(u.IssueID), u.UnblocksCount))
+			}
+			topStr := "-"
+			if len(topParts) > 0 {
+				topStr = strings.Join(topParts, ", ")
+			}
+			sb.WriteString(fmt.Sprintf("| `%s` | %d | %d | %s | %s |\n",
+				escapeTableCodeSpan(cas.SourceLabel),
+				cas.BlockedCount,
+				cas.TotalImpact,
+				affStr,
+				topStr,
+			))
+		}
+		sb.WriteString("\n")
+	}
+
+	// Active Sprint Progress (W33-4)
+	if config.ActiveSprint != nil && config.ActiveSprint.TotalIssues > 0 {
+		sp := config.ActiveSprint
+		sb.WriteString("## 🏃 Active Sprint Progress\n\n")
+		sb.WriteString("| Sprint | Window | Progress | Remaining | Days Left | Pace | At-Risk |\n")
+		sb.WriteString("|--------|--------|:--------:|:---------:|:---------:|:----:|:-------:|\n")
+		window := "-"
+		if sp.StartDate != "" || sp.EndDate != "" {
+			window = fmt.Sprintf("%s → %s", sp.StartDate, sp.EndDate)
+		}
+		pace := "Behind"
+		if sp.OnTrack {
+			pace = "On Track"
+		}
+		atRiskStr := fmt.Sprintf("%d", sp.AtRiskCount)
+		if len(sp.AtRiskIssueIDs) > 0 {
+			parts := make([]string, 0, min(len(sp.AtRiskIssueIDs), 3))
+			for i, id := range sp.AtRiskIssueIDs {
+				if i >= 3 {
+					break
+				}
+				parts = append(parts, "`"+escapeTableCodeSpan(id)+"`")
+			}
+			if len(sp.AtRiskIssueIDs) > 3 {
+				atRiskStr = fmt.Sprintf("%d (%s +%d)", sp.AtRiskCount, strings.Join(parts, ", "), len(sp.AtRiskIssueIDs)-3)
+			} else {
+				atRiskStr = fmt.Sprintf("%d (%s)", sp.AtRiskCount, strings.Join(parts, ", "))
+			}
+		}
+		sb.WriteString(fmt.Sprintf("| %s | %s | %d/%d (%.0f%%) | %d | %d | %s | %s |\n\n",
+			escapeTableText(sp.Name),
+			escapeTableText(window),
+			sp.CompletedIssues, sp.TotalIssues, sp.PercentComplete,
+			sp.RemainingIssues,
+			sp.DaysRemaining,
+			pace,
+			atRiskStr,
+		))
+	}
+
+	// Baseline Drift Summary (W33-4)
+	if config.BaselineDrift != nil {
+		dr := config.BaselineDrift
+		sb.WriteString("## 📉 Baseline Drift\n\n")
+		status := "Clean (no drift)"
+		hasAlerts := dr.HasDrift || dr.CriticalCount+dr.WarningCount+dr.InfoCount > 0
+		if hasAlerts && dr.SkippedChecksCount > 0 {
+			status = fmt.Sprintf("Drift detected (%d check(s) skipped)", dr.SkippedChecksCount)
+		} else if hasAlerts {
+			status = "Drift detected"
+		} else if dr.SkippedChecksCount > 0 {
+			status = fmt.Sprintf("Partial (%d check(s) skipped)", dr.SkippedChecksCount)
+		}
+		commitLabel := "-"
+		if dr.BaselineCommit != "" {
+			commitLabel = "`" + escapeTableCodeSpan(dr.BaselineCommit) + "`"
+		}
+		sb.WriteString("| Baseline Commit | Status | Critical | Warning | Info |\n")
+		sb.WriteString("|-----------------|:------:|:--------:|:-------:|:----:|\n")
+		sb.WriteString(fmt.Sprintf("| %s | %s | %d | %d | %d |\n\n",
+			commitLabel, status, dr.CriticalCount, dr.WarningCount, dr.InfoCount))
+		if len(dr.SkippedCheckReasons) > 0 {
+			reasons := make([]string, 0, min(len(dr.SkippedCheckReasons), 3))
+			for i, r := range dr.SkippedCheckReasons {
+				if i >= 3 {
+					break
+				}
+				reasons = append(reasons, sanitizeInlineMarkdown(truncateString(r, 110)))
+			}
+			sb.WriteString(fmt.Sprintf("*Skipped checks (%d):* %s\n\n", dr.SkippedChecksCount, strings.Join(reasons, "; ")))
+		}
+		if len(dr.TopAlerts) > 0 {
+			limit := min(len(dr.TopAlerts), 5)
+			for i := 0; i < limit; i++ {
+				al := dr.TopAlerts[i]
+				target := ""
+				if al.IssueID != "" {
+					target = fmt.Sprintf(" (`%s`)", sanitizeInlineCodeSpan(al.IssueID))
+				}
+				sb.WriteString(fmt.Sprintf("- **%s** `%s`%s: %s\n",
+					sanitizeInlineMarkdown(strings.ToUpper(al.Severity)),
+					sanitizeInlineCodeSpan(al.Type),
+					target,
+					sanitizeInlineMarkdown(truncateString(al.Message, 110)),
+				))
+			}
+			sb.WriteString("\n")
+		}
+	}
+
+	// Cross-Repo Dependency Flow (multi-repo only, W33-4)
+	if config.CrossRepoFlow != nil && config.CrossRepoFlow.TotalCrossRepoDeps > 0 {
+		crf := config.CrossRepoFlow
+		sb.WriteString("## 🔀 Cross-Repo Dependency Flow\n\n")
+		sb.WriteString("| Blocker Repo | Blocked Repo | Active Edges | Top Blockers |\n")
+		sb.WriteString("|--------------|--------------|:------------:|--------------|\n")
+		limit := min(len(crf.Dependencies), 6)
+		for i := 0; i < limit; i++ {
+			dep := crf.Dependencies[i]
+			blockerParts := make([]string, 0, min(len(dep.BlockerIDs), 3))
+			for j, id := range dep.BlockerIDs {
+				if j >= 3 {
+					break
+				}
+				blockerParts = append(blockerParts, "`"+escapeTableCodeSpan(id)+"`")
+			}
+			blockersCell := "-"
+			if len(blockerParts) > 0 {
+				blockersCell = strings.Join(blockerParts, ", ")
+				if len(dep.BlockerIDs) > len(blockerParts) {
+					blockersCell += fmt.Sprintf(" (+%d)", len(dep.BlockerIDs)-len(blockerParts))
+				}
+			}
+			sb.WriteString(fmt.Sprintf("| `%s` | `%s` | %d | %s |\n",
+				escapeTableCodeSpan(dep.FromRepo),
+				escapeTableCodeSpan(dep.ToRepo),
+				dep.IssueCount,
+				blockersCell,
+			))
+		}
+		sb.WriteString("\n")
+		if len(crf.TopHandoffBlockers) > 0 {
+			hbParts := make([]string, 0, min(len(crf.TopHandoffBlockers), 4))
+			for i, hb := range crf.TopHandoffBlockers {
+				if i >= 4 {
+					break
+				}
+				hbParts = append(hbParts, fmt.Sprintf("`%s` (`%s` → %d blocked)", sanitizeInlineCodeSpan(hb.IssueID), sanitizeInlineCodeSpan(hb.SourceRepo), hb.BlockedCount))
+			}
+			sb.WriteString("**Top Cross-Repo Handoff Blockers:** " + strings.Join(hbParts, ", ") + "\n\n")
+		}
 	}
 
 	// Legend

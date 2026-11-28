@@ -1162,3 +1162,51 @@ func TestWave33_BundleRemoveManagedFileAndOfflineAssetsPruning(t *testing.T) {
 		}
 	}
 }
+
+// TestCopyEmbeddedAssets_WorkflowWarningRoutesToStderr proves RC-C42 / WS-25:
+// when writing .github/workflows/static.yml fails non-fatally, the warning is
+// routed to os.Stderr and writes 0 bytes to os.Stdout.
+func TestCopyEmbeddedAssets_WorkflowWarningRoutesToStderr(t *testing.T) {
+	tmpDir := t.TempDir()
+	// Pre-create a directory at the exact target file path so WriteFile fails with EISDIR.
+	if err := os.MkdirAll(filepath.Join(tmpDir, ".github", "workflows", "static.yml"), 0o755); err != nil {
+		t.Fatalf("mkdir collision target: %v", err)
+	}
+	bundle, err := OpenBundle(tmpDir)
+	if err != nil {
+		t.Fatalf("OpenBundle: %v", err)
+	}
+	defer bundle.Close()
+
+	origStdout, origStderr := os.Stdout, os.Stderr
+	outR, outW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("stdout pipe: %v", err)
+	}
+	errR, errW, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("stderr pipe: %v", err)
+	}
+	os.Stdout, os.Stderr = outW, errW
+	copyErr := bundle.CopyEmbeddedAssets("Stderr Isolation Test")
+	_ = outW.Close()
+	_ = errW.Close()
+	os.Stdout, os.Stderr = origStdout, origStderr
+
+	stdoutBytes, readOutErr := io.ReadAll(outR)
+	stderrBytes, readErrErr := io.ReadAll(errR)
+	_ = outR.Close()
+	_ = errR.Close()
+	if readOutErr != nil || readErrErr != nil {
+		t.Fatalf("read captured pipes: stdout=%v stderr=%v", readOutErr, readErrErr)
+	}
+	if copyErr != nil {
+		t.Fatalf("CopyEmbeddedAssets should remain non-fatal on workflow write error, got: %v", copyErr)
+	}
+	if len(stdoutBytes) != 0 {
+		t.Fatalf("RC-C42 regression: CopyEmbeddedAssets leaked %d bytes to stdout: %q", len(stdoutBytes), string(stdoutBytes))
+	}
+	if !strings.Contains(string(stderrBytes), "Warning: Could not add GitHub Actions workflow:") {
+		t.Fatalf("RC-C42 regression: expected workflow warning on stderr, got: %q", string(stderrBytes))
+	}
+}

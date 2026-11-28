@@ -10442,6 +10442,7 @@ func TestWave29_Pass15Fixes_And_W29_TUI(t *testing.T) {
 				"2222222222222222222222222222222222222222": {"H-CLOSED"},
 			},
 		}, theme)
+		hv.SetReferenceTime(refNow)
 		hv.SetSize(220, 40)
 		hv.SetOrphans([]correlation.OrphanCandidate{
 			{
@@ -11438,6 +11439,1596 @@ func TestWave31_TUIRegressions(t *testing.T) {
 		panel := ansi.Strip(gm.renderMetricsPanel("OPEN-BRIDGE", 72, gm.theme))
 		if strings.Contains(panel, "Cut Vertex") {
 			t.Fatalf("P19-10 regression: OPEN-BRIDGE bridging only a closed issue must not be flagged as Cut Vertex:\n%s", panel)
+		}
+	})
+}
+
+func TestWave32_Pass21AndTUIParity(t *testing.T) {
+	now := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+	keyRune := func(s string) tea.KeyMsg { return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)} }
+
+	t.Run("P21-1_FlowMatrixSwitchResetsBoardActionableAndHistory", func(t *testing.T) {
+		issues := []model.Issue{
+			{ID: "F-1", Title: "Alpha", Status: model.StatusOpen, Priority: 1, Labels: []string{"api"}, CreatedAt: now, UpdatedAt: now},
+			{ID: "F-2", Title: "Beta", Status: model.StatusOpen, Priority: 2, Labels: []string{"web"}, CreatedAt: now, UpdatedAt: now,
+				Dependencies: []*model.Dependency{{IssueID: "F-2", DependsOnID: "F-1", Type: model.DepBlocks}}},
+		}
+		m := NewModel(copyIssues(issues), nil, "")
+		defer m.Stop()
+		m.Update(tea.WindowSizeMsg{Width: 120, Height: 30})
+
+		// Board -> Flow Matrix -> Esc must return cleanly to focusList with isBoardView=false.
+		m.Update(keyRune("b"))
+		if !m.isBoardView {
+			t.Fatalf("expected isBoardView=true after pressing b")
+		}
+		m.Update(keyRune("f"))
+		if m.focused != focusFlowMatrix || m.isBoardView || m.isActionableView || m.isHistoryView {
+			t.Fatalf("P21-1 regression: pressing f from Board left stale view flags (focus=%v board=%v act=%v hist=%v)",
+				m.focused, m.isBoardView, m.isActionableView, m.isHistoryView)
+		}
+		m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+		if m.focused != focusList || m.isBoardView {
+			t.Fatalf("P21-1 regression: Esc from FlowMatrix left focus=%v isBoardView=%v", m.focused, m.isBoardView)
+		}
+
+		// Actionable -> Flow Matrix -> Esc must return cleanly to focusList with isActionableView=false.
+		m.Update(keyRune("a"))
+		if !m.isActionableView {
+			t.Fatalf("expected isActionableView=true after pressing a")
+		}
+		m.Update(keyRune("f"))
+		if m.focused != focusFlowMatrix || m.isActionableView {
+			t.Fatalf("P21-1 regression: pressing f from Actionable left stale isActionableView (focus=%v act=%v)", m.focused, m.isActionableView)
+		}
+		m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+		if m.focused != focusList || m.isActionableView {
+			t.Fatalf("P21-1 regression: Esc from FlowMatrix left focus=%v isActionableView=%v", m.focused, m.isActionableView)
+		}
+
+		// Stale isHistoryView with in-flight causality -> Flow Matrix (via global 'f') must cancel causality & exit History.
+		m.isHistoryView = true
+		m.focused = focusList
+		canceled := false
+		m.causalityCancel = func() { canceled = true }
+		genBefore := m.causalityRequestGen
+		m.Update(keyRune("f"))
+		if !canceled || m.isHistoryView || m.causalityRequestGen != genBefore+1 {
+			t.Fatalf("P21-1 regression: pressing f with isHistoryView=true did not cancel causality (canceled=%v isHist=%v gen=%d->%d)",
+				canceled, m.isHistoryView, genBefore, m.causalityRequestGen)
+		}
+	})
+
+	t.Run("W32-1_BatchWhatIfInGraphAndActionablePlusNotReadyLabels", func(t *testing.T) {
+		t.Setenv("BV_ROBOT_NOT_READY_LABELS", "needs-spec")
+		// Diamond: DIA-A and DIA-B both block DIA-C (synergy unlock = DIA-C only when both close together).
+		issues := []model.Issue{
+			{ID: "DIA-A", Title: "Left branch", Status: model.StatusOpen, Priority: 1, Labels: []string{"needs-spec"}, CreatedAt: now, UpdatedAt: now},
+			{ID: "DIA-B", Title: "Right branch", Status: model.StatusOpen, Priority: 1, CreatedAt: now, UpdatedAt: now},
+			{ID: "DIA-C", Title: "Join node", Status: model.StatusOpen, Priority: 0, CreatedAt: now, UpdatedAt: now,
+				Dependencies: []*model.Dependency{
+					{IssueID: "DIA-C", DependsOnID: "DIA-A", Type: model.DepBlocks},
+					{IssueID: "DIA-C", DependsOnID: "DIA-B", Type: model.DepBlocks},
+				}},
+		}
+		m := NewModel(copyIssues(issues), nil, "")
+		defer m.Stop()
+		if m.analysis != nil {
+			m.analysis.WaitForPhase2()
+		}
+		m.Update(tea.WindowSizeMsg{Width: 140, Height: 36})
+
+		// 1) Actionable view honors BV_ROBOT_NOT_READY_LABELS and supports W Batch What-If + Esc clear.
+		m.Update(keyRune("a"))
+		if !m.isActionableView || m.focused != focusActionable {
+			t.Fatalf("expected Actionable view active")
+		}
+		actRender := ansi.Strip(m.actionableView.Render())
+		if !strings.Contains(actRender, "[not-ready]") {
+			t.Fatalf("W32-1 regression: Actionable view missing [not-ready] tag for BV_ROBOT_NOT_READY_LABELS:\n%s", actRender)
+		}
+		// Toggle DIA-A and DIA-B into Batch What-If.
+		m.actionableView.SelectIssueByID("DIA-A")
+		m.Update(keyRune("W"))
+		m.actionableView.SelectIssueByID("DIA-B")
+		m.Update(keyRune("W"))
+		res := m.actionableView.WhatIfBatchResult()
+		if res == nil || res.SynergyUnblocks != 1 || len(res.SynergyIssueIDs) != 1 || res.SynergyIssueIDs[0] != "DIA-C" {
+			t.Fatalf("W32-1 Actionable Batch What-If expected SynergyUnblocks=1 (DIA-C), got %+v", res)
+		}
+		actBatchRender := ansi.Strip(m.actionableView.Render())
+		if !strings.Contains(actBatchRender, "BATCH WHAT-IF (2)") || !strings.Contains(actBatchRender, "DIA-C") {
+			t.Fatalf("W32-1 Actionable Batch What-If banner missing synergy details:\n%s", actBatchRender)
+		}
+		// First Esc clears batch, stays in Actionable; second Esc exits to List.
+		m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+		if !m.isActionableView || m.actionableView.HasWhatIfBatch() {
+			t.Fatalf("W32-1 first Esc in Actionable should clear batch and stay in view (isAct=%v hasBatch=%v)", m.isActionableView, m.actionableView.HasWhatIfBatch())
+		}
+		m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+		if m.isActionableView || m.focused != focusList {
+			t.Fatalf("W32-1 second Esc in Actionable should exit to List")
+		}
+
+		// 2) Graph view supports W Batch What-If + Synergy HUD + Esc clear + q clears and exits.
+		m.Update(keyRune("g"))
+		m.graphView.SelectByID("DIA-A")
+		m.Update(keyRune("W"))
+		m.graphView.SelectByID("DIA-B")
+		m.Update(keyRune("W"))
+		gRes := m.graphView.WhatIfBatchResult()
+		if gRes == nil || gRes.SynergyUnblocks != 1 || gRes.SynergyIssueIDs[0] != "DIA-C" {
+			t.Fatalf("W32-1 Graph Batch What-If expected SynergyUnblocks=1 (DIA-C), got %+v", gRes)
+		}
+		gPanel := ansi.Strip(m.graphView.renderMetricsPanel("DIA-B", 76, m.theme))
+		if !strings.Contains(gPanel, "Batch What-If (2") || !strings.Contains(gPanel, "Synergy +1: DIA-C") {
+			t.Fatalf("W32-1 Graph metrics panel missing Batch What-If HUD:\n%s", gPanel)
+		}
+		// q clears batch AND exits Graph view cleanly.
+		m.Update(keyRune("q"))
+		if m.isGraphView || m.graphView.HasWhatIfBatch() {
+			t.Fatalf("W32-1 q in Graph should clear batch and exit (isGraph=%v hasBatch=%v)", m.isGraphView, m.graphView.HasWhatIfBatch())
+		}
+	})
+
+	t.Run("W32-2_GraphCycleBreakCacheAndCopyCommandGuard", func(t *testing.T) {
+		issues := []model.Issue{
+			{ID: "CYC-A", Title: "Cycle A", Status: model.StatusOpen, Priority: 1, CreatedAt: now, UpdatedAt: now,
+				Dependencies: []*model.Dependency{{IssueID: "CYC-A", DependsOnID: "CYC-B", Type: model.DepBlocks}}},
+			{ID: "CYC-B", Title: "Cycle B", Status: model.StatusOpen, Priority: 1, CreatedAt: now, UpdatedAt: now,
+				Dependencies: []*model.Dependency{{IssueID: "CYC-B", DependsOnID: "CYC-A", Type: model.DepBlocks}}},
+		}
+		m := NewModel(copyIssues(issues), nil, "")
+		defer m.Stop()
+		if m.analysis != nil {
+			m.analysis.WaitForPhase2()
+		}
+		m.Update(tea.WindowSizeMsg{Width: 140, Height: 36})
+		m.Update(keyRune("g"))
+		m.graphView.SelectByID("CYC-A")
+
+		if m.graphView.cycleBreaksValid {
+			t.Fatalf("expected cycleBreaksValid=false before first query")
+		}
+		cb := m.graphView.MatchingCycleBreak("CYC-A")
+		if cb == nil || !m.graphView.cycleBreaksValid {
+			t.Fatalf("W32-2 expected cached MatchingCycleBreak, got cb=%+v valid=%v", cb, m.graphView.cycleBreaksValid)
+		}
+		cmdStr := m.evaluateGraphCycleCutCommand(cb.EdgeFrom, cb.EdgeTo)
+		if !strings.HasPrefix(cmdStr, "br dep remove ") {
+			t.Fatalf("W32-2 expected verified br dep remove command, got %q", cmdStr)
+		}
+		// Negative control: degraded source must withhold cycle-cut command.
+		m.sourceDegraded = true
+		if suppressed := m.evaluateGraphCycleCutCommand(cb.EdgeFrom, cb.EdgeTo); suppressed != "" {
+			t.Fatalf("W32-2 degraded source must withhold cycle-cut command, got %q", suppressed)
+		}
+		// SetIssues must invalidate cycleBreaks cache.
+		m.graphView.SetIssues(copyIssues(issues), m.graphView.insights)
+		if m.graphView.cycleBreaksValid {
+			t.Fatalf("W32-2 SetIssues must invalidate cycleBreaksValid")
+		}
+	})
+
+	t.Run("W32-6_RepoPickerRendersCrossRepoBadges", func(t *testing.T) {
+		// P22A-1 + P22A-9: Uppercase repo keys in CrossRepoFlow still match normalized picker repos,
+		// and short terminals reserve chrome for the 2-line cross-repo summary without overflowing.
+		repos := []string{"api", "web", "r03", "r04", "r05", "r06", "r07", "r08", "r09", "r10"}
+		picker := NewRepoPickerModel(repos, DefaultTheme(lipgloss.NewRenderer(&strings.Builder{})))
+		picker.SetSize(80, 18)
+		picker.SetCrossRepoFlow(&analysis.CrossRepoFlow{
+			Repos:              []string{"API", "Web"},
+			TotalCrossRepoDeps: 2,
+			BottleneckRepos:    []string{"api"},
+			Dependencies: []analysis.RepoDependency{
+				{FromRepo: "API", ToRepo: "Web", IssueCount: 2},
+			},
+		})
+		view := ansi.Strip(picker.View())
+		if !strings.Contains(view, "api (→2)") || !strings.Contains(view, "web (←2)") || !strings.Contains(view, "Cross-repo: 2 blocking edge(s)") {
+			t.Fatalf("W32-6/P22A-1 RepoPicker missing normalized cross-repo flow indicators:\n%s", view)
+		}
+		if lines := strings.Split(view, "\n"); len(lines) > 18 {
+			t.Fatalf("P22A-9 RepoPicker overflowed height=18 with %d lines:\n%s", len(lines), view)
+		}
+		// Also verify ultra-short height=14 in middle of list stays within 14 lines!
+		picker.SetSize(80, 14)
+		picker.selectedIndex = 4
+		if shortLines := strings.Split(ansi.Strip(picker.View()), "\n"); len(shortLines) > 14 {
+			t.Fatalf("P22A-9 RepoPicker overflowed height=14 (mid-scroll) with %d lines:\n%s", len(shortLines), ansi.Strip(picker.View()))
+		}
+	})
+
+	t.Run("Pass22_GraphAndActionableBatchWhatIfAndCycleBreakLimit", func(t *testing.T) {
+		// P22A-2 + P22A-4 + P22A-5:
+		// 1) Graph SetAnalyzer recomputes whatIfBatchResult for repo-scoped analyzer and drops newly closed items.
+		// 2) Graph Enter clears whatIfBatch via exitGraphView().
+		// 3) Actionable refreshActionableView() preserves Batch What-If across in-view reload, while explicit exit clears it.
+		issues := []model.Issue{
+			{ID: "api-1", Title: "API 1", Status: model.StatusOpen, Priority: 1, SourceRepo: "api", CreatedAt: now, UpdatedAt: now},
+			{ID: "api-2", Title: "API 2", Status: model.StatusOpen, Priority: 1, SourceRepo: "api", CreatedAt: now, UpdatedAt: now},
+			{ID: "web-1", Title: "Web Join", Status: model.StatusOpen, Priority: 0, SourceRepo: "web", CreatedAt: now, UpdatedAt: now,
+				Dependencies: []*model.Dependency{
+					{IssueID: "web-1", DependsOnID: "api-1", Type: model.DepBlocks},
+					{IssueID: "web-1", DependsOnID: "api-2", Type: model.DepBlocks},
+				}},
+		}
+		m := NewModel(copyIssues(issues), nil, "")
+		defer m.Stop()
+		if m.analysis != nil {
+			m.analysis.WaitForPhase2()
+		}
+		m.Update(tea.WindowSizeMsg{Width: 140, Height: 36})
+
+		// Actionable Batch What-If survives refreshActionableView() (P22A-5), then clears on explicit Enter exit!
+		m.Update(keyRune("a"))
+		m.actionableView.SelectIssueByID("api-1")
+		m.Update(keyRune("W"))
+		m.actionableView.SelectIssueByID("api-2")
+		m.Update(keyRune("W"))
+		m.refreshActionableView()
+		if !m.actionableView.HasWhatIfBatch() || len(m.actionableView.WhatIfBatchIDs()) != 2 || m.actionableView.WhatIfBatchResult() == nil || m.actionableView.WhatIfBatchResult().SynergyUnblocks != 1 {
+			t.Fatalf("P22A-5 refreshActionableView wiped Actionable Batch What-If: ids=%v res=%+v", m.actionableView.WhatIfBatchIDs(), m.actionableView.WhatIfBatchResult())
+		}
+		m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+		if m.isActionableView || m.actionableView.HasWhatIfBatch() {
+			t.Fatalf("P22A-5 Enter exit from Actionable should clear Batch What-If")
+		}
+
+		// Graph SetAnalyzer recomputes against scoped analyzer & drops newly closed issues (P22A-2), and Enter exits cleanly (P22A-4)!
+		m.Update(tea.KeyMsg{Type: tea.KeyTab})
+		m.Update(keyRune("g"))
+		if !m.isGraphView || m.focused != focusGraph {
+			t.Fatalf("expected Graph view active after Tab+g (isGraph=%v focus=%v)", m.isGraphView, m.focused)
+		}
+		m.graphView.SelectByID("api-1")
+		m.Update(keyRune("W"))
+		m.graphView.SelectByID("api-2")
+		m.Update(keyRune("W"))
+		if m.graphView.WhatIfBatchResult() == nil || m.graphView.WhatIfBatchResult().SynergyUnblocks != 1 {
+			t.Fatalf("expected unscoped Graph Batch What-If SynergyUnblocks=1, got %+v", m.graphView.WhatIfBatchResult())
+		}
+		// Swap to api-only scoped analyzer (without web-1): SetAnalyzer must recompute SynergyUnblocks -> 0!
+		apiOnly := []model.Issue{issues[0], issues[1]}
+		apiAn := analysis.NewAnalyzer(apiOnly)
+		apiAn.SetNow(now)
+		apiStats := apiAn.Analyze()
+		apiIns := apiStats.GenerateInsights(10)
+		m.graphView.SetIssues(apiOnly, &apiIns)
+		m.graphView.SetAnalyzer(apiAn, func() time.Time { return now })
+		if got := m.graphView.WhatIfBatchResult(); got == nil || got.SynergyUnblocks != 0 {
+			t.Fatalf("P22A-2 SetAnalyzer leaked hidden-repo synergy into api-only scope: %+v", got)
+		}
+		// Closing api-1 externally + SetIssues must drop api-1 from whatIfBatch!
+		closedAPI := copyIssues(apiOnly)
+		closedAPI[0].Status = model.StatusClosed
+		m.graphView.SetIssues(closedAPI, &apiIns)
+		if ids := m.graphView.WhatIfBatchIDs(); len(ids) != 1 || ids[0] != "api-2" {
+			t.Fatalf("P22A-2 reconcileWhatIfBatchScope retained closed issue api-1: %v", ids)
+		}
+		// Enter exits Graph view and clears whatIfBatch (P22A-4).
+		m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+		if m.isGraphView || m.graphView.HasWhatIfBatch() {
+			t.Fatalf("P22A-4 Graph Enter leaked whatIfBatch: isGraph=%v hasBatch=%v", m.isGraphView, m.graphView.HasWhatIfBatch())
+		}
+
+		// P22A-6: 4 disjoint 2-cycles (8 cycle edges > DefaultAdvancedInsightsConfig().CycleBreakLimit=5)
+		// must NOT starve visible cycles in MatchingCycleBreak!
+		cycIssues := []model.Issue{
+			{ID: "C1A", Title: "C1A", Status: model.StatusOpen, Priority: 1, CreatedAt: now, UpdatedAt: now, Dependencies: []*model.Dependency{{IssueID: "C1A", DependsOnID: "C1B", Type: model.DepBlocks}}},
+			{ID: "C1B", Title: "C1B", Status: model.StatusOpen, Priority: 1, CreatedAt: now, UpdatedAt: now, Dependencies: []*model.Dependency{{IssueID: "C1B", DependsOnID: "C1A", Type: model.DepBlocks}}},
+			{ID: "C2A", Title: "C2A", Status: model.StatusOpen, Priority: 1, CreatedAt: now, UpdatedAt: now, Dependencies: []*model.Dependency{{IssueID: "C2A", DependsOnID: "C2B", Type: model.DepBlocks}}},
+			{ID: "C2B", Title: "C2B", Status: model.StatusOpen, Priority: 1, CreatedAt: now, UpdatedAt: now, Dependencies: []*model.Dependency{{IssueID: "C2B", DependsOnID: "C2A", Type: model.DepBlocks}}},
+			{ID: "C3A", Title: "C3A", Status: model.StatusOpen, Priority: 1, CreatedAt: now, UpdatedAt: now, Dependencies: []*model.Dependency{{IssueID: "C3A", DependsOnID: "C3B", Type: model.DepBlocks}}},
+			{ID: "C3B", Title: "C3B", Status: model.StatusOpen, Priority: 1, CreatedAt: now, UpdatedAt: now, Dependencies: []*model.Dependency{{IssueID: "C3B", DependsOnID: "C3A", Type: model.DepBlocks}}},
+			{ID: "C4A", Title: "C4A", Status: model.StatusOpen, Priority: 1, CreatedAt: now, UpdatedAt: now, Dependencies: []*model.Dependency{{IssueID: "C4A", DependsOnID: "C4B", Type: model.DepBlocks}}},
+			{ID: "C4B", Title: "C4B", Status: model.StatusOpen, Priority: 1, CreatedAt: now, UpdatedAt: now, Dependencies: []*model.Dependency{{IssueID: "C4B", DependsOnID: "C4A", Type: model.DepBlocks}}},
+		}
+		cm := NewModel(copyIssues(cycIssues), nil, "")
+		defer cm.Stop()
+		if cm.analysis != nil {
+			cm.analysis.WaitForPhase2()
+		}
+		cm.Update(tea.WindowSizeMsg{Width: 140, Height: 36})
+		cm.Update(keyRune("g"))
+		for _, id := range []string{"C1A", "C2A", "C3A", "C4A"} {
+			if cb := cm.graphView.MatchingCycleBreak(id); cb == nil {
+				t.Fatalf("P22A-6 MatchingCycleBreak starved for %s when 8 cycle edges exist", id)
+			}
+		}
+	})
+}
+
+func TestWave33_Pass23_And_W33_2_4_5_TUI(t *testing.T) {
+	now := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+	keyRune := func(s string) tea.KeyMsg {
+		return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)}
+	}
+
+	t.Run("P23-2_ActionableExitPathsClearWhatIfBatch", func(t *testing.T) {
+		issues := []model.Issue{
+			{ID: "A-1", Title: "Root 1", Status: model.StatusOpen, Priority: 1, Labels: []string{"api"}, CreatedAt: now, UpdatedAt: now},
+			{ID: "A-2", Title: "Root 2", Status: model.StatusOpen, Priority: 1, Labels: []string{"web"}, CreatedAt: now, UpdatedAt: now},
+			{ID: "A-3", Title: "Join", Status: model.StatusOpen, Priority: 0, Labels: []string{"api"}, CreatedAt: now, UpdatedAt: now,
+				Dependencies: []*model.Dependency{
+					{IssueID: "A-3", DependsOnID: "A-1", Type: model.DepBlocks},
+					{IssueID: "A-3", DependsOnID: "A-2", Type: model.DepBlocks},
+				}},
+		}
+		m := NewModel(copyIssues(issues), nil, "")
+		defer m.Stop()
+		if m.analysis != nil {
+			m.analysis.WaitForPhase2()
+		}
+		m.Update(tea.WindowSizeMsg{Width: 140, Height: 36})
+
+		// Queue Batch What-If in Actionable, then leave via Graph ('g') -> batch MUST clear!
+		m.Update(keyRune("a"))
+		m.actionableView.SelectIssueByID("A-1")
+		m.Update(keyRune("W"))
+		if !m.actionableView.HasWhatIfBatch() {
+			t.Fatal("precondition failed: expected A-1 in Actionable Batch What-If")
+		}
+		m.Update(keyRune("g"))
+		if m.isActionableView || m.actionableView.HasWhatIfBatch() {
+			t.Fatalf("P23-2 regression: leaving Actionable via 'g' did not clear whatIfBatch")
+		}
+		// Re-enter Actionable, queue again, leave via openSprintView() with an active sprint -> batch MUST clear!
+		m.sprints = []model.Sprint{{
+			ID: "sp-w33", Name: "Sprint W33",
+			StartDate: now.Add(-24 * time.Hour), EndDate: now.Add(24 * time.Hour),
+			BeadIDs: []string{"A-1"},
+		}}
+		m.Update(keyRune("a"))
+		m.actionableView.SelectIssueByID("A-1")
+		m.Update(keyRune("W"))
+		m.openSprintView()
+		if !m.isSprintView || m.isActionableView || m.actionableView.HasWhatIfBatch() {
+			t.Fatalf("P23-2 regression: openSprintView() did not clear Actionable whatIfBatch (isSprint=%v isAct=%v hasBatch=%v)",
+				m.isSprintView, m.isActionableView, m.actionableView.HasWhatIfBatch())
+		}
+		// Re-entering Actionable via 'a' must start clean with zero ghost selections.
+		m.Update(keyRune("a"))
+		if m.actionableView.HasWhatIfBatch() {
+			t.Fatalf("P23-2 regression: ghost Batch What-If resurrected on re-entering Actionable")
+		}
+	})
+
+	t.Run("P23-6_RepoPickerMixedCaseAndNarrowHeightSafety", func(t *testing.T) {
+		repos := []string{"API-", "Web", "r03", "r04", "r05", "r06", "r07", "r08"}
+		picker := NewRepoPickerModel(repos, DefaultTheme(lipgloss.NewRenderer(&strings.Builder{})))
+		picker.SetCrossRepoFlow(&analysis.CrossRepoFlow{
+			Repos:              []string{"api", "web"},
+			TotalCrossRepoDeps: 3,
+			BottleneckRepos:    []string{"api"},
+			Dependencies: []analysis.RepoDependency{
+				{FromRepo: "api", ToRepo: "web", IssueCount: 3},
+			},
+		})
+		picker.SetSize(80, 20)
+		wide := ansi.Strip(picker.View())
+		if !strings.Contains(wide, "API- (→3)") || !strings.Contains(wide, "Web (←3)") {
+			t.Fatalf("P23-6 regression: mixed-case repo keys did not match normalized cross-repo counts:\n%s", wide)
+		}
+		for _, dims := range [][2]int{{36, 16}, {40, 12}, {32, 10}, {24, 7}, {30, 8}} {
+			picker.SetSize(dims[0], dims[1])
+			picker.selectedIndex = 3
+			out := ansi.Strip(picker.View())
+			lines := strings.Split(out, "\n")
+			if len(lines) > dims[1] {
+				t.Fatalf("P23-6/P24A-8 regression: RepoPicker (%dx%d) overflowed height with %d lines:\n%s", dims[0], dims[1], len(lines), out)
+			}
+			for _, ln := range lines {
+				if w := ansi.StringWidth(ln); w > dims[0] {
+					t.Fatalf("P24A-8 regression: RepoPicker (%dx%d) overflowed width (%d > %d): %q", dims[0], dims[1], w, dims[0], ln)
+				}
+			}
+		}
+	})
+
+	t.Run("W33-2_GraphInteractiveDepRemovalPreflight", func(t *testing.T) {
+		issues := []model.Issue{
+			{ID: "CYC-A", Title: "Cycle A", Status: model.StatusOpen, Priority: 1, CreatedAt: now, UpdatedAt: now,
+				Dependencies: []*model.Dependency{{IssueID: "CYC-A", DependsOnID: "CYC-B", Type: model.DepBlocks}}},
+			{ID: "CYC-B", Title: "Cycle B", Status: model.StatusOpen, Priority: 1, CreatedAt: now, UpdatedAt: now,
+				Dependencies: []*model.Dependency{{IssueID: "CYC-B", DependsOnID: "CYC-A", Type: model.DepBlocks}}},
+			{ID: "LEAF", Title: "Standalone Leaf", Status: model.StatusOpen, Priority: 2, CreatedAt: now, UpdatedAt: now},
+		}
+		m := NewModel(copyIssues(issues), nil, "")
+		defer m.Stop()
+		if m.analysis != nil {
+			m.analysis.WaitForPhase2()
+		}
+		m.Update(tea.WindowSizeMsg{Width: 140, Height: 42})
+		m.Update(keyRune("g"))
+		m.graphView.SelectByID("CYC-A")
+
+		// Press 'X' on CYC-A -> evaluates removing CYC-A -> CYC-B (only outgoing blocking edge).
+		m.Update(keyRune("X"))
+		res := m.graphView.CheckDepResult()
+		if res == nil || res.Operation != "remove" || !res.CanRemove || res.CyclesBroken != 1 || !res.WouldBreakAllCycles {
+			t.Fatalf("W33-2 expected Cycle removal preflight breaking 1 cycle, got %+v", res)
+		}
+		if !strings.HasPrefix(res.Command, "br dep remove ") {
+			t.Fatalf("W33-2 expected br dep remove command, got %q", res.Command)
+		}
+		foundA := false
+		for _, id := range res.NewlyUnblocked {
+			if id == "CYC-A" {
+				foundA = true
+			}
+		}
+		if !foundA {
+			t.Fatalf("W33-2 expected CYC-A in NewlyUnblocked, got %+v", res.NewlyUnblocked)
+		}
+		metricsOut := ansi.Strip(m.graphView.renderMetricsPanel("CYC-A", 100, m.theme))
+		if !strings.Contains(metricsOut, "Check Remove Dep") || !strings.Contains(metricsOut, "breaks 1/1") {
+			t.Fatalf("W33-2 Graph metrics panel missing removal preflight details:\n%s", metricsOut)
+		}
+
+		// Escape clears removal preflight with accurate "Check Remove Dep cleared" status (P24A-6).
+		m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+		if !m.isGraphView || m.graphView.CheckDepResult() != nil || m.graphView.CheckDepActive() || m.statusMsg != "Check Remove Dep cleared" {
+			t.Fatalf("W33-2/P24A-6 Esc should clear removal preflight cleanly (isGraph=%v active=%v status=%q)", m.isGraphView, m.graphView.CheckDepActive(), m.statusMsg)
+		}
+
+		// P24A-6: Reloading SetIssues after Check Remove Dep MUST NOT morph into phantom Check Add Dep prompt!
+		m.Update(keyRune("X"))
+		if m.graphView.CheckDepResult() == nil || m.graphView.CheckDepFromID() != "" {
+			t.Fatalf("P24A-6 SetCheckDepResult(remove) must not arm checkDepFromID: from=%q res=%+v", m.graphView.CheckDepFromID(), m.graphView.CheckDepResult())
+		}
+		m.graphView.SetIssues(copyIssues(issues), m.graphView.insights)
+		if m.graphView.CheckDepActive() {
+			t.Fatalf("P24A-6 reload morphed Check Remove Dep into phantom Check Add Dep: from=%q res=%+v", m.graphView.CheckDepFromID(), m.graphView.CheckDepResult())
+		}
+
+		// Negative control 1: Degraded source withholds removal command.
+		m.sourceDegraded = true
+		m.Update(keyRune("X"))
+		if degRes := m.graphView.CheckDepResult(); degRes == nil || degRes.Command != "" {
+			t.Fatalf("W33-2 degraded source must withhold br dep remove command, got %+v", degRes)
+		}
+		m.sourceDegraded = false
+
+		// Negative control 2: Pressing 'X' on blocker-less LEAF MUST clear any prior check card (P24A-6)!
+		m.graphView.SelectByID("LEAF")
+		m.Update(keyRune("X"))
+		if m.graphView.CheckDepActive() || m.graphView.CheckDepResult() != nil || !strings.Contains(m.statusMsg, "no active outgoing blocking") {
+			t.Fatalf("W33-2/P24A-6 LEAF without blockers must clear stale check card (active=%v res=%+v status=%q)", m.graphView.CheckDepActive(), m.graphView.CheckDepResult(), m.statusMsg)
+		}
+	})
+
+	t.Run("W33-4_InsightsCrossRepoHandoffsMultiVsSingleRepo", func(t *testing.T) {
+		multi := []model.Issue{
+			{ID: "api-1", Title: "API core", Status: model.StatusOpen, Priority: 1, SourceRepo: "api", CreatedAt: now, UpdatedAt: now},
+			{ID: "web-1", Title: "Web UI", Status: model.StatusOpen, Priority: 1, SourceRepo: "web", CreatedAt: now, UpdatedAt: now,
+				Dependencies: []*model.Dependency{{IssueID: "web-1", DependsOnID: "api-1", Type: model.DepBlocks}}},
+		}
+		mMulti := NewModel(copyIssues(multi), nil, "")
+		defer mMulti.Stop()
+		if mMulti.analysis != nil {
+			mMulti.analysis.WaitForPhase2()
+		}
+		mMulti.Update(tea.WindowSizeMsg{Width: 140, Height: 40})
+		mMulti.focused = focusInsights
+		mMulti.insightsPanel.focusedPanel = PanelPriority
+		mMulti.rebuildInsightsPanel()
+		mMulti.insightsPanel.updateDetailContent()
+		multiDetail := ansi.Strip(mMulti.insightsPanel.detailContent)
+		if !strings.Contains(multiDetail, "Cross-Repo Handoffs") || !strings.Contains(multiDetail, "api") || !strings.Contains(multiDetail, "web") {
+			t.Fatalf("W33-4 multi-repo Insights missing Cross-Repo Handoffs:\n%s", multiDetail)
+		}
+
+		// Negative control: single-repo project must omit Cross-Repo Handoffs completely.
+		single := []model.Issue{
+			{ID: "S-1", Title: "Core", Status: model.StatusOpen, Priority: 1, SourceRepo: "api", CreatedAt: now, UpdatedAt: now},
+			{ID: "S-2", Title: "Leaf", Status: model.StatusOpen, Priority: 1, SourceRepo: "api", CreatedAt: now, UpdatedAt: now,
+				Dependencies: []*model.Dependency{{IssueID: "S-2", DependsOnID: "S-1", Type: model.DepBlocks}}},
+		}
+		mSingle := NewModel(copyIssues(single), nil, "")
+		defer mSingle.Stop()
+		if mSingle.analysis != nil {
+			mSingle.analysis.WaitForPhase2()
+		}
+		mSingle.Update(tea.WindowSizeMsg{Width: 140, Height: 40})
+		mSingle.focused = focusInsights
+		mSingle.insightsPanel.focusedPanel = PanelPriority
+		mSingle.rebuildInsightsPanel()
+		mSingle.insightsPanel.updateDetailContent()
+		if strings.Contains(ansi.Strip(mSingle.insightsPanel.detailContent), "Cross-Repo Handoffs") {
+			t.Fatalf("W33-4 negative control: single-repo Insights emitted Cross-Repo Handoffs")
+		}
+	})
+
+	t.Run("W33-5_OperationalRiskAndPriorityHintsAcrossBoardTreeActionable", func(t *testing.T) {
+		stale := now.Add(-45 * 24 * time.Hour)
+		issues := []model.Issue{
+			{ID: "RISK-1", Title: "Stale cross-repo bottleneck", Status: model.StatusOpen, Priority: 4, SourceRepo: "api", CreatedAt: stale, UpdatedAt: stale},
+			{ID: "DEP-1", Title: "Urgent consumer 1", Status: model.StatusOpen, Priority: 0, SourceRepo: "web", CreatedAt: stale, UpdatedAt: now,
+				Dependencies: []*model.Dependency{{IssueID: "DEP-1", DependsOnID: "RISK-1", Type: model.DepBlocks}}},
+			{ID: "DONE-1", Title: "Closed issue", Status: model.StatusClosed, Priority: 1, SourceRepo: "api", CreatedAt: stale, UpdatedAt: now},
+			{ID: "TMPL-1", Title: "Template issue", Status: model.StatusOpen, Priority: 2, IsTemplate: true, SourceRepo: "api", CreatedAt: stale, UpdatedAt: stale},
+		}
+		theme := DefaultTheme(lipgloss.NewRenderer(&strings.Builder{}))
+		riskMap := map[string]analysis.RiskSignals{
+			"RISK-1": {CompositeRisk: 0.72, Explanation: "High status risk & cross-repo exposure"},
+			"DONE-1": {CompositeRisk: 0.85, Explanation: "Must be suppressed on closed"},
+			"TMPL-1": {CompositeRisk: 0.85, Explanation: "Must be suppressed on template"},
+		}
+		hintMap := map[string]*analysis.PriorityRecommendation{
+			"RISK-1": {IssueID: "RISK-1", CurrentPriority: 4, SuggestedPriority: 1, Direction: "increase", Confidence: 0.88, Reasoning: []string{"Blocks P0 consumer"}},
+			"DONE-1": {IssueID: "DONE-1", CurrentPriority: 1, SuggestedPriority: 0, Direction: "increase", Confidence: 0.90, Reasoning: []string{"Suppressed"}},
+			"TMPL-1": {IssueID: "TMPL-1", CurrentPriority: 2, SuggestedPriority: 0, Direction: "increase", Confidence: 0.90, Reasoning: []string{"Suppressed"}},
+		}
+
+		// 1. Board: card high-risk badge + detail pane Risk & Priority Alignment + closed/template suppression + cache stability.
+		bm := NewBoardModel(copyIssues(issues), theme)
+		bm.SetReferenceTime(now)
+		bm.SetRiskByID(riskMap)
+		bm.SetPriorityHints(hintMap)
+		bm.ToggleDetail()
+		bm.SetSize(140, 32)
+		bm.SelectIssueByID("RISK-1")
+		boardOut := ansi.Strip(bm.View(140, 32))
+		for _, want := range []string{"⚠72%", "Operational Risk:", "72%", "Priority Alignment:", "P4 → P1"} {
+			if !strings.Contains(boardOut, want) {
+				t.Fatalf("W33-5 Board missing %q for active high-risk issue:\n%s", want, boardOut)
+			}
+		}
+		rendersBefore := bm.detailCache.renders
+		// Re-passing equal maps must NOT invalidate detailCache (zero Glamour thrash).
+		bm.SetRiskByID(map[string]analysis.RiskSignals{
+			"RISK-1": {CompositeRisk: 0.72, Explanation: "High status risk & cross-repo exposure"},
+			"DONE-1": {CompositeRisk: 0.85, Explanation: "Must be suppressed on closed"},
+			"TMPL-1": {CompositeRisk: 0.85, Explanation: "Must be suppressed on template"},
+		})
+		_ = bm.View(140, 32)
+		if bm.detailCache.renders != rendersBefore {
+			t.Fatalf("W33-5 Board SetRiskByID thrashed detailCache on equal map (%d -> %d)", rendersBefore, bm.detailCache.renders)
+		}
+		// Updating risk score MUST invalidate detailCache and render updated percentage,
+		// AND changing PriorityHint Reasoning[0] must invalidate detailCache while preserving scroll YOffset (P24A-7).
+		bm.DetailScrollDown(2)
+		yBefore := bm.detailVP.YOffset
+		bm.SetRiskByID(map[string]analysis.RiskSignals{"RISK-1": {CompositeRisk: 0.81, Explanation: "Escalated risk"}})
+		bm.SetPriorityHints(map[string]*analysis.PriorityRecommendation{
+			"RISK-1": {IssueID: "RISK-1", CurrentPriority: 4, SuggestedPriority: 1, Direction: "increase", Confidence: 0.88, Reasoning: []string{"Updated rationale P24A7"}},
+		})
+		bm.syncDetailContent()
+		if bm.detailVP.YOffset != yBefore {
+			t.Fatalf("P24A-7 Board metadata refresh snapped detailVP scroll offset (%d -> %d)", yBefore, bm.detailVP.YOffset)
+		}
+		boardUpdated := ansi.Strip(bm.detailCache.rendered)
+		if !strings.Contains(boardUpdated, "81%") || !strings.Contains(boardUpdated, "Updated rationale P24A7") {
+			t.Fatalf("W33-5/P24A-7 Board SetRiskByID/SetPriorityHints did not refresh detailCache:\n%s", boardUpdated)
+		}
+		// Negative controls: closed & template issues suppress Risk & Priority Alignment.
+		bm.SetRiskByID(riskMap)
+		for _, suppressedID := range []string{"DONE-1", "TMPL-1"} {
+			if bm.SelectIssueByID(suppressedID) {
+				out := ansi.Strip(bm.View(140, 32))
+				if strings.Contains(out, "Operational Risk:") || strings.Contains(out, "Priority Alignment:") {
+					t.Fatalf("W33-5 Board leaked Risk/Priority Alignment on %s:\n%s", suppressedID, out)
+				}
+			}
+		}
+
+		// 2. Tree: wide renders ⚠72%, narrow (44 cols) sheds badge with zero overflow; closed/template suppressed.
+		tm := NewTreeModel(theme)
+		tm.SetRiskByID(riskMap)
+		tm.BuildFromIssues(copyIssues(issues))
+		tm.SetSize(140, 20)
+		treeWide := ansi.Strip(tm.View())
+		if !strings.Contains(treeWide, "⚠72%") {
+			t.Fatalf("W33-5 Tree (wide) missing high-risk badge ⚠72%%:\n%s", treeWide)
+		}
+		if strings.Contains(treeWide, "⚠85%") {
+			t.Fatalf("W33-5 Tree leaked high-risk badge on closed/template issue:\n%s", treeWide)
+		}
+		tm.SetSize(44, 20)
+		treeNarrow := ansi.Strip(tm.View())
+		for _, ln := range strings.Split(treeNarrow, "\n") {
+			if w := ansi.StringWidth(ln); w > 44 {
+				t.Fatalf("W33-5 Tree (narrow 44) overflowed (%d): %q", w, ln)
+			}
+		}
+
+		// 3. Actionable: wide renders ⚠72%, narrow (42 cols) stays single-line bounded.
+		plan := analysis.ExecutionPlan{
+			Tracks: []analysis.ExecutionTrack{{
+				TrackID: "track-A",
+				Reason:  "Critical track",
+				Items: []analysis.PlanItem{
+					{ID: "RISK-1", Title: "Stale cross-repo bottleneck task title", Priority: 4},
+				},
+			}},
+			TotalActionable: 1,
+		}
+		am := NewActionableModel(plan, theme)
+		am.SetRiskByID(riskMap)
+		am.SetSize(140, 20)
+		actWide := ansi.Strip(am.Render())
+		if !strings.Contains(actWide, "⚠72%") {
+			t.Fatalf("W33-5 Actionable (wide) missing high-risk badge ⚠72%%:\n%s", actWide)
+		}
+		am.SetSize(42, 20)
+		actNarrow := ansi.Strip(am.Render())
+		for _, ln := range strings.Split(actNarrow, "\n") {
+			if w := ansi.StringWidth(ln); w > 42 {
+				t.Fatalf("W33-5 Actionable (narrow 42) overflowed (%d): %q", w, ln)
+			}
+		}
+	})
+}
+
+// TestWave22_RC_C41_InsightsPanelCyclesRemovalPreflight proves Surface 4 of RC-C41:
+// pressing X on a selected cycle in Insights PanelCycles runs CheckDependencyRemovalWithScope,
+// cycles candidate edges across the cycle on repeated X presses, renders the preflight card in
+// detailContent, clears stale verdicts on panel switch/reload, and withholds commands under
+// read-only/degraded, time-travel, or workspace/cross-repo sources (both on X and on c re-eval).
+func TestWave22_RC_C41_InsightsPanelCyclesRemovalPreflight(t *testing.T) {
+	keyRune := func(r string) tea.KeyMsg { return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(r)} }
+	now := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+	issues := []model.Issue{
+		{
+			ID: "CYC-A", Title: "Cycle node A", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask,
+			CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "CYC-A", DependsOnID: "CYC-B", Type: model.DepBlocks}},
+		},
+		{
+			ID: "CYC-B", Title: "Cycle node B", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask,
+			CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "CYC-B", DependsOnID: "CYC-A", Type: model.DepBlocks}},
+		},
+		{
+			ID: "LEAF-1", Title: "Independent leaf", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask,
+			CreatedAt: now, UpdatedAt: now,
+		},
+	}
+
+	m := NewModel(copyIssues(issues), nil, "")
+	defer m.Stop()
+	if m.analysis != nil {
+		m.analysis.WaitForPhase2()
+	}
+	m.Update(tea.WindowSizeMsg{Width: 140, Height: 42})
+	m.focused = focusInsights
+	m.insightsPanel.focusedPanel = PanelCycles
+	m.insightsPanel.selectedIndex[PanelCycles] = 0
+	m.rebuildInsightsPanel()
+	m.insightsPanel.focusedPanel = PanelCycles
+	m.insightsPanel.selectedIndex[PanelCycles] = 0
+
+	// 1. Positive path: X preflights a valid cycle cut and renders Cycle-Cut Removal Preflight.
+	m.Update(keyRune("X"))
+	res1 := m.insightsPanel.CycleCutPreflight()
+	if res1 == nil || !res1.Exists || !res1.CanRemove || res1.CyclesBroken != 1 || !res1.WouldBreakAllCycles {
+		t.Fatalf("RC-C41 expected valid cycle-cut preflight on PanelCycles, got %+v (status=%q)", res1, m.statusMsg)
+	}
+	if !strings.HasPrefix(res1.Command, "br dep remove ") {
+		t.Fatalf("RC-C41 expected writable br dep remove command, got %q", res1.Command)
+	}
+	detail1 := ansi.Strip(m.insightsPanel.detailContent)
+	if !strings.Contains(detail1, "Cycle-Cut Removal Preflight") || !strings.Contains(detail1, "acyclic") {
+		t.Fatalf("RC-C41 PanelCycles detailContent missing preflight summary:\n%s", detail1)
+	}
+
+	// 2. Pressing X again cycles to the second directed edge of the 2-cycle.
+	m.Update(keyRune("X"))
+	res2 := m.insightsPanel.CycleCutPreflight()
+	if res2 == nil || !res2.Exists || (res2.FromID == res1.FromID && res2.ToID == res1.ToID) {
+		t.Fatalf("RC-C41 second X press should cycle to alternate cycle edge: first=%+v second=%+v", res1, res2)
+	}
+
+	// 3. Negative control A: Degraded/read-only source withholds command on live 'c' re-evaluation.
+	m.sourceDegraded = true
+	m.Update(keyRune("c"))
+	degRes := m.insightsPanel.CycleCutPreflight()
+	if degRes == nil || degRes.Command != "" {
+		t.Fatalf("RC-C41 degraded source must withhold command on 'c' re-eval, got %+v", degRes)
+	}
+	if !strings.Contains(m.statusMsg, "No writable") {
+		t.Fatalf("RC-C41 expected read-only withholding status on 'c', got %q", m.statusMsg)
+	}
+	if !strings.Contains(ansi.Strip(m.insightsPanel.detailContent), "withheld") {
+		t.Fatalf("RC-C41 detailContent must display withheld note when command is suppressed:\n%s", ansi.Strip(m.insightsPanel.detailContent))
+	}
+	m.sourceDegraded = false
+
+	// 4. Negative control B: Historical time-travel mode withholds command on X.
+	m.timeTravelMode = true
+	m.Update(keyRune("X"))
+	if ttRes := m.insightsPanel.CycleCutPreflight(); ttRes == nil || ttRes.Command != "" {
+		t.Fatalf("RC-C41 time-travel mode must withhold command on X, got %+v", ttRes)
+	}
+	m.timeTravelMode = false
+
+	// 5. Negative control C: Workspace mode withholds command on X.
+	m.workspaceMode = true
+	m.Update(keyRune("X"))
+	if wsRes := m.insightsPanel.CycleCutPreflight(); wsRes == nil || wsRes.Command != "" {
+		t.Fatalf("RC-C41 workspace mode must withhold command on X, got %+v", wsRes)
+	}
+	m.workspaceMode = false
+
+	// 6. Switching away from PanelCycles clears stale CycleCutPreflight.
+	m.insightsPanel.NextPanel()
+	if m.insightsPanel.CycleCutPreflight() != nil {
+		t.Fatalf("RC-C41 NextPanel must clear stale CycleCutPreflight, got %+v", m.insightsPanel.CycleCutPreflight())
+	}
+}
+
+func TestPass26_InsightsCyclePreflightScopeClearingAndXToggle(t *testing.T) {
+	now := time.Date(2026, 11, 25, 16, 0, 0, 0, time.UTC)
+	issues := []model.Issue{
+		{
+			ID: "CYC-1A", Title: "Cycle 1 A", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask,
+			CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "CYC-1A", DependsOnID: "CYC-1B", Type: model.DepBlocks}},
+		},
+		{
+			ID: "CYC-1B", Title: "Cycle 1 B", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask,
+			CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "CYC-1B", DependsOnID: "CYC-1A", Type: model.DepBlocks}},
+		},
+		{
+			ID: "CYC-2A", Title: "Cycle 2 A", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask,
+			CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "CYC-2A", DependsOnID: "CYC-2B", Type: model.DepBlocks}},
+		},
+		{
+			ID: "CYC-2B", Title: "Cycle 2 B", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask,
+			CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "CYC-2B", DependsOnID: "CYC-2A", Type: model.DepBlocks}},
+		},
+		{
+			ID: "READY-ONLY", Title: "Ready leaf", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask,
+			CreatedAt: now, UpdatedAt: now,
+		},
+	}
+
+	keyRune := func(s string) tea.KeyMsg {
+		return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)}
+	}
+	m := NewModel(copyIssues(issues), nil, "")
+	defer m.Stop()
+	if m.analysis != nil {
+		m.analysis.WaitForPhase2()
+	}
+	m.Update(tea.WindowSizeMsg{Width: 140, Height: 42})
+
+	// Simulate Graph View filtered down to READY-ONLY while Insights shows the full workspace scope (P26-A1).
+	ins := m.analysis.GenerateInsights(10)
+	m.graphView.SetIssues([]model.Issue{issues[4]}, &ins)
+	m.focused = focusInsights
+	m.rebuildInsightsPanel()
+	m.insightsPanel.focusedPanel = PanelCycles
+	m.insightsPanel.selectedIndex[PanelCycles] = 0
+
+	// 1. P26-A1: Insights X must scope to m.insightsPanel.issueMap (2 cycles), NOT filtered m.graphView.issueMap (0 cycles).
+	m.Update(keyRune("X"))
+	res := m.insightsPanel.CycleCutPreflight()
+	if res == nil || !res.Exists || res.CyclesBefore != 2 || res.CyclesBroken != 1 || res.CyclesAfter != 1 {
+		t.Fatalf("P26-A1 Insights X leaked filtered GraphView scope: got %+v (status=%q)", res, m.statusMsg)
+	}
+
+	// 2. P26-A7: Toggling calculation proof OFF ('x') must STILL display Cycle-Cut Removal Preflight.
+	m.Update(keyRune("x"))
+	if m.insightsPanel.showCalculation {
+		t.Fatal("expected 'x' to toggle showCalculation off")
+	}
+	detailNoCalc := ansi.Strip(m.insightsPanel.detailContent)
+	if !strings.Contains(detailNoCalc, "Cycle-Cut Removal Preflight") {
+		t.Fatalf("P26-A7 Cycle-Cut Removal Preflight disappeared when showCalculation=false:\n%s", detailNoCalc)
+	}
+
+	// 3. P26-A2: MoveToBottom ('G') clears stale preflight on cycle change.
+	m.insightsPanel.MoveToBottom()
+	if m.insightsPanel.CycleCutPreflight() != nil {
+		t.Fatalf("P26-A2 MoveToBottom must clear stale CycleCutPreflight, got %+v", m.insightsPanel.CycleCutPreflight())
+	}
+
+	// 4. P26-A2: First Esc clears active CycleCutPreflight while remaining in focusInsights; second Esc exits Insights.
+	m.Update(keyRune("X"))
+	if m.insightsPanel.CycleCutPreflight() == nil {
+		t.Fatal("expected X to populate CycleCutPreflight on second cycle")
+	}
+	m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if m.focused != focusInsights || m.insightsPanel.CycleCutPreflight() != nil {
+		t.Fatalf("P26-A2 first Esc must clear preflight and remain in focusInsights: focused=%v preflight=%+v", m.focused, m.insightsPanel.CycleCutPreflight())
+	}
+	m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if m.focused != focusList {
+		t.Fatalf("P26-A2 second Esc must exit focusInsights to focusList, got %v", m.focused)
+	}
+}
+
+func TestWave35_TreeZeroWidthRiskInsightsWatchlistBoardBatchAndHistoryHotspots(t *testing.T) {
+	now := time.Date(2026, 11, 25, 16, 0, 0, 0, time.UTC)
+	issues := []model.Issue{
+		{ID: "JB-1", Title: "Joint blocker alpha", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
+		{ID: "JB-2", Title: "Joint blocker beta", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
+		{
+			ID: "JOINT-DEP", Title: "Jointly blocked feature", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeFeature,
+			CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{
+				{IssueID: "JOINT-DEP", DependsOnID: "JB-1", Type: model.DepBlocks},
+				{IssueID: "JOINT-DEP", DependsOnID: "JB-2", Type: model.DepBlocks},
+			},
+		},
+		{ID: "CLOSED-HIGH", Title: "Closed historical item", Status: model.StatusClosed, Priority: 1, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
+	}
+
+	theme := DefaultTheme(lipgloss.NewRenderer(os.Stdout))
+
+	// 1. W35-2: TreeModel renders riskSeg even when width == 0.
+	tm := NewTreeModel(theme)
+	tm.Build(issues)
+	tm.SetRiskByID(map[string]analysis.RiskSignals{
+		"JB-1": {CompositeRisk: 0.72, Explanation: "High fan variance"},
+	})
+	// Keep width == 0 intentionally.
+	if len(tm.flatList) == 0 {
+		t.Fatal("expected non-empty tree flatList")
+	}
+	var jb1Node *IssueTreeNode
+	for _, n := range tm.flatList {
+		if n.Issue != nil && n.Issue.ID == "JB-1" {
+			jb1Node = n
+			break
+		}
+	}
+	if jb1Node == nil {
+		t.Fatal("expected JB-1 in tree flatList")
+	}
+	renderedZeroW := ansi.Strip(tm.renderNode(jb1Node, false))
+	if !strings.Contains(renderedZeroW, "72%") {
+		t.Fatalf("W35-2 TreeModel width==0 fallback dropped riskSeg: %q", renderedZeroW)
+	}
+
+	// 2. W35-2: InsightsModel renders High-Risk Watchlist on PanelPriority (active only).
+	an := analysis.NewAnalyzer(issues)
+	stats := an.AnalyzeWithConfig(analysis.DefaultConfig())
+	issueMap := map[string]*model.Issue{
+		"JB-1":        &issues[0],
+		"JB-2":        &issues[1],
+		"JOINT-DEP":   &issues[2],
+		"CLOSED-HIGH": &issues[3],
+	}
+	im := NewInsightsModel(stats.GenerateInsights(10), issueMap, theme)
+	im.SetSize(140, 40)
+	im.focusedPanel = PanelPriority
+	im.SetRiskByID(map[string]analysis.RiskSignals{
+		"JB-1":        {CompositeRisk: 0.78, Explanation: "Fan spike + churn"},
+		"CLOSED-HIGH": {CompositeRisk: 0.91, Explanation: "Should be excluded because closed"},
+	})
+	extrasMD := im.renderPriorityExtrasMD()
+	if !strings.Contains(extrasMD, "High-Risk Watchlist") || !strings.Contains(extrasMD, "JB-1") || !strings.Contains(extrasMD, "78%") {
+		t.Fatalf("W35-2 Insights PanelPriority missing High-Risk Watchlist for JB-1:\n%s", extrasMD)
+	}
+	if strings.Contains(extrasMD, "CLOSED-HIGH") {
+		t.Fatalf("W35-2 Insights High-Risk Watchlist leaked closed issue CLOSED-HIGH:\n%s", extrasMD)
+	}
+
+	// 3. W35-6: Board View Batch What-If ('W') detects joint synergy on JB-1 + JB-2 and Esc clears batch first.
+	keyRune := func(s string) tea.KeyMsg {
+		return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)}
+	}
+	m := NewModel(copyIssues(issues), nil, "")
+	defer m.Stop()
+	if m.analysis != nil {
+		m.analysis.WaitForPhase2()
+	}
+	m.Update(tea.WindowSizeMsg{Width: 140, Height: 42})
+	m.Update(keyRune("b"))
+	if !m.isBoardView || m.focused != focusBoard {
+		t.Fatalf("expected board view focused, got isBoardView=%v focused=%v", m.isBoardView, m.focused)
+	}
+	// Select JB-1 and toggle W, then select JB-2 and toggle W.
+	selectBoardID := func(target string) {
+		for col := 0; col < 4; col++ {
+			for row, iss := range m.board.columns[col] {
+				if iss.ID == target {
+					m.board.JumpToColumn(col)
+					m.board.selectedRow[col] = row
+					return
+				}
+			}
+		}
+		t.Fatalf("could not find %s on board", target)
+	}
+	selectBoardID("JB-1")
+	m.Update(keyRune("W"))
+	selectBoardID("JB-2")
+	m.Update(keyRune("W"))
+	batchRes := m.board.WhatIfBatchResult()
+	if batchRes == nil || batchRes.Delta.DirectUnblocks != 1 || batchRes.SynergyUnblocks != 1 {
+		t.Fatalf("W35-6 Board Batch What-If expected 1 direct + 1 joint synergy for JB-1+JB-2, got %+v (status=%q)", batchRes, m.statusMsg)
+	}
+	boardView := ansi.Strip(m.board.View(140, 36))
+	if !strings.Contains(boardView, "Batch(2)") || !strings.Contains(boardView, "BATCH") {
+		t.Fatalf("W35-6 Board View missing Batch(2) banner or BATCH card badge:\n%s", boardView)
+	}
+	m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if !m.isBoardView || m.board.HasWhatIfBatch() {
+		t.Fatalf("W35-6 first Esc in Board must clear Batch What-If while staying in Board: isBoard=%v hasBatch=%v", m.isBoardView, m.board.HasWhatIfBatch())
+	}
+
+	// 4. W35-5: History View Code Hotspots & Co-Change mode ('H'), co-change detail, and Enter file filter.
+	report := &correlation.HistoryReport{
+		Histories: map[string]correlation.BeadHistory{
+			"JB-1": {
+				BeadID: "JB-1", Title: "Joint blocker alpha", Status: "open",
+				Commits: []correlation.CorrelatedCommit{
+					{
+						SHA: "1111111111111111", ShortSHA: "1111111", Message: "feat: auth core", Author: "dev",
+						Timestamp: now.Add(-2 * time.Hour),
+						Files: []correlation.FileChange{
+							{Path: "pkg/auth/core.go", Action: "M"},
+							{Path: "pkg/auth/token.go", Action: "M"},
+						},
+					},
+				},
+			},
+			"JB-2": {
+				BeadID: "JB-2", Title: "Joint blocker beta", Status: "open",
+				Commits: []correlation.CorrelatedCommit{
+					{
+						SHA: "2222222222222222", ShortSHA: "2222222", Message: "fix: auth token", Author: "dev",
+						Timestamp: now.Add(-1 * time.Hour),
+						Files: []correlation.FileChange{
+							{Path: "pkg/auth/core.go", Action: "M"},
+							{Path: "pkg/auth/token.go", Action: "M"},
+						},
+					},
+				},
+			},
+		},
+	}
+	hm := NewHistoryModel(report, theme)
+	hm.SetSize(130, 32)
+	hm.ToggleHotspotsMode()
+	if !hm.IsHotspotsMode() || hm.HotspotCount() < 2 {
+		t.Fatalf("W35-5 expected Hotspots mode with >=2 files, got active=%v count=%d", hm.IsHotspotsMode(), hm.HotspotCount())
+	}
+	hotView := ansi.Strip(hm.View())
+	if !strings.Contains(hotView, "CODE HOTSPOTS") || !strings.Contains(hotView, "Co-Changed Files") || !strings.Contains(hotView, "pkg/auth/token.go") {
+		t.Fatalf("W35-5 Hotspots view missing leaderboard or co-changed files:\n%s", hotView)
+	}
+	appliedPath := hm.ApplyHotspotFileFilter()
+	if appliedPath == "" || hm.IsHotspotsMode() || hm.GetFileFilter() != appliedPath {
+		t.Fatalf("W35-5 ApplyHotspotFileFilter expected exit to Bead mode filtered on %q, got active=%v filter=%q", appliedPath, hm.IsHotspotsMode(), hm.GetFileFilter())
+	}
+}
+
+func TestWave36_ForceFullAnalysisTUI(t *testing.T) {
+	now := time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC)
+	// 520 issues crosses the >500 medium-graph threshold where ConfigForSize approximates betweenness
+	// and caps/skips expensive metrics unless ForceFullAnalysis is enabled.
+	issues := make([]model.Issue, 0, 520)
+	for i := 0; i < 520; i++ {
+		id := fmt.Sprintf("N-%03d", i)
+		iss := model.Issue{
+			ID:        id,
+			Title:     "Node " + id,
+			Status:    model.StatusOpen,
+			Priority:  2,
+			IssueType: model.TypeTask,
+			CreatedAt: now,
+			UpdatedAt: now,
+		}
+		if i > 0 && i < 6 {
+			iss.Dependencies = []*model.Dependency{{IssueID: id, DependsOnID: fmt.Sprintf("N-%03d", i-1), Type: model.DepBlocks}}
+		}
+		issues = append(issues, iss)
+	}
+	// Close a 2-cycle between N-000 and N-001 so exact cycle detection finds it.
+	issues[0].Dependencies = []*model.Dependency{{IssueID: "N-000", DependsOnID: "N-001", Type: model.DepBlocks}}
+
+	m := NewModel(copyIssues(issues), nil, "", ReadinessScope{
+		Authority:         model.NewReadinessIndex(issues),
+		ReferenceNow:      now,
+		ForceFullAnalysis: true,
+	})
+	defer m.Stop()
+	if !m.forceFullAnalysis {
+		t.Fatalf("W36-1 expected m.forceFullAnalysis=true")
+	}
+	m.analysis.WaitForPhase2()
+	if m.analysis.Status().Betweenness.State != "computed" || m.analysis.Status().Betweenness.Sample != 0 {
+		t.Fatalf("W36-1 expected ForceFullAnalysis NewModel to compute exact Betweenness on 520-node graph, got %+v", m.analysis.Status().Betweenness)
+	}
+	if len(m.analysis.Cycles()) == 0 {
+		t.Fatalf("W36-1 expected ForceFullAnalysis NewModel to detect cycle on 520-node graph")
+	}
+
+	// Verify SnapshotBuilder.WithForceFullAnalysis(true) propagates exact full analysis too.
+	snap := NewSnapshotBuilder(copyIssues(issues)).
+		WithForceFullAnalysis(true).
+		Build()
+	if snap == nil || snap.Analysis == nil {
+		t.Fatalf("W36-1 SnapshotBuilder returned nil snapshot/analysis")
+	}
+	snap.Analysis.WaitForPhase2()
+	if snap.Analysis.Status().Betweenness.State != "computed" || snap.Analysis.Status().Betweenness.Sample != 0 {
+		t.Fatalf("W36-1 expected ForceFullAnalysis SnapshotBuilder exact Betweenness, got %+v", snap.Analysis.Status().Betweenness)
+	}
+}
+
+func TestWave36_DetailPaneAlertsSuggestionsAndFullHistory(t *testing.T) {
+	now := time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC)
+	issues := []model.Issue{
+		{
+			ID: "AUTH-1", Title: "Auth token refresh gateway", Status: model.StatusOpen, Priority: 1,
+			IssueType: model.TypeTask, Labels: []string{"auth"}, CreatedAt: now.Add(-72 * time.Hour), UpdatedAt: now.Add(-1 * time.Hour),
+			Dependencies: []*model.Dependency{{IssueID: "AUTH-1", DependsOnID: "AUTH-2", Type: model.DepBlocks}},
+		},
+		{
+			ID: "AUTH-2", Title: "Auth session store", Status: model.StatusOpen, Priority: 1,
+			IssueType: model.TypeTask, Labels: []string{"auth"}, CreatedAt: now.Add(-72 * time.Hour), UpdatedAt: now.Add(-1 * time.Hour),
+			Dependencies: []*model.Dependency{{IssueID: "AUTH-2", DependsOnID: "AUTH-1", Type: model.DepBlocks}},
+		},
+		{
+			ID: "OTHER-1", Title: "Unrelated billing cleanup", Status: model.StatusOpen, Priority: 3,
+			IssueType: model.TypeTask, Labels: []string{"billing"}, CreatedAt: now.Add(-24 * time.Hour), UpdatedAt: now,
+		},
+	}
+	m := NewModel(copyIssues(issues), nil, "", ReadinessScope{
+		Authority:    model.NewReadinessIndex(issues),
+		ReferenceNow: now,
+	})
+	defer m.Stop()
+	m.analysis.WaitForPhase2()
+	m.Update(tea.WindowSizeMsg{Width: 140, Height: 180})
+
+	// Seed per-issue alert on AUTH-1 (and a separate one on OTHER-1 to test scoping) plus event-only history + CycleTime + Related.
+	m.alerts = []drift.Alert{
+		{Type: drift.AlertStaleIssue, Severity: drift.SeverityWarning, IssueID: "AUTH-1", Message: "AUTH-1 stalled for 3 days"},
+		{Type: drift.AlertStaleIssue, Severity: drift.SeverityWarning, IssueID: "OTHER-1", Message: "OTHER-1 unrelated alert"},
+	}
+	createToClaim := 4 * time.Hour
+	claimToClose := 6 * time.Hour
+	histRep := &correlation.HistoryReport{
+		Histories: map[string]correlation.BeadHistory{
+			"AUTH-1": {
+				BeadID: "AUTH-1", Title: "Auth token refresh gateway", Status: "open",
+				Events: []correlation.BeadEvent{
+					{EventType: correlation.EventCreated, Timestamp: now.Add(-72 * time.Hour), CommitSHA: "aaa1111", Author: "alice"},
+					{EventType: correlation.EventClaimed, Timestamp: now.Add(-68 * time.Hour), CommitSHA: "bbb2222", Author: "alice"},
+				},
+				CycleTime: &correlation.CycleTime{
+					CreateToClaim: &createToClaim,
+					ClaimToClose:  &claimToClose,
+				},
+			},
+			"AUTH-2": {
+				BeadID: "AUTH-2", Title: "Auth session store", Status: "open",
+				Commits: []correlation.CorrelatedCommit{
+					{SHA: "aaa1111", ShortSHA: "aaa1111", Message: "feat: auth core", Timestamp: now.Add(-72 * time.Hour), Files: []correlation.FileChange{{Path: "pkg/auth/core.go", Action: "M"}}},
+				},
+			},
+		},
+	}
+	m.historyFullReport = histRep
+	m.historyView.SetReport(histRep)
+	// P28-A10: Stale history generation must NOT render in Detail Pane until synced with semanticDataGeneration.
+	for idx, it := range m.list.Items() {
+		if bi, ok := it.(IssueItem); ok && bi.Issue.ID == "AUTH-1" {
+			m.list.Select(idx)
+			break
+		}
+	}
+	m.historyReportDataGeneration = m.semanticDataGeneration - 1
+	m.updateViewportContent()
+	if strings.Contains(ansi.Strip(m.viewport.View()), "Cycle Time") {
+		t.Fatalf("P28-A10 expected stale-generation history to be suppressed in Detail Pane")
+	}
+	m.historyReportDataGeneration = m.semanticDataGeneration
+	m.updateViewportContent()
+	detailText := ansi.Strip(m.viewport.View())
+	for _, want := range []string{"Alerts", "AUTH-1 stalled for 3 days", "Hygiene Suggestions", "Cycle Time", "4.0h", "Lifecycle"} {
+		if !strings.Contains(detailText, want) {
+			t.Fatalf("W36-2 Detail Pane for AUTH-1 missing %q:\n%s", want, detailText)
+		}
+	}
+	if strings.Contains(detailText, "OTHER-1 unrelated alert") {
+		t.Fatalf("W36-2 Detail Pane for AUTH-1 leaked unrelated OTHER-1 alert:\n%s", detailText)
+	}
+}
+
+func TestWave36_AlertsPanelSkippedChecksAndCopyAction(t *testing.T) {
+	now := time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC)
+	issues := []model.Issue{
+		{ID: "A-1", Title: "First task", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
+	}
+	m := NewModel(copyIssues(issues), nil, "", ReadinessScope{
+		Authority:    model.NewReadinessIndex(issues),
+		ReferenceNow: now,
+	})
+	defer m.Stop()
+	m.analysis.WaitForPhase2()
+	m.Update(tea.WindowSizeMsg{Width: 130, Height: 38})
+
+	m.alerts = []drift.Alert{
+		{
+			Type:            drift.AlertStaleIssue,
+			Severity:        drift.SeverityWarning,
+			IssueID:         "A-1",
+			Message:         "A-1 needs triage attention",
+			SuggestedAction: "br update A-1 --status=in_progress",
+		},
+	}
+	m.alertsSkippedChecks = []drift.SkippedCheck{
+		{Type: "baseline_scope", Reason: "saved baseline scope does not match active CLI scope"},
+	}
+	m.recomputeVisibleAlertCounts()
+	m.showAlertsPanel = true
+	m.alertsTab = 0
+	m.alertsCursor = 0
+
+	panel := ansi.Strip(m.renderAlertsPanel())
+	if !strings.Contains(panel, "baseline_scope") || !strings.Contains(panel, "Skipped checks:") {
+		t.Fatalf("W36-3 Alerts panel missing SkippedChecks summary:\n%s", panel)
+	}
+	if !strings.Contains(panel, "c: copy") {
+		t.Fatalf("W36-3 Alerts panel footer missing 'c: copy' hint:\n%s", panel)
+	}
+	// Pressing 'c' on Alerts tab 0 dispatches async clipboard copy command for SuggestedAction.
+	prevClipID := m.clipboardRequestID
+	_, copyCmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	if copyCmd == nil || m.clipboardRequestID != prevClipID+1 {
+		t.Fatalf("W36-3 pressing 'c' on Alerts tab 0 expected async clipboard command & requestID increment, got cmd=%v id=%d (prev %d)", copyCmd != nil, m.clipboardRequestID, prevClipID)
+	}
+	// Negative control: alert without SuggestedAction produces explicit status message and nil cmd.
+	m.alerts[0].SuggestedAction = ""
+	_, emptyCmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	if emptyCmd != nil || !strings.Contains(m.statusMsg, "No suggested action") {
+		t.Fatalf("W36-3 expected 'No suggested action' for empty SuggestedAction, got cmd=%v status=%q", emptyCmd != nil, m.statusMsg)
+	}
+
+	// P28-A7: Read-only/provisional/workspace mode must withhold both Tab 0 SuggestedAction and Tab 1 ActionCommand copy!
+	m.alerts[0].SuggestedAction = "br update A-1 --status=in_progress"
+	m.suggestionsCache = []analysis.Suggestion{
+		{Type: analysis.SuggestionCycleWarning, TargetBead: "A-1", Summary: "Break cycle", ActionCommand: "br dep remove A-1 A-2", Confidence: 0.9},
+	}
+	m.suggestionsCacheLoaded = true
+	m.suggestionsCacheGen = m.semanticDataGeneration
+	m.suggestionsCacheScope = m.etaScopeKey()
+	m.authorityIncomplete = true
+	_, withheldTab0 := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	if withheldTab0 != nil || !strings.Contains(strings.ToLower(m.statusMsg), "withheld") {
+		t.Fatalf("P28-A7 expected Tab 0 copy withheld when authorityIncomplete=true, got cmd=%v status=%q", withheldTab0 != nil, m.statusMsg)
+	}
+	m.statusMsg = ""
+	m.alertsTab = 1
+	m.suggestionsCursor = 0
+	tab1Panel := ansi.Strip(m.renderAlertsPanel())
+	if strings.Contains(tab1Panel, "br dep remove A-1 A-2") {
+		t.Fatalf("P28-A7 Tab 1 rendered ActionCommand when authorityIncomplete=true:\n%s", tab1Panel)
+	}
+	_, withheldTab1 := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	if withheldTab1 != nil || !strings.Contains(strings.ToLower(m.statusMsg), "withheld") {
+		t.Fatalf("P28-A7 expected Tab 1 copy withheld when authorityIncomplete=true, got cmd=%v status=%q", withheldTab1 != nil, m.statusMsg)
+	}
+	m.authorityIncomplete = false
+
+	// P28-A11: Pressing '!' opens Alerts Panel when ONLY alertsSkippedChecks exist (0 alerts, 0 suggestions).
+	m.showAlertsPanel = false
+	m.alerts = nil
+	m.suggestionsCache = nil
+	m.recomputeVisibleAlertCounts()
+	m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("!")})
+	if !m.showAlertsPanel {
+		t.Fatalf("P28-A11 expected '!' to open Alerts Panel when only alertsSkippedChecks exist (status=%q)", m.statusMsg)
+	}
+
+	// P28-A6: DataSnapshot.WithPhase2 re-sorts active recipes using risk or eta.
+	est30, est300 := 30, 300
+	etaIssues := []model.Issue{
+		{ID: "SLOW-1", Title: "Slow task", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, EstimatedMinutes: &est300, CreatedAt: now, UpdatedAt: now},
+		{ID: "FAST-1", Title: "Fast task", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, EstimatedMinutes: &est30, CreatedAt: now, UpdatedAt: now},
+	}
+	etaRecipe := &recipe.Recipe{Name: "eta-asc", Sort: recipe.SortConfig{Field: "eta", Direction: "asc"}}
+	an := analysis.NewAnalyzer(etaIssues)
+	an.SetNow(now)
+	st := an.Analyze()
+	snap := NewSnapshotBuilder(copyIssues(etaIssues)).WithRecipe(etaRecipe).Build()
+	snapP2 := snap.WithPhase2(&st, st.GenerateInsights(len(etaIssues)), copyIssues(etaIssues), an)
+	if len(snapP2.ViewIssues) != 2 || snapP2.ViewIssues[0].ID != "FAST-1" {
+		t.Fatalf("P28-A6 expected DataSnapshot.WithPhase2 to sort eta recipe with FAST-1 first, got %+v", snapP2.ViewIssues)
+	}
+}
+
+func TestPass29_And_Wave37_TUI(t *testing.T) {
+	now := time.Date(2026, 11, 27, 12, 0, 0, 0, time.UTC)
+
+	t.Run("P29-9_ReadOnlyOriginWithholdingAndWorkspaceOriginRouting", func(t *testing.T) {
+		roIssues := []model.Issue{
+			{
+				ID:        "RO-1",
+				Title:     "Read-only snapshot issue",
+				Status:    model.StatusOpen,
+				Priority:  1,
+				IssueType: model.TypeTask,
+				CreatedAt: now,
+				UpdatedAt: now,
+				Origin:    &model.IssueOrigin{ReadOnlyReason: "snapshot loaded from read-only export"},
+			},
+		}
+		m := NewModel(copyIssues(roIssues), nil, "", ReadinessScope{
+			Authority:    model.NewReadinessIndex(roIssues),
+			ReferenceNow: now,
+		})
+		defer m.Stop()
+		m.analysis.WaitForPhase2()
+		m.Update(tea.WindowSizeMsg{Width: 130, Height: 38})
+
+		m.alerts = []drift.Alert{
+			{Type: drift.AlertStaleIssue, Severity: drift.SeverityWarning, IssueID: "RO-1", Message: "RO-1 stale", SuggestedAction: "br update RO-1 --status=in_progress"},
+		}
+		m.suggestionsCache = []analysis.Suggestion{
+			{Type: analysis.SuggestionLabelSuggestion, TargetBead: "RO-1", Summary: "Add label", ActionCommand: "br update RO-1 --add-label core", Confidence: 0.9},
+		}
+		m.suggestionsCacheLoaded = true
+		m.suggestionsCacheGen = m.semanticDataGeneration
+		m.suggestionsCacheScope = m.etaScopeKey()
+		m.recomputeVisibleAlertCounts()
+		m.showAlertsPanel = true
+		m.alertsTab = 0
+		m.alertsCursor = 0
+
+		// Tab 0 must withhold copy AND hide 'c: copy' footer hint when issue origin is read-only.
+		tab0View := ansi.Strip(m.renderAlertsPanel())
+		if strings.Contains(tab0View, "c: copy") {
+			t.Fatalf("P29-9 expected Tab 0 footer to hide 'c: copy' on read-only origin:\n%s", tab0View)
+		}
+		_, roCmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+		if roCmd != nil || !strings.Contains(strings.ToLower(m.statusMsg), "withheld") {
+			t.Fatalf("P29-9 expected Tab 0 copy withheld on read-only origin, got cmd=%v status=%q", roCmd != nil, m.statusMsg)
+		}
+
+		// Workspace mode: an Origin-routed suggestion (with Action.WorkingDirectory) IS allowed on Tab 1!
+		wsIssues := []model.Issue{
+			{ID: "api-1", Title: "Workspace API issue", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, SourceRepo: "api", CreatedAt: now, UpdatedAt: now},
+		}
+		mw := NewModel(copyIssues(wsIssues), nil, "", ReadinessScope{
+			Authority:    model.NewReadinessIndex(wsIssues),
+			ReferenceNow: now,
+		})
+		defer mw.Stop()
+		mw.analysis.WaitForPhase2()
+		mw.Update(tea.WindowSizeMsg{Width: 130, Height: 38})
+		mw.workspaceMode = true
+		mw.suggestionsCache = []analysis.Suggestion{
+			{
+				Type:          analysis.SuggestionMissingDependency,
+				TargetBead:    "api-1",
+				Summary:       "Routed workspace fix",
+				ActionCommand: "cd -- '/tmp/repo-api' && br update api-1 --status=in_progress",
+				Action:        &model.IssueCommand{WorkingDirectory: "/tmp/repo-api", Shell: "cd -- '/tmp/repo-api' && br update api-1 --status=in_progress"},
+				Confidence:    0.9,
+			},
+		}
+		mw.suggestionsCacheLoaded = true
+		mw.suggestionsCacheGen = mw.semanticDataGeneration
+		mw.suggestionsCacheScope = mw.etaScopeKey()
+		mw.showAlertsPanel = true
+		mw.alertsTab = 1
+		mw.suggestionsCursor = 0
+
+		wsPanel := ansi.Strip(mw.renderAlertsPanel())
+		if !strings.Contains(wsPanel, "c: copy cmd") {
+			t.Fatalf("P29-9 expected workspace Tab 1 footer to show 'c: copy cmd' for Origin-routed suggestion:\n%s", wsPanel)
+		}
+		prevID := mw.clipboardRequestID
+		_, wsCmd := mw.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+		if wsCmd == nil || mw.clipboardRequestID != prevID+1 {
+			t.Fatalf("P29-9 expected Origin-routed workspace suggestion copy to succeed, got cmd=%v id=%d (prev %d) status=%q", wsCmd != nil, mw.clipboardRequestID, prevID, mw.statusMsg)
+		}
+	})
+
+	t.Run("P29-11_DismissLastAlertSwitchesToSuggestionsTabWhenNoSkippedChecks", func(t *testing.T) {
+		issues := []model.Issue{
+			{ID: "D-1", Title: "Dismiss target", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
+		}
+		m := NewModel(copyIssues(issues), nil, "", ReadinessScope{
+			Authority:    model.NewReadinessIndex(issues),
+			ReferenceNow: now,
+		})
+		defer m.Stop()
+		m.analysis.WaitForPhase2()
+		m.Update(tea.WindowSizeMsg{Width: 120, Height: 36})
+
+		m.alerts = []drift.Alert{{Type: drift.AlertStaleIssue, Severity: drift.SeverityWarning, IssueID: "D-1", Message: "D-1 stale"}}
+		m.suggestionsCache = []analysis.Suggestion{{Type: analysis.SuggestionLabelSuggestion, TargetBead: "D-1", Summary: "Suggest label", Confidence: 0.85}}
+		m.suggestionsCacheLoaded = true
+		m.suggestionsCacheGen = m.semanticDataGeneration
+		m.suggestionsCacheScope = m.etaScopeKey()
+		m.recomputeVisibleAlertCounts()
+		m.showAlertsPanel = true
+		m.alertsTab = 0
+		m.alertsCursor = 0
+
+		// With 0 skipped checks and 1 suggestion, dismissing the last alert switches to Tab 1 instead of closing!
+		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("d")})
+		if !m.showAlertsPanel || m.alertsTab != 1 {
+			t.Fatalf("P29-11 expected dismissing last alert to switch to Suggestions tab (tab=1, open=true), got open=%v tab=%d", m.showAlertsPanel, m.alertsTab)
+		}
+
+		// Negative control: when alertsSkippedChecks is non-empty, dismissing the last alert stays on Tab 0!
+		m.dismissedAlerts = make(map[string]bool)
+		m.alerts = []drift.Alert{{Type: drift.AlertStaleIssue, Severity: drift.SeverityWarning, IssueID: "D-1", Message: "D-1 stale"}}
+		m.alertsSkippedChecks = []drift.SkippedCheck{{Type: "baseline_scope", Reason: "mismatch"}}
+		m.recomputeVisibleAlertCounts()
+		m.alertsTab = 0
+		m.alertsCursor = 0
+		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("d")})
+		if !m.showAlertsPanel || m.alertsTab != 0 {
+			t.Fatalf("P29-11 expected skipped checks to keep Alerts panel open on Tab 0, got open=%v tab=%d", m.showAlertsPanel, m.alertsTab)
+		}
+	})
+
+	t.Run("W37-6_HistoryDependencyAwareClusterPeersAndSprintRowBadges", func(t *testing.T) {
+		theme := DefaultTheme(lipgloss.NewRenderer(os.Stdout))
+		// Two beads touching completely disjoint files by different authors 20h apart:
+		// without SetIssues, NewNetworkBuilder finds 0 clusters; with SetIssues, DepBlocks links them!
+		rep := &correlation.HistoryReport{
+			GeneratedAt: now,
+			DataHash:    "w37-net",
+			Stats:       correlation.HistoryStats{TotalBeads: 2, BeadsWithCommits: 2, TotalCommits: 2, UniqueAuthors: 2, AvgCommitsPerBead: 1.0},
+			Histories: map[string]correlation.BeadHistory{
+				"DEP-A": {
+					BeadID: "DEP-A", Title: "Core auth service", Status: "open",
+					Commits: []correlation.CorrelatedCommit{{
+						SHA: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", ShortSHA: "aaaaaaa", BeadID: "DEP-A",
+						Message: "feat(DEP-A): core auth", Author: "alice", Timestamp: now.Add(-24 * time.Hour),
+						Method: correlation.MethodExplicitID, Confidence: 0.95,
+						Files: []correlation.FileChange{{Path: "auth/core.go", Action: "M", Insertions: 10}},
+					}},
+				},
+				"DEP-B": {
+					BeadID: "DEP-B", Title: "Downstream web consumer", Status: "open",
+					Commits: []correlation.CorrelatedCommit{{
+						SHA: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", ShortSHA: "bbbbbbb", BeadID: "DEP-B",
+						Message: "feat(DEP-B): web consumer", Author: "bob", Timestamp: now.Add(-2 * time.Hour),
+						Method: correlation.MethodExplicitID, Confidence: 0.95,
+						Files: []correlation.FileChange{{Path: "web/login.go", Action: "M", Insertions: 15}},
+					}},
+				},
+			},
+			CommitIndex: map[string][]string{
+				"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": {"DEP-A"},
+				"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb": {"DEP-B"},
+			},
+		}
+		hv := NewHistoryModel(rep, theme)
+		hv.SetReferenceTime(now)
+		hv.SetSize(200, 40)
+		if strings.Contains(ansi.Strip(hv.View()), "Cluster:") {
+			t.Fatalf("W37-6 baseline without SetIssues unexpectedly showed Cluster for disjoint commits")
+		}
+		hv.SetIssues([]model.Issue{
+			{ID: "DEP-A", Title: "Core auth service", Status: model.StatusOpen, Priority: 1, CreatedAt: now, UpdatedAt: now},
+			{ID: "DEP-B", Title: "Downstream web consumer", Status: model.StatusOpen, Priority: 1, CreatedAt: now, UpdatedAt: now,
+				Dependencies: []*model.Dependency{{IssueID: "DEP-B", DependsOnID: "DEP-A", Type: model.DepBlocks}}},
+		})
+		afterView := ansi.Strip(hv.View())
+		if !strings.Contains(afterView, "Cluster:") || (!strings.Contains(afterView, "DEP-B") && !strings.Contains(afterView, "DEP-A")) {
+			t.Fatalf("W37-6 expected HistoryModel.SetIssues to surface dependency-linked cluster peer:\n%s", afterView)
+		}
+
+		// W37-6 Sprint View row badges: open issue shows [P0 · 2.0h · ~...d], closed issue suppresses risk/ETA.
+		est120, est30 := 120, 30
+		closedAt := now.Add(-12 * time.Hour)
+		spIssues := []model.Issue{
+			{ID: "SP-BLK", Title: "API blocker", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, SourceRepo: "api", EstimatedMinutes: &est120, CreatedAt: now.Add(-72 * time.Hour), UpdatedAt: now},
+			{ID: "SP-1", Title: "High risk sprint task", Status: model.StatusBlocked, Priority: 0, IssueType: model.TypeTask, SourceRepo: "web", EstimatedMinutes: &est120, CreatedAt: now.Add(-72 * time.Hour), UpdatedAt: now,
+				Dependencies: []*model.Dependency{{IssueID: "SP-1", DependsOnID: "SP-BLK", Type: model.DepBlocks}}},
+			{ID: "SP-2", Title: "Done sprint task", Status: model.StatusClosed, Priority: 3, IssueType: model.TypeTask, SourceRepo: "web", EstimatedMinutes: &est30, CreatedAt: now.Add(-72 * time.Hour), UpdatedAt: closedAt, ClosedAt: &closedAt},
+		}
+		ms := NewModel(copyIssues(spIssues), nil, "", ReadinessScope{
+			Authority:    model.NewReadinessIndex(spIssues),
+			ReferenceNow: now,
+		})
+		defer ms.Stop()
+		ms.analysis.WaitForPhase2()
+		ms.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+		ms.selectedSprint = &model.Sprint{
+			ID:        "sprint-37",
+			Name:      "Sprint 37",
+			StartDate: now.Add(-7 * 24 * time.Hour),
+			EndDate:   now.Add(7 * 24 * time.Hour),
+			BeadIDs:   []string{"SP-1", "SP-2"},
+		}
+		sprintOut := ansi.Strip(ms.renderSprintDashboard())
+		var sp1Line, sp2Line string
+		for _, line := range strings.Split(sprintOut, "\n") {
+			if strings.Contains(line, "SP-1") && strings.Contains(line, "High risk") {
+				sp1Line = line
+			}
+			if strings.Contains(line, "SP-2") && strings.Contains(line, "Done sprint") {
+				sp2Line = line
+			}
+		}
+		if sp1Line == "" || !strings.Contains(sp1Line, "P0") || !strings.Contains(sp1Line, "2.0h") || !strings.Contains(sp1Line, "~") {
+			t.Fatalf("W37-6 Sprint View open bead row missing P0/2.0h/ETA badges (line=%q):\n%s", sp1Line, sprintOut)
+		}
+		if sp2Line == "" || !strings.Contains(sp2Line, "P3") || !strings.Contains(sp2Line, "30m") {
+			t.Fatalf("W37-6 Sprint View closed bead row missing P3/30m badges (line=%q):\n%s", sp2Line, sprintOut)
+		}
+		if strings.Contains(sp2Line, "~") || strings.Contains(sp2Line, "⚠") {
+			t.Fatalf("W37-6 Sprint View closed bead row must not render ETA/risk badges: %q", sp2Line)
+		}
+	})
+}
+
+func TestPass31_And_Wave38_TUI(t *testing.T) {
+	now := time.Date(2026, 11, 28, 12, 0, 0, 0, time.UTC)
+
+	t.Run("P31-3_AlertsPanelOutOfBoundsCursorClampsFooterToLastItem", func(t *testing.T) {
+		origin := &model.IssueOrigin{
+			LocalID:          "AL-1",
+			WorkingDirectory: "/repo",
+			TrackerDirectory: "/repo/.beads",
+			Database:         "/repo/.beads/beads.db",
+			Tracker:          "br",
+			Executable:       "/usr/bin/br",
+			SupportsClaim:    true,
+		}
+		issues := []model.Issue{
+			{ID: "AL-1", Title: "First alert issue", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now, Origin: origin},
+			{ID: "AL-2", Title: "Second alert issue", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now, Origin: origin},
+		}
+		m := NewModel(copyIssues(issues), nil, "", ReadinessScope{
+			Authority:    model.NewReadinessIndex(issues),
+			ReferenceNow: now,
+		})
+		defer m.Stop()
+		m.analysis.WaitForPhase2()
+		m.Update(tea.WindowSizeMsg{Width: 120, Height: 40})
+		m.showAlertsPanel = true
+		m.alertsTab = 0
+		m.alerts = []drift.Alert{
+			{Type: drift.AlertStaleIssue, Severity: drift.SeverityWarning, IssueID: "AL-1", Message: "AL-1 copyable", SuggestedAction: "br update AL-1 --status=in_progress"},
+			{Type: drift.AlertStaleIssue, Severity: drift.SeverityWarning, IssueID: "AL-2", Message: "AL-2 non-copyable", SuggestedAction: ""},
+		}
+		m.recomputeVisibleAlertCounts()
+
+		// Cursor=0 -> copyable item AL-1 shows "c: copy".
+		m.alertsCursor = 0
+		out0 := ansi.Strip(m.renderAlertsPanel())
+		if !strings.Contains(out0, "c: copy") {
+			t.Fatalf("expected c: copy hint for copyable alert[0]:\n%s", out0)
+		}
+		// Out-of-bounds cursor=99 clamps to last alert[1] (non-copyable) -> must NOT advertise "c: copy".
+		m.alertsCursor = 99
+		outClamped := ansi.Strip(m.renderAlertsPanel())
+		if strings.Contains(outClamped, "c: copy") {
+			t.Fatalf("P31-3 out-of-bounds cursor=99 must clamp to non-copyable alert[1] and hide c: copy:\n%s", outClamped)
+		}
+		// Flip order so last item IS copyable: out-of-bounds cursor=99 must show "c: copy".
+		m.alerts[0], m.alerts[1] = m.alerts[1], m.alerts[0]
+		outClampedCopyable := ansi.Strip(m.renderAlertsPanel())
+		if !strings.Contains(outClampedCopyable, "c: copy") {
+			t.Fatalf("P31-3 out-of-bounds cursor=99 must clamp to copyable last alert and show c: copy:\n%s", outClampedCopyable)
+		}
+	})
+
+	t.Run("W38-5_TreeViewBatchWhatIfSynergyViewportEscAndPruning", func(t *testing.T) {
+		// Diamond: A and B jointly block C; C blocks D.
+		// Completing A alone unblocks 0; completing B alone unblocks 0; completing {A, B} jointly unblocks C (+1 synergy, +2 transitive).
+		issues := []model.Issue{
+			{ID: "TREE-A", Title: "Alpha Blocker", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
+			{ID: "TREE-B", Title: "Beta Blocker", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
+			{
+				ID: "TREE-C", Title: "Joint Child", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now,
+				Dependencies: []*model.Dependency{
+					{IssueID: "TREE-C", DependsOnID: "TREE-A", Type: model.DepBlocks},
+					{IssueID: "TREE-C", DependsOnID: "TREE-B", Type: model.DepBlocks},
+				},
+			},
+			{
+				ID: "TREE-D", Title: "Downstream Grandchild", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now,
+				Dependencies: []*model.Dependency{
+					{IssueID: "TREE-D", DependsOnID: "TREE-C", Type: model.DepBlocks},
+				},
+			},
+		}
+		m := NewModel(copyIssues(issues), nil, "", ReadinessScope{
+			Authority:    model.NewReadinessIndex(issues),
+			ReferenceNow: now,
+		})
+		defer m.Stop()
+		m.analysis.WaitForPhase2()
+		m.Update(tea.WindowSizeMsg{Width: 110, Height: 14})
+
+		// Enter Tree view via 'E'.
+		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("E")})
+		if m.focused != focusTree {
+			t.Fatalf("expected focusTree after E, got %v", m.focused)
+		}
+		// Switch to Blocking Chain mode via 'b'.
+		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("b")})
+		if m.tree.Mode() != TreeModeBlocking {
+			t.Fatalf("expected TreeModeBlocking after b, got %v", m.tree.Mode())
+		}
+
+		selectTreeID := func(target string) {
+			t.Helper()
+			if !m.tree.SelectByID(target) {
+				t.Fatalf("SelectByID(%q) failed in Tree view", target)
+			}
+		}
+
+		selectTreeID("TREE-A")
+		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("W")})
+		if !m.tree.HasWhatIfBatch() || !m.tree.IsInWhatIfBatch("TREE-A") {
+			t.Fatalf("expected TREE-A in Tree What-If batch")
+		}
+
+		selectTreeID("TREE-B")
+		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("W")})
+		ids := m.tree.WhatIfBatchIDs()
+		if len(ids) != 2 || ids[0] != "TREE-A" || ids[1] != "TREE-B" {
+			t.Fatalf("expected sorted batch [TREE-A TREE-B], got %v", ids)
+		}
+		if !strings.Contains(m.statusMsg, "synergy") || !strings.Contains(m.statusMsg, "+1 direct") {
+			t.Fatalf("expected synergy unblocks in statusMsg, got %q", m.statusMsg)
+		}
+		viewStr := ansi.Strip(m.tree.View())
+		if !strings.Contains(viewStr, "[W]") || !strings.Contains(viewStr, "Batch What-If") {
+			t.Fatalf("expected [W] badge and Batch What-If banner in Tree View:\n%s", viewStr)
+		}
+		lines := strings.Split(viewStr, "\n")
+		if len(lines) > m.tree.height {
+			t.Fatalf("Tree View with batch banner exceeded viewport height: got %d lines > %d\n%s", len(lines), m.tree.height, viewStr)
+		}
+
+		// SyncWhatIfBatch via refreshTreeView prunes closed/missing batched IDs.
+		closedAt := now
+		m.issues[0].Status = model.StatusClosed
+		m.issues[0].ClosedAt = &closedAt
+		m.issueMap["TREE-A"] = &m.issues[0]
+		m.refreshTreeView()
+		afterPrune := m.tree.WhatIfBatchIDs()
+		if len(afterPrune) != 1 || afterPrune[0] != "TREE-B" {
+			t.Fatalf("expected refreshTreeView to prune closed/removed TREE-A leaving [TREE-B], got %v", afterPrune)
+		}
+
+		// First Esc clears the active Tree batch while keeping focus in focusTree.
+		m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+		if m.tree.HasWhatIfBatch() || m.focused != focusTree {
+			t.Fatalf("first Esc should clear Tree batch and stay in focusTree, got hasBatch=%v focused=%v", m.tree.HasWhatIfBatch(), m.focused)
+		}
+		// Second Esc exits Tree view back to focusList.
+		m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+		if m.focused != focusList {
+			t.Fatalf("second Esc should exit focusTree to focusList, got %v", m.focused)
+		}
+
+		// P32 A#5 & A#6: Toggling off the last batched ID clears whatIfBatchResult, toggling W on the
+		// bottom visible row keeps cursor in visibleRange(), and exiting via 'q'/'i'/reset clears batch.
+		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("E")})
+		m.tree.SetSize(100, 3) // 1 header + 2 visible rows; adding batch banner shrinks to 1 visible row
+		m.tree.cursor = 1      // bottom visible row before banner
+		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("W")})
+		visStart, visEnd := m.tree.visibleRange()
+		if m.tree.cursor < visStart || m.tree.cursor >= visEnd {
+			t.Fatalf("P32 A#5 cursor=%d scrolled outside visibleRange=[%d,%d) after batch banner appeared", m.tree.cursor, visStart, visEnd)
+		}
+		// Toggling off the same item empties batch AND clears whatIfBatchResult.
+		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("W")})
+		if m.tree.HasWhatIfBatch() || m.tree.whatIfBatchResult != nil {
+			t.Fatalf("P32 A#5 expected empty batch and nil whatIfBatchResult after removing last ID")
+		}
+		// Re-add batch and exit via 'q' -> batch must be cleared (never resurrected on re-enter).
+		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("W")})
+		if !m.tree.HasWhatIfBatch() {
+			t.Fatalf("expected Tree batch active before 'q'")
+		}
+		m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q")})
+		if m.focused != focusList || m.tree.HasWhatIfBatch() {
+			t.Fatalf("P32 A#6 'q' in focusTree must exit to focusList and clear Tree batch, got focused=%v hasBatch=%v", m.focused, m.tree.HasWhatIfBatch())
 		}
 	})
 }

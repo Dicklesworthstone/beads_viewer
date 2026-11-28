@@ -141,6 +141,9 @@ type SQLiteExportConfig struct {
 	// full-graph velocity issues + matching stats (preserving identical-units scaling
 	// when --pages-include-closed=false or scoped recipes omit closed issues).
 	ETAContext *analysis.ETAContext
+	// Feedback optionally supplies adaptive triage weight telemetry (W38-1) so
+	// data/triage.json matches --robot-triage and Static Pages renders learned weights.
+	Feedback *analysis.FeedbackJSON
 }
 
 // DefaultSQLiteExportConfig returns sensible defaults for export configuration.

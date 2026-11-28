@@ -99,6 +99,7 @@ type snapshotBuildConfig struct {
 	PrecomputeGraphLayout bool
 	PrecomputeInsights    bool
 	SkipPhase2            bool
+	ForceFullAnalysis     bool
 }
 
 func snapshotBuildConfigDefault() snapshotBuildConfig {
@@ -222,17 +223,18 @@ type DataSnapshot struct {
 	// Pre-computed UI data. The unexported adapter/cache fields let the UI install
 	// the common unfiltered view without rebuilding interface slices, search
 	// documents, alert state, or selection indexes on the event loop.
-	ListItems      []IssueItem // Pre-built list items with scores
-	listModelItems []list.Item
-	listIndexByID  map[string]int
-	listOrderHash  uint64
-	semanticIDs    []string
-	semanticDocs   map[string]string
-	alerts         []drift.Alert
-	alertsCritical int
-	alertsWarning  int
-	alertsInfo     int
-	phase2Triage   *analysis.TriageResult
+	ListItems           []IssueItem // Pre-built list items with scores
+	listModelItems      []list.Item
+	listIndexByID       map[string]int
+	listOrderHash       uint64
+	semanticIDs         []string
+	semanticDocs        map[string]string
+	alerts              []drift.Alert
+	alertsSkippedChecks []drift.SkippedCheck
+	alertsCritical      int
+	alertsWarning       int
+	alertsInfo          int
+	phase2Triage        *analysis.TriageResult
 	// Detached mutable inputs are prepared before publication, so starting a
 	// Phase2 command does not deep-copy every view on the event loop.
 	phase2Input   *DataSnapshot
@@ -508,6 +510,12 @@ func (b *SnapshotBuilder) WithSkipSourceDiff(skip bool) *SnapshotBuilder {
 	return b
 }
 
+// WithForceFullAnalysis forces exact Phase 2 metrics regardless of graph size (--force-full-analysis).
+func (b *SnapshotBuilder) WithForceFullAnalysis(force bool) *SnapshotBuilder {
+	b.cfg.ForceFullAnalysis = force
+	return b
+}
+
 // WithDataHash supplies a precomputed issue data hash so Build need not
 // recompute it and UI-thread SnapshotReadyMsg swaps stay O(1).
 func (b *SnapshotBuilder) WithDataHash(hash string) *SnapshotBuilder {
@@ -671,7 +679,11 @@ func (b *SnapshotBuilder) Build() *DataSnapshot {
 		if analysisCtx == nil {
 			analysisCtx = context.Background()
 		}
-		if b.cfg.SkipPhase2 {
+		if b.cfg.ForceFullAnalysis {
+			fullCfg := analysis.FullAnalysisConfig()
+			b.analyzer.SetConfig(&fullCfg)
+			graphStats = b.analyzer.AnalyzeAsyncWithConfig(analysisCtx, fullCfg)
+		} else if b.cfg.SkipPhase2 {
 			// Still compute Phase 1 metrics, but skip expensive Phase 2 work.
 			cfg := analysis.ConfigForSize(len(issues), 0)
 			cfg.ComputePageRank = false
@@ -818,7 +830,7 @@ func (b *SnapshotBuilder) Build() *DataSnapshot {
 	if b.recipe != nil && strings.TrimSpace(b.recipe.Name) != "" {
 		snapAlertScope = &baseline.BaselineScope{Recipe: strings.TrimSpace(b.recipe.Name)}
 	}
-	alerts, alertsCritical, alertsWarning, alertsInfo := computeAlertsWithOptions(issues, graphStats, b.analyzer, alertComputeOptions{
+	alerts, alertsSkippedChecks, alertsCritical, alertsWarning, alertsInfo := computeAlertsDetailedWithOptions(issues, graphStats, b.analyzer, alertComputeOptions{
 		ProjectDir:     projectDir,
 		BeadsPath:      b.beadsPath,
 		Scope:          snapAlertScope,
@@ -830,44 +842,45 @@ func (b *SnapshotBuilder) Build() *DataSnapshot {
 	}
 
 	snapshot := &DataSnapshot{
-		LoadError:         recipeErr,
-		Issues:            issues,
-		DataHash:          dataHash,
-		IssueMap:          issueMap,
-		ViewIssues:        viewIssues,
-		Analyzer:          b.analyzer,
-		Analysis:          graphStats,
-		insights:          insights,
-		CountOpen:         cOpen,
-		CountReady:        cReady,
-		CountBlocked:      cBlocked,
-		CountClosed:       cClosed,
-		ListItems:         listItems,
-		listModelItems:    listModelItems,
-		listIndexByID:     listIndexByID,
-		listOrderHash:     listOrderFingerprint(listItems),
-		semanticIDs:       semanticIDs,
-		semanticDocs:      semanticDocs,
-		alerts:            alerts,
-		alertsCritical:    alertsCritical,
-		alertsWarning:     alertsWarning,
-		alertsInfo:        alertsInfo,
-		TriageScores:      triageScores,
-		TriageReasons:     triageReasons,
-		QuickWinSet:       quickWinSet,
-		BlockerSet:        blockerSet,
-		UnblocksMap:       unblocksMap,
-		TreeRoots:         treeRoots,
-		TreeNodeMap:       treeNodeMap,
-		BoardState:        boardState,
-		graphLayout:       graphLayout,
-		CreatedAt:         createdAt,
-		AuthorityComplete: true,
-		RecipeName:        recipeName(b.recipe),
-		RecipeHash:        recipeFingerprint(b.recipe),
-		recipe:            b.recipe,
-		phase2Ready:       graphStats.IsPhase2Ready(),
-		IssueDiff:         b.diff,
+		LoadError:           recipeErr,
+		Issues:              issues,
+		DataHash:            dataHash,
+		IssueMap:            issueMap,
+		ViewIssues:          viewIssues,
+		Analyzer:            b.analyzer,
+		Analysis:            graphStats,
+		insights:            insights,
+		CountOpen:           cOpen,
+		CountReady:          cReady,
+		CountBlocked:        cBlocked,
+		CountClosed:         cClosed,
+		ListItems:           listItems,
+		listModelItems:      listModelItems,
+		listIndexByID:       listIndexByID,
+		listOrderHash:       listOrderFingerprint(listItems),
+		semanticIDs:         semanticIDs,
+		semanticDocs:        semanticDocs,
+		alerts:              alerts,
+		alertsSkippedChecks: alertsSkippedChecks,
+		alertsCritical:      alertsCritical,
+		alertsWarning:       alertsWarning,
+		alertsInfo:          alertsInfo,
+		TriageScores:        triageScores,
+		TriageReasons:       triageReasons,
+		QuickWinSet:         quickWinSet,
+		BlockerSet:          blockerSet,
+		UnblocksMap:         unblocksMap,
+		TreeRoots:           treeRoots,
+		TreeNodeMap:         treeNodeMap,
+		BoardState:          boardState,
+		graphLayout:         graphLayout,
+		CreatedAt:           createdAt,
+		AuthorityComplete:   true,
+		RecipeName:          recipeName(b.recipe),
+		RecipeHash:          recipeFingerprint(b.recipe),
+		recipe:              b.recipe,
+		phase2Ready:         graphStats.IsPhase2Ready(),
+		IssueDiff:           b.diff,
 		IssueDiffStats: IssueDiffStats{
 			Changed: b.diffStats.Changed,
 			Total:   b.diffStats.Total,
@@ -1107,13 +1120,7 @@ func generateTUIInsights(
 	return analyzer.GenerateScopedInsights(stats, limit, includeInactive)
 }
 
-func applyRecipeToIssues(issues []model.Issue, analyzer *analysis.Analyzer, stats *analysis.GraphStats, triage map[string]float64, r *recipe.Recipe, now time.Time) ([]model.Issue, error) {
-	if r == nil {
-		return append([]model.Issue(nil), issues...), nil
-	}
-	if err := r.Validate(); err != nil {
-		return nil, err
-	}
+func buildTUIRecipeMetrics(issues []model.Issue, analyzer *analysis.Analyzer, stats *analysis.GraphStats, triage map[string]float64, r *recipe.Recipe, now time.Time) recipe.Metrics {
 	metrics := recipe.Metrics{Triage: triage}
 	if stats != nil {
 		metrics.Graph = stats
@@ -1121,6 +1128,67 @@ func applyRecipeToIssues(issues []model.Issue, analyzer *analysis.Analyzer, stat
 	if analyzer != nil {
 		metrics.Readiness = analyzer.Readiness()
 	}
+	if r == nil {
+		return metrics
+	}
+	if now.IsZero() {
+		if analyzer != nil {
+			now = analyzer.Now()
+		} else {
+			now = time.Now()
+		}
+	}
+	if stats != nil {
+		if r.NeedsSlackScores() {
+			metrics.Slack = stats.Slack()
+		}
+		if r.NeedsKCoreScores() {
+			if activeCore := stats.ActiveCoreNumber(); len(activeCore) > 0 {
+				metrics.KCore = activeCore
+			} else {
+				metrics.KCore = stats.CoreNumber()
+			}
+		}
+		if r.NeedsRiskScores() {
+			issueMap := make(map[string]model.Issue, len(issues))
+			for _, iss := range issues {
+				issueMap[iss.ID] = iss
+			}
+			readiness := metrics.Readiness
+			if readiness == nil {
+				readiness = model.NewReadinessIndex(issues)
+			}
+			riskMap := analysis.ComputeAllRiskSignalsWithReadiness(issueMap, stats, readiness, now)
+			metrics.Risk = make(map[string]float64, len(riskMap))
+			for id, sig := range riskMap {
+				metrics.Risk[id] = sig.CompositeRisk
+			}
+		}
+		if r.NeedsETAScores() {
+			etaCtx := analysis.NewETAContext(issues, stats, now)
+			metrics.ETA = make(map[string]float64, len(issues))
+			for _, iss := range issues {
+				if isClosedLikeStatus(iss.Status) || iss.IsTemplate || iss.Pinned || iss.Status == model.StatusPinned {
+					continue
+				}
+				est := etaCtx.EstimateForIssue(iss, 1)
+				if est.IssueID != "" {
+					metrics.ETA[iss.ID] = est.EstimatedDays
+				}
+			}
+		}
+	}
+	return metrics
+}
+
+func applyRecipeToIssues(issues []model.Issue, analyzer *analysis.Analyzer, stats *analysis.GraphStats, triage map[string]float64, r *recipe.Recipe, now time.Time) ([]model.Issue, error) {
+	if r == nil {
+		return append([]model.Issue(nil), issues...), nil
+	}
+	if err := r.Validate(); err != nil {
+		return nil, err
+	}
+	metrics := buildTUIRecipeMetrics(issues, analyzer, stats, triage, r, now)
 	candidates := issues
 	if analyzer != nil && analyzer.HasCandidateScope() {
 		candidates = make([]model.Issue, 0, len(issues))
@@ -1606,7 +1674,7 @@ func (s *DataSnapshot) WithPhase2(stats *analysis.GraphStats, insights analysis.
 	treeRoots, treeNodeMap := deepCopyTree(s.TreeRoots, s.TreeNodeMap, clonedIssueMap)
 	viewIssues := cloneIssuesForAsync(s.ViewIssues)
 	var listItems []IssueItem
-	if s.recipe != nil && (s.recipe.NeedsGraphMetrics() || s.recipe.NeedsTriageScores()) && analyzer != nil && stats != nil {
+	if s.recipe != nil && (s.recipe.NeedsGraphMetrics() || s.recipe.NeedsTriageScores() || s.recipe.NeedsRiskScores() || s.recipe.NeedsETAScores() || s.recipe.NeedsSlackScores() || s.recipe.NeedsKCoreScores()) && analyzer != nil && stats != nil {
 		if applied, err := applyRecipeToIssues(issuesClone, analyzer, stats, triageScores, s.recipe, analyzer.Now()); err == nil {
 			viewIssues = applied
 			listItems = buildListItems(viewIssues, stats)
@@ -1655,7 +1723,7 @@ func (s *DataSnapshot) WithPhase2(stats *analysis.GraphStats, insights analysis.
 	if s.recipe != nil && strings.TrimSpace(s.recipe.Name) != "" {
 		phase2AlertScope = &baseline.BaselineScope{Recipe: strings.TrimSpace(s.recipe.Name)}
 	}
-	alerts, alertsCritical, alertsWarning, alertsInfo := computeAlertsWithOptions(issuesClone, stats, analyzer, alertComputeOptions{
+	alerts, alertsSkippedChecks, alertsCritical, alertsWarning, alertsInfo := computeAlertsDetailedWithOptions(issuesClone, stats, analyzer, alertComputeOptions{
 		ProjectDir:     s.projectDir,
 		BeadsPath:      s.beadsPath,
 		Scope:          phase2AlertScope,
@@ -1665,24 +1733,25 @@ func (s *DataSnapshot) WithPhase2(stats *analysis.GraphStats, insights analysis.
 	return &DataSnapshot{
 		// Clone mutable Phase 1 data so the new snapshot stays immutable even if
 		// legacy UI state continues mutating its own slices or maps.
-		Issues:         issuesClone,
-		IssueMap:       clonedIssueMap,
-		pooledIssues:   s.pooledIssues,
-		ViewIssues:     viewIssues,
-		ListItems:      listItems, // Deep copy - contains mutable SearchComponents/TriageReasons
-		listModelItems: listModelItems,
-		listIndexByID:  listIndexByID,
-		listOrderHash:  newListOrderHash,
-		semanticIDs:    semanticIDs,
-		semanticDocs:   semanticDocs,
-		alerts:         alerts,
-		alertsCritical: alertsCritical,
-		alertsWarning:  alertsWarning,
-		alertsInfo:     alertsInfo,
-		phase2Triage:   completedTriage,
-		TreeRoots:      treeRoots,                        // Deep copy - tree view mutates these
-		TreeNodeMap:    treeNodeMap,                      // Deep copy - tree view mutates these
-		BoardState:     deepCopyBoardState(s.BoardState), // Deep copy - contains mutable [4][]model.Issue arrays
+		Issues:              issuesClone,
+		IssueMap:            clonedIssueMap,
+		pooledIssues:        s.pooledIssues,
+		ViewIssues:          viewIssues,
+		ListItems:           listItems, // Deep copy - contains mutable SearchComponents/TriageReasons
+		listModelItems:      listModelItems,
+		listIndexByID:       listIndexByID,
+		listOrderHash:       newListOrderHash,
+		semanticIDs:         semanticIDs,
+		semanticDocs:        semanticDocs,
+		alerts:              alerts,
+		alertsSkippedChecks: alertsSkippedChecks,
+		alertsCritical:      alertsCritical,
+		alertsWarning:       alertsWarning,
+		alertsInfo:          alertsInfo,
+		phase2Triage:        completedTriage,
+		TreeRoots:           treeRoots,                        // Deep copy - tree view mutates these
+		TreeNodeMap:         treeNodeMap,                      // Deep copy - tree view mutates these
+		BoardState:          deepCopyBoardState(s.BoardState), // Deep copy - contains mutable [4][]model.Issue arrays
 
 		// Updated with Phase 2 data
 		Analyzer:      analyzer,

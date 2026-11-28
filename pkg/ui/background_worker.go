@@ -179,6 +179,7 @@ type BackgroundWorker struct {
 	projectDir        string
 	sourceDegraded    bool
 	skipSourceDiff    bool
+	forceFullAnalysis bool
 	debounceDelay     time.Duration
 	heartbeatInterval time.Duration
 	watchdogInterval  time.Duration
@@ -268,12 +269,13 @@ type IdleGCConfig struct {
 
 // WorkerConfig configures the BackgroundWorker.
 type WorkerConfig struct {
-	BeadsPath      string
-	ProjectDir     string
-	SourceDegraded bool
-	SkipSourceDiff bool
-	SourceReload   func(context.Context) (SourceReloadResult, error)
-	DebounceDelay  time.Duration
+	BeadsPath         string
+	ProjectDir        string
+	SourceDegraded    bool
+	SkipSourceDiff    bool
+	ForceFullAnalysis bool
+	SourceReload      func(context.Context) (SourceReloadResult, error)
+	DebounceDelay     time.Duration
 
 	IdleGC *IdleGCConfig
 
@@ -347,6 +349,7 @@ func NewBackgroundWorker(cfg WorkerConfig) (*BackgroundWorker, error) {
 		projectDir:        cfg.ProjectDir,
 		sourceDegraded:    cfg.SourceDegraded,
 		skipSourceDiff:    cfg.SkipSourceDiff,
+		forceFullAnalysis: cfg.ForceFullAnalysis,
 		sourceReload:      cfg.SourceReload,
 		debounceDelay:     cfg.DebounceDelay,
 		heartbeatInterval: cfg.HeartbeatInterval,
@@ -1812,7 +1815,8 @@ func (w *BackgroundWorker) buildSnapshotResultContext(ctx context.Context, force
 			WithSkipSourceDiff(skipSourceDiff).
 			WithRecipe(currentRecipe).
 			WithWeights(feedbackWeightsForBeadsPath(effectiveBeadsPath)).
-			WithBuildConfig(snapshotBuildConfigForTier(tier))
+			WithBuildConfig(snapshotBuildConfigForTier(tier)).
+			WithForceFullAnalysis(w.forceFullAnalysis)
 		if prevSnapshot != nil {
 			builder.WithPreviousSnapshot(prevSnapshot, diff)
 		}

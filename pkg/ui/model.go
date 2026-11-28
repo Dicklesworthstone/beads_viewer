@@ -406,7 +406,7 @@ func (m *Model) SetExplicitDB(explicit bool) {
 	}
 	m.isExplicitDB = explicit
 	if m.analysis != nil && m.analyzer != nil {
-		m.alerts, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlertsWithOptions(m.issues, m.analysis, m.analyzer, m.alertOptions())
+		m.alerts, m.alertsSkippedChecks, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlertsDetailedWithOptions(m.issues, m.analysis, m.analyzer, m.alertOptions())
 		m.recomputeVisibleAlertCounts()
 	}
 }
@@ -2681,9 +2681,11 @@ type ReadinessScope struct {
 	CandidateIDs        map[string]bool
 	LabelFilter         string
 	RepoFilter          string
+	GraphRoot           string
 	AuthorityIncomplete bool
 	SourceDegraded      bool
 	ExplicitDB          bool
+	ForceFullAnalysis   bool
 	ReferenceNow        time.Time
 }
 
@@ -2707,7 +2709,9 @@ type Model struct {
 	candidateIDs             map[string]bool              // Owned selection; graph context remains in issues.
 	scopeLabelFilter         string                       // Optional CLI --label filter for dynamic historical scoping.
 	scopeRepoFilter          string                       // Optional CLI --repo filter for dynamic historical scoping.
+	scopeGraphRoot           string                       // Optional CLI --graph-root epic/node scope (W36-5).
 	scopeRecipeFilter        string                       // Immutable startup CLI --recipe scope paired with candidateIDs (P17-2).
+	forceFullAnalysis        bool                         // CLI --force-full-analysis: compute exact Phase 2 metrics regardless of graph size (W36-1).
 	authorityHash            string                       // Full authority hash (including tombstones) for export provenance.
 	authorityIncomplete      bool                         // True when authority is incomplete, historical, or warned.
 	sourceDegraded           bool                         // True when discovery fell back to a stale/degraded source.
@@ -2954,6 +2958,7 @@ type Model struct {
 
 	// Alerts panel (bv-168)
 	alerts                 []drift.Alert
+	alertsSkippedChecks    []drift.SkippedCheck
 	alertsCritical         int
 	alertsWarning          int
 	alertsInfo             int
@@ -2993,6 +2998,12 @@ type Model struct {
 	boardScopedDataGen   uint64
 	boardScopedScopeKey  string
 	boardScopedRefNow    int64
+	scopedRiskCache      map[string]analysis.RiskSignals
+	scopedRiskStatsRef   *analysis.GraphStats
+	scopedRiskPhase2     bool
+	scopedRiskDataGen    uint64
+	scopedRiskScopeKey   string
+	scopedRiskRefNow     int64
 
 	// Concurrently readable active internal watcher/worker path for external sibling watcher Sync.
 	internalWatchedPath *atomic.Pointer[string]
@@ -3989,7 +4000,7 @@ func (m *Model) SetAsOfRevision(rev string) {
 	m.historyView.SetReport(nil)
 	m.historyView.SetOrphans(nil, 0)
 	if m.analysis != nil && m.analyzer != nil {
-		m.alerts, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlertsWithOptions(m.issues, m.analysis, m.analyzer, m.alertOptions())
+		m.alerts, m.alertsSkippedChecks, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlertsDetailedWithOptions(m.issues, m.analysis, m.analyzer, m.alertOptions())
 		m.recomputeVisibleAlertCounts()
 	}
 }
@@ -4049,8 +4060,9 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 	// Graph Analysis - Phase 1 is instant, Phase 2 runs in background
 	analyzer := analysis.NewAnalyzer(issues)
 	var candidateIDs map[string]bool
-	var scopeLabelFilter, scopeRepoFilter, scopeRecipeFilter string
+	var scopeLabelFilter, scopeRepoFilter, scopeGraphRoot, scopeRecipeFilter string
 	var referenceNow time.Time
+	forceFullAnalysis := false
 	if activeRecipe != nil {
 		scopeRecipeFilter = strings.TrimSpace(activeRecipe.Name)
 	}
@@ -4063,6 +4075,8 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 		}
 		scopeLabelFilter = strings.TrimSpace(scope[0].LabelFilter)
 		scopeRepoFilter = strings.TrimSpace(scope[0].RepoFilter)
+		scopeGraphRoot = strings.TrimSpace(scope[0].GraphRoot)
+		forceFullAnalysis = scope[0].ForceFullAnalysis
 		if !scope[0].ReferenceNow.IsZero() {
 			referenceNow = scope[0].ReferenceNow
 			analyzer.SetNow(referenceNow)
@@ -4076,11 +4090,18 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 		analyzer.SetWeights(*initialWeights)
 	}
 	analysisCtx, analysisCancel := context.WithCancel(context.Background())
-	graphStats := analyzer.AnalyzeAsync(analysisCtx)
+	var graphStats *analysis.GraphStats
+	if forceFullAnalysis {
+		fullCfg := analysis.FullAnalysisConfig()
+		analyzer.SetConfig(&fullCfg)
+		graphStats = analyzer.AnalyzeAsyncWithConfig(analysisCtx, fullCfg)
+	} else {
+		graphStats = analyzer.AnalyzeAsync(analysisCtx)
+	}
 
 	// Sort issues
 	if activeRecipe != nil && activeRecipe.Sort.Field != "" {
-		recipe.SortIssues(issues, recipe.Metrics{Graph: graphStats}, activeRecipe)
+		recipe.SortIssues(issues, buildTUIRecipeMetrics(issues, analyzer, graphStats, nil, activeRecipe, referenceNow), activeRecipe)
 	} else {
 		// Default Sort: Open first, then by Priority (ascending), then by date (newest first)
 		sort.Slice(issues, func(i, j int) bool {
@@ -4274,11 +4295,12 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 
 	if beadsPath != "" && !isGitRefSource && backgroundModeRequested {
 		bw, err := NewBackgroundWorker(WorkerConfig{
-			BeadsPath:      beadsPath,
-			ProjectDir:     workDir,
-			SourceDegraded: sourceDegraded,
-			SkipSourceDiff: isExplicitDB,
-			DebounceDelay:  200 * time.Millisecond,
+			BeadsPath:         beadsPath,
+			ProjectDir:        workDir,
+			SourceDegraded:    sourceDegraded,
+			SkipSourceDiff:    isExplicitDB,
+			ForceFullAnalysis: forceFullAnalysis,
+			DebounceDelay:     200 * time.Millisecond,
 		})
 		if err != nil {
 			backgroundModeErr = err
@@ -4367,18 +4389,19 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 
 	// Precompute drift/health alerts (bv-168)
 	var initAlertScope *baseline.BaselineScope
-	if scopeLabelFilter != "" || scopeRepoFilter != "" || (activeRecipe != nil && strings.TrimSpace(activeRecipe.Name) != "") {
+	if scopeLabelFilter != "" || scopeRepoFilter != "" || scopeGraphRoot != "" || (activeRecipe != nil && strings.TrimSpace(activeRecipe.Name) != "") {
 		recipeName := ""
 		if activeRecipe != nil {
 			recipeName = strings.TrimSpace(activeRecipe.Name)
 		}
 		initAlertScope = &baseline.BaselineScope{
-			Label:  strings.TrimSpace(scopeLabelFilter),
-			Repo:   strings.TrimSpace(scopeRepoFilter),
-			Recipe: recipeName,
+			Label:     strings.TrimSpace(scopeLabelFilter),
+			Repo:      strings.TrimSpace(scopeRepoFilter),
+			GraphRoot: strings.TrimSpace(scopeGraphRoot),
+			Recipe:    recipeName,
 		}
 	}
-	alerts, alertsCritical, alertsWarning, alertsInfo := computeAlertsWithOptions(issues, graphStats, analyzer, alertComputeOptions{
+	alerts, alertsSkippedChecks, alertsCritical, alertsWarning, alertsInfo := computeAlertsDetailedWithOptions(issues, graphStats, analyzer, alertComputeOptions{
 		ProjectDir:     workDir,
 		BeadsPath:      beadsPath,
 		CandidateIDs:   candidateIDs,
@@ -4425,7 +4448,9 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 		candidateIDs:                   candidateIDs,
 		scopeLabelFilter:               scopeLabelFilter,
 		scopeRepoFilter:                scopeRepoFilter,
+		scopeGraphRoot:                 scopeGraphRoot,
 		scopeRecipeFilter:              scopeRecipeFilter,
+		forceFullAnalysis:              forceFullAnalysis,
 		authorityHash:                  authorityHash,
 		referenceNow:                   referenceNow,
 		asOfRevision:                   asOfRevision,
@@ -4497,11 +4522,12 @@ func NewModel(issues []model.Issue, activeRecipe *recipe.Recipe, beadsPath strin
 		statusIsError:       initialStatusErr,
 		historyLoading:      len(issues) > 0, // Will be loaded in Init()
 		// Alerts panel (bv-168)
-		alerts:          alerts,
-		alertsCritical:  alertsCritical,
-		alertsWarning:   alertsWarning,
-		alertsInfo:      alertsInfo,
-		dismissedAlerts: make(map[string]bool),
+		alerts:              alerts,
+		alertsSkippedChecks: alertsSkippedChecks,
+		alertsCritical:      alertsCritical,
+		alertsWarning:       alertsWarning,
+		alertsInfo:          alertsInfo,
+		dismissedAlerts:     make(map[string]bool),
 		// Sprint view (bv-161, bv-apal.28)
 		sprints:                sprints,
 		sprintsLoadedFromDisk:  sprintsLoadedFromDisk,
@@ -4563,7 +4589,7 @@ func (m *Model) SetWorkDir(dir string) {
 		if driftCfg, err := drift.LoadConfig(m.workDir); err == nil && driftCfg != nil {
 			m.sprintAtRiskThresholds = driftCfg.AtRiskThresholds()
 		}
-		m.alerts, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlertsWithOptions(m.issues, m.analysis, m.analyzer, m.alertOptions())
+		m.alerts, m.alertsSkippedChecks, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlertsDetailedWithOptions(m.issues, m.analysis, m.analyzer, m.alertOptions())
 		m.recomputeVisibleAlertCounts()
 	}
 }
@@ -5119,6 +5145,7 @@ func (m *Model) recordTriageFeedback(action string) {
 		}
 		m.boardScopedAnalyzer = nil
 		m.boardScopedPrioHints = nil
+		m.scopedRiskCache = nil
 		m.updateListDelegate()
 		if m.activeRecipe != nil && m.sortMode == SortDefault {
 			m.applyRecipe(m.activeRecipe)
@@ -5169,6 +5196,12 @@ func (m *Model) syncBoardReadinessAndFullIssues() {
 	}
 	if m.analyzer != nil {
 		m.board.SetReadiness(m.analyzer.Readiness())
+	}
+	m.board.SetPriorityHints(m.activeScopePriorityHints())
+	if m.isBoardView {
+		m.board.SetRiskByID(m.activeScopeRiskMap())
+	} else {
+		m.board.SetRiskByID(nil)
 	}
 	if m.workspaceMode && m.activeRepos != nil {
 		m.board.SetFullIssues(m.repoScopedIssues())
@@ -5223,7 +5256,14 @@ func (m *Model) activeScopeAnalysis() (*analysis.Analyzer, *analysis.GraphStats,
 	} else {
 		an.SetReadinessScope(model.NewReadinessIndex(m.issues), candidates)
 	}
-	stats := an.Analyze()
+	var stats analysis.GraphStats
+	if m.forceFullAnalysis {
+		fullCfg := analysis.FullAnalysisConfig()
+		an.SetConfig(&fullCfg)
+		stats = an.AnalyzeWithConfig(fullCfg)
+	} else {
+		stats = an.Analyze()
+	}
 	var etaCtx *analysis.ETAContext
 	if etaScoped := m.candidateScopedIssues(); len(etaScoped) > 0 {
 		etaCtx = analysis.NewETAContext(etaScoped, &stats, now)
@@ -5251,6 +5291,64 @@ func (m *Model) activeScopePriorityHints() map[string]*analysis.PriorityRecommen
 	}
 	_, _, _ = m.activeScopeAnalysis()
 	return m.boardScopedPrioHints
+}
+
+// activeScopeRiskMap computes and caches operational risk signals for all active issues
+// in the current repo/filter scope so Board, Tree, and Actionable share consistent risk badges (W33-5).
+func (m *Model) activeScopeRiskMap() map[string]analysis.RiskSignals {
+	scopeAn, scopeStats, _ := m.activeScopeAnalysis()
+	if scopeStats == nil {
+		return nil
+	}
+	scopeKey := m.etaScopeKey()
+	now := m.analysisReferenceTime()
+	nowBucket := now.Unix() / 60
+	if !m.referenceNow.IsZero() || m.analyzer != nil {
+		nowBucket = now.UnixNano()
+	}
+	phase2 := scopeStats.IsPhase2Ready()
+	if m.scopedRiskCache != nil &&
+		m.scopedRiskStatsRef == scopeStats &&
+		m.scopedRiskPhase2 == phase2 &&
+		m.scopedRiskDataGen == m.semanticDataGeneration &&
+		m.scopedRiskScopeKey == scopeKey &&
+		m.scopedRiskRefNow == nowBucket {
+		return m.scopedRiskCache
+	}
+	scoped := m.repoScopedIssues()
+	if len(scoped) == 0 {
+		return nil
+	}
+	var readiness *model.ReadinessIndex
+	if scopeAn != nil {
+		readiness = scopeAn.Readiness()
+	} else {
+		readiness = m.exportReadiness()
+	}
+	issueValMap := make(map[string]model.Issue, len(scoped))
+	for _, iss := range scoped {
+		issueValMap[iss.ID] = iss
+	}
+	weights := analysis.DefaultRiskWeights()
+	riskMap := make(map[string]analysis.RiskSignals, len(scoped))
+	refUTC := now.UTC()
+	for _, iss := range scoped {
+		if isClosedLikeStatus(iss.Status) || iss.Status.IsTombstone() || iss.IsTemplate || iss.Pinned || iss.Status == model.StatusPinned {
+			continue
+		}
+		issCopy := iss
+		sig := analysis.ComputeRiskSignalsWithReadiness(&issCopy, scopeStats, issueValMap, readiness, refUTC, weights)
+		if sig.CompositeRisk > 0 {
+			riskMap[iss.ID] = sig
+		}
+	}
+	m.scopedRiskCache = riskMap
+	m.scopedRiskStatsRef = scopeStats
+	m.scopedRiskPhase2 = phase2
+	m.scopedRiskDataGen = m.semanticDataGeneration
+	m.scopedRiskScopeKey = scopeKey
+	m.scopedRiskRefNow = nowBucket
+	return riskMap
 }
 
 func (m *Model) currentAdvancedInsightsKey() advancedInsightsCacheKey {
@@ -5376,6 +5474,17 @@ func (m *Model) rebuildInsightsPanel() {
 	panel.SetGlobalCapacity(m.computeGlobalCapacitySummary(scoped, scopedStats))
 	panel.SetFeedbackSummary(m.feedbackSummary)
 	panel.SetPriorityHints(m.activeScopePriorityHints())
+	var crossRepoCandidates map[string]bool
+	if m.candidateIDs != nil {
+		crossRepoCandidates = make(map[string]bool, len(scoped))
+		for i := range scoped {
+			if m.candidateIDs[scoped[i].ID] {
+				crossRepoCandidates[scoped[i].ID] = true
+			}
+		}
+	}
+	panel.SetCrossRepoFlow(analysis.ComputeCrossRepoFlow(scoped, crossRepoCandidates))
+	panel.SetRiskByID(m.activeScopeRiskMap())
 
 	panelHeight := m.height - 2
 	if panelHeight < 3 {
@@ -6137,8 +6246,9 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Dispatch single "g" as graph toggle
 			if msg.key == "g" && !m.isGraphView {
 				m.isGraphView = true
-				m.isBoardView = false
-				m.isActionableView = false
+				m.exitBoardView()
+				m.exitActionableView()
+				m.exitTreeView()
 				m.exitHistoryView()
 				m.focused = focusGraph
 				m.refreshBoardAndGraphForCurrentFilter()
@@ -6280,12 +6390,13 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Refresh alerts now that full Phase 2 metrics (cycles, etc.) are available
 		if msg.prepared != nil && m.candidateIDs == nil && !m.workspaceMode &&
-			m.scopeLabelFilter == "" && m.scopeRepoFilter == "" &&
+			m.scopeLabelFilter == "" && m.scopeRepoFilter == "" && m.scopeGraphRoot == "" &&
 			m.scopeRecipeFilter == "" && m.activeRecipe == nil && !m.isExplicitDB && m.asOfRevision == "" && m.referenceNow.IsZero() {
 			m.alerts = msg.prepared.alerts
+			m.alertsSkippedChecks = msg.prepared.alertsSkippedChecks
 			m.alertsCritical, m.alertsWarning, m.alertsInfo = msg.prepared.alertsCritical, msg.prepared.alertsWarning, msg.prepared.alertsInfo
 		} else {
-			m.alerts, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlertsWithOptions(m.issues, m.analysis, m.analyzer, m.alertOptions())
+			m.alerts, m.alertsSkippedChecks, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlertsDetailedWithOptions(m.issues, m.analysis, m.analyzer, m.alertOptions())
 		}
 		m.recomputeVisibleAlertCounts()
 
@@ -6410,7 +6521,7 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.historyOrphanRatio = msg.OrphanRatio
 			m.historyOrphanRepoKeys = msg.OrphanRepoKeys
 			m.historyOrphanRootStats = msg.OrphanRootStats
-			m.historyView.SetReport(m.scopeHistoryReportForActiveRepos(msg.Report))
+			m.historyView.SetReportAndIssues(m.scopeHistoryReportForActiveRepos(msg.Report), m.issues)
 			scopedOrphans, scopedRatio := m.scopeHistoryOrphansForActiveRepos(msg.Orphans)
 			m.historyView.SetOrphans(scopedOrphans, scopedRatio)
 			m.syncHistoryCassSessions()
@@ -6778,7 +6889,6 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.countBlocked = msg.Snapshot.CountBlocked
 			m.countClosed = msg.Snapshot.CountClosed
 		}
-		m.syncBoardReadinessAndFullIssues()
 		oldPooled := m.pooledIssues
 		m.pooledIssues = nil
 		// Preserve existing triage data unless the snapshot has Phase 2 results.
@@ -6793,14 +6903,12 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.blockerSet = msg.Snapshot.BlockerSet
 		}
 
-		// Clear caches that need recomputation
+		// Clear caches that need recomputation (P24A-7: nil out priorityHints instead of
+		// clearing in-place so BoardModel/GraphModel never alias a mutated map, at zero alloc).
 		m.labelHealthCached = false
 		m.attentionCached = false
-		if m.priorityHints == nil {
-			m.priorityHints = make(map[string]*analysis.PriorityRecommendation)
-		} else {
-			clear(m.priorityHints)
-		}
+		m.priorityHints = nil
+		m.scopedRiskCache = nil
 		if m.labelDrilldownCache == nil {
 			m.labelDrilldownCache = make(map[string][]model.Issue)
 		} else {
@@ -6816,11 +6924,12 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 			clear(m.dismissedAlerts)
 		}
 		if m.candidateIDs != nil || !m.referenceNow.IsZero() || m.workspaceMode ||
-			m.scopeLabelFilter != "" || m.scopeRepoFilter != "" ||
+			m.scopeLabelFilter != "" || m.scopeRepoFilter != "" || m.scopeGraphRoot != "" ||
 			m.scopeRecipeFilter != "" || m.activeRecipe != nil || m.isExplicitDB || m.asOfRevision != "" {
-			m.alerts, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlertsWithOptions(m.issues, m.analysis, m.analyzer, m.alertOptions())
+			m.alerts, m.alertsSkippedChecks, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlertsDetailedWithOptions(m.issues, m.analysis, m.analyzer, m.alertOptions())
 		} else {
 			m.alerts = msg.Snapshot.alerts
+			m.alertsSkippedChecks = msg.Snapshot.alertsSkippedChecks
 			m.alertsCritical = msg.Snapshot.alertsCritical
 			m.alertsWarning = msg.Snapshot.alertsWarning
 			m.alertsInfo = msg.Snapshot.alertsInfo
@@ -6830,8 +6939,9 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.showAlertsPanel = false
 
 		// Invalidate every async semantic result from the previous dataset before
-		// scheduling current-generation replacements.
+		// scheduling current-generation replacements and syncing board telemetry (P24A-7).
 		m.beginSemanticDatasetUpdate()
+		m.syncBoardReadinessAndFullIssues()
 		if historyCmd := m.startHistoryLoad(); historyCmd != nil {
 			cmds = append(cmds, historyCmd)
 		}
@@ -7416,7 +7526,13 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.graphView.SetAnalyzer(m.analyzer, m.analysisReferenceTime)
 		m.cancelOwnedAnalysis()
 		analysisCtx, analysisCancel := context.WithCancel(context.Background())
-		m.analysis = cachedAnalyzer.AnalyzeAsync(analysisCtx)
+		if m.forceFullAnalysis {
+			fullCfg := analysis.FullAnalysisConfig()
+			cachedAnalyzer.SetConfig(&fullCfg)
+			m.analysis = cachedAnalyzer.AnalyzeAsyncWithConfig(analysisCtx, fullCfg)
+		} else {
+			m.analysis = cachedAnalyzer.AnalyzeAsync(analysisCtx)
+		}
 		cacheHit := cachedAnalyzer.WasCacheHit()
 		if !cacheHit {
 			m.ownedAnalysis = m.analysis
@@ -7487,7 +7603,7 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if profileRefresh {
 			alertsStart = time.Now()
 		}
-		m.alerts, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlertsWithOptions(m.issues, m.analysis, m.analyzer, m.alertOptions())
+		m.alerts, m.alertsSkippedChecks, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlertsDetailedWithOptions(m.issues, m.analysis, m.analyzer, m.alertOptions())
 		m.cancelCassPrefetch()
 		if profileRefresh {
 			recordTiming("alerts", time.Since(alertsStart))
@@ -7712,12 +7828,13 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			if autoAllowed || m.restoreBackgroundAfterEdit {
 				bw, err := NewBackgroundWorker(WorkerConfig{
-					BeadsPath:      m.beadsPath,
-					ProjectDir:     m.workDir,
-					SourceDegraded: m.sourceDegraded,
-					SkipSourceDiff: m.isExplicitDB,
-					SourceReload:   m.sourceReload,
-					DebounceDelay:  200 * time.Millisecond,
+					BeadsPath:         m.beadsPath,
+					ProjectDir:        m.workDir,
+					SourceDegraded:    m.sourceDegraded,
+					SkipSourceDiff:    m.isExplicitDB,
+					ForceFullAnalysis: m.forceFullAnalysis,
+					SourceReload:      m.sourceReload,
+					DebounceDelay:     200 * time.Millisecond,
 				})
 				if err == nil {
 					if m.watcher != nil {
@@ -8215,10 +8332,16 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, m.pendingSemanticFilterCmd()
 				case "c", "y":
 					if m.suggestionsCursor >= 0 && m.suggestionsCursor < len(suggestions) {
-						cmdText := strings.TrimSpace(suggestions[m.suggestionsCursor].ActionCommand)
+						sg := suggestions[m.suggestionsCursor]
+						cmdText := strings.TrimSpace(sg.ActionCommand)
 						if cmdText != "" {
+							if !m.canEmitSuggestionCommand(sg) {
+								m.statusMsg = "Action command withheld on read-only, unrouted workspace, or provisional source"
+								m.statusIsError = false
+								return m, nil
+							}
 							m.clipboardRequestID++
-							return m, copyToClipboardStatusCmd(cmdText, fmt.Sprintf("📋 Copied command for %s", suggestions[m.suggestionsCursor].TargetBead), m.clipboardRequestID)
+							return m, copyToClipboardStatusCmd(cmdText, fmt.Sprintf("📋 Copied command for %s", sg.TargetBead), m.clipboardRequestID)
 						}
 						m.statusMsg = "No action command for this suggestion"
 						m.statusIsError = false
@@ -8272,11 +8395,36 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 					if m.alertsCursor < 0 {
 						m.alertsCursor = 0
 					}
-					if remaining == 0 {
-						m.showAlertsPanel = false
-						m.focused = m.restoreTopModalOrListFocus()
-						m.ensureActiveModalInputFocus()
+					if remaining == 0 && len(m.alertsSkippedChecks) == 0 {
+						if len(m.activeScopedSuggestions()) > 0 {
+							m.alertsTab = 1
+							m.suggestionsCursor = 0
+						} else {
+							m.showAlertsPanel = false
+							m.focused = m.restoreTopModalOrListFocus()
+							m.ensureActiveModalInputFocus()
+						}
 					}
+					if m.isSplitView {
+						m.updateViewportContent()
+					}
+				}
+				return m, nil
+			case "c", "y":
+				if m.alertsCursor >= 0 && m.alertsCursor < len(activeAlerts) {
+					al := activeAlerts[m.alertsCursor]
+					action := strings.TrimSpace(al.SuggestedAction)
+					if action != "" {
+						if !m.canEmitMutationCommandForIssues(al.IssueID, al.RelatedIssueID) {
+							m.statusMsg = "Suggested action withheld on read-only, workspace, or provisional source"
+							m.statusIsError = false
+							return m, nil
+						}
+						m.clipboardRequestID++
+						return m, copyToClipboardStatusCmd(action, "📋 Copied suggested action", m.clipboardRequestID)
+					}
+					m.statusMsg = "No suggested action for this alert"
+					m.statusIsError = false
 				}
 				return m, nil
 			case "S":
@@ -8707,6 +8855,7 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.insightsPanel.HeatmapBack()
 						return m, nil
 					}
+					m.insightsPanel.SetCycleCutPreflight(nil)
 					m.focused = focusList
 					return m, nil
 				}
@@ -8727,11 +8876,12 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.board.HideDetail()
 					m.board.CancelSearch()
 					m.board.CollapseExpanded()
-					m.isBoardView = false
+					m.exitBoardView()
 					m.focused = focusList
 					return m, nil
 				}
 				if m.isActionableView {
+					m.actionableView.ClearWhatIfBatch()
 					m.isActionableView = false
 					m.focused = focusList
 					return m, nil
@@ -8757,6 +8907,7 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 				if m.focused == focusTree {
+					m.exitTreeView()
 					m.focused = focusList
 					return m, nil
 				}
@@ -8779,6 +8930,13 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.insightsPanel.HeatmapBack()
 						return m, nil
 					}
+					if m.insightsPanel.focusedPanel == PanelCycles && m.insightsPanel.CycleCutPreflight() != nil {
+						m.insightsPanel.SetCycleCutPreflight(nil)
+						m.statusMsg = "Cycle-cut preflight cleared"
+						m.statusIsError = false
+						return m, nil
+					}
+					m.insightsPanel.SetCycleCutPreflight(nil)
 					m.focused = focusList
 					return m, nil
 				}
@@ -8792,8 +8950,19 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				if m.isGraphView {
 					if m.graphView.CheckDepActive() {
+						isRemove := m.graphView.CheckDepResult() != nil && m.graphView.CheckDepResult().Operation == "remove"
 						m.graphView.ClearCheckDep()
-						m.statusMsg = "Check Add Dep cleared"
+						if isRemove {
+							m.statusMsg = "Check Remove Dep cleared"
+						} else {
+							m.statusMsg = "Check Add Dep cleared"
+						}
+						m.statusIsError = false
+						return m, nil
+					}
+					if m.graphView.HasWhatIfBatch() {
+						m.graphView.ClearWhatIfBatch()
+						m.statusMsg = "Batch What-If cleared"
 						m.statusIsError = false
 						return m, nil
 					}
@@ -8818,11 +8987,23 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.board.CollapseExpanded()
 						return m, nil
 					}
-					m.isBoardView = false
+					if m.board.HasWhatIfBatch() {
+						m.board.ClearWhatIfBatch()
+						m.statusMsg = "Batch What-If cleared"
+						m.statusIsError = false
+						return m, nil
+					}
+					m.exitBoardView()
 					m.focused = focusList
 					return m, nil
 				}
 				if m.isActionableView {
+					if m.actionableView.HasWhatIfBatch() {
+						m.actionableView.ClearWhatIfBatch()
+						m.statusMsg = "Batch What-If cleared"
+						m.statusIsError = false
+						return m, nil
+					}
 					m.isActionableView = false
 					m.focused = focusList
 					return m, nil
@@ -8831,6 +9012,18 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 					if m.historyReportIsCurrent() && m.historyView.FileTreeHasFocus() {
 						m, cmd = m.handleHistoryKeys(msg)
 						return m, cmd
+					}
+					if m.historyReportIsCurrent() && m.historyView.IsHotspotsMode() {
+						if strings.TrimSpace(m.historyView.SearchQuery()) != "" {
+							m.historyView.CancelSearch()
+							m.statusMsg = "🔍 Hotspot search cleared"
+							m.statusIsError = false
+							return m, nil
+						}
+						m.historyView.ToggleHotspotsMode()
+						m.statusMsg = "◈ Returned to History mode"
+						m.statusIsError = false
+						return m, nil
 					}
 					if m.historyReportIsCurrent() && (m.historyView.SearchQuery() != "" || m.historyView.HasActiveFilters()) {
 						m.historyView.ClearFilters()
@@ -8859,8 +9052,15 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.focused = focusList
 					return m, nil
 				}
-				// Exit tree view cleanly to list while preserving any active list filters
+				// Exit tree view cleanly to list while preserving any active list filters;
+				// first Esc clears an active Tree Batch What-If (matching Graph/Board/Actionable).
 				if m.focused == focusTree {
+					if m.tree.HasWhatIfBatch() {
+						m.tree.ClearWhatIfBatch()
+						m.statusMsg = "Batch What-If cleared"
+						m.statusIsError = false
+						return m, nil
+					}
 					m.focused = focusList
 					return m, nil
 				}
@@ -8963,6 +9163,26 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 				case "V":
 					cmds = append(cmds, m.showCassSessionModal())
 					viewToggleHandled = true
+				case "X":
+					m.handleInsightsCheckDepRemovalKey()
+					viewToggleHandled = true
+				case "c":
+					if m.insightsPanel.focusedPanel == PanelCycles {
+						if preflight := m.insightsPanel.CycleCutPreflight(); preflight != nil {
+							liveRes := m.evaluateGraphCheckDepRemoval(preflight.FromID, preflight.ToID, m.insightsPanel.issueMap)
+							m.insightsPanel.SetCycleCutPreflight(liveRes)
+							if liveRes.Command != "" {
+								cmds = append(cmds, m.copyTextToClipboardCmd(liveRes.Command, "📋 Copied: "+liveRes.Command))
+							} else {
+								m.statusMsg = "No writable br/bd dep remove command available for this check"
+								m.statusIsError = false
+							}
+						} else {
+							m.statusMsg = "Press X on a cycle first to preflight a cycle-cut removal command"
+							m.statusIsError = false
+						}
+						viewToggleHandled = true
+					}
 				case "+", "-":
 					if m.insightsPanel.focusedPanel == PanelPriority && (!m.insightsPanel.showHeatmap || m.insightsPanel.heatmapDrill) {
 						action := "accept"
@@ -9007,6 +9227,11 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.pendingComboKey = ""
 					m, cmd = m.handleBoardKeys(msg)
 					cmds = append(cmds, cmd)
+					viewToggleHandled = true
+				case "W":
+					// Multi-issue Batch What-If simulation in Board view (W35-6)
+					m.pendingComboKey = ""
+					m.handleBoardWhatIfBatchKey()
 					viewToggleHandled = true
 				case "V":
 					// Session preview for the focused board card (E4)
@@ -9112,17 +9337,31 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 					"J", "K", " ", "enter":
 					m = m.handleGraphKeys(msg)
 					viewToggleHandled = true
+				case "W":
+					m.handleGraphWhatIfBatchKey()
+					viewToggleHandled = true
 				case "D":
 					m.handleGraphCheckDepKey()
 					viewToggleHandled = true
+				case "X":
+					m.handleGraphCheckDepRemovalKey()
+					viewToggleHandled = true
 				case "c":
 					if res := m.graphView.CheckDepResult(); res != nil {
-						// P20A-2: Re-evaluate against live graph/read-only state before copying
+						// P20A-2 / W33-2: Re-evaluate against live graph/read-only state before copying
 						// so time-travel entry, background reloads, or authority degradation cannot copy stale commands.
-						liveRes := m.evaluateGraphCheckDep(res.FromID, res.ToID)
+						var liveRes *graphCheckDepResult
+						if res.Operation == "remove" {
+							liveRes = m.evaluateGraphCheckDepRemoval(res.FromID, res.ToID, m.graphView.issueMap)
+						} else {
+							liveRes = m.evaluateGraphCheckDep(res.FromID, res.ToID)
+						}
 						m.graphView.SetCheckDepResult(liveRes)
 						if liveRes.Command != "" {
 							cmds = append(cmds, m.copyTextToClipboardCmd(liveRes.Command, "📋 Copied: "+liveRes.Command))
+						} else if res.Operation == "remove" {
+							m.statusMsg = "No writable br/bd dep remove command available for this check"
+							m.statusIsError = false
 						} else {
 							m.statusMsg = "No writable br/bd dep add command available for this check"
 							m.statusIsError = false
@@ -9130,15 +9369,53 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 					} else if m.graphView.CheckDepActive() {
 						m.statusMsg = "No writable br/bd dep add command available for this check"
 						m.statusIsError = false
+					} else if sel := m.graphView.SelectedIssue(); sel != nil {
+						if cb := m.graphView.MatchingCycleBreak(sel.ID); cb != nil {
+							remRes := m.evaluateGraphCheckDepRemoval(cb.EdgeFrom, cb.EdgeTo, m.graphView.issueMap)
+							if remRes.Command != "" {
+								detail := ""
+								if remRes.CyclesBefore > 0 {
+									switch {
+									case remRes.CyclesTruncated && remRes.WouldBreakAllCycles:
+										detail = fmt.Sprintf(" (capped: ≥%d → acyclic, +%d unblocked)", remRes.CyclesBefore, len(remRes.NewlyUnblocked))
+									case remRes.CyclesTruncated && remRes.CyclesBroken > 0:
+										detail = fmt.Sprintf(" (capped: ≥%d broken, +%d unblocked)", remRes.CyclesBroken, len(remRes.NewlyUnblocked))
+									case remRes.CyclesTruncated:
+										detail = fmt.Sprintf(" (capped, inconclusive, +%d unblocked)", len(remRes.NewlyUnblocked))
+									case remRes.WouldBreakAllCycles:
+										detail = fmt.Sprintf(" (breaks %d/%d → acyclic, +%d unblocked)", remRes.CyclesBroken, remRes.CyclesBefore, len(remRes.NewlyUnblocked))
+									default:
+										detail = fmt.Sprintf(" (breaks %d/%d cycles, +%d unblocked)", remRes.CyclesBroken, remRes.CyclesBefore, len(remRes.NewlyUnblocked))
+									}
+								}
+								cmds = append(cmds, m.copyTextToClipboardCmd(remRes.Command, "📋 Copied cycle-cut: "+remRes.Command+detail))
+							} else {
+								m.statusMsg = "No writable br/bd dep remove command available for cycle cut"
+								m.statusIsError = false
+							}
+						} else {
+							m.statusMsg = "Press D to check add dep or X to preflight remove dep"
+							m.statusIsError = false
+						}
 					} else {
-						m.statusMsg = "Press D in Graph view to check adding a dependency (A → B)"
+						m.statusMsg = "Press D to check add dep or X to preflight remove dep"
 						m.statusIsError = false
 					}
 					viewToggleHandled = true
 				case "esc":
 					if m.graphView.CheckDepActive() {
+						isRemove := m.graphView.CheckDepResult() != nil && m.graphView.CheckDepResult().Operation == "remove"
 						m.graphView.ClearCheckDep()
-						m.statusMsg = "Check Add Dep cleared"
+						if isRemove {
+							m.statusMsg = "Check Remove Dep cleared"
+						} else {
+							m.statusMsg = "Check Add Dep cleared"
+						}
+						m.statusIsError = false
+						viewToggleHandled = true
+					} else if m.graphView.HasWhatIfBatch() {
+						m.graphView.ClearWhatIfBatch()
+						m.statusMsg = "Batch What-If cleared"
 						m.statusIsError = false
 						viewToggleHandled = true
 					}
@@ -9188,6 +9465,10 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.pendingComboKey = ""
 					m = m.handleTreeKeys(msg)
 					viewToggleHandled = true
+				case "W":
+					m.pendingComboKey = ""
+					m.handleTreeWhatIfBatchKey()
+					viewToggleHandled = true
 				case "y":
 					m.pendingComboKey = ""
 					var selectedID string
@@ -9203,13 +9484,23 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 
 			case focusActionable:
-				// Actionable uses j/k/page/home/end/enter/y/V — no conflicts with view-toggles.
+				// Actionable uses j/k/page/home/end/enter/W/y/V — no conflicts with view-toggles.
 				switch keyStr {
 				case "j", "k", "up", "down",
 					"ctrl+d", "ctrl+u", "pgdown", "pgup",
 					"home", "G", "end", "enter":
 					m = m.handleActionableKeys(msg)
 					viewToggleHandled = true
+				case "W":
+					m.handleActionableWhatIfBatchKey()
+					viewToggleHandled = true
+				case "esc":
+					if m.actionableView.HasWhatIfBatch() {
+						m.actionableView.ClearWhatIfBatch()
+						m.statusMsg = "Batch What-If cleared"
+						m.statusIsError = false
+						viewToggleHandled = true
+					}
 				case "y":
 					cmds = append(cmds, m.copyIssueIDByIDCmd(m.actionableView.SelectedIssueID()))
 					viewToggleHandled = true
@@ -9242,7 +9533,7 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 						"home", "G", "end",
 						"J", "K", "v", "tab", "enter",
 						"y", "c", "F", "o", "/", "A",
-						"O", "W", "+", "-", "x":
+						"O", "H", "W", "+", "-", "x":
 						m, cmd = m.handleHistoryKeys(msg)
 						cmds = append(cmds, cmd)
 						viewToggleHandled = true
@@ -9377,29 +9668,35 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 
 			case "b":
-				m.isBoardView = !m.isBoardView
+				enteringBoard := !m.isBoardView
+				m.exitInsightsView()
 				m.exitGraphView()
-				m.isActionableView = false
+				m.exitActionableView()
+				m.exitTreeView()
 				m.exitHistoryView()
 				m.isSprintView = false
 				m.showVelocityComparison = false
-				if m.isBoardView {
+				if enteringBoard {
+					m.isBoardView = true
 					m.focused = focusBoard
 					m.refreshBoardAndGraphForCurrentFilter()
 				} else {
+					m.exitBoardView()
 					m.focused = focusList
 				}
 				return m, nil
 
 			case "g":
 				// Toggle graph view
+				m.exitInsightsView()
 				if m.isGraphView {
 					m.exitGraphView()
 				} else {
 					m.isGraphView = true
 				}
-				m.isBoardView = false
-				m.isActionableView = false
+				m.exitBoardView()
+				m.exitActionableView()
+				m.exitTreeView()
 				m.exitHistoryView()
 				m.isSprintView = false
 				m.showVelocityComparison = false
@@ -9413,16 +9710,20 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			case "a":
 				// Toggle actionable view
-				m.isActionableView = !m.isActionableView
+				enteringActionable := !m.isActionableView
+				m.exitInsightsView()
 				m.exitGraphView()
-				m.isBoardView = false
+				m.exitBoardView()
+				m.exitTreeView()
 				m.exitHistoryView()
 				m.isSprintView = false
 				m.showVelocityComparison = false
-				if m.isActionableView {
+				if enteringActionable {
+					m.isActionableView = true
 					m.refreshActionableView()
 					m.focused = focusActionable
 				} else {
+					m.exitActionableView()
 					m.focused = focusList
 				}
 				return m, nil
@@ -9430,11 +9731,13 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "E":
 				// Toggle hierarchical tree view (bv-gllx)
 				if m.focused == focusTree {
+					m.exitTreeView()
 					m.focused = focusList
 				} else {
+					m.exitInsightsView()
 					m.exitGraphView()
-					m.isBoardView = false
-					m.isActionableView = false
+					m.exitBoardView()
+					m.exitActionableView()
 					m.exitHistoryView()
 					m.isSprintView = false
 					m.showVelocityComparison = false
@@ -9445,11 +9748,13 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			case "i":
 				if m.focused == focusInsights {
+					m.exitInsightsView()
 					m.focused = focusList
 				} else {
 					m.exitGraphView()
-					m.isBoardView = false
-					m.isActionableView = false
+					m.exitBoardView()
+					m.exitActionableView()
+					m.exitTreeView()
 					m.exitHistoryView()
 					m.isSprintView = false
 					m.showVelocityComparison = false
@@ -9478,9 +9783,11 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			case "h":
 				// Toggle history view
+				m.exitInsightsView()
 				m.exitGraphView()
-				m.isBoardView = false
-				m.isActionableView = false
+				m.exitBoardView()
+				m.exitActionableView()
+				m.exitTreeView()
 				m.isSprintView = false
 				m.showVelocityComparison = false
 				if m.isHistoryView {
@@ -9500,9 +9807,11 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.statusMsg = ""
 					return m, nil
 				}
+				m.exitInsightsView()
 				m.exitGraphView()
-				m.isBoardView = false
-				m.isActionableView = false
+				m.exitBoardView()
+				m.exitActionableView()
+				m.exitTreeView()
 				m.exitHistoryView()
 				m.isSprintView = false
 				m.showVelocityComparison = false
@@ -9528,9 +9837,11 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			case "]", "f4":
 				// Attention view (bv-117): ranked labels with a cursor
+				m.exitInsightsView()
 				m.exitGraphView()
-				m.isBoardView = false
-				m.isActionableView = false
+				m.exitBoardView()
+				m.exitActionableView()
+				m.exitTreeView()
 				m.exitHistoryView()
 				m.isSprintView = false
 				m.showVelocityComparison = false
@@ -9545,7 +9856,12 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 				scopedIssues := m.repoScopedIssues()
 				cfg := analysis.DefaultLabelHealthConfig()
 				flow := analysis.ComputeCrossLabelFlowWithScope(scopedIssues, cfg, m.candidateIDs)
+				m.exitInsightsView()
 				m.exitGraphView()
+				m.exitBoardView()
+				m.exitActionableView()
+				m.exitTreeView()
+				m.exitHistoryView()
 				m.isSprintView = false
 				m.showVelocityComparison = false
 				m.focused = focusFlowMatrix
@@ -9574,6 +9890,10 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.showAlertsPanel = true
 					m.alertsTab = 1
 					m.suggestionsCursor = 0
+				} else if len(m.alertsSkippedChecks) > 0 {
+					m.showAlertsPanel = true
+					m.alertsTab = 0
+					m.alertsCursor = 0
 				} else {
 					m.statusMsg = "No active alerts"
 					m.statusIsError = false
@@ -9604,6 +9924,7 @@ func (m *Model) updateInternal(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.focusBeforeRepoPicker = m.focused
 					m.repoPicker = NewRepoPickerModel(m.availableRepos, m.theme)
 					m.repoPicker.SetActiveRepos(m.activeRepos)
+					m.repoPicker.SetCrossRepoFlow(analysis.ComputeCrossRepoFlow(m.issues, m.candidateIDs))
 					m.repoPicker.SetSize(m.width, m.height-1)
 					m.focused = m.restoreTopModalOrListFocus()
 				} else {
@@ -10231,7 +10552,7 @@ func (m *Model) handleBoardKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 		if selected := m.board.SelectedIssue(); selected != nil {
 			m.revealRecipeIssue(selected.ID)
 			m.selectListIssueByID(selected.ID)
-			m.isBoardView = false
+			m.exitBoardView()
 			m.focused = focusList
 			if m.isSplitView {
 				m.focused = focusDetail
@@ -10277,11 +10598,10 @@ func (m *Model) handleGraphKeys(msg tea.KeyMsg) *Model {
 		m.graphView.ToggleExpand()
 	case "enter":
 		if selected := m.graphView.SelectedIssue(); selected != nil {
-			m.graphView.ClearCheckDep()
 			m.revealRecipeIssue(selected.ID)
 			// Find and select in list
 			m.selectListIssueByID(selected.ID)
-			m.isGraphView = false
+			m.exitGraphView()
 			m.focused = focusList
 			if m.isSplitView {
 				m.focused = focusDetail
@@ -10534,6 +10854,672 @@ func (m *Model) evaluateGraphCheckDep(fromID, toID string) *graphCheckDepResult 
 	return res
 }
 
+// evaluateGraphCycleCutCommand builds a live-verified br/bd dep remove command for
+// a cycle-break suggestion, applying the exact same writability, origin, workspace,
+// and injection guards as evaluateGraphCheckDep (W32-2).
+func (m *Model) evaluateGraphCycleCutCommand(fromID, toID string) string {
+	if fromID == "" || toID == "" {
+		return ""
+	}
+	canEmitCmd := !m.timeTravelMode &&
+		strings.TrimSpace(m.asOfRevision) == "" &&
+		!m.isExplicitDB &&
+		!m.sourceDegraded &&
+		!m.authorityIncomplete &&
+		!isHistoricalGitBeadsPath(m.beadsPath)
+	if !canEmitCmd {
+		return ""
+	}
+	fullIssues := m.issues
+	if len(fullIssues) == 0 {
+		fullIssues = m.graphView.issues
+	}
+	if len(fullIssues) == 0 && len(m.insightsPanel.issueMap) > 0 {
+		ids := make([]string, 0, len(m.insightsPanel.issueMap))
+		for id := range m.insightsPanel.issueMap {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		fullIssues = make([]model.Issue, 0, len(ids))
+		for _, id := range ids {
+			if iss := m.insightsPanel.issueMap[id]; iss != nil {
+				fullIssues = append(fullIssues, *iss)
+			}
+		}
+	}
+	var fromIss, toIss *model.Issue
+	for i := range fullIssues {
+		if fullIssues[i].ID == fromID {
+			fromIss = &fullIssues[i]
+		}
+		if fullIssues[i].ID == toID {
+			toIss = &fullIssues[i]
+		}
+	}
+	if fromIss == nil || toIss == nil {
+		return ""
+	}
+	// Confirm the blocking dependency still exists live.
+	edgeExists := false
+	for _, dep := range fromIss.Dependencies {
+		if dep != nil && dep.Type.IsBlocking() && dep.DependsOnID == toID {
+			edgeExists = true
+			break
+		}
+	}
+	if !edgeExists {
+		return ""
+	}
+	fromRepo := strings.TrimSpace(fromIss.SourceRepo)
+	toRepo := strings.TrimSpace(toIss.SourceRepo)
+	crossRepo := fromRepo != "" && toRepo != "" && !strings.EqualFold(fromRepo, toRepo)
+	if crossRepo && m.workspaceMode {
+		return ""
+	}
+	cmdFrom, cmdTo := fromID, toID
+	trackerCLI := "br"
+	if fromIss.Origin != nil || toIss.Origin != nil {
+		o, pOrig := fromIss.Origin, toIss.Origin
+		if o == nil || pOrig == nil ||
+			strings.TrimSpace(o.ReadOnlyReason) != "" ||
+			strings.TrimSpace(pOrig.ReadOnlyReason) != "" {
+			return ""
+		}
+		sameTracker := o.Tracker == pOrig.Tracker &&
+			o.Database == pOrig.Database &&
+			o.WorkingDirectory == pOrig.WorkingDirectory &&
+			o.TrackerDirectory == pOrig.TrackerDirectory &&
+			o.Executable == pOrig.Executable
+		if !sameTracker {
+			return ""
+		}
+		if lid := strings.TrimSpace(o.LocalID); lid != "" {
+			cmdFrom = lid
+		}
+		if lid := strings.TrimSpace(pOrig.LocalID); lid != "" {
+			cmdTo = lid
+		}
+		if strings.EqualFold(strings.TrimSpace(o.Tracker), "bd") {
+			trackerCLI = "bd"
+		}
+	} else if m.workspaceMode {
+		return ""
+	}
+	isSafeDepArg := func(s string) bool {
+		if s == "" || strings.HasPrefix(s, "-") {
+			return false
+		}
+		for _, r := range s {
+			if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) {
+				return false
+			}
+		}
+		return true
+	}
+	if !isSafeDepArg(cmdFrom) || !isSafeDepArg(cmdTo) {
+		return ""
+	}
+	if m.workspaceMode {
+		if fromIss.Origin == nil || strings.TrimSpace(fromIss.Origin.WorkingDirectory) == "" {
+			return ""
+		}
+		return fmt.Sprintf("cd -- %s && %s dep remove %s %s",
+			quoteTUIShellWord(fromIss.Origin.WorkingDirectory),
+			trackerCLI,
+			quoteTUIShellWord(cmdFrom),
+			quoteTUIShellWord(cmdTo))
+	}
+	return fmt.Sprintf("%s dep remove %s %s", trackerCLI, quoteTUIShellWord(cmdFrom), quoteTUIShellWord(cmdTo))
+}
+
+// evaluateGraphCheckDepRemoval preflights removing blocking edge fromID -> toID against
+// the full graph + pruned tombstone readiness stubs, scoping Cycles and NewlyUnblocked
+// to visibleIssueMap (Graph View or Insights Panel) so hidden repos/filters never leak (W33-2 / P26-A1).
+func (m *Model) evaluateGraphCheckDepRemoval(fromID, toID string, visibleIssueMap map[string]*model.Issue) *graphCheckDepResult {
+	res := &graphCheckDepResult{
+		Operation: "remove",
+		FromID:    fromID,
+		ToID:      toID,
+	}
+	fullIssues := m.issues
+	if len(fullIssues) == 0 {
+		fullIssues = m.graphView.issues
+	}
+	if len(fullIssues) == 0 && len(visibleIssueMap) > 0 {
+		ids := make([]string, 0, len(visibleIssueMap))
+		for id := range visibleIssueMap {
+			ids = append(ids, id)
+		}
+		sort.Strings(ids)
+		fullIssues = make([]model.Issue, 0, len(ids))
+		for _, id := range ids {
+			if iss := visibleIssueMap[id]; iss != nil {
+				fullIssues = append(fullIssues, *iss)
+			}
+		}
+	}
+	byID := make(map[string]model.Issue, len(fullIssues))
+	for _, iss := range fullIssues {
+		byID[iss.ID] = iss
+	}
+	fromIss, fromOK := byID[fromID]
+	toIss, toOK := byID[toID]
+	if !fromOK || !toOK {
+		var missing []string
+		if !fromOK {
+			missing = append(missing, fromID)
+		}
+		if !toOK && toID != fromID {
+			missing = append(missing, toID)
+		}
+		res.Warning = fmt.Sprintf("Unknown issue ID(s): %s", strings.Join(missing, ", "))
+		return res
+	}
+	fromRepo := strings.TrimSpace(fromIss.SourceRepo)
+	toRepo := strings.TrimSpace(toIss.SourceRepo)
+	res.CrossRepo = fromRepo != "" && toRepo != "" && !strings.EqualFold(fromRepo, toRepo)
+
+	remInput := fullIssues
+	if readiness := m.exportReadiness(); readiness != nil {
+		var resolvedStubs []model.Issue
+		for _, rid := range readiness.ResolvedIDs() {
+			if _, ok := byID[rid]; !ok {
+				resolvedStubs = append(resolvedStubs, model.Issue{ID: rid, Status: model.StatusTombstone})
+			}
+		}
+		if len(resolvedStubs) > 0 {
+			remInput = make([]model.Issue, 0, len(fullIssues)+len(resolvedStubs))
+			remInput = append(remInput, fullIssues...)
+			remInput = append(remInput, resolvedStubs...)
+		}
+	}
+
+	var scopeIDs map[string]bool
+	if visibleIssueMap != nil {
+		scopeIDs = make(map[string]bool, len(visibleIssueMap))
+		for id := range visibleIssueMap {
+			if m.candidateIDs == nil || m.candidateIDs[id] {
+				scopeIDs[id] = true
+			}
+		}
+	} else if m.candidateIDs != nil {
+		scopeIDs = m.candidateIDs
+	}
+
+	rem := analysis.CheckDependencyRemovalWithScope(remInput, fromID, toID, scopeIDs, m.analysisReferenceTime())
+	res.Exists = rem.Exists
+	res.CanRemove = rem.Exists
+	res.CyclesBefore = rem.CyclesBefore
+	res.CyclesAfter = rem.CyclesAfter
+	res.CyclesBroken = rem.CyclesBroken
+	res.WouldBreakAllCycles = rem.WouldBreakAllCycles
+	res.CyclesTruncated = rem.CyclesTruncated
+	res.Warning = rem.Warning
+	if rem.Exists {
+		res.NewlyUnblocked = rem.NewlyUnblocked
+		res.Command = m.evaluateGraphCycleCutCommand(fromID, toID)
+	}
+	return res
+}
+
+// handleGraphCheckDepRemovalKey preflights removing a recommended cycle cut (if selected
+// node participates in a cycle) or cycles through removing visible outgoing blocking edges (W33-2).
+func (m *Model) handleGraphCheckDepRemovalKey() {
+	sel := m.graphView.SelectedIssue()
+	if sel == nil {
+		m.statusMsg = "Select an issue in Graph view to preflight dependency removal"
+		m.statusIsError = false
+		return
+	}
+	var fromID, toID string
+	if cb := m.graphView.MatchingCycleBreak(sel.ID); cb != nil {
+		fromID, toID = cb.EdgeFrom, cb.EdgeTo
+	} else {
+		targets := m.graphView.ActiveBlockingTargets(sel.ID)
+		if len(targets) == 0 {
+			m.graphView.ClearCheckDep()
+			m.statusMsg = fmt.Sprintf("%s has no active outgoing blocking dependencies to remove", sel.ID)
+			m.statusIsError = false
+			return
+		}
+		fromID = sel.ID
+		toID = targets[0]
+		if cur := m.graphView.CheckDepResult(); cur != nil && cur.Operation == "remove" && cur.FromID == sel.ID && len(targets) > 1 {
+			for i, t := range targets {
+				if t == cur.ToID {
+					toID = targets[(i+1)%len(targets)]
+					break
+				}
+			}
+		}
+	}
+	res := m.evaluateGraphCheckDepRemoval(fromID, toID, m.graphView.issueMap)
+	m.graphView.SetCheckDepResult(res)
+	if !res.Exists {
+		m.statusMsg = fmt.Sprintf("⚠ %s", res.Warning)
+		m.statusIsError = false
+		return
+	}
+	msg := fmt.Sprintf("✂ Remove %s → %s", fromID, toID)
+	if res.CyclesBefore > 0 {
+		switch {
+		case res.CyclesTruncated && res.WouldBreakAllCycles:
+			msg += fmt.Sprintf(" • breaks ≥%d (capped) → acyclic", res.CyclesBefore)
+		case res.CyclesTruncated && res.CyclesBroken > 0:
+			msg += fmt.Sprintf(" • breaks ≥%d (capped)", res.CyclesBroken)
+		case res.CyclesTruncated:
+			msg += fmt.Sprintf(" • %d cycles (capped, inconclusive)", res.CyclesBefore)
+		case res.WouldBreakAllCycles:
+			msg += fmt.Sprintf(" • breaks %d/%d → acyclic", res.CyclesBroken, res.CyclesBefore)
+		default:
+			msg += fmt.Sprintf(" • breaks %d/%d cycles", res.CyclesBroken, res.CyclesBefore)
+		}
+	}
+	if len(res.NewlyUnblocked) > 0 {
+		msg += fmt.Sprintf(" • +%d unblocked", len(res.NewlyUnblocked))
+	}
+	if res.Command != "" {
+		msg += " • c copy"
+	}
+	msg += " • Esc clear"
+	m.statusMsg = msg
+	m.statusIsError = false
+}
+
+// handleInsightsCheckDepRemovalKey preflights removing a recommended or member cycle edge
+// directly from Insights PanelCycles, cycling through candidate edges on repeated presses (RC-C41 / P26-A8).
+func (m *Model) handleInsightsCheckDepRemovalKey() {
+	if m.insightsPanel.focusedPanel != PanelCycles {
+		m.statusMsg = "Switch to Cycles panel to preflight cycle-cut dependency removal"
+		m.statusIsError = false
+		return
+	}
+	rawCycle := m.insightsPanel.SelectedCycle()
+	if len(rawCycle) == 0 {
+		m.insightsPanel.SetCycleCutPreflight(nil)
+		m.statusMsg = "No cycle selected to preflight"
+		m.statusIsError = false
+		return
+	}
+	cycle := rawCycle
+	if len(cycle) > 1 && cycle[0] == cycle[len(cycle)-1] {
+		cycle = cycle[:len(cycle)-1]
+	}
+	nodeSet := make(map[string]bool, len(cycle))
+	for _, id := range cycle {
+		nodeSet[id] = true
+	}
+
+	// Build O(deg) blocking adjacency for nodes in this cycle so we never invoke
+	// full Tarjan SCC recomputation per candidate edge (P26-A8).
+	blockingOut := make(map[string]map[string]bool, len(cycle))
+	registerDeps := func(iss *model.Issue) {
+		if iss == nil || !nodeSet[iss.ID] {
+			return
+		}
+		// Last-record-wins dedup matching loader/analysis semantics when duplicate IDs appear.
+		delete(blockingOut, iss.ID)
+		for _, dep := range iss.Dependencies {
+			if dep == nil || !dep.Type.IsBlocking() || dep.DependsOnID == "" {
+				continue
+			}
+			if !nodeSet[dep.DependsOnID] {
+				continue
+			}
+			if blockingOut[iss.ID] == nil {
+				blockingOut[iss.ID] = make(map[string]bool)
+			}
+			blockingOut[iss.ID][dep.DependsOnID] = true
+		}
+	}
+	if len(m.issues) > 0 {
+		for i := range m.issues {
+			registerDeps(&m.issues[i])
+		}
+	} else {
+		for _, iss := range m.insightsPanel.issueMap {
+			registerDeps(iss)
+		}
+	}
+
+	type edgePair struct {
+		from string
+		to   string
+	}
+	hasEdge := func(from, to string) bool {
+		return from != "" && to != "" && blockingOut[from][to]
+	}
+	seen := make(map[edgePair]bool)
+	validEdges := make([]edgePair, 0, len(cycle)+2)
+	addValid := func(from, to string) bool {
+		if !hasEdge(from, to) {
+			return false
+		}
+		ep := edgePair{from: from, to: to}
+		if seen[ep] {
+			return false
+		}
+		seen[ep] = true
+		validEdges = append(validEdges, ep)
+		return true
+	}
+
+	// Prioritize recommended CycleBreak cuts touching this cycle.
+	if m.insightsPanel.advancedInsights != nil && m.insightsPanel.advancedInsights.CycleBreak != nil {
+		for _, s := range m.insightsPanel.advancedInsights.CycleBreak.Suggestions {
+			if nodeSet[s.EdgeFrom] && nodeSet[s.EdgeTo] {
+				addValid(s.EdgeFrom, s.EdgeTo)
+			}
+		}
+	}
+	// Prefer forward consecutive edges along the selected cycle; only fall back to
+	// reverse orientation if zero forward edges exist (avoids admitting reverse chords).
+	if len(cycle) == 1 {
+		addValid(cycle[0], cycle[0])
+	} else {
+		forwardFound := false
+		for i := 0; i < len(cycle); i++ {
+			u := cycle[i]
+			v := cycle[(i+1)%len(cycle)]
+			if hasEdge(u, v) {
+				forwardFound = true
+				addValid(u, v)
+			}
+		}
+		if !forwardFound {
+			for i := 0; i < len(cycle); i++ {
+				u := cycle[i]
+				v := cycle[(i+1)%len(cycle)]
+				addValid(v, u)
+			}
+		}
+	}
+
+	if len(validEdges) == 0 {
+		m.insightsPanel.SetCycleCutPreflight(nil)
+		m.statusMsg = "No removable blocking edge found for selected cycle"
+		m.statusIsError = false
+		return
+	}
+
+	chosenEdge := validEdges[0]
+	if cur := m.insightsPanel.CycleCutPreflight(); cur != nil && len(validEdges) > 1 {
+		for i, ep := range validEdges {
+			if ep.from == cur.FromID && ep.to == cur.ToID {
+				chosenEdge = validEdges[(i+1)%len(validEdges)]
+				break
+			}
+		}
+	}
+
+	// Evaluate only the single chosen edge against the Insights panel's visible scope (P26-A1/A8).
+	chosen := m.evaluateGraphCheckDepRemoval(chosenEdge.from, chosenEdge.to, m.insightsPanel.issueMap)
+	if !chosen.Exists {
+		m.insightsPanel.SetCycleCutPreflight(nil)
+		m.statusMsg = "No removable blocking edge found for selected cycle"
+		m.statusIsError = false
+		return
+	}
+	m.insightsPanel.SetCycleCutPreflight(chosen)
+
+	msg := fmt.Sprintf("✂ Remove %s → %s", chosen.FromID, chosen.ToID)
+	if chosen.CyclesBefore > 0 {
+		switch {
+		case chosen.CyclesTruncated && chosen.WouldBreakAllCycles:
+			msg += fmt.Sprintf(" • breaks ≥%d (capped) → acyclic", chosen.CyclesBefore)
+		case chosen.CyclesTruncated && chosen.CyclesBroken > 0:
+			msg += fmt.Sprintf(" • breaks ≥%d (capped)", chosen.CyclesBroken)
+		case chosen.CyclesTruncated:
+			msg += fmt.Sprintf(" • %d cycles (capped, inconclusive)", chosen.CyclesBefore)
+		case chosen.WouldBreakAllCycles:
+			msg += fmt.Sprintf(" • breaks %d/%d → acyclic", chosen.CyclesBroken, chosen.CyclesBefore)
+		default:
+			msg += fmt.Sprintf(" • breaks %d/%d cycles", chosen.CyclesBroken, chosen.CyclesBefore)
+		}
+	}
+	if len(chosen.NewlyUnblocked) > 0 {
+		msg += fmt.Sprintf(" • +%d unblocked", len(chosen.NewlyUnblocked))
+	}
+	if chosen.Command != "" {
+		msg += " • c copy"
+	} else {
+		msg += " • command withheld"
+	}
+	m.statusMsg = msg
+	m.statusIsError = false
+}
+
+// handleGraphWhatIfBatchKey toggles the selected graph node in multi-issue Batch What-If (W32-1).
+func (m *Model) handleGraphWhatIfBatchKey() {
+	sel := m.graphView.SelectedIssue()
+	if sel == nil {
+		m.statusMsg = "Select an issue in Graph view to toggle Batch What-If"
+		m.statusIsError = false
+		return
+	}
+	if isClosedLikeStatus(sel.Status) {
+		m.statusMsg = fmt.Sprintf("%s is already closed — select an open issue for Batch What-If", sel.ID)
+		m.statusIsError = false
+		return
+	}
+	scopedAn, scopedStats, _ := m.activeScopeAnalysis()
+	if scopedAn == nil {
+		scopedAn = m.analyzer
+	}
+	if scopedStats == nil {
+		scopedStats = m.analysis
+	}
+	alreadySelected := m.graphView.IsInWhatIfBatch(sel.ID)
+	if !alreadySelected && scopedAn == nil {
+		m.statusMsg = "Analysis unavailable for Batch What-If"
+		m.statusIsError = false
+		return
+	}
+	added := m.graphView.ToggleWhatIfBatch(sel.ID)
+	batchIDs := m.graphView.WhatIfBatchIDs()
+	if len(batchIDs) == 0 {
+		m.graphView.SetWhatIfBatchResult(nil)
+		m.statusMsg = "Batch What-If cleared"
+		m.statusIsError = false
+		return
+	}
+	if scopedAn == nil {
+		m.graphView.SetWhatIfBatchResult(nil)
+		m.statusMsg = "Analysis unavailable for Batch What-If"
+		m.statusIsError = false
+		return
+	}
+	res := scopedAn.ComputeWhatIfBatch(batchIDs, scopedStats)
+	m.graphView.SetWhatIfBatchResult(res)
+	verb := "Added"
+	if !added {
+		verb = "Removed"
+	}
+	if res != nil {
+		extra := ""
+		if res.SynergyUnblocks > 0 {
+			extra = fmt.Sprintf(", ★ %d synergy", res.SynergyUnblocks)
+		}
+		m.statusMsg = fmt.Sprintf("⚡ Batch What-If (%d): %s %s → +%d direct (+%d total%s) • Esc clear",
+			len(batchIDs), verb, sel.ID, res.Delta.DirectUnblocks, res.Delta.TransitiveUnblocks, extra)
+	} else {
+		m.statusMsg = fmt.Sprintf("⚡ Batch What-If (%d): %s %s", len(batchIDs), verb, sel.ID)
+	}
+	m.statusIsError = false
+}
+
+// handleActionableWhatIfBatchKey toggles the selected track item in multi-issue Batch What-If (W32-1).
+func (m *Model) handleActionableWhatIfBatchKey() {
+	id := m.actionableView.SelectedIssueID()
+	if id == "" {
+		m.statusMsg = "Select an actionable item to toggle Batch What-If"
+		m.statusIsError = false
+		return
+	}
+	scopedAn, scopedStats, _ := m.activeScopeAnalysis()
+	if scopedAn == nil {
+		scopedAn = m.analyzer
+	}
+	if scopedStats == nil {
+		scopedStats = m.analysis
+	}
+	alreadySelected := m.actionableView.IsInWhatIfBatch(id)
+	if !alreadySelected && scopedAn == nil {
+		m.statusMsg = "Analysis unavailable for Batch What-If"
+		m.statusIsError = false
+		return
+	}
+	added := m.actionableView.ToggleWhatIfBatch(id)
+	batchIDs := m.actionableView.WhatIfBatchIDs()
+	if len(batchIDs) == 0 {
+		m.actionableView.SetWhatIfBatchResult(nil)
+		m.statusMsg = "Batch What-If cleared"
+		m.statusIsError = false
+		return
+	}
+	if scopedAn == nil {
+		m.actionableView.SetWhatIfBatchResult(nil)
+		m.statusMsg = "Analysis unavailable for Batch What-If"
+		m.statusIsError = false
+		return
+	}
+	res := scopedAn.ComputeWhatIfBatch(batchIDs, scopedStats)
+	m.actionableView.SetWhatIfBatchResult(res)
+	verb := "Added"
+	if !added {
+		verb = "Removed"
+	}
+	if res != nil {
+		extra := ""
+		if res.SynergyUnblocks > 0 {
+			extra = fmt.Sprintf(", ★ %d synergy", res.SynergyUnblocks)
+		}
+		m.statusMsg = fmt.Sprintf("⚡ Batch What-If (%d): %s %s → +%d direct (+%d total%s) • Esc clear",
+			len(batchIDs), verb, id, res.Delta.DirectUnblocks, res.Delta.TransitiveUnblocks, extra)
+	} else {
+		m.statusMsg = fmt.Sprintf("⚡ Batch What-If (%d): %s %s", len(batchIDs), verb, id)
+	}
+	m.statusIsError = false
+}
+
+// handleBoardWhatIfBatchKey toggles the selected Kanban card in multi-issue Batch What-If (W35-6).
+func (m *Model) handleBoardWhatIfBatchKey() {
+	sel := m.board.SelectedIssue()
+	if sel == nil {
+		m.statusMsg = "Select a card in Board view to toggle Batch What-If"
+		m.statusIsError = false
+		return
+	}
+	if isClosedLikeStatus(sel.Status) {
+		m.statusMsg = fmt.Sprintf("%s is already closed — select an open issue for Batch What-If", sel.ID)
+		m.statusIsError = false
+		return
+	}
+	scopedAn, scopedStats, _ := m.activeScopeAnalysis()
+	if scopedAn == nil {
+		scopedAn = m.analyzer
+	}
+	if scopedStats == nil {
+		scopedStats = m.analysis
+	}
+	alreadySelected := m.board.IsInWhatIfBatch(sel.ID)
+	if !alreadySelected && scopedAn == nil {
+		m.statusMsg = "Analysis unavailable for Batch What-If"
+		m.statusIsError = false
+		return
+	}
+	added := m.board.ToggleWhatIfBatch(sel.ID)
+	batchIDs := m.board.WhatIfBatchIDs()
+	if len(batchIDs) == 0 {
+		m.board.SetWhatIfBatchResult(nil)
+		m.statusMsg = "Batch What-If cleared"
+		m.statusIsError = false
+		return
+	}
+	if scopedAn == nil {
+		m.board.SetWhatIfBatchResult(nil)
+		m.statusMsg = "Analysis unavailable for Batch What-If"
+		m.statusIsError = false
+		return
+	}
+	res := scopedAn.ComputeWhatIfBatch(batchIDs, scopedStats)
+	m.board.SetWhatIfBatchResult(res)
+	verb := "Added"
+	if !added {
+		verb = "Removed"
+	}
+	if res != nil {
+		extra := ""
+		if res.SynergyUnblocks > 0 {
+			extra = fmt.Sprintf(", ★ %d synergy", res.SynergyUnblocks)
+		}
+		m.statusMsg = fmt.Sprintf("⚡ Batch What-If (%d): %s %s → +%d direct (+%d total%s) • Esc clear",
+			len(batchIDs), verb, sel.ID, res.Delta.DirectUnblocks, res.Delta.TransitiveUnblocks, extra)
+	} else {
+		m.statusMsg = fmt.Sprintf("⚡ Batch What-If (%d): %s %s", len(batchIDs), verb, sel.ID)
+	}
+	m.statusIsError = false
+}
+
+// handleTreeWhatIfBatchKey toggles the selected Tree node in multi-issue Batch What-If (W38-5).
+func (m *Model) handleTreeWhatIfBatchKey() {
+	sel := m.tree.SelectedIssue()
+	if sel == nil {
+		m.statusMsg = "Select an issue in Tree view to toggle Batch What-If"
+		m.statusIsError = false
+		return
+	}
+	if isClosedLikeStatus(sel.Status) {
+		m.statusMsg = fmt.Sprintf("%s is already closed — select an open issue for Batch What-If", sel.ID)
+		m.statusIsError = false
+		return
+	}
+	scopedAn, scopedStats, _ := m.activeScopeAnalysis()
+	if scopedAn == nil {
+		scopedAn = m.analyzer
+	}
+	if scopedStats == nil {
+		scopedStats = m.analysis
+	}
+	alreadySelected := m.tree.IsInWhatIfBatch(sel.ID)
+	if !alreadySelected && scopedAn == nil {
+		m.statusMsg = "Analysis unavailable for Batch What-If"
+		m.statusIsError = false
+		return
+	}
+	added := m.tree.ToggleWhatIfBatch(sel.ID)
+	batchIDs := m.tree.WhatIfBatchIDs()
+	if len(batchIDs) == 0 {
+		m.tree.SetWhatIfBatchResult(nil)
+		m.statusMsg = "Batch What-If cleared"
+		m.statusIsError = false
+		return
+	}
+	if scopedAn == nil {
+		m.tree.SetWhatIfBatchResult(nil)
+		m.statusMsg = "Analysis unavailable for Batch What-If"
+		m.statusIsError = false
+		return
+	}
+	res := scopedAn.ComputeWhatIfBatch(batchIDs, scopedStats)
+	m.tree.SetWhatIfBatchResult(res)
+	verb := "Added"
+	if !added {
+		verb = "Removed"
+	}
+	if res != nil {
+		extra := ""
+		if res.SynergyUnblocks > 0 {
+			extra = fmt.Sprintf(", ★ %d synergy", res.SynergyUnblocks)
+		}
+		m.statusMsg = fmt.Sprintf("⚡ Batch What-If (%d): %s %s → +%d direct (+%d total%s) • Esc clear",
+			len(batchIDs), verb, sel.ID, res.Delta.DirectUnblocks, res.Delta.TransitiveUnblocks, extra)
+	} else {
+		m.statusMsg = fmt.Sprintf("⚡ Batch What-If (%d): %s %s", len(batchIDs), verb, sel.ID)
+	}
+	m.statusIsError = false
+}
+
 // handleTreeKeys handles keyboard input when tree view is focused (bv-gllx)
 func (m *Model) handleTreeKeys(msg tea.KeyMsg) *Model {
 	switch msg.String() {
@@ -10563,7 +11549,16 @@ func (m *Model) handleTreeKeys(msg tea.KeyMsg) *Model {
 		m.tree.PageDown()
 	case "ctrl+u", "pgup":
 		m.tree.PageUp()
-	case "E", "esc":
+	case "E":
+		m.tree.ClearWhatIfBatch()
+		m.focused = focusList
+	case "esc":
+		if m.tree.HasWhatIfBatch() {
+			m.tree.ClearWhatIfBatch()
+			m.statusMsg = "Batch What-If cleared"
+			m.statusIsError = false
+			return m
+		}
 		// Return to list view
 		m.focused = focusList
 	case "tab":
@@ -10604,7 +11599,7 @@ func (m *Model) handleActionableKeys(msg tea.KeyMsg) *Model {
 		if selectedID != "" {
 			m.revealRecipeIssue(selectedID)
 			m.selectListIssueByID(selectedID)
-			m.isActionableView = false
+			m.exitActionableView()
 			m.focused = focusList
 			if m.isSplitView {
 				m.focused = focusDetail
@@ -10784,6 +11779,9 @@ func (m *Model) handleHistoryKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 			m.historyView.MoveToEnd()
 		}
 	case "J":
+		if m.historyView.IsHotspotsMode() {
+			break
+		}
 		// In orphans mode: next probable bead; in git mode: next related bead; in bead mode: next commit
 		if m.historyView.IsOrphansMode() {
 			m.historyView.NextOrphanProbableBead()
@@ -10793,6 +11791,9 @@ func (m *Model) handleHistoryKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 			m.historyView.NextCommit()
 		}
 	case "K":
+		if m.historyView.IsHotspotsMode() {
+			break
+		}
 		// In orphans mode: prev probable bead; in git mode: prev related bead; in bead mode: prev commit
 		if m.historyView.IsOrphansMode() {
 			m.historyView.PrevOrphanProbableBead()
@@ -10802,7 +11803,7 @@ func (m *Model) handleHistoryKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 			m.historyView.PrevCommit()
 		}
 	case "tab":
-		if m.historyView.IsOrphansMode() {
+		if m.historyView.IsOrphansMode() || m.historyView.IsHotspotsMode() {
 			break
 		}
 		// Cycle focus: list -> [timeline ->] [middle ->] detail -> file tree (if rendered) -> list (bv-190l)
@@ -10822,6 +11823,13 @@ func (m *Model) handleHistoryKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 			m.historyView.ToggleFocus()
 		}
 	case "enter":
+		if m.historyView.IsHotspotsMode() {
+			if path := m.historyView.ApplyHotspotFileFilter(); path != "" {
+				m.statusMsg = fmt.Sprintf("🔥 Filtered History by hotspot file: %s (Esc to clear)", path)
+				m.statusIsError = false
+			}
+			break
+		}
 		// Jump to selected bead in main list
 		var selectedID string
 		if m.historyView.IsOrphansMode() {
@@ -10850,6 +11858,18 @@ func (m *Model) handleHistoryKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 			m.updateViewportContent()
 		}
 	case "y":
+		if m.historyView.IsHotspotsMode() {
+			if hs := m.historyView.SelectedHotspot(); hs != nil && hs.FilePath != "" {
+				cmd = m.copyTextToClipboardCmd(
+					hs.FilePath,
+					fmt.Sprintf("📋 Copied path: %s", hs.FilePath),
+				)
+			} else {
+				m.statusMsg = "❌ No hotspot file selected"
+				m.statusIsError = true
+			}
+			break
+		}
 		// Copy selected commit SHA to clipboard
 		var sha, shortSHA string
 		if m.historyView.IsOrphansMode() {
@@ -10889,10 +11909,19 @@ func (m *Model) handleHistoryKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 			m.statusMsg = "◈ Returned to History mode"
 		}
 		m.statusIsError = false
+	case "H":
+		// Toggle Code Hotspots & Co-Change leaderboard mode (W35-5)
+		m.historyView.ToggleHotspotsMode()
+		if m.historyView.IsHotspotsMode() {
+			m.statusMsg = fmt.Sprintf("🔥 Hotspots mode (%d files) • j/k nav • Enter filter file • g graph • H back", m.historyView.HotspotCount())
+		} else {
+			m.statusMsg = "◈ Returned to History mode"
+		}
+		m.statusIsError = false
 	case "W":
 		// Toggle Temporal Causality & Wait-Time Analysis panel (W30-2)
-		if m.historyView.IsOrphansMode() {
-			m.statusMsg = "⏱ Causality requires Bead or Git history mode (press O to switch)"
+		if m.historyView.IsOrphansMode() || m.historyView.IsHotspotsMode() {
+			m.statusMsg = "⏱ Causality requires Bead or Git history mode (press O/H to switch)"
 			m.statusIsError = false
 			break
 		}
@@ -10928,14 +11957,29 @@ func (m *Model) handleHistoryKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 		m.statusIsError = false
 		cmd = m.loadCausalityForBeadCmd(targetBeadID)
 	case "+":
+		if m.historyView.IsHotspotsMode() {
+			m.statusMsg = "🔥 Correlation feedback applies to Bead/Git/Orphans modes (press H to exit)"
+			m.statusIsError = false
+			break
+		}
 		cmd = m.recordCorrelationFeedback("confirm")
 	case "-":
+		if m.historyView.IsHotspotsMode() {
+			m.statusMsg = "🔥 Correlation feedback applies to Bead/Git/Orphans modes (press H to exit)"
+			m.statusIsError = false
+			break
+		}
 		cmd = m.recordCorrelationFeedback("reject")
 	case "x":
+		if m.historyView.IsHotspotsMode() {
+			m.statusMsg = "🔥 Correlation feedback applies to Bead/Git/Orphans modes (press H to exit)"
+			m.statusIsError = false
+			break
+		}
 		cmd = m.recordCorrelationFeedback("ignore")
 	case "c":
-		if m.historyView.IsOrphansMode() {
-			m.statusMsg = "◎ Confidence filter applies to Bead/Git history modes (press O to switch)"
+		if m.historyView.IsOrphansMode() || m.historyView.IsHotspotsMode() {
+			m.statusMsg = "🔍 Confidence filter applies to Bead/Git history modes (press O/H to switch)"
 			m.statusIsError = false
 			break
 		}
@@ -10949,6 +11993,11 @@ func (m *Model) handleHistoryKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 		}
 		m.statusIsError = false
 	case "A":
+		if m.historyView.IsHotspotsMode() {
+			m.statusMsg = "🔥 Press Enter to filter commits for this hotspot file first"
+			m.statusIsError = false
+			break
+		}
 		// Toggle author filter for the currently selected commit/item
 		var author string
 		if m.historyView.IsOrphansMode() {
@@ -10978,9 +12027,9 @@ func (m *Model) handleHistoryKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 			m.statusIsError = true
 		}
 	case "f", "F":
-		// Toggle file tree panel (bv-190l); unavailable in Orphans Audit mode (P16A-5).
-		if m.historyView.IsOrphansMode() {
-			m.statusMsg = "📁 File tree is unavailable in Orphans mode (press O to exit)"
+		// Toggle file tree panel (bv-190l); unavailable in Orphans/Hotspots mode (P16A-5 / W35-5).
+		if m.historyView.IsOrphansMode() || m.historyView.IsHotspotsMode() {
+			m.statusMsg = "📁 File tree is unavailable in Orphans/Hotspots mode (press O/H to exit)"
 			m.statusIsError = false
 			break
 		}
@@ -11011,6 +12060,11 @@ func (m *Model) handleHistoryKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 		}
 		m.statusIsError = false
 	case "o":
+		if m.historyView.IsHotspotsMode() {
+			m.statusMsg = "🔥 Press Enter to view commits for this hotspot file first"
+			m.statusIsError = false
+			break
+		}
 		// Open commit in browser (bv-xf4p)
 		var sha string
 		if m.historyView.IsOrphansMode() {
@@ -11052,7 +12106,9 @@ func (m *Model) handleHistoryKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 	case "g":
 		// Jump to graph view for selected bead (bv-xf4p)
 		var selectedID string
-		if m.historyView.IsOrphansMode() {
+		if m.historyView.IsHotspotsMode() {
+			selectedID = m.historyView.SelectedHotspotPrimaryBeadID()
+		} else if m.historyView.IsOrphansMode() {
 			if pb := m.historyView.SelectedOrphanProbableBead(); pb != nil {
 				selectedID = pb.BeadID
 			}
@@ -11597,7 +12653,8 @@ func (m *Model) handleRecipePickerKeys(msg tea.KeyMsg) *Model {
 			m.setActiveRecipe(selected)
 			m.applyRecipe(selected)
 			if !m.isBoardView && !m.isGraphView {
-				m.isActionableView = false
+				m.exitInsightsView()
+				m.exitActionableView()
 				m.exitHistoryView()
 				m.isSprintView = false
 				m.savedViewFocus = focusList
@@ -11630,12 +12687,26 @@ func (m *Model) refreshTreeView() {
 	m.tree.SetPriorityHints(m.activeScopePriorityHints(), m.showPriorityHints)
 	scopeAn, scopeStats, scopeETA := m.activeScopeAnalysis()
 	m.tree.SetTelemetry(scopeAn, scopeStats, scopeETA)
+	m.tree.SetRiskByID(m.activeScopeRiskMap())
 	if m.workspaceMode && m.activeRepos != nil {
 		m.tree.BuildFromIssues(m.repoScopedIssues())
 	} else if m.snapshot != nil {
 		m.tree.BuildFromSnapshot(m.snapshot)
 	} else {
 		m.tree.BuildFromIssues(m.issues)
+	}
+	if m.tree.SyncWhatIfBatch() {
+		if scopeAn == nil {
+			scopeAn = m.analyzer
+		}
+		if scopeStats == nil {
+			scopeStats = m.analysis
+		}
+		if scopeAn != nil {
+			m.tree.SetWhatIfBatchResult(scopeAn.ComputeWhatIfBatch(m.tree.WhatIfBatchIDs(), scopeStats))
+		} else {
+			m.tree.SetWhatIfBatchResult(nil)
+		}
 	}
 	m.tree.SetSize(m.mainContentWidth(), max(m.height-1, 1))
 }
@@ -11669,7 +12740,7 @@ func (m *Model) syncSecondaryViewsForRepoScope(targetFocus focus) {
 		m.sprintViewText = m.renderSprintDashboard()
 	}
 	if m.historyFullReport != nil && m.historyReportDataGeneration == m.semanticDataGeneration {
-		m.historyView.SetReport(m.scopeHistoryReportForActiveRepos(m.historyFullReport))
+		m.historyView.SetReportAndIssues(m.scopeHistoryReportForActiveRepos(m.historyFullReport), m.issues)
 		scopedOrphans, scopedRatio := m.scopeHistoryOrphansForActiveRepos(m.historyFullOrphans)
 		m.historyView.SetOrphans(scopedOrphans, scopedRatio)
 		m.syncHistoryCassSessions()
@@ -11816,7 +12887,8 @@ func (m *Model) handleLabelPickerKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 			m.statusMsg = fmt.Sprintf("Filtered by label: %s", selected)
 			m.statusIsError = false
 			if !m.isBoardView && !m.isGraphView {
-				m.isActionableView = false
+				m.exitInsightsView()
+				m.exitActionableView()
 				m.exitHistoryView()
 				m.isSprintView = false
 				m.savedViewFocus = focusList
@@ -11843,6 +12915,13 @@ func (m *Model) handleInsightsKeys(msg tea.KeyMsg) *Model {
 			return m
 		}
 		if msg.String() == "esc" {
+			if m.insightsPanel.focusedPanel == PanelCycles && m.insightsPanel.CycleCutPreflight() != nil {
+				m.insightsPanel.SetCycleCutPreflight(nil)
+				m.statusMsg = "Cycle-cut preflight cleared"
+				m.statusIsError = false
+				return m
+			}
+			m.insightsPanel.SetCycleCutPreflight(nil)
 			m.focused = focusList
 		}
 	case "j", "down":
@@ -11904,6 +12983,7 @@ func (m *Model) handleInsightsKeys(msg tea.KeyMsg) *Model {
 		// Jump to selected issue in list view
 		selectedID := m.insightsPanel.SelectedIssueID()
 		if selectedID != "" {
+			m.insightsPanel.SetCycleCutPreflight(nil)
 			m.revealRecipeIssue(selectedID)
 			m.selectListIssueByID(selectedID)
 			m.focused = focusList
@@ -12043,7 +13123,7 @@ func (m *Model) handleTimeTravelInputKeys(msg tea.KeyMsg) (*Model, tea.Cmd) {
 		m.endEmbeddedTextInputSession(embeddedTextInputTimeTravel)
 		m.enterTimeTravelMode(revision)
 		if m.timeTravelMode && !m.isBoardView && !m.isGraphView && m.savedViewFocus != focusTree {
-			m.isActionableView = false
+			m.exitActionableView()
 			m.exitHistoryView()
 			m.isSprintView = false
 			m.showVelocityComparison = false
@@ -12093,8 +13173,31 @@ func (m *Model) recordSavedViewFocus() {
 func (m *Model) exitGraphView() {
 	if m.isGraphView {
 		m.graphView.ClearCheckDep()
+		m.graphView.ClearWhatIfBatch()
 	}
 	m.isGraphView = false
+}
+
+func (m *Model) exitBoardView() {
+	if m.isBoardView {
+		m.board.ClearWhatIfBatch()
+	}
+	m.isBoardView = false
+}
+
+func (m *Model) exitInsightsView() {
+	m.insightsPanel.SetCycleCutPreflight(nil)
+}
+
+func (m *Model) exitActionableView() {
+	if m.isActionableView {
+		m.actionableView.ClearWhatIfBatch()
+	}
+	m.isActionableView = false
+}
+
+func (m *Model) exitTreeView() {
+	m.tree.ClearWhatIfBatch()
 }
 
 func (m *Model) exitHistoryView() {
@@ -12108,9 +13211,11 @@ func (m *Model) exitHistoryView() {
 func (m *Model) resetUnderlyingViewToMainList() {
 	hadFlowDetail := m.flowDetailID != ""
 	m.flowDetailID = ""
-	m.isBoardView = false
+	m.insightsPanel.SetCycleCutPreflight(nil)
+	m.exitBoardView()
 	m.exitGraphView()
-	m.isActionableView = false
+	m.exitActionableView()
+	m.exitTreeView()
 	m.exitHistoryView()
 	m.isSprintView = false
 	m.showVelocityComparison = false
@@ -12627,6 +13732,7 @@ func (m *Model) renderMainView() (body string, overlay bool) {
 			scopeAn, scopeStats, scopeETA := m.activeScopeAnalysis()
 			m.tree.SetPriorityHints(m.activeScopePriorityHints(), m.showPriorityHints)
 			m.tree.SetTelemetry(scopeAn, scopeStats, scopeETA)
+			m.tree.SetRiskByID(m.activeScopeRiskMap())
 			m.tree.SetSize(bodyWidth, max(bodyHeight, 1))
 			body = m.tree.View()
 		case m.isGraphView:
@@ -12640,6 +13746,8 @@ func (m *Model) renderMainView() (body string, overlay bool) {
 			m.board.SetAnalyzer(boardAn)
 			m.board.SetAnalysis(boardStats)
 			m.board.SetETAContext(boardETA)
+			m.board.SetPriorityHints(m.activeScopePriorityHints())
+			m.board.SetRiskByID(m.activeScopeRiskMap())
 			m.board.SetSize(bodyWidth, bodyHeight)
 			body = m.board.View(bodyWidth, bodyHeight)
 		case m.isActionableView:
@@ -14812,8 +15920,11 @@ func (m *Model) setActiveRecipe(r *recipe.Recipe) {
 	m.recipeCollapsed = make(map[string]bool)
 	if r != nil && r.View.ShowGraph {
 		m.recipeGraphOwned = true
+		m.exitInsightsView()
+		m.exitBoardView()
 		m.exitHistoryView()
-		m.isGraphView, m.isBoardView, m.isActionableView = true, false, false
+		m.exitActionableView()
+		m.isGraphView = true
 		m.isSprintView = false
 		m.showVelocityComparison = false
 		m.savedViewFocus = focusGraph
@@ -14822,7 +15933,7 @@ func (m *Model) setActiveRecipe(r *recipe.Recipe) {
 	m.refreshRecipeMetrics()
 	m.updateListDelegate()
 	if m.analysis != nil && m.analyzer != nil {
-		m.alerts, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlertsWithOptions(m.issues, m.analysis, m.analyzer, m.alertOptions())
+		m.alerts, m.alertsSkippedChecks, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlertsDetailedWithOptions(m.issues, m.analysis, m.analyzer, m.alertOptions())
 		m.recomputeVisibleAlertCounts()
 	}
 	if m.backgroundWorker != nil {
@@ -14992,7 +16103,11 @@ func (m *Model) refreshRecipeMetrics() {
 				m.recipeMetricValues[name] = m.triageScores
 			case "kcore":
 				values := make(map[string]float64)
-				for id, value := range m.analysis.CoreNumber() {
+				kcores := m.analysis.ActiveCoreNumber()
+				if len(kcores) == 0 {
+					kcores = m.analysis.CoreNumber()
+				}
+				for id, value := range kcores {
 					values[id] = float64(value)
 				}
 				m.recipeMetricValues[name] = values
@@ -16584,6 +17699,74 @@ func (m *Model) updateViewportContent() {
 		sb.WriteString("```text\n" + treeStr + "```\n\n")
 	}
 
+	// Per-Issue Alerts (W36-2: strictly scoped to active alerts matching this issue)
+	if len(m.alerts) > 0 {
+		var itemAlerts []drift.Alert
+		for _, a := range m.activeScopedAlerts() {
+			if a.IssueID == item.ID || a.RelatedIssueID == item.ID {
+				itemAlerts = append(itemAlerts, a)
+			}
+		}
+		if len(itemAlerts) > 0 {
+			sb.WriteString(fmt.Sprintf("### 🔔 Alerts (%d)\n", len(itemAlerts)))
+			limit := min(5, len(itemAlerts))
+			for _, a := range itemAlerts[:limit] {
+				sev := strings.ToUpper(string(a.Severity))
+				if sev == "" {
+					sev = "WARNING"
+				}
+				msg := strings.TrimSpace(a.Message)
+				if msg == "" {
+					msg = string(a.Type)
+				}
+				fmt.Fprintf(&sb, "- **[%s]** %s\n", sev, msg)
+				if act := strings.TrimSpace(a.SuggestedAction); act != "" {
+					fmt.Fprintf(&sb, "  - *Suggested:* %s\n", act)
+				}
+			}
+			if len(itemAlerts) > limit {
+				fmt.Fprintf(&sb, "- *…and %d more alert(s) (press `!` for Alerts panel)*\n", len(itemAlerts)-limit)
+			}
+			sb.WriteString("\n")
+		}
+	}
+
+	// Per-Issue Hygiene Suggestions (W36-2: lazy-cached, bounded on very large repos to avoid scroll stalls)
+	if m.suggestionsCacheLoaded || len(m.issues) <= 500 {
+		var itemSuggestions []analysis.Suggestion
+		for _, sug := range m.activeScopedSuggestions() {
+			if sug.TargetBead != item.ID && sug.RelatedBead != item.ID {
+				continue
+			}
+			if !m.isIssueIDInActiveScope(sug.TargetBead) || (sug.RelatedBead != "" && !m.isIssueIDInActiveScope(sug.RelatedBead)) {
+				continue
+			}
+			itemSuggestions = append(itemSuggestions, sug)
+		}
+		if len(itemSuggestions) > 0 {
+			sb.WriteString(fmt.Sprintf("### 💡 Hygiene Suggestions (%d)\n", len(itemSuggestions)))
+			limit := min(5, len(itemSuggestions))
+			for _, sug := range itemSuggestions[:limit] {
+				summary := strings.TrimSpace(sug.Summary)
+				if summary == "" {
+					summary = strings.TrimSpace(sug.Reason)
+				}
+				confTag := ""
+				if sug.Confidence > 0 {
+					confTag = fmt.Sprintf(" (%.0f%%)", sug.Confidence*100)
+				}
+				fmt.Fprintf(&sb, "- `%s`%s %s\n", sug.Type, confTag, summary)
+				if sug.ActionCommand != "" && m.canEmitSuggestionCommand(sug) {
+					fmt.Fprintf(&sb, "  - `%s`\n", sug.ActionCommand)
+				}
+			}
+			if len(itemSuggestions) > limit {
+				fmt.Fprintf(&sb, "- *…and %d more suggestion(s) (press `!` → Tab for Suggestions)*\n", len(itemSuggestions)-limit)
+			}
+			sb.WriteString("\n")
+		}
+	}
+
 	// Comments
 	if len(item.Comments) > 0 {
 		sb.WriteString(fmt.Sprintf("### Comments (%d)\n", len(item.Comments)))
@@ -16598,8 +17781,8 @@ func (m *Model) updateViewportContent() {
 		}
 	}
 
-	// History Section (if data is loaded)
-	if m.historyView.HasReport() {
+	// History Section (if current-generation history data is loaded)
+	if m.historyReportIsCurrent() {
 		historyMD := m.renderBeadHistoryMD(item.ID)
 		if historyMD != "" {
 			sb.WriteString(historyMD)
@@ -16614,10 +17797,87 @@ func (m *Model) updateViewportContent() {
 	}
 }
 
-// renderBeadHistoryMD generates markdown for a bead's history
+// canEmitMutationCommands reports whether this TUI session is backed by a live,
+// authoritative single-repo tracker where emitting/copying direct br/bd mutation commands is safe.
+func (m *Model) canEmitMutationCommands() bool {
+	if m == nil {
+		return false
+	}
+	return m.sessionCommandsWritable() && !m.workspaceMode
+}
+
+func (m *Model) sessionCommandsWritable() bool {
+	if m == nil {
+		return false
+	}
+	return !m.authorityIncomplete &&
+		!m.timeTravelMode &&
+		strings.TrimSpace(m.asOfRevision) == "" &&
+		!m.isExplicitDB &&
+		!m.sourceDegraded &&
+		!isHistoricalGitBeadsPath(m.beadsPath)
+}
+
+func (m *Model) hasReadOnlyIssueOrigin(issueIDs ...string) bool {
+	if m == nil || len(issueIDs) == 0 {
+		return false
+	}
+	for _, rawID := range issueIDs {
+		id := strings.TrimSpace(rawID)
+		if id == "" {
+			continue
+		}
+		if m.issueMap != nil {
+			if iss, ok := m.issueMap[id]; ok && iss != nil && iss.Origin != nil && strings.TrimSpace(iss.Origin.ReadOnlyReason) != "" {
+				return true
+			}
+			continue
+		}
+		for i := len(m.issues) - 1; i >= 0; i-- {
+			if m.issues[i].ID == id {
+				if m.issues[i].Origin != nil && strings.TrimSpace(m.issues[i].Origin.ReadOnlyReason) != "" {
+					return true
+				}
+				break
+			}
+		}
+	}
+	return false
+}
+
+func (m *Model) canEmitMutationCommandForIssues(issueIDs ...string) bool {
+	return m.canEmitMutationCommands() && !m.hasReadOnlyIssueOrigin(issueIDs...)
+}
+
+func (m *Model) canEmitSuggestionCommand(sug analysis.Suggestion) bool {
+	if !m.sessionCommandsWritable() || strings.TrimSpace(sug.ActionCommand) == "" {
+		return false
+	}
+	if m.hasReadOnlyIssueOrigin(sug.TargetBead, sug.RelatedBead) {
+		return false
+	}
+	if m.workspaceMode {
+		return sug.Action != nil && strings.TrimSpace(sug.Action.WorkingDirectory) != ""
+	}
+	return true
+}
+
+// renderBeadHistoryMD generates markdown for a bead's history (W36-2: includes event-only history, cycle time, and related work)
 func (m *Model) renderBeadHistoryMD(beadID string) string {
 	hist := m.historyView.GetHistoryForBead(beadID)
-	if hist == nil || len(hist.Commits) == 0 {
+	if hist == nil {
+		return ""
+	}
+	rawRelated := m.historyView.relatedBeadsFor(beadID)
+	related := make([]correlation.RelatedWorkBead, 0, len(rawRelated))
+	for _, rb := range rawRelated {
+		if m.isIssueIDInActiveScope(rb.BeadID) {
+			related = append(related, rb)
+		}
+	}
+	hasCycleTime := hist.CycleTime != nil &&
+		(hist.CycleTime.CreateToClaim != nil || hist.CycleTime.ClaimToClose != nil || hist.CycleTime.CreateToClose != nil)
+	if len(hist.Events) == 0 && len(hist.Commits) == 0 && !hasCycleTime && len(related) == 0 {
 		return ""
 	}
 
@@ -16639,38 +17899,86 @@ func (m *Model) renderBeadHistoryMD(beadID string) string {
 		sb.WriteString("\n")
 	}
 
-	// Correlated commits
-	sb.WriteString(fmt.Sprintf("**Related Commits (%d):**\n", len(hist.Commits)))
-	for i, commit := range hist.Commits {
-		if i >= 5 {
-			sb.WriteString(fmt.Sprintf("  ... and %d more commits\n", len(hist.Commits)-5))
-			break
-		}
-
-		// Confidence indicator
-		confIcon := "🟢"
-		if commit.Confidence < 0.5 {
-			confIcon = "🟡"
-		} else if commit.Confidence < 0.8 {
-			confIcon = "🟠"
-		}
-
-		sb.WriteString(fmt.Sprintf("- %s **%.0f%%** `%s` %s\n",
-			confIcon,
-			commit.Confidence*100,
-			commit.ShortSHA,
-			truncateString(commit.Message, 40),
-		))
-
-		// Show files for high-confidence commits
-		if commit.Confidence >= 0.8 && len(commit.Files) > 0 && len(commit.Files) <= 3 {
-			for _, f := range commit.Files {
-				sb.WriteString(fmt.Sprintf("  - `%s` (+%d, -%d)\n", f.Path, f.Insertions, f.Deletions))
+	// Cycle time metrics (when lifecycle timestamps span claim/close)
+	if hist.CycleTime != nil {
+		formatDur := func(d time.Duration) string {
+			if d < time.Hour {
+				return fmt.Sprintf("%.0fm", d.Minutes())
 			}
+			if d < 48*time.Hour {
+				return fmt.Sprintf("%.1fh", d.Hours())
+			}
+			return fmt.Sprintf("%.1fd", d.Hours()/24)
+		}
+		var ctParts []string
+		if hist.CycleTime.CreateToClaim != nil {
+			ctParts = append(ctParts, "create→claim "+formatDur(*hist.CycleTime.CreateToClaim))
+		}
+		if hist.CycleTime.ClaimToClose != nil {
+			ctParts = append(ctParts, "claim→close "+formatDur(*hist.CycleTime.ClaimToClose))
+		}
+		if hist.CycleTime.CreateToClose != nil {
+			ctParts = append(ctParts, "total "+formatDur(*hist.CycleTime.CreateToClose))
+		}
+		if len(ctParts) > 0 {
+			sb.WriteString("**Cycle Time:** " + strings.Join(ctParts, " • ") + "\n\n")
 		}
 	}
 
-	sb.WriteString("\n*Press h for full history view*\n\n")
+	// Correlated commits
+	if len(hist.Commits) > 0 {
+		sb.WriteString(fmt.Sprintf("**Related Commits (%d):**\n", len(hist.Commits)))
+		for i, commit := range hist.Commits {
+			if i >= 5 {
+				sb.WriteString(fmt.Sprintf("  ... and %d more commits\n", len(hist.Commits)-5))
+				break
+			}
+
+			// Confidence indicator
+			confIcon := "🟢"
+			if commit.Confidence < 0.5 {
+				confIcon = "🟡"
+			} else if commit.Confidence < 0.8 {
+				confIcon = "🟠"
+			}
+
+			sb.WriteString(fmt.Sprintf("- %s **%.0f%%** `%s` %s\n",
+				confIcon,
+				commit.Confidence*100,
+				commit.ShortSHA,
+				truncateString(commit.Message, 40),
+			))
+
+			// Show files for high-confidence commits
+			if commit.Confidence >= 0.8 && len(commit.Files) > 0 && len(commit.Files) <= 3 {
+				for _, f := range commit.Files {
+					sb.WriteString(fmt.Sprintf("  - `%s` (+%d, -%d)\n", f.Path, f.Insertions, f.Deletions))
+				}
+			}
+		}
+		sb.WriteString("\n")
+	}
+
+	// Related beads sharing files or commits (strictly scoped to visible issues)
+	if len(related) > 0 {
+		sb.WriteString("**Related Work (Shared Files / Commits):**\n")
+		for _, rb := range related {
+			title := strings.TrimSpace(rb.Title)
+			if title == "" {
+				if iss := m.issueMap[rb.BeadID]; iss != nil {
+					title = iss.Title
+				}
+			}
+			if title != "" {
+				sb.WriteString(fmt.Sprintf("- **%s** (%d%%) — %s\n", rb.BeadID, rb.Relevance, truncateString(title, 48)))
+			} else {
+				sb.WriteString(fmt.Sprintf("- **%s** (%d%%)\n", rb.BeadID, rb.Relevance))
+			}
+		}
+		sb.WriteString("\n")
+	}
+
+	sb.WriteString("*Press h for full history view*\n\n")
 	return sb.String()
 }
 
@@ -16752,6 +18060,8 @@ func (m *Model) EnableWorkspaceMode(info WorkspaceInfo) {
 	m.workspaceInfo = clonedInfo
 	m.workspaceMode = info.Enabled
 	m.workspaceFailedCount = info.FailedCount
+	m.suggestionsCacheLoaded = false
+	m.suggestionsCache = nil
 	prefixes := info.RepoPrefixes
 	if len(prefixes) == 0 && len(info.Repos) > 0 {
 		prefixes = make([]string, 0, len(info.Repos))
@@ -16777,7 +18087,7 @@ func (m *Model) EnableWorkspaceMode(info WorkspaceInfo) {
 	// Update delegate to show repo badges and recompute workspace-scoped alerts
 	m.updateListDelegate()
 	if m.analysis != nil && m.analyzer != nil {
-		m.alerts, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlertsWithOptions(m.issues, m.analysis, m.analyzer, m.alertOptions())
+		m.alerts, m.alertsSkippedChecks, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlertsDetailedWithOptions(m.issues, m.analysis, m.analyzer, m.alertOptions())
 		m.recomputeVisibleAlertCounts()
 	}
 }
@@ -16926,7 +18236,7 @@ func filterDiffCyclesForCandidates(cycles [][]string, candidateIDs map[string]bo
 	return out
 }
 
-func newScopedTimeTravelSnapshot(issues []model.Issue, readiness *model.ReadinessIndex, candidateIDs map[string]bool, timestamp time.Time, refNow time.Time, revision string) *analysis.Snapshot {
+func newScopedTimeTravelSnapshot(issues []model.Issue, readiness *model.ReadinessIndex, candidateIDs map[string]bool, timestamp time.Time, refNow time.Time, revision string, forceFull ...bool) *analysis.Snapshot {
 	if readiness == nil {
 		readiness = model.NewReadinessIndex(issues)
 	}
@@ -16938,6 +18248,10 @@ func newScopedTimeTravelSnapshot(issues []model.Issue, readiness *model.Readines
 	analyzer.SetReadinessScope(readiness, candidateIDs)
 	if !evalNow.IsZero() {
 		analyzer.SetNow(evalNow)
+	}
+	if len(forceFull) > 0 && forceFull[0] {
+		fullCfg := analysis.FullAnalysisConfig()
+		analyzer.SetConfig(&fullCfg)
 	}
 	stats := analyzer.Analyze()
 	snapIssues := issues
@@ -17010,6 +18324,36 @@ func (m *Model) evaluateTimeTravelCandidates(
 	activeSourceRepos map[string]bool,
 	retainClosedFrom map[string]bool,
 ) map[string]bool {
+	var graphRootAllowed map[string]bool
+	if rootID := strings.TrimSpace(m.scopeGraphRoot); rootID != "" {
+		issueSet := make(map[string]bool, len(issues))
+		children := make(map[string][]string, len(issues))
+		for i := range issues {
+			iss := &issues[i]
+			issueSet[iss.ID] = true
+			for _, dep := range iss.Dependencies {
+				if dep != nil && (dep.Type.IsBlocking() || dep.Type == model.DepParentChild) {
+					children[dep.DependsOnID] = append(children[dep.DependsOnID], iss.ID)
+				}
+			}
+		}
+		graphRootAllowed = make(map[string]bool)
+		if issueSet[rootID] {
+			graphRootAllowed[rootID] = true
+			queue := []string{rootID}
+			for len(queue) > 0 {
+				curr := queue[0]
+				queue = queue[1:]
+				for _, childID := range children[curr] {
+					if graphRootAllowed[childID] || !issueSet[childID] {
+						continue
+					}
+					graphRootAllowed[childID] = true
+					queue = append(queue, childID)
+				}
+			}
+		}
+	}
 	scopedCandidates := make([]model.Issue, 0, len(issues))
 	baseCandidateIDs := make(map[string]bool, len(issues))
 	for i := range issues {
@@ -17025,6 +18369,9 @@ func (m *Model) evaluateTimeTravelCandidates(
 		if m.scopeLabelFilter != "" && !issueHasExactLabel(iss, m.scopeLabelFilter) {
 			continue
 		}
+		if graphRootAllowed != nil && !graphRootAllowed[iss.ID] {
+			continue
+		}
 		scopedCandidates = append(scopedCandidates, iss)
 		baseCandidateIDs[iss.ID] = true
 	}
@@ -17034,7 +18381,7 @@ func (m *Model) evaluateTimeTravelCandidates(
 
 	az := analysis.NewAnalyzer(issues)
 	var azCands map[string]bool
-	if (m.workspaceMode && m.activeRepos != nil) || m.scopeRepoFilter != "" || m.scopeLabelFilter != "" {
+	if (m.workspaceMode && m.activeRepos != nil) || m.scopeRepoFilter != "" || m.scopeLabelFilter != "" || graphRootAllowed != nil {
 		azCands = baseCandidateIDs
 	}
 	az.SetReadinessScope(readiness, azCands)
@@ -17043,6 +18390,10 @@ func (m *Model) evaluateTimeTravelCandidates(
 	}
 	if w := feedbackWeightsForBeadsPath(m.beadsPath); w != nil {
 		az.SetWeights(*w)
+	}
+	if m.forceFullAnalysis {
+		fullCfg := analysis.FullAnalysisConfig()
+		az.SetConfig(&fullCfg)
 	}
 	stats := az.Analyze()
 	triageRes := analysis.ComputeTriageFromAnalyzer(az, &stats, issues, tuiTriageOptions(nil), az.Now())
@@ -17442,11 +18793,13 @@ func (m *Model) enterTimeTravelMode(revision string) bool {
 
 	hasDynamicScope := m.scopeLabelFilter != "" ||
 		m.scopeRepoFilter != "" ||
+		m.scopeGraphRoot != "" ||
 		m.activeRecipe != nil ||
 		(m.workspaceMode && m.activeRepos != nil)
 	useStaticCandidates := m.candidateIDs != nil &&
 		m.scopeLabelFilter == "" &&
 		m.scopeRepoFilter == "" &&
+		m.scopeGraphRoot == "" &&
 		m.activeRecipe == nil
 	hasScope := hasDynamicScope || useStaticCandidates
 
@@ -17484,8 +18837,8 @@ func (m *Model) enterTimeTravelMode(revision string) bool {
 	}
 
 	// Create snapshots and compute diff with consistent authority, candidate scope, and reference timestamps
-	fromSnapshot := newScopedTimeTravelSnapshot(historicalIssues, histReadiness, fromCandidates, fromTime, toTime, resolvedFromRev)
-	toSnapshot := newScopedTimeTravelSnapshot(m.issues, curReadiness, toCandidates, toTime, toTime, toRev)
+	fromSnapshot := newScopedTimeTravelSnapshot(historicalIssues, histReadiness, fromCandidates, fromTime, toTime, resolvedFromRev, m.forceFullAnalysis)
+	toSnapshot := newScopedTimeTravelSnapshot(m.issues, curReadiness, toCandidates, toTime, toTime, toRev, m.forceFullAnalysis)
 	diff := analysis.CompareSnapshots(fromSnapshot, toSnapshot)
 	if hasScope {
 		diff.NewCycles = filterDiffCyclesForCandidates(diff.NewCycles, toCandidates)
@@ -17538,6 +18891,7 @@ func (m *Model) enterTimeTravelMode(revision string) bool {
 	m.timeTravelDensityDelta = densityDelta
 	m.tree.SetReadOnly(true)
 	m.graphView.ClearCheckDep()
+	m.insightsPanel.SetCycleCutPreflight(nil)
 
 	// Success feedback with full summary counts and graph/health deltas
 	healthTrend := diff.Summary.HealthTrend
@@ -17567,6 +18921,7 @@ func (m *Model) exitTimeTravelMode() {
 	m.modifiedIssueIDs = nil
 	m.tree.SetReadOnly(m.beadsPath == "" || isHistoricalGitBeadsPath(m.beadsPath))
 	m.graphView.ClearCheckDep()
+	m.insightsPanel.SetCycleCutPreflight(nil)
 
 	// Feedback
 	m.statusMsg = "⏱️ Time-travel mode disabled"
@@ -17868,6 +19223,32 @@ func (m *Model) baselineStatusSummary() string {
 		scopeNote)
 }
 
+func (m *Model) alertsSkippedChecksSummary() string {
+	if m == nil || len(m.alertsSkippedChecks) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, min(2, len(m.alertsSkippedChecks)))
+	for i, sc := range m.alertsSkippedChecks {
+		if i >= 2 {
+			break
+		}
+		label := string(sc.Type)
+		if label == "" {
+			label = "baseline"
+		}
+		if r := strings.TrimSpace(sc.Reason); r != "" {
+			parts = append(parts, fmt.Sprintf("%s (%s)", label, truncateString(r, 42)))
+		} else {
+			parts = append(parts, label)
+		}
+	}
+	suffix := ""
+	if len(m.alertsSkippedChecks) > 2 {
+		suffix = fmt.Sprintf(" (+%d more)", len(m.alertsSkippedChecks)-2)
+	}
+	return "⚠ Skipped checks: " + strings.Join(parts, "; ") + suffix
+}
+
 func (m *Model) saveBaselineInteractive() {
 	if reason := m.baselineSaveBlockedReason(); reason != "" {
 		m.statusMsg = reason
@@ -17931,7 +19312,7 @@ func (m *Model) saveBaselineInteractive() {
 		m.statusIsError = true
 		return
 	}
-	m.alerts, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlertsWithOptions(m.issues, m.analysis, m.analyzer, opts)
+	m.alerts, m.alertsSkippedChecks, m.alertsCritical, m.alertsWarning, m.alertsInfo = computeAlertsDetailedWithOptions(m.issues, m.analysis, m.analyzer, opts)
 	m.recomputeVisibleAlertCounts()
 	activeAfter := len(m.activeScopedAlerts())
 	if activeAfter == 0 {
@@ -17941,6 +19322,9 @@ func (m *Model) saveBaselineInteractive() {
 	}
 	m.statusMsg = fmt.Sprintf("✓ Baseline saved (%d nodes, %d edges, %d cycles)", bl.Stats.NodeCount, bl.Stats.EdgeCount, bl.Stats.CycleCount)
 	m.statusIsError = false
+	if m.isSplitView {
+		m.updateViewportContent()
+	}
 }
 
 func (f focus) String() string {
@@ -18181,6 +19565,10 @@ func (m *Model) exportToMarkdown() {
 			candidates = filtered
 		}
 		scopedAnalyzer.SetReadinessScope(readiness, candidates)
+		if m.forceFullAnalysis {
+			fullCfg := analysis.FullAnalysisConfig()
+			scopedAnalyzer.SetConfig(&fullCfg)
+		}
 		stats := scopedAnalyzer.Analyze()
 		graphStats = &stats
 	}
@@ -19264,7 +20652,9 @@ func (m *Model) selectedIssueForActionWithReason() (*model.Issue, string) {
 		return m.resolveLiveIssue(sel.ID, sel), ""
 	case focusHistory:
 		var id string
-		if m.historyView.IsOrphansMode() {
+		if m.historyView.IsHotspotsMode() {
+			id = m.historyView.SelectedHotspotPrimaryBeadID()
+		} else if m.historyView.IsOrphansMode() {
 			if pb := m.historyView.SelectedOrphanProbableBead(); pb != nil {
 				id = pb.BeadID
 			}
@@ -19700,9 +21090,10 @@ func (m *Model) refreshAttentionView() {
 }
 
 // refreshActionableView rebuilds the execution plan for the current issue set
-// while preserving the selected issue ID when still present.
+// while preserving the selected issue ID and active Batch What-If selection when still present.
 func (m *Model) refreshActionableView() {
 	prevSelectedID := m.actionableView.SelectedIssueID()
+	prevBatch := m.actionableView.WhatIfBatchIDs()
 	scopedIssues := m.repoScopedIssues()
 	analyzer := analysis.NewAnalyzer(scopedIssues)
 	analyzer.SetNow(m.analysisReferenceTime())
@@ -19727,11 +21118,15 @@ func (m *Model) refreshActionableView() {
 		}
 		analyzer.SetReadinessScope(m.analyzer.Readiness(), candidates)
 	}
-	plan := analyzer.GetExecutionPlan()
+	plan := analyzer.GetExecutionPlanWithOptions(tuiNotReadyLabels())
 	m.actionableView = NewActionableModel(plan, m.theme)
 	var scopedStats *analysis.GraphStats
 	etaStats := m.analysis
 	if m.workspaceMode && m.activeRepos != nil {
+		if m.forceFullAnalysis {
+			fullCfg := analysis.FullAnalysisConfig()
+			analyzer.SetConfig(&fullCfg)
+		}
 		s := analyzer.Analyze()
 		scopedStats = &s
 		etaStats = scopedStats
@@ -19776,10 +21171,31 @@ func (m *Model) refreshActionableView() {
 	if len(etaMap) > 0 {
 		m.actionableView.SetETAByID(etaMap)
 	}
+	if riskMap := m.activeScopeRiskMap(); len(riskMap) > 0 {
+		m.actionableView.SetRiskByID(riskMap)
+	}
 	if len(whatIfMap) > 0 {
 		m.actionableView.SetWhatIfByID(whatIfMap)
 	}
 	m.actionableView.SetSize(m.mainContentWidth(), m.height-2)
+	if len(prevBatch) > 0 {
+		planIDs := make(map[string]bool)
+		for _, track := range plan.Tracks {
+			for _, item := range track.Items {
+				planIDs[item.ID] = true
+			}
+		}
+		kept := make([]string, 0, len(prevBatch))
+		for _, id := range prevBatch {
+			if planIDs[id] {
+				m.actionableView.ToggleWhatIfBatch(id)
+				kept = append(kept, id)
+			}
+		}
+		if len(kept) > 0 {
+			m.actionableView.SetWhatIfBatchResult(analyzer.ComputeWhatIfBatch(kept, etaStats))
+		}
+	}
 	if prevSelectedID != "" {
 		_ = m.actionableView.SelectIssueByID(prevSelectedID)
 	}
@@ -20127,12 +21543,14 @@ func (m *Model) alertOptions() alertComputeOptions {
 	label := strings.TrimSpace(m.scopeLabelFilter)
 	repo := strings.TrimSpace(m.scopeRepoFilter)
 	recipeName := strings.TrimSpace(m.scopeRecipeFilter)
+	graphRoot := strings.TrimSpace(m.scopeGraphRoot)
 	var scope *baseline.BaselineScope
-	if label != "" || repo != "" || recipeName != "" || m.workspaceMode {
+	if label != "" || repo != "" || recipeName != "" || graphRoot != "" || m.workspaceMode {
 		scope = &baseline.BaselineScope{
 			Label:     label,
 			Repo:      repo,
 			Recipe:    recipeName,
+			GraphRoot: graphRoot,
 			Workspace: m.workspaceMode,
 		}
 	}
@@ -20195,8 +21613,13 @@ func computeAlertsForDir(issues []model.Issue, stats *analysis.GraphStats, analy
 }
 
 func computeAlertsWithOptions(issues []model.Issue, stats *analysis.GraphStats, analyzer *analysis.Analyzer, opts alertComputeOptions) ([]drift.Alert, int, int, int) {
+	alerts, _, critical, warning, info := computeAlertsDetailedWithOptions(issues, stats, analyzer, opts)
+	return alerts, critical, warning, info
+}
+
+func computeAlertsDetailedWithOptions(issues []model.Issue, stats *analysis.GraphStats, analyzer *analysis.Analyzer, opts alertComputeOptions) ([]drift.Alert, []drift.SkippedCheck, int, int, int) {
 	if len(issues) == 0 || stats == nil || analyzer == nil {
-		return nil, 0, 0, 0
+		return nil, nil, 0, 0, 0
 	}
 
 	resolvedDir := strings.TrimSpace(opts.ProjectDir)
@@ -20272,7 +21695,7 @@ func computeAlertsWithOptions(issues []model.Issue, stats *analysis.GraphStats, 
 		}
 	}
 
-	return result.Alerts, critical, warning, info
+	return result.Alerts, result.SkippedChecks, critical, warning, info
 }
 
 func buildBaselineMetricItems(scores map[string]float64, limit int) []baseline.MetricItem {
@@ -20516,10 +21939,6 @@ func (m *Model) renderAlertsPanel() string {
 	boxWidth := max(24, min(80, m.width-4))
 	maxBoxHeight := max(10, m.height-4)
 	innerWidth := max(16, boxWidth-4)
-	footerText := "Tab: suggest • j/k • Enter • d: dismiss • S: save • Esc: close"
-	if m.alertsTab == 1 {
-		footerText = "Tab: alerts • j/k: nav • Enter: jump • c: copy cmd • Esc: close"
-	}
 
 	boxStyle := t.Renderer.NewStyle().
 		Border(lipgloss.RoundedBorder()).
@@ -20537,6 +21956,36 @@ func (m *Model) renderAlertsPanel() string {
 	var suggestions []analysis.Suggestion
 	if m.alertsTab == 1 || m.suggestionsCacheLoaded {
 		suggestions = m.activeScopedSuggestions()
+	}
+
+	// Gate footer copy hints strictly on whether the currently selected item can emit a command (P30-10 / P31-3).
+	alertCur := 0
+	if len(visibleAlerts) > 0 {
+		alertCur = min(max(m.alertsCursor, 0), len(visibleAlerts)-1)
+	}
+	suggCur := 0
+	if len(suggestions) > 0 {
+		suggCur = min(max(m.suggestionsCursor, 0), len(suggestions)-1)
+	}
+	canCopySelected := false
+	if m.alertsTab == 0 {
+		if len(visibleAlerts) > 0 {
+			al := visibleAlerts[alertCur]
+			canCopySelected = strings.TrimSpace(al.SuggestedAction) != "" && m.canEmitMutationCommandForIssues(al.IssueID, al.RelatedIssueID)
+		}
+	} else if len(suggestions) > 0 {
+		canCopySelected = m.canEmitSuggestionCommand(suggestions[suggCur])
+	}
+	footerText := "Tab: suggest • j/k • Enter • d: dismiss • S: save • Esc: close"
+	if canCopySelected {
+		footerText = "Tab: suggest • j/k • Enter • c: copy • d: dismiss • S: save • Esc: close"
+	}
+	if m.alertsTab == 1 {
+		if canCopySelected {
+			footerText = "Tab: alerts • j/k: nav • Enter: jump • c: copy cmd • Esc: close"
+		} else {
+			footerText = "Tab: alerts • j/k: nav • Enter: jump • Esc: close"
+		}
 	}
 
 	var sb strings.Builder
@@ -20571,7 +22020,10 @@ func (m *Model) renderAlertsPanel() string {
 				footerText = compactFooter
 			}
 		} else {
-			mid := "Tab • j/k • c: copy • Esc: close"
+			mid := "Tab • j/k • Enter: jump • Esc: close"
+			if canCopySelected {
+				mid = "Tab • j/k • c: copy • Esc: close"
+			}
 			if lipgloss.Width(mid) <= innerWidth {
 				footerText = mid
 			} else {
@@ -20698,7 +22150,7 @@ func (m *Model) renderAlertsPanel() string {
 				if reasonClean := sanitizeSuggText(sg.Reason); reasonClean != "" {
 					details = append(details, ansi.Truncate("     "+reasonClean, innerWidth, "…"))
 				}
-				if cmdClean := sanitizeSuggText(sg.ActionCommand); cmdClean != "" {
+				if cmdClean := sanitizeSuggText(sg.ActionCommand); cmdClean != "" && m.canEmitSuggestionCommand(sg) {
 					details = append(details, ansi.Truncate("     Cmd (c to copy): "+cmdClean, innerWidth, "…"))
 				}
 				return mainLine, details
@@ -20822,10 +22274,14 @@ func (m *Model) renderAlertsPanel() string {
 
 	alertFooterSep := "\n"
 	baselineHint := m.baselineStatusSummary()
+	skippedHint := m.alertsSkippedChecksSummary()
 	if len(visibleAlerts) == 0 {
 		emptyMsg := "✓ No active alerts"
 		if baselineHint != "" {
 			emptyMsg += "\n" + baselineHint
+		}
+		if skippedHint != "" {
+			emptyMsg += "\n" + skippedHint
 		}
 		alertFooterSep = writeEmptyState(emptyMsg)
 	} else {
@@ -20854,6 +22310,9 @@ func (m *Model) renderAlertsPanel() string {
 		}
 		if baselineHint != "" {
 			summary += "\n" + baselineHint
+		}
+		if skippedHint != "" {
+			summary += "\n" + skippedHint
 		}
 		var lineBudget int
 		lineBudget, alertFooterSep = writeChrome(summary, summaryStyle)
@@ -21055,10 +22514,12 @@ func (m *Model) RenderDebugView(viewName string, width, height int) string {
 	m.height = height
 	m.ready = true
 	m.snapshotInitPending = false
-	m.isBoardView = false
+	m.insightsPanel.SetCycleCutPreflight(nil)
+	m.exitBoardView()
 	m.exitGraphView()
 	m.exitHistoryView()
-	m.isActionableView = false
+	m.exitActionableView()
+	m.exitTreeView()
 	m.isSprintView = false
 	m.showVelocityComparison = false
 	if width < SplitViewMinWidth {
@@ -21119,6 +22580,8 @@ func (m *Model) RenderDebugView(viewName string, width, height int) string {
 		m.board.SetAnalyzer(boardAn)
 		m.board.SetAnalysis(boardStats)
 		m.board.SetETAContext(boardETA)
+		m.board.SetPriorityHints(m.activeScopePriorityHints())
+		m.board.SetRiskByID(m.activeScopeRiskMap())
 		m.board.SetSize(width, bodyHeight)
 		return m.board.View(width, bodyHeight)
 	case "history":
@@ -21307,7 +22770,9 @@ func (m *Model) focusedIssueForSessions() *model.Issue {
 		return nil
 	case focusHistory:
 		var id string
-		if m.historyView.IsOrphansMode() {
+		if m.historyView.IsHotspotsMode() {
+			id = m.historyView.SelectedHotspotPrimaryBeadID()
+		} else if m.historyView.IsOrphansMode() {
 			if pb := m.historyView.SelectedOrphanProbableBead(); pb != nil {
 				id = pb.BeadID
 			}
@@ -21427,6 +22892,8 @@ func (m *Model) etaScopeKey() string {
 	b.WriteString(m.scopeLabelFilter)
 	b.WriteByte('\x00')
 	b.WriteString(m.scopeRepoFilter)
+	b.WriteByte('\x00')
+	b.WriteString(m.scopeGraphRoot)
 	b.WriteByte('\x00')
 	if m.candidateIDs != nil {
 		// Order-independent zero-alloc membership fingerprint (FNV-1a XOR + sum + count).

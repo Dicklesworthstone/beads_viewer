@@ -342,8 +342,8 @@ func (b *Bundle) CopyEmbeddedAssetsWithSubtitle(title, subtitle string) error {
 	// Always add GitHub Actions workflow for reliable Pages deployment
 	// This ensures deployments trigger even if the built-in Pages workflow doesn't auto-trigger
 	if wfErr := b.WriteFile(filepath.Join(".github", "workflows", "static.yml"), []byte(GitHubActionsWorkflowContent), 0644); wfErr != nil {
-		// Non-fatal - just log a warning (fmt is already imported via other usage)
-		fmt.Printf("  Warning: Could not add GitHub Actions workflow: %v\n", wfErr)
+		// Non-fatal - log warning to stderr so stdout stays clean for callers/scripts
+		fmt.Fprintf(os.Stderr, "  Warning: Could not add GitHub Actions workflow: %v\n", wfErr)
 	}
 
 	return nil

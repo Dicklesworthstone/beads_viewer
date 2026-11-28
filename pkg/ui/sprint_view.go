@@ -322,11 +322,14 @@ func (m *Model) renderSprintDashboardWithFocus(keepBeadVisible bool) string {
 			sb.WriteString(valStyle.Render(fmt.Sprintf("  … +%d above", startIdx)))
 			sb.WriteString("\n")
 		}
+		riskMap := m.activeScopeRiskMap()
+		etaCtx := m.etaContext()
 		for i := startIdx; i < endIdx; i++ {
 			iss := sprintIssues[i]
 			statusIcon := "○"
 			statusStyle := valStyle
-			if isClosedLikeStatus(iss.Status) {
+			isClosed := isClosedLikeStatus(iss.Status)
+			if isClosed {
 				statusIcon = "✓"
 				statusStyle = t.Renderer.NewStyle().Foreground(t.Open)
 			} else {
@@ -346,7 +349,55 @@ func (m *Model) renderSprintDashboardWithFocus(keepBeadVisible bool) string {
 				prefix = "▸ "
 				statusStyle = statusStyle.Bold(true).Foreground(t.Primary)
 			}
-			sb.WriteString(statusStyle.Render(fmt.Sprintf("%s%s %s - %s", prefix, statusIcon, iss.ID, truncateStrSprint(iss.Title, 40))))
+			var metaParts []string
+			metaParts = append(metaParts, fmt.Sprintf("P%d", iss.Priority))
+			if iss.EstimatedMinutes != nil && *iss.EstimatedMinutes > 0 {
+				if *iss.EstimatedMinutes >= 60 {
+					metaParts = append(metaParts, fmt.Sprintf("%.1fh", float64(*iss.EstimatedMinutes)/60.0))
+				} else {
+					metaParts = append(metaParts, fmt.Sprintf("%dm", *iss.EstimatedMinutes))
+				}
+			}
+			if !isClosed && !iss.IsTemplate && !iss.Pinned && iss.Status != model.StatusPinned {
+				if sig, ok := riskMap[iss.ID]; ok && sig.CompositeRisk >= 0.5 {
+					metaParts = append(metaParts, fmt.Sprintf("⚠%.0f%%", sig.CompositeRisk*100))
+				}
+				if etaCtx != nil {
+					if est := etaCtx.EstimateForIssue(iss, 1); est.EstimatedDays > 0 && !est.ETADate.IsZero() {
+						metaParts = append(metaParts, fmt.Sprintf("~%.1fd", est.EstimatedDays))
+					}
+				}
+			}
+			formatBadge := func(parts []string) string {
+				if len(parts) == 0 {
+					return ""
+				}
+				return " [" + strings.Join(parts, " · ") + "]"
+			}
+			head := fmt.Sprintf("%s%s %s - ", prefix, statusIcon, iss.ID)
+			headW := lipgloss.Width(head)
+			badgeParts := append([]string(nil), metaParts...)
+			badgeStr := formatBadge(badgeParts)
+			availTitle := innerWidth - headW - lipgloss.Width(badgeStr)
+			for availTitle < 6 && len(badgeParts) > 0 {
+				badgeParts = badgeParts[:len(badgeParts)-1]
+				badgeStr = formatBadge(badgeParts)
+				availTitle = innerWidth - headW - lipgloss.Width(badgeStr)
+			}
+			titleText := iss.Title
+			if availTitle <= 0 {
+				titleText = ""
+			} else {
+				maxTitleW := min(32, availTitle)
+				if lipgloss.Width(titleText) > maxTitleW {
+					if maxTitleW <= 1 {
+						titleText = ansi.Truncate(titleText, maxTitleW, "")
+					} else {
+						titleText = ansi.Truncate(titleText, maxTitleW, "…")
+					}
+				}
+			}
+			sb.WriteString(statusStyle.Render(head + titleText + badgeStr))
 			sb.WriteString("\n")
 		}
 		if endIdx < len(sprintIssues) {
@@ -498,10 +549,11 @@ func (m *Model) openSprintView() (*Model, tea.Cmd) {
 		m.statusIsError = false
 		return m, nil
 	}
-	m.isGraphView = false
-	m.isBoardView = false
-	m.isActionableView = false
-	m.isHistoryView = false
+	m.exitInsightsView()
+	m.exitGraphView()
+	m.exitBoardView()
+	m.exitActionableView()
+	m.exitHistoryView()
 	if !m.isSplitView {
 		// The dashboard replaces the detail pane; closing it lands on the list.
 		m.showDetails = false

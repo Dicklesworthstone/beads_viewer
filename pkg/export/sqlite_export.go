@@ -998,20 +998,23 @@ func (e *SQLiteExporter) writeRobotOutputs(bundle *Bundle, dataDir string) error
 			suppressExportGroupedClaims(&triageOut)
 		}
 		if _, reproducible := sourceDateEpochTime(); reproducible {
-			// Strip non-deterministic wall-clock compute timings so data/triage.json
-			// and coi-serviceworker.js OFFLINE_ASSETS stay bit-identical under SOURCE_DATE_EPOCH.
+			// Strip non-deterministic wall-clock compute timings so data/triage.json,
+			// data/graph_layout.json, and coi-serviceworker.js OFFLINE_ASSETS stay
+			// bit-identical under SOURCE_DATE_EPOCH.
 			triageOut.Meta.ComputeTimeMs = 0
-			triageOut.Status.PageRank.Elapsed = 0
-			triageOut.Status.Betweenness.Elapsed = 0
-			triageOut.Status.Eigenvector.Elapsed = 0
-			triageOut.Status.HITS.Elapsed = 0
-			triageOut.Status.Critical.Elapsed = 0
-			triageOut.Status.Cycles.Elapsed = 0
-			triageOut.Status.KCore.Elapsed = 0
-			triageOut.Status.Articulation.Elapsed = 0
-			triageOut.Status.Slack.Elapsed = 0
+			zeroMetricStatusElapsed(&triageOut.Status)
 		}
-		if err := e.writeRobotJSON(bundle, filepath.Join(dataDir, "triage.json"), &triageOut); err != nil {
+		var triagePayload any = &triageOut
+		if e.Config.Feedback != nil {
+			triagePayload = struct {
+				analysis.TriageResult
+				Feedback *analysis.FeedbackJSON `json:"feedback,omitempty"`
+			}{
+				TriageResult: triageOut,
+				Feedback:     e.Config.Feedback,
+			}
+		}
+		if err := e.writeRobotJSON(bundle, filepath.Join(dataDir, "triage.json"), triagePayload); err != nil {
 			return fmt.Errorf("write triage.json: %w", err)
 		}
 
@@ -1327,12 +1330,10 @@ func removeChunkArtifacts(bundle *Bundle, chunksDir string) error {
 	return nil
 }
 
-// writeJSON writes data as JSON to a file.
+// writeJSON writes data as compact deterministic JSON to a file.
 func writeJSON(bundle *Bundle, path string, data interface{}) error {
 	return bundle.writeFile(path, 0o666, func(w io.Writer) error {
-		enc := json.NewEncoder(w)
-		enc.SetIndent("", "  ")
-		return enc.Encode(data)
+		return json.NewEncoder(w).Encode(data)
 	})
 }
 
@@ -1638,6 +1639,21 @@ type GraphCentrality struct {
 	Status      analysis.MetricStatus `json:"status"`
 }
 
+func zeroMetricStatusElapsed(status *analysis.MetricStatus) {
+	if status == nil {
+		return
+	}
+	status.PageRank.Elapsed = 0
+	status.Betweenness.Elapsed = 0
+	status.Eigenvector.Elapsed = 0
+	status.HITS.Elapsed = 0
+	status.Critical.Elapsed = 0
+	status.Cycles.Elapsed = 0
+	status.KCore.Elapsed = 0
+	status.Articulation.Elapsed = 0
+	status.Slack.Elapsed = 0
+}
+
 func (e *SQLiteExporter) graphCentrality() *GraphCentrality {
 	// Analyze the exported topology rather than borrowing possibly scoped or
 	// incomplete caller stats. Include omitted endpoints just as WASM does.
@@ -1678,8 +1694,16 @@ func (e *SQLiteExporter) graphCentrality() *GraphCentrality {
 	cfg.ComputeKCore = false
 	cfg.ComputeArticulation = false
 	cfg.ComputeSlack = false
+	_, reproducible := sourceDateEpochTime()
+	if reproducible {
+		cfg.RunToCompletion = true
+	}
 	stats := analysis.NewAnalyzer(issues).AnalyzeWithConfig(cfg)
-	result := &GraphCentrality{Version: 1, Status: stats.Status()}
+	status := stats.Status()
+	if reproducible {
+		zeroMetricStatusElapsed(&status)
+	}
+	result := &GraphCentrality{Version: 1, Status: status}
 	if result.Status.PageRank.State == "computed" {
 		result.PageRank = stats.PageRank()
 	}

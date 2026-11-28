@@ -61,10 +61,21 @@ type GraphModel struct {
 	// Interactive Pre-Flight Dependency Validator state (W31-4: D key)
 	checkDepFromID string
 	checkDepResult *graphCheckDepResult
+
+	// Multi-Issue Batch What-If state (W32-1: W key)
+	whatIfBatch       []string
+	whatIfBatchSet    map[string]bool
+	whatIfBatchResult *analysis.WhatIfBatchResult
+
+	// Cached cycle-break suggestions invalidated on snapshot/issues/analyzer change (W32-2)
+	cycleBreaks      []analysis.CycleBreakItem
+	cycleBreaksValid bool
 }
 
-// graphCheckDepResult holds the evaluated pre-flight check for adding blocking edge FromID -> ToID (W31-4).
+// graphCheckDepResult holds the evaluated pre-flight check for adding or removing
+// blocking edge FromID -> ToID (W31-4 / W33-2).
 type graphCheckDepResult struct {
+	Operation            string // "" (add) or "remove"
 	FromID               string
 	ToID                 string
 	CanAdd               bool
@@ -73,8 +84,37 @@ type graphCheckDepResult struct {
 	CyclePath            []string
 	WouldBlockActionable bool
 	CrossRepo            bool
+	Exists               bool
+	CanRemove            bool
+	CyclesBefore         int
+	CyclesAfter          int
+	CyclesBroken         int
+	WouldBreakAllCycles  bool
+	CyclesTruncated      bool
+	NewlyUnblocked       []string
 	Warning              string
 	Command              string
+}
+
+// ActiveBlockingTargets returns the sorted visible active blocking targets of issueID (W33-2).
+func (g *GraphModel) ActiveBlockingTargets(issueID string) []string {
+	raw := g.blockers[issueID]
+	if len(raw) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(raw))
+	out := make([]string, 0, len(raw))
+	for _, targetID := range raw {
+		if _, dup := seen[targetID]; dup {
+			continue
+		}
+		if iss := g.issueMap[targetID]; iss != nil && !isClosedLikeStatus(iss.Status) {
+			seen[targetID] = struct{}{}
+			out = append(out, targetID)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 func (g *GraphModel) StartCheckDep(fromID string) {
@@ -84,9 +124,11 @@ func (g *GraphModel) StartCheckDep(fromID string) {
 
 func (g *GraphModel) SetCheckDepResult(res *graphCheckDepResult) {
 	g.checkDepResult = res
-	if res != nil {
-		g.checkDepFromID = res.FromID
+	if res == nil || res.Operation == "remove" {
+		g.checkDepFromID = ""
+		return
 	}
+	g.checkDepFromID = res.FromID
 }
 
 func (g *GraphModel) ClearCheckDep() {
@@ -107,13 +149,152 @@ func (g *GraphModel) CheckDepResult() *graphCheckDepResult {
 }
 
 func (g *GraphModel) reconcileCheckDepScope() {
-	// P20A-2: Always discard any cached verdict on snapshot/issue reloads so an edge
-	// addition, status change, time-travel entry, or degraded source cannot preserve
-	// a stale CanAdd/Command result.
-	g.checkDepResult = nil
-	if g.checkDepFromID != "" && g.issueMap[g.checkDepFromID] == nil {
+	// P20A-2 + P24A-6: Always discard any completed check verdict (both Add and Remove)
+	// cleanly via ClearCheckDep() on snapshot/issue reloads so a completed check never
+	// morphs back into a phantom Check Add Dep picking prompt. Only preserve an active
+	// picking source (checkDepResult == nil) while that node remains in issueMap.
+	if g.checkDepResult != nil {
+		g.ClearCheckDep()
+	} else if g.checkDepFromID != "" && g.issueMap[g.checkDepFromID] == nil {
 		g.checkDepFromID = ""
 	}
+	g.reconcileWhatIfBatchScope()
+}
+
+// ToggleWhatIfBatch adds or removes id from the Graph View multi-issue Batch What-If set (W32-1).
+func (g *GraphModel) ToggleWhatIfBatch(id string) bool {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return false
+	}
+	if g.whatIfBatchSet == nil {
+		g.whatIfBatchSet = make(map[string]bool)
+	}
+	if g.whatIfBatchSet[id] {
+		delete(g.whatIfBatchSet, id)
+		filtered := g.whatIfBatch[:0]
+		for _, existing := range g.whatIfBatch {
+			if existing != id {
+				filtered = append(filtered, existing)
+			}
+		}
+		g.whatIfBatch = filtered
+		if len(g.whatIfBatch) == 0 {
+			g.whatIfBatchResult = nil
+		}
+		return false
+	}
+	g.whatIfBatchSet[id] = true
+	g.whatIfBatch = append(g.whatIfBatch, id)
+	return true
+}
+
+func (g *GraphModel) ClearWhatIfBatch() {
+	g.whatIfBatch = nil
+	g.whatIfBatchSet = nil
+	g.whatIfBatchResult = nil
+}
+
+func (g *GraphModel) HasWhatIfBatch() bool {
+	return len(g.whatIfBatch) > 0
+}
+
+func (g *GraphModel) IsInWhatIfBatch(id string) bool {
+	return g.whatIfBatchSet[id]
+}
+
+func (g *GraphModel) WhatIfBatchIDs() []string {
+	if len(g.whatIfBatch) == 0 {
+		return nil
+	}
+	out := make([]string, len(g.whatIfBatch))
+	copy(out, g.whatIfBatch)
+	return out
+}
+
+func (g *GraphModel) SetWhatIfBatchResult(res *analysis.WhatIfBatchResult) {
+	g.whatIfBatchResult = res
+}
+
+func (g *GraphModel) WhatIfBatchResult() *analysis.WhatIfBatchResult {
+	return g.whatIfBatchResult
+}
+
+func (g *GraphModel) reconcileWhatIfBatchScope() {
+	if len(g.whatIfBatch) == 0 {
+		g.whatIfBatchResult = nil
+		return
+	}
+	kept := make([]string, 0, len(g.whatIfBatch))
+	newSet := make(map[string]bool, len(g.whatIfBatch))
+	for _, id := range g.whatIfBatch {
+		if iss := g.issueMap[id]; iss != nil && !isClosedLikeStatus(iss.Status) {
+			kept = append(kept, id)
+			newSet[id] = true
+		}
+	}
+	g.whatIfBatch = kept
+	g.whatIfBatchSet = newSet
+	if len(kept) == 0 {
+		g.whatIfBatchResult = nil
+		return
+	}
+	if g.analyzer != nil && g.insights != nil && g.insights.Stats != nil {
+		g.whatIfBatchResult = g.analyzer.ComputeWhatIfBatch(kept, g.insights.Stats)
+	} else {
+		g.whatIfBatchResult = nil
+	}
+}
+
+func (g *GraphModel) invalidateCycleBreaks() {
+	g.cycleBreaks = nil
+	g.cycleBreaksValid = false
+}
+
+func (g *GraphModel) cachedCycleBreaks(stats *analysis.GraphStats) []analysis.CycleBreakItem {
+	if g.analyzer == nil || stats == nil || len(stats.Cycles()) == 0 {
+		return nil
+	}
+	if !g.cycleBreaksValid {
+		cfg := analysis.DefaultAdvancedInsightsConfig()
+		totalCycleEdges := 0
+		for _, cyc := range stats.Cycles() {
+			if len(cyc) > 1 {
+				totalCycleEdges += len(cyc)
+			}
+		}
+		if totalCycleEdges > cfg.CycleBreakLimit {
+			cfg.CycleBreakLimit = totalCycleEdges
+		}
+		adv := g.analyzer.GenerateAdvancedInsightsFromStats(stats, cfg)
+		if adv != nil && adv.CycleBreak != nil && len(adv.CycleBreak.Suggestions) > 0 {
+			g.cycleBreaks = append([]analysis.CycleBreakItem(nil), adv.CycleBreak.Suggestions...)
+		} else {
+			g.cycleBreaks = nil
+		}
+		g.cycleBreaksValid = true
+	}
+	return g.cycleBreaks
+}
+
+// MatchingCycleBreak returns the highest-ranked visible cycle-break suggestion touching issueID (W32-2).
+func (g *GraphModel) MatchingCycleBreak(issueID string) *analysis.CycleBreakItem {
+	if issueID == "" || g.insights == nil || g.insights.Stats == nil {
+		return nil
+	}
+	for _, cb := range g.cachedCycleBreaks(g.insights.Stats) {
+		if _, okFrom := g.issueMap[cb.EdgeFrom]; !okFrom {
+			continue
+		}
+		if _, okTo := g.issueMap[cb.EdgeTo]; !okTo {
+			continue
+		}
+		if cb.EdgeFrom == issueID || cb.EdgeTo == issueID {
+			copyCB := cb
+			return &copyCB
+		}
+	}
+	return nil
 }
 
 // NewGraphModel creates a new graph view from issues
@@ -190,6 +371,7 @@ func (g *GraphModel) SetSnapshot(snapshot *DataSnapshot) {
 		g.selectedIdx = 0
 	}
 	g.restoreNavigation(selectedID)
+	g.invalidateCycleBreaks()
 	g.reconcileCheckDepScope()
 }
 
@@ -199,6 +381,8 @@ func (g *GraphModel) SetAnalyzer(analyzer *analysis.Analyzer, nowFunc func() tim
 	if g.analyzer != analyzer {
 		g.analyzer = analyzer
 		g.canvasLines = nil
+		g.invalidateCycleBreaks()
+		g.reconcileWhatIfBatchScope()
 	}
 	g.nowFunc = nowFunc
 }
@@ -268,6 +452,7 @@ func (g *GraphModel) restoreNavigation(selectedID string) {
 
 func (g *GraphModel) rebuildGraph() {
 	g.canvasLines = nil
+	g.invalidateCycleBreaks()
 	size := len(g.issues)
 	g.issueMap = make(map[string]*model.Issue, size)
 	g.blockers = make(map[string][]string, size)
@@ -1322,27 +1507,9 @@ func (g *GraphModel) renderMetricsPanel(id string, width int, t Theme) string {
 				}
 			}
 		}
-		if len(stats.Cycles()) > 0 {
-			adv := g.analyzer.GenerateAdvancedInsightsFromStats(stats, analysis.DefaultAdvancedInsightsConfig())
-			if adv != nil && adv.CycleBreak != nil && len(adv.CycleBreak.Suggestions) > 0 {
-				var matched []analysis.CycleBreakItem
-				for _, cb := range adv.CycleBreak.Suggestions {
-					if _, okFrom := g.issueMap[cb.EdgeFrom]; !okFrom {
-						continue
-					}
-					if _, okTo := g.issueMap[cb.EdgeTo]; !okTo {
-						continue
-					}
-					if cb.EdgeFrom == id || cb.EdgeTo == id {
-						matched = append(matched, cb)
-					}
-				}
-				if len(matched) > 0 {
-					cb := matched[0]
-					cutLine := fmt.Sprintf("  Cut cycle: %s → %s (breaks %d, col %d)", cb.EdgeFrom, cb.EdgeTo, cb.Impact, cb.Collateral)
-					rows = append(rows, mutedStyle.Render(truncateRunesHelper(cutLine, max(20, width-4), "…")))
-				}
-			}
+		if cb := g.MatchingCycleBreak(id); cb != nil {
+			cutLine := fmt.Sprintf("  Cut cycle: %s → %s (breaks %d, col %d · c copy)", cb.EdgeFrom, cb.EdgeTo, cb.Impact, cb.Collateral)
+			rows = append(rows, mutedStyle.Render(truncateRunesHelper(cutLine, max(20, width-4), "…")))
 		}
 	} else {
 		rows = append(rows, sectionStyle.Render("Connections"))
@@ -1455,9 +1622,45 @@ func (g *GraphModel) renderMetricsPanel(id string, width int, t Theme) string {
 		}
 	}
 
+	if g.HasWhatIfBatch() && g.whatIfBatchResult != nil {
+		res := g.whatIfBatchResult
+		rows = append(rows, "")
+		rows = append(rows, sectionStyle.Render(fmt.Sprintf("Batch What-If (%d • W / Esc)", len(g.whatIfBatch))))
+		detailStyle := t.Renderer.NewStyle().Foreground(ColorText)
+		okStyle := t.Renderer.NewStyle().Foreground(t.Open).Bold(true)
+		mutedStyle := t.Renderer.NewStyle().Foreground(ColorMuted)
+		maxW := max(20, width-4)
+		shownBatch := g.whatIfBatch
+		batchSuffix := ""
+		if len(shownBatch) > 4 {
+			batchSuffix = fmt.Sprintf(" +%d", len(shownBatch)-4)
+			shownBatch = shownBatch[:4]
+		}
+		rows = append(rows, mutedStyle.Render(truncateRunesHelper("  Selected: "+strings.Join(shownBatch, ", ")+batchSuffix, maxW, "…")))
+		summary := fmt.Sprintf("  Unblocks +%d direct (+%d total)", res.Delta.DirectUnblocks, res.Delta.TransitiveUnblocks)
+		if res.Delta.EstimatedDaysSaved >= 0.1 {
+			summary += fmt.Sprintf(" · ~%.1fd saved", res.Delta.EstimatedDaysSaved)
+		}
+		rows = append(rows, detailStyle.Render(truncateRunesHelper(summary, maxW, "…")))
+		if res.SynergyUnblocks > 0 {
+			synShown := res.SynergyIssueIDs
+			synSuffix := ""
+			if len(synShown) > 3 {
+				synSuffix = fmt.Sprintf(" +%d", len(synShown)-3)
+				synShown = synShown[:3]
+			}
+			synLine := fmt.Sprintf("  ★ Synergy +%d: %s%s", res.SynergyUnblocks, strings.Join(synShown, ", "), synSuffix)
+			rows = append(rows, okStyle.Render(truncateRunesHelper(synLine, maxW, "…")))
+		}
+	}
+
 	if g.CheckDepActive() {
 		rows = append(rows, "")
-		rows = append(rows, sectionStyle.Render("Check Add Dep (D / Esc)"))
+		header := "Check Add Dep (D / Esc)"
+		if g.checkDepResult != nil && g.checkDepResult.Operation == "remove" {
+			header = "Check Remove Dep (X / Esc)"
+		}
+		rows = append(rows, sectionStyle.Render(header))
 		detailStyle := t.Renderer.NewStyle().Foreground(ColorText)
 		warnStyle := t.Renderer.NewStyle().Foreground(t.Blocked).Bold(true)
 		okStyle := t.Renderer.NewStyle().Foreground(t.Open).Bold(true)
@@ -1466,6 +1669,55 @@ func (g *GraphModel) renderMetricsPanel(id string, width int, t Theme) string {
 		if g.checkDepResult == nil {
 			rows = append(rows, detailStyle.Render(truncateRunesHelper(
 				fmt.Sprintf("  From %s → move to target & press D", g.checkDepFromID), maxW, "…")))
+		} else if g.checkDepResult.Operation == "remove" {
+			res := g.checkDepResult
+			if !res.Exists {
+				msg := res.Warning
+				if msg == "" {
+					msg = fmt.Sprintf("Blocking dependency %s → %s does not exist", res.FromID, res.ToID)
+				}
+				rows = append(rows, warnStyle.Render(truncateRunesHelper("  ⚠ "+msg, maxW, "…")))
+			} else {
+				summary := fmt.Sprintf("  ✂ Remove %s → %s", res.FromID, res.ToID)
+				if res.CyclesBefore > 0 {
+					switch {
+					case res.CyclesTruncated && res.WouldBreakAllCycles:
+						summary += fmt.Sprintf(" · breaks ≥%d (capped) → acyclic", res.CyclesBefore)
+					case res.CyclesTruncated && res.CyclesBroken > 0:
+						summary += fmt.Sprintf(" · breaks ≥%d (capped)", res.CyclesBroken)
+					case res.CyclesTruncated:
+						summary += fmt.Sprintf(" · %d cycles (capped, inconclusive)", res.CyclesBefore)
+					case res.WouldBreakAllCycles:
+						summary += fmt.Sprintf(" · breaks %d/%d → acyclic", res.CyclesBroken, res.CyclesBefore)
+					default:
+						summary += fmt.Sprintf(" · breaks %d/%d cycles", res.CyclesBroken, res.CyclesBefore)
+					}
+				}
+				if res.CrossRepo {
+					summary += " [cross-repo]"
+				}
+				summaryStyle := okStyle
+				if res.CyclesTruncated {
+					summaryStyle = warnStyle
+				}
+				rows = append(rows, summaryStyle.Render(truncateRunesHelper(summary, maxW, "…")))
+				if len(res.NewlyUnblocked) > 0 {
+					shown := res.NewlyUnblocked
+					suffix := ""
+					if len(shown) > 3 {
+						suffix = fmt.Sprintf(" +%d", len(shown)-3)
+						shown = shown[:3]
+					}
+					rows = append(rows, detailStyle.Render(truncateRunesHelper(
+						fmt.Sprintf("  Unblocks +%d: %s%s", len(res.NewlyUnblocked), strings.Join(shown, ", "), suffix), maxW, "…")))
+				}
+				if res.Warning != "" {
+					rows = append(rows, warnStyle.Render(truncateRunesHelper("  ⚠ "+res.Warning, maxW, "…")))
+				}
+			}
+			if res.Command != "" {
+				rows = append(rows, mutedStyle.Render(truncateRunesHelper("  Cmd (c to copy): "+res.Command, maxW, "…")))
+			}
 		} else {
 			res := g.checkDepResult
 			switch {

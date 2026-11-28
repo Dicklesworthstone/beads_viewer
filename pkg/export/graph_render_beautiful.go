@@ -323,7 +323,8 @@ func generateUltimateHTMLWithTime(title, dataHash, graphDataJSON string, nodeCou
             background: var(--bg-glass); backdrop-filter: blur(15px);
             padding: 0.75rem 1rem; border-radius: var(--radius);
             font-size: 0.8rem; color: var(--fg-muted);
-            z-index: 10; display: flex; gap: 1.25rem;
+            z-index: 10; display: flex; flex-wrap: wrap; gap: 0.65rem 1.25rem;
+            max-width: calc(100%% - 5rem);
             border: 1px solid var(--bg-elevated);
             box-shadow: var(--shadow);
         }
@@ -750,6 +751,7 @@ func generateUltimateHTMLWithTime(title, dataHash, graphDataJSON string, nodeCou
                 <button id="btn-heatmap" title="Toggle heatmap coloring - shows node importance by color intensity (H)">🔥</button>
                 <button id="btn-triage" title="Show/hide triage recommendations panel with prioritized work items (G)">📋</button>
                 <button id="btn-cycles" title="Inspect dependency cycles (C)" style="display:none">🔄</button>
+                <button id="btn-diff-only" title="Toggle Changed Only (diff overlay)" style="display:none">Δ Changed</button>
                 <button id="btn-top" title="Show/hide top nodes panel with highest PageRank nodes (T)">⭐</button>
                 <button id="btn-recent" title="Show/hide recently viewed nodes (Y)">🕐</button>
                 <button id="btn-path" title="Enter path finder mode - click two nodes to find shortest path (P)">🛤️</button>
@@ -827,6 +829,11 @@ func generateUltimateHTMLWithTime(title, dataHash, graphDataJSON string, nodeCou
                 <div class="stat"><span class="stat-value">%d</span> nodes</div>
                 <div class="stat"><span class="stat-value">%d</span> edges</div>
                 <div class="stat" id="stat-visible"><span class="stat-value">%d</span> visible</div>
+                <div class="stat" id="stat-history" style="display:none"><span class="stat-value" id="stat-history-value"></span></div>
+            </div>
+            <div class="pathfinder-banner" id="diff-banner" style="bottom:1rem;top:auto;left:1rem;transform:none;animation:none;background:var(--bg-glass);color:var(--fg);border:1px solid #22c55e;display:none;flex-wrap:wrap;max-width:calc(100%% - 12.5rem);gap:0.5rem;align-items:center;font-size:0.75rem">
+                <span id="diff-banner-text" style="min-width:0;word-break:break-word">Δ Diff</span>
+                <button type="button" id="btn-diff-filter-toggle" style="padding:0.15rem 0.45rem;font-size:0.7rem;background:var(--bg-elevated);color:var(--fg);border:1px solid var(--fg-dim);border-radius:4px;cursor:pointer;flex-shrink:0">Changed only</button>
             </div>
             <button class="fullscreen-btn" id="btn-fullscreen" title="Toggle fullscreen mode for immersive graph viewing (Space)">⛶</button>
             <div class="top-nodes-panel" id="top-nodes-panel"></div>
@@ -845,6 +852,7 @@ func generateUltimateHTMLWithTime(title, dataHash, graphDataJSON string, nodeCou
             <div class="pathfinder-banner" id="pathfinder-banner">🔗 Path Finder: Click destination node (Esc to cancel)</div>
             <div class="pathfinder-banner" id="cycle-banner" style="top:3.5rem;border-color:#ef4444;display:none;gap:0.5rem;align-items:center">
                 <span id="cycle-banner-text">🔄 Cycle</span>
+                <button type="button" id="btn-cycle-preview-cut" style="display:none;padding:0.15rem 0.45rem;font-size:0.75rem;background:#d97706;color:#fff;border:none;border-radius:4px;cursor:pointer">Preview Cut</button>
                 <button type="button" id="btn-cycle-prev" style="padding:0.15rem 0.45rem;font-size:0.75rem">◀</button>
                 <button type="button" id="btn-cycle-next" style="padding:0.15rem 0.45rem;font-size:0.75rem">▶</button>
                 <button type="button" id="btn-cycle-close" style="padding:0.15rem 0.45rem;font-size:0.75rem">×</button>
@@ -925,7 +933,10 @@ func generateUltimateHTMLWithTime(title, dataHash, graphDataJSON string, nodeCou
                     <button type="button" class="triage-tab-btn" data-tab="quick_wins" style="padding:0.2rem 0.45rem;font-size:0.7rem">Quick Wins</button>
                     <button type="button" class="triage-tab-btn" data-tab="blockers" style="padding:0.2rem 0.45rem;font-size:0.7rem">Blockers</button>
                     <button type="button" class="triage-tab-btn" data-tab="alerts" style="padding:0.2rem 0.45rem;font-size:0.7rem">Alerts</button>
+                    <button type="button" class="triage-tab-btn" data-tab="high_risk" style="padding:0.2rem 0.45rem;font-size:0.7rem">High Risk</button>
+                    <button type="button" class="triage-tab-btn" data-tab="structural" style="padding:0.2rem 0.45rem;font-size:0.7rem">Structural</button>
                 </div>
+                <div id="triage-cross-repo-summary" style="display:none;margin-bottom:0.5rem;padding:0.4rem 0.5rem;border-radius:6px;background:rgba(99,102,241,0.14);border:1px solid rgba(129,140,248,0.35);font-size:0.7rem;color:#c7d2fe;line-height:1.35"></div>
                 <div id="triage-list"></div>
             </div>
             <div class="panel">
@@ -959,6 +970,10 @@ func generateUltimateHTMLWithTime(title, dataHash, graphDataJSON string, nodeCou
                     <div style="margin:0.5rem 0">
                         <button type="button" id="btn-detail-whatif" style="width:100%%;padding:0.35rem 0.5rem;font-size:0.75rem;display:none">⚡ Simulate Close (What-If)</button>
                     </div>
+                    <div id="detail-blockers-wrap" style="margin:0.5rem 0;display:none">
+                        <div class="metric-label" style="margin-bottom:0.25rem">Direct Blockers (✂ preflight cut)</div>
+                        <div id="detail-blockers-list" style="display:flex;flex-wrap:wrap;gap:0.25rem"></div>
+                    </div>
                     <div class="detail-metrics">
                         <div class="metric-item"><span class="metric-label">PageRank</span><span class="metric-value" id="m-pagerank">-</span></div>
                         <div class="metric-item"><span class="metric-label">Rank</span><span class="metric-value" id="m-prrank">-</span></div>
@@ -981,7 +996,8 @@ func generateUltimateHTMLWithTime(title, dataHash, graphDataJSON string, nodeCou
                 <div class="keyboard-hints">
                     <kbd>F</kbd> Fit · <kbd>R</kbd> Reset · <kbd>Space</kbd> Fullscreen<br>
                     <kbd>Esc</kbd> Clear · <kbd>1-4</kbd> View modes<br>
-                    <kbd>H</kbd> Heatmap · <kbd>T</kbd> Top · <kbd>G</kbd> Triage
+                    <kbd>H</kbd> Heatmap · <kbd>T</kbd> Top · <kbd>G</kbd> Triage<br>
+                    <kbd>Shift+Click</kbd> Batch What-If
                 </div>
             </div>
         </div>
@@ -998,6 +1014,7 @@ func generateUltimateHTMLWithTime(title, dataHash, graphDataJSON string, nodeCou
         <div class="context-menu-item" id="ctx-dependents">📤 Show dependents</div>
         <div class="context-menu-item" id="ctx-connected">✨ Highlight connected</div>
         <div class="context-menu-item" id="ctx-whatif">⚡ What-If: simulate close</div>
+        <div class="context-menu-item" id="ctx-whatif-batch">⚡ Toggle in Batch What-If (Shift+Click)</div>
         <div class="context-menu-item" id="ctx-checkdep">🧪 Check Add Dep → …</div>
         <div class="context-menu-divider"></div>
         <div class="context-menu-item" id="ctx-path">🛤️ Find path to...</div>
@@ -1044,6 +1061,7 @@ func generateUltimateHTMLWithTime(title, dataHash, graphDataJSON string, nodeCou
                 <div class="help-grid">
                     <div class="help-item"><span class="help-key">Hover</span> Show node details</div>
                     <div class="help-item"><span class="help-key">Click</span> Select node</div>
+                    <div class="help-item"><span class="help-key">Shift+Click</span> Toggle node in Batch What-If</div>
                     <div class="help-item"><span class="help-key">Right-click</span> Context menu</div>
                     <div class="help-item"><span class="help-key">Scroll</span> Zoom in/out</div>
                     <div class="help-item"><span class="help-key">Drag</span> Pan the view</div>
@@ -1517,6 +1535,27 @@ const Graph = ForceGraph()(container)
             ctx.fillStyle = g; ctx.fill();
         }
 
+        // Historical diff halo (--diff-since overlay, W32-3)
+        if (node.diff_status) {
+            ctx.save();
+            ctx.globalAlpha = alpha;
+            ctx.beginPath();
+            ctx.arc(x, y, size + 5, 0, 2 * Math.PI);
+            if (node.diff_status === 'added') {
+                ctx.strokeStyle = '#22c55e';
+                ctx.lineWidth = 2.5 / Math.max(0.5, globalScale);
+            } else if (node.diff_status === 'reopened' || node.diff_status === 'modified') {
+                ctx.strokeStyle = '#f59e0b';
+                ctx.lineWidth = 2.2 / Math.max(0.5, globalScale);
+            } else if (node.diff_status === 'closed') {
+                ctx.strokeStyle = '#94a3b8';
+                ctx.setLineDash([3 / Math.max(0.5, globalScale), 2 / Math.max(0.5, globalScale)]);
+                ctx.lineWidth = 2 / Math.max(0.5, globalScale);
+            }
+            ctx.stroke();
+            ctx.restore();
+        }
+
         // Articulation point glow (active issues only)
         if (isActiveNodeStatus(node.status) && node.is_articulation && isHighlighted) {
             ctx.beginPath(); ctx.arc(x, y, size + 6, 0, 2 * Math.PI);
@@ -1633,6 +1672,14 @@ function populatePanelContent(prefix, node) {
     addBadge('', 'P' + node.priority);
     if (isActiveNodeStatus(node.status) && node.is_articulation) addBadge('badge-articulation', 'Cut Vertex');
     if (node.slack_available !== false && isActiveNodeStatus(node.status) && node.slack === 0) addBadge('badge-critical', 'Critical Path');
+    if (node.diff_status) {
+        const diffLabels = { added: '+ Added', closed: '✓ Closed', reopened: '↺ Reopened', modified: '~ Modified' };
+        let diffText = diffLabels[node.diff_status] || ('Δ ' + node.diff_status);
+        if (node.diff_status === 'modified' && Array.isArray(node.diff_fields) && node.diff_fields.length > 0) {
+            diffText += ' (' + node.diff_fields.slice(0, 3).join(', ') + ')';
+        }
+        addBadge('badge-type', diffText);
+    }
     (node.labels || []).forEach(l => addBadge('badge-type', l));
 
     // Description
@@ -1924,6 +1971,92 @@ function selectNode(node) {
     if (whatIfBtn) {
         whatIfBtn.style.display = isActiveNodeStatus(node.status) ? '' : 'none';
     }
+    const blockersWrap = document.getElementById('detail-blockers-wrap');
+    const blockersList = document.getElementById('detail-blockers-list');
+    if (blockersWrap && blockersList) {
+        blockersList.textContent = '';
+        const model = buildStandaloneWhatIfModel();
+        const directSet = new Set();
+        DATA.links.forEach(l => {
+            const src = typeof l.source === 'object' ? l.source.id : l.source;
+            const tgt = typeof l.target === 'object' ? l.target.id : l.target;
+            if (src === node.id && tgt && isBlockingLinkType(l.type || 'blocks')) {
+                directSet.add(tgt);
+            }
+        });
+        if (Array.isArray(node.blocked_by)) {
+            const openParents = model.openParents.get(node.id);
+            node.blocked_by.forEach(bId => {
+                if (!bId || !model.allNodes.has(bId)) return;
+                const isParent = model.parentChildEdges && model.parentChildEdges.has(node.id + '\0' + bId);
+                if (!isParent && (!openParents || !openParents.has(bId))) {
+                    directSet.add(bId);
+                }
+            });
+        }
+        const blockers = [...directSet].filter(bId => model.allNodes.has(bId)).sort();
+        if (blockers.length > 0) {
+            blockers.forEach(bId => {
+                const blkNode = model.allNodes.get(bId);
+                const chip = document.createElement('span');
+                chip.className = 'detail-blocker-chip';
+                chip.style.display = 'inline-flex';
+                chip.style.alignItems = 'center';
+                chip.style.gap = '0.2rem';
+                chip.style.padding = '0.1rem 0.3rem';
+                chip.style.borderRadius = '4px';
+                chip.style.background = 'rgba(245, 158, 11, 0.14)';
+                chip.style.border = '1px solid rgba(245, 158, 11, 0.35)';
+                chip.style.fontSize = '0.7rem';
+
+                const navBtn = document.createElement('button');
+                navBtn.type = 'button';
+                navBtn.className = 'btn-detail-blocker-nav';
+                navBtn.textContent = bId;
+                navBtn.style.background = 'transparent';
+                navBtn.style.border = 'none';
+                navBtn.style.color = 'inherit';
+                navBtn.style.cursor = 'pointer';
+                navBtn.style.padding = '0';
+                navBtn.style.fontFamily = 'monospace';
+                if (blkNode && !isActiveNodeStatus(blkNode.status)) {
+                    navBtn.style.opacity = '0.6';
+                    navBtn.style.textDecoration = 'line-through';
+                }
+                navBtn.title = 'Focus blocker ' + bId;
+                navBtn.onclick = (e) => {
+                    e.stopPropagation();
+                    focusVisibleGraphNode(bId);
+                };
+
+                const cutBtn = document.createElement('button');
+                cutBtn.type = 'button';
+                cutBtn.className = 'btn-detail-remove-blocker';
+                cutBtn.dataset.removeFrom = node.id;
+                cutBtn.dataset.removeTo = bId;
+                cutBtn.textContent = '✂';
+                cutBtn.style.background = 'transparent';
+                cutBtn.style.border = 'none';
+                cutBtn.style.borderLeft = '1px solid rgba(245, 158, 11, 0.35)';
+                cutBtn.style.padding = '0 0 0 0.25rem';
+                cutBtn.style.color = '#f59e0b';
+                cutBtn.style.cursor = 'pointer';
+                cutBtn.title = 'Preflight removing blocking dependency ' + node.id + ' → ' + bId;
+                cutBtn.setAttribute('aria-label', 'Preflight remove blocker ' + bId);
+                cutBtn.onclick = (e) => {
+                    e.stopPropagation();
+                    runStandaloneCheckDepRemoval(node.id, bId);
+                };
+
+                chip.appendChild(navBtn);
+                chip.appendChild(cutBtn);
+                blockersList.appendChild(chip);
+            });
+            blockersWrap.style.display = 'block';
+        } else {
+            blockersWrap.style.display = 'none';
+        }
+    }
     document.getElementById('node-detail').classList.add('visible');
     document.getElementById('no-selection').style.display = 'none';
 }
@@ -1935,6 +2068,10 @@ function clearSelection() {
     closeCycleInspector();
     cancelCheckDep();
     clearWhatIfSimulation();
+    const blockersWrap = document.getElementById('detail-blockers-wrap');
+    const blockersList = document.getElementById('detail-blockers-list');
+    if (blockersList) blockersList.textContent = '';
+    if (blockersWrap) blockersWrap.style.display = 'none';
     document.getElementById('node-detail').classList.remove('visible');
     document.getElementById('no-selection').style.display = 'block';
     Graph.nodeColor(Graph.nodeColor());
@@ -2026,6 +2163,10 @@ function showContextMenu(node, event) {
     if (whatIfItem) {
         whatIfItem.style.display = (node && isActiveNodeStatus(node.status)) ? '' : 'none';
     }
+    const whatIfBatchItem = document.getElementById('ctx-whatif-batch');
+    if (whatIfBatchItem) {
+        whatIfBatchItem.style.display = (node && isActiveNodeStatus(node.status)) ? '' : 'none';
+    }
     const menu = document.getElementById('context-menu');
     menu.style.left = '0px';
     menu.style.top = '0px';
@@ -2101,6 +2242,20 @@ document.getElementById('ctx-whatif').onclick = () => {
     if (contextNode && isActiveNodeStatus(contextNode.status)) runWhatIfSimulation(contextNode.id);
     hideContextMenu();
 };
+document.getElementById('ctx-whatif-batch').onclick = () => {
+    if (contextNode) {
+        if (!isActiveNodeStatus(contextNode.status)) {
+            showToast('What-If only simulates closing active issues');
+        } else {
+            const idx = activeWhatIfIds.indexOf(contextNode.id);
+            const nextIds = idx >= 0
+                ? activeWhatIfIds.filter(id => id !== contextNode.id)
+                : [...activeWhatIfIds, contextNode.id];
+            runWhatIfBatchSimulation(nextIds);
+        }
+    }
+    hideContextMenu();
+};
 document.getElementById('ctx-checkdep').onclick = () => {
     if (contextNode) startStandaloneCheckDep(contextNode.id);
     hideContextMenu();
@@ -2146,6 +2301,10 @@ function buildStandaloneWhatIfModel() {
     const openChildren = new Map();
     const unresolvableBlockers = new Set();
     const selfLoops = new Set();
+    const blockingSelfLoops = new Set();
+    const parentChildSelfLoops = new Set();
+    const otherUnresolvableBlockers = new Set();
+    const parentChildEdges = new Set();
     activeNodes.forEach((_, id) => {
         directBlockers.set(id, new Set());
         directDependents.set(id, new Set());
@@ -2158,20 +2317,24 @@ function buildStandaloneWhatIfModel() {
         if (!activeNodes.has(src)) return;
         const ltype = l.type || 'blocks';
         if (ltype === 'parent-child') {
+            parentChildEdges.add(src + '\0' + tgt);
             if (src === tgt) {
                 unresolvableBlockers.add(src);
+                parentChildSelfLoops.add(src);
                 selfLoops.add(src);
             } else if (activeNodes.has(tgt)) {
                 openParents.get(src).add(tgt);
                 openChildren.get(tgt).add(src);
             } else if (!allNodes.has(tgt)) {
                 unresolvableBlockers.add(src);
+                otherUnresolvableBlockers.add(src);
             }
             return;
         }
         if (ltype !== 'blocks' && ltype !== 'conditional-blocks' && ltype !== 'waits-for') return;
         if (src === tgt) {
             unresolvableBlockers.add(src);
+            blockingSelfLoops.add(src);
             selfLoops.add(src);
             return;
         }
@@ -2182,6 +2345,7 @@ function buildStandaloneWhatIfModel() {
             const extNode = allNodes.get(tgt);
             if (!extNode || isActiveNodeStatus(extNode.status)) {
                 unresolvableBlockers.add(src);
+                otherUnresolvableBlockers.add(src);
             }
         }
     });
@@ -2191,8 +2355,10 @@ function buildStandaloneWhatIfModel() {
         const parents = openParents.get(id);
         if (Array.isArray(n.blocked_by)) {
             for (const bId of n.blocked_by) {
+                if (parentChildEdges.has(id + '\0' + bId)) continue;
                 if (bId === id) {
                     unresolvableBlockers.add(id);
+                    blockingSelfLoops.add(id);
                     selfLoops.add(id);
                 } else if (parents && parents.has(bId)) {
                     // Inherited via openParents; do not flatten parent itself into directBlockers.
@@ -2204,12 +2370,26 @@ function buildStandaloneWhatIfModel() {
                     const extNode = allNodes.get(bId);
                     if (!extNode || isActiveNodeStatus(extNode.status)) {
                         unresolvableBlockers.add(id);
+                        otherUnresolvableBlockers.add(id);
                     }
                 }
             }
         }
     });
-    const model = { allNodes, activeNodes, directBlockers, directDependents, openParents, openChildren, unresolvableBlockers, selfLoops };
+    const model = {
+        allNodes,
+        activeNodes,
+        directBlockers,
+        directDependents,
+        openParents,
+        openChildren,
+        unresolvableBlockers,
+        otherUnresolvableBlockers,
+        blockingSelfLoops,
+        parentChildSelfLoops,
+        parentChildEdges,
+        selfLoops,
+    };
     _standaloneWhatIfCache = {
         nodesRef: DATA.nodes,
         linksRef: DATA.links,
@@ -2598,10 +2778,11 @@ function checkStandaloneDep(fromId, toId) {
         }
     }
     res.canAdd = true;
+    const isSafeDepArg = (s) => typeof s === 'string' && s.length > 0 && !s.startsWith('-') && !/[\x00-\x1f\x7f-\x9f]/.test(s);
     const allowCmd = !(DATA.source_authority && DATA.source_authority.claim_safe === false) &&
         DATA.source_kind !== 'workspace' &&
         !DATA.as_of && !DATA.as_of_commit;
-    if (allowCmd && !res.crossRepo) {
+    if (allowCmd && !res.crossRepo && isSafeDepArg(fromId) && isSafeDepArg(toId)) {
         res.command = 'br dep add ' + quoteStandaloneWord(fromId) + ' ' + quoteStandaloneWord(toId);
     }
     return res;
@@ -2687,6 +2868,309 @@ function runStandaloneCheckDep(fromId, toId) {
 }
 window.bvCheckStandaloneDep = checkStandaloneDep;
 window.bvRunStandaloneCheckDep = runStandaloneCheckDep;
+
+// Pure-JS active dependency removal / cycle-cut preflight matching --robot-check-dep remove:FROM:TO (W33-2 + P24B-2/P24B-3).
+function countStandaloneActiveCycles(model, excludeFrom, excludeTo) {
+    const ids = [...model.activeNodes.keys()].sort();
+    const adj = new Map();
+    const MAX_CYCLES = 100;
+    const MAX_STEPS = 50000;
+    let cycleCount = 0;
+
+    // Count blocking self-loops directly (excluding the proposed removed edge).
+    if (model.blockingSelfLoops) {
+        model.blockingSelfLoops.forEach(id => {
+            if (id === excludeFrom && id === excludeTo) return;
+            if (model.activeNodes.has(id) && cycleCount < MAX_CYCLES) cycleCount++;
+        });
+    }
+    if (cycleCount >= MAX_CYCLES) return { count: cycleCount, truncated: true };
+
+    ids.forEach(id => {
+        const nexts = [];
+        const bs = model.directBlockers.get(id);
+        if (bs) {
+            bs.forEach(bId => {
+                if (id === excludeFrom && bId === excludeTo) return;
+                if (bId === id) return;
+                if (model.activeNodes.has(bId)) nexts.push(bId);
+            });
+        }
+        nexts.sort();
+        adj.set(id, nexts);
+    });
+
+    // Tarjan SCC decomposition (O(V+E)) eliminates exponential blowup on acyclic DAGs
+    // and guarantees any cycle of arbitrary length (>25 nodes) is never falsely counted as 0.
+    let tarjanIdx = 0;
+    const indexMap = new Map();
+    const lowlink = new Map();
+    const onStack = new Set();
+    const tStack = [];
+    const sccs = [];
+    const strongConnect = (v) => {
+        indexMap.set(v, tarjanIdx);
+        lowlink.set(v, tarjanIdx);
+        tarjanIdx++;
+        tStack.push(v);
+        onStack.add(v);
+        for (const w of (adj.get(v) || [])) {
+            if (!indexMap.has(w)) {
+                strongConnect(w);
+                lowlink.set(v, Math.min(lowlink.get(v), lowlink.get(w)));
+            } else if (onStack.has(w)) {
+                lowlink.set(v, Math.min(lowlink.get(v), indexMap.get(w)));
+            }
+        }
+        if (lowlink.get(v) === indexMap.get(v)) {
+            const comp = [];
+            while (true) {
+                const w = tStack.pop();
+                onStack.delete(w);
+                comp.push(w);
+                if (w === v) break;
+            }
+            if (comp.length > 1) {
+                comp.sort();
+                sccs.push(comp);
+            }
+        }
+    };
+    for (const id of ids) {
+        if (!indexMap.has(id)) strongConnect(id);
+    }
+
+    // Bounded Johnson elementary cycle enumeration inside each non-trivial SCC.
+    let steps = 0;
+    for (const comp of sccs) {
+        if (cycleCount >= MAX_CYCLES) break;
+        const compSet = new Set(comp);
+        const beforeComp = cycleCount;
+        const idxInComp = new Map(comp.map((id, i) => [id, i]));
+        for (let s = 0; s < comp.length && cycleCount < MAX_CYCLES && steps < MAX_STEPS; s++) {
+            const startId = comp[s];
+            const blocked = new Set();
+            const blockMap = new Map();
+            const unblock = (u) => {
+                blocked.delete(u);
+                const bs = blockMap.get(u);
+                if (bs) {
+                    for (const w of [...bs]) {
+                        bs.delete(w);
+                        if (blocked.has(w)) unblock(w);
+                    }
+                }
+            };
+            const circuit = (v) => {
+                if (cycleCount >= MAX_CYCLES || steps >= MAX_STEPS) return false;
+                steps++;
+                let found = false;
+                blocked.add(v);
+                for (const w of (adj.get(v) || [])) {
+                    if (!compSet.has(w) || idxInComp.get(w) < s) continue;
+                    if (w === startId) {
+                        cycleCount++;
+                        found = true;
+                        if (cycleCount >= MAX_CYCLES) return true;
+                    } else if (!blocked.has(w)) {
+                        if (circuit(w)) found = true;
+                    }
+                }
+                if (found) {
+                    unblock(v);
+                } else {
+                    for (const w of (adj.get(v) || [])) {
+                        if (!compSet.has(w) || idxInComp.get(w) < s) continue;
+                        if (!blockMap.has(w)) blockMap.set(w, new Set());
+                        blockMap.get(w).add(v);
+                    }
+                }
+                return found;
+            };
+            circuit(startId);
+        }
+        // Any non-trivial SCC provably contains >=1 cycle even if step budget was hit.
+        if (cycleCount === beforeComp) {
+            cycleCount = Math.min(MAX_CYCLES, cycleCount + 1);
+        }
+    }
+    return { count: cycleCount, truncated: cycleCount >= MAX_CYCLES || steps >= MAX_STEPS };
+}
+function checkStandaloneDepRemoval(fromIdRaw, toIdRaw) {
+    const fromId = String(fromIdRaw || '').trim();
+    const toId = String(toIdRaw || '').trim();
+    const res = {
+        operation: 'remove',
+        fromId,
+        toId,
+        exists: false,
+        canRemove: false,
+        cyclesBefore: 0,
+        cyclesAfter: 0,
+        cyclesBroken: 0,
+        cyclesTruncated: false,
+        wouldBreakAllCycles: false,
+        newlyUnblocked: [],
+        crossRepo: false,
+        warning: '',
+        command: '',
+    };
+    if (!fromId || !toId) {
+        res.warning = 'Both source and target issue IDs are required';
+        return res;
+    }
+    const model = buildStandaloneWhatIfModel();
+    const fromNode = model.allNodes.get(fromId);
+    const toNode = model.allNodes.get(toId);
+    if (!fromNode || !toNode) {
+        const missing = [];
+        if (!fromNode) missing.push(fromId);
+        if (!toNode && toId !== fromId) missing.push(toId);
+        res.warning = 'Unknown issue ID(s): ' + missing.join(', ');
+        return res;
+    }
+    const fromRepo = String(fromNode.source_repo || '').trim();
+    const toRepo = String(toNode.source_repo || '').trim();
+    res.crossRepo = Boolean(fromRepo && toRepo && fromRepo.toLowerCase() !== toRepo.toLowerCase());
+
+    let edgeExists = false;
+    DATA.links.forEach(l => {
+        if (edgeExists) return;
+        const src = typeof l.source === 'object' ? l.source.id : l.source;
+        const tgt = typeof l.target === 'object' ? l.target.id : l.target;
+        if (src === fromId && tgt === toId && isBlockingLinkType(l.type || 'blocks')) {
+            edgeExists = true;
+        }
+    });
+    if (!edgeExists && Array.isArray(fromNode.blocked_by) && fromNode.blocked_by.includes(toId)) {
+        const parents = model.openParents.get(fromId);
+        const isParentChild = model.parentChildEdges && model.parentChildEdges.has(fromId + '\0' + toId);
+        if (!isParentChild && (!parents || !parents.has(toId))) edgeExists = true;
+    }
+    if (!edgeExists) {
+        res.warning = 'Blocking dependency ' + fromId + ' → ' + toId + ' does not exist';
+        return res;
+    }
+    res.exists = true;
+    res.canRemove = true;
+    const beforeCycles = countStandaloneActiveCycles(model, null, null);
+    const afterCycles = countStandaloneActiveCycles(model, fromId, toId);
+    res.cyclesBefore = beforeCycles.count;
+    res.cyclesAfter = afterCycles.count;
+    res.cyclesTruncated = Boolean(beforeCycles.truncated || afterCycles.truncated);
+    if (res.cyclesTruncated) {
+        if (afterCycles.truncated || (res.cyclesBefore > 0 && res.cyclesAfter >= res.cyclesBefore)) {
+            res.cyclesBroken = 0;
+            res.wouldBreakAllCycles = false;
+            res.warning = 'Cycle enumeration reached cap (100); exact cycle reduction is inconclusive';
+        } else if (res.cyclesAfter === 0) {
+            res.cyclesBroken = res.cyclesBefore;
+            res.wouldBreakAllCycles = res.cyclesBefore > 0;
+            res.warning = 'Cycle enumeration reached cap (100) before removal; removal leaves 0 active cycles (acyclic)';
+        } else {
+            res.cyclesBroken = Math.max(0, res.cyclesBefore - res.cyclesAfter);
+            res.wouldBreakAllCycles = false;
+            res.warning = 'Cycle enumeration reached cap (100); exact cycle reduction is approximate (≥ ' + res.cyclesBroken + ' broken, ' + res.cyclesAfter + ' remaining)';
+        }
+    } else {
+        res.cyclesBroken = Math.max(0, res.cyclesBefore - res.cyclesAfter);
+        res.wouldBreakAllCycles = res.cyclesBefore > 0 && res.cyclesAfter === 0;
+    }
+
+    // Evaluate newly unblocked issues by cloning directBlockers without fromId -> toId,
+    // preserving unrelated unresolvableBlockers and parent-child self-loops (P24B-2).
+    const emptyClosed = new Set();
+    const beforeEval = createStandaloneDepsEvaluator(model, emptyClosed);
+    const afterDirect = new Map();
+    model.directBlockers.forEach((set, id) => {
+        const copy = new Set(set);
+        if (id === fromId) copy.delete(toId);
+        afterDirect.set(id, copy);
+    });
+    const afterUnres = new Set(model.otherUnresolvableBlockers || []);
+    if (model.parentChildSelfLoops) {
+        model.parentChildSelfLoops.forEach(id => afterUnres.add(id));
+    }
+    if (model.blockingSelfLoops) {
+        model.blockingSelfLoops.forEach(id => {
+            if (fromId === toId && id === fromId) return;
+            afterUnres.add(id);
+        });
+    }
+    const afterModel = { ...model, directBlockers: afterDirect, unresolvableBlockers: afterUnres };
+    const afterEval = createStandaloneDepsEvaluator(afterModel, emptyClosed);
+    const newly = [];
+    model.activeNodes.forEach((n, id) => {
+        if (!isWhatIfUnlockableNode(n)) return;
+        if (!beforeEval(id) && afterEval(id)) {
+            newly.push(id);
+        }
+    });
+    newly.sort();
+    res.newlyUnblocked = newly;
+
+    const isSafeDepArg = (s) => typeof s === 'string' && s.length > 0 && !s.startsWith('-') && !/[\x00-\x1f\x7f-\x9f]/.test(s);
+    const allowCmd = !(DATA.source_authority && DATA.source_authority.claim_safe === false) &&
+        DATA.source_kind !== 'workspace' &&
+        !DATA.as_of && !DATA.as_of_commit;
+    if (allowCmd && !res.crossRepo && isSafeDepArg(fromId) && isSafeDepArg(toId)) {
+        res.command = 'br dep remove ' + quoteStandaloneWord(fromId) + ' ' + quoteStandaloneWord(toId);
+    }
+    return res;
+}
+function runStandaloneCheckDepRemoval(fromId, toId) {
+    cancelPathFinder();
+    closeCycleInspector();
+    clearWhatIfSimulation();
+    const res = checkStandaloneDepRemoval(fromId, toId);
+    checkDepMode = false;
+    checkDepFromId = fromId;
+    checkDepToId = toId;
+    checkDepCommand = res.command || '';
+    if (res.exists) {
+        const ids = new Set([fromId, toId, ...(res.newlyUnblocked || [])]);
+        activePathNodes = ids;
+        highlightedNodes = ids;
+    } else {
+        activePathNodes = null;
+        highlightedNodes = new Set();
+    }
+    Graph.nodeColor(Graph.nodeColor());
+    Graph.linkColor(Graph.linkColor());
+    Graph.linkWidth(Graph.linkWidth());
+    const banner = document.getElementById('checkdep-banner');
+    const textEl = document.getElementById('checkdep-banner-text');
+    const copyBtn = document.getElementById('btn-checkdep-copy');
+    if (banner && textEl) {
+        if (!res.exists) {
+            banner.style.borderColor = '#f59e0b';
+            textEl.textContent = '⚠ Missing: ' + (res.warning || (fromId + ' → ' + toId));
+        } else {
+            banner.style.borderColor = res.cyclesTruncated ? '#f59e0b' : '#10b981';
+            let msg = '✂ Remove ' + fromId + ' → ' + toId;
+            if (res.cyclesTruncated && res.warning) {
+                msg += ' · ⚠ ' + res.warning;
+            } else if (res.cyclesBefore > 0) {
+                msg += res.wouldBreakAllCycles
+                    ? (' · breaks ' + res.cyclesBroken + '/' + res.cyclesBefore + ' → acyclic')
+                    : (' · breaks ' + res.cyclesBroken + '/' + res.cyclesBefore + ' cycles');
+            }
+            if (res.newlyUnblocked.length > 0) {
+                msg += ' · +' + res.newlyUnblocked.length + ' ready (' + res.newlyUnblocked.slice(0, 3).join(', ') + (res.newlyUnblocked.length > 3 ? ' +' + (res.newlyUnblocked.length - 3) : '') + ')';
+            }
+            textEl.textContent = msg;
+        }
+        banner.style.display = 'flex';
+        banner.classList.add('visible');
+    }
+    if (copyBtn) {
+        copyBtn.style.display = checkDepCommand ? 'inline-block' : 'none';
+        copyBtn.title = checkDepCommand;
+    }
+    return res;
+}
+window.bvCheckStandaloneDepRemoval = checkStandaloneDepRemoval;
+window.bvRunStandaloneCheckDepRemoval = runStandaloneCheckDepRemoval;
 document.getElementById('btn-checkdep-copy').onclick = () => {
     if (checkDepCommand) void copyContextField(checkDepCommand, 'Command');
 };
@@ -2701,10 +3185,14 @@ document.getElementById('btn-checkdep-close').onclick = () => {
 
 // Cycle Inspector (uses exported DATA.cycles + DATA.cycle_breaks)
 let activeCycleIndex = -1;
+let activeCycleBreakEdge = null;
 function closeCycleInspector() {
     activeCycleIndex = -1;
+    activeCycleBreakEdge = null;
     const banner = document.getElementById('cycle-banner');
     if (banner) { banner.style.display = 'none'; banner.classList.remove('visible'); }
+    const previewBtn = document.getElementById('btn-cycle-preview-cut');
+    if (previewBtn) previewBtn.style.display = 'none';
     const btn = document.getElementById('btn-cycles');
     if (btn) btn.classList.remove('active');
 }
@@ -2759,8 +3247,13 @@ function showCycleInspector(idx, step = 1) {
         return String(a.from || '').localeCompare(String(b.from || '')) || String(a.to || '').localeCompare(String(b.to || ''));
     });
     const breakSug = matchingBreaks[0] || null;
+    activeCycleBreakEdge = breakSug;
     const banner = document.getElementById('cycle-banner');
     const textEl = document.getElementById('cycle-banner-text');
+    const previewCutBtn = document.getElementById('btn-cycle-preview-cut');
+    if (previewCutBtn) {
+        previewCutBtn.style.display = (breakSug && breakSug.from && breakSug.to) ? 'inline-block' : 'none';
+    }
     if (banner && textEl) {
         const pathStr = openCycle.concat([openCycle[0]]).join(' → ');
         let cutSuffix = '';
@@ -2799,6 +3292,11 @@ if (cyclesBtn && Array.isArray(DATA.cycles) && DATA.cycles.length > 0) {
         }
     };
 }
+document.getElementById('btn-cycle-preview-cut').onclick = () => {
+    if (activeCycleBreakEdge && activeCycleBreakEdge.from && activeCycleBreakEdge.to) {
+        runStandaloneCheckDepRemoval(activeCycleBreakEdge.from, activeCycleBreakEdge.to);
+    }
+};
 document.getElementById('btn-cycle-prev').onclick = () => { if (activeCycleIndex >= 0) showCycleInspector(activeCycleIndex - 1, -1); };
 document.getElementById('btn-cycle-next').onclick = () => { if (activeCycleIndex >= 0) showCycleInspector(activeCycleIndex + 1, 1); };
 document.getElementById('btn-cycle-close').onclick = () => {
@@ -2922,7 +3420,66 @@ function highlightDependencies(node, type) {
 
 // Unified filter state and handler
 let statusFilter = 'all', typeFilter = 'all', priorityFilter = 'all', labelFilter = 'all', repoFilter = 'all';
+let diffOnlyFilter = false;
 let currentVisibilityFilter = () => true;
+
+// Wire optional --diff-since overlay HUD & "Changed only" filter (W32-3)
+(function initDiffOverlay() {
+    const ds = DATA.diff_summary;
+    if (!ds) return;
+    const banner = document.getElementById('diff-banner');
+    const textEl = document.getElementById('diff-banner-text');
+    const toolbarBtn = document.getElementById('btn-diff-only');
+    const bannerBtn = document.getElementById('btn-diff-filter-toggle');
+    const parts = [
+        'Δ Since ' + (ds.diff_since || 'baseline') + ':',
+        '+' + (ds.issues_added || 0) + ' added',
+        '✓' + (ds.issues_closed || 0) + ' closed',
+    ];
+    if (ds.issues_reopened) parts.push('↺' + ds.issues_reopened + ' reopened');
+    if (ds.issues_modified) parts.push('~' + ds.issues_modified + ' modified');
+    if (ds.issues_removed) parts.push('-' + ds.issues_removed + ' removed');
+    if (ds.cycle_delta) parts.push((ds.cycle_delta > 0 ? '+' : '') + ds.cycle_delta + ' cycles');
+    if (ds.health_trend) parts.push('trend: ' + ds.health_trend);
+    if (Array.isArray(ds.removed_ids) && ds.removed_ids.length > 0) {
+        const shown = ds.removed_ids.slice(0, 3).join(', ');
+        const more = ds.removed_ids.length > 3 ? (' +' + (ds.removed_ids.length - 3)) : '';
+        parts.push('removed: ' + shown + more);
+    }
+    if (textEl) textEl.textContent = parts.join(' · ');
+    if (banner) banner.style.display = 'flex';
+    if (toolbarBtn) toolbarBtn.style.display = '';
+    const toggleDiffOnly = () => {
+        diffOnlyFilter = !diffOnlyFilter;
+        if (toolbarBtn) toolbarBtn.classList.toggle('active', diffOnlyFilter);
+        if (bannerBtn) bannerBtn.textContent = diffOnlyFilter ? 'Show all' : 'Changed only';
+        applyFilters();
+    };
+    if (toolbarBtn) toolbarBtn.onclick = toggleDiffOnly;
+    if (bannerBtn) bannerBtn.onclick = toggleDiffOnly;
+})();
+
+// Surface optional git history correlation summary badge in overlay stats (W37-7)
+(function initHistoryStatsOverlay() {
+    const hs = DATA.history_stats;
+    if (!hs || !hs.total_commits) return;
+    const statEl = document.getElementById('stat-history');
+    const valEl = document.getElementById('stat-history-value');
+    if (!statEl || !valEl) return;
+    const parts = ['📜 ' + hs.total_commits + ' commits'];
+    if (hs.beads_with_commits) parts.push(hs.beads_with_commits + ' beads');
+    if (typeof hs.avg_cycle_time_days === 'number' && Number.isFinite(hs.avg_cycle_time_days)) {
+        parts.push(hs.avg_cycle_time_days.toFixed(1) + 'd avg cycle');
+    }
+    valEl.textContent = parts.join(' · ');
+    const titleParts = [];
+    if (hs.unique_authors) titleParts.push(hs.unique_authors + ' authors');
+    if (typeof hs.avg_commits_per_bead === 'number' && Number.isFinite(hs.avg_commits_per_bead)) {
+        titleParts.push(hs.avg_commits_per_bead.toFixed(1) + ' commits/bead');
+    }
+    if (titleParts.length > 0) statEl.title = 'Git correlation: ' + titleParts.join(' · ');
+    statEl.style.display = 'flex';
+})();
 
 const allLabels = new Set();
 const allRepos = new Set();
@@ -2983,6 +3540,7 @@ function applyFilters() {
         if (priorityFilter && priorityFilter !== 'all' && n.priority !== parseInt(priorityFilter, 10)) return false;
         if (labelFilter && labelFilter !== 'all' && !(n.labels || []).includes(labelFilter)) return false;
         if (repoFilter && repoFilter !== 'all' && (n.source_repo || '') !== repoFilter) return false;
+        if (diffOnlyFilter && !n.diff_status) return false;
         return true;
     };
     Graph.nodeVisibility(currentVisibilityFilter);
@@ -3078,6 +3636,11 @@ document.getElementById('btn-reset').onclick = () => {
     priorityFilter = 'all';
     labelFilter = 'all';
     repoFilter = 'all';
+    diffOnlyFilter = false;
+    const diffBtn = document.getElementById('btn-diff-only');
+    if (diffBtn) diffBtn.classList.remove('active');
+    const diffToggleBtn = document.getElementById('btn-diff-filter-toggle');
+    if (diffToggleBtn) diffToggleBtn.textContent = 'Changed only';
     sizeMetric = 'pagerank';
     document.getElementById('heatmap-metric').textContent = 'PageRank';
     heatmapMode = false;
@@ -3167,10 +3730,84 @@ function renderTriageTab(tab) {
                 '<div class="triage-item-title">' + escapeHTML(a.message || '') + '</div>' +
                 (id ? '<div class="triage-item-reason">Bead: ' + escapeHTML(id) + '</div>' : '') + '</div>';
         }).join('') : '<div class="triage-item-reason">No alerts</div>';
+    } else if (activeTriageTab === 'high_risk') {
+        const items = DATA.nodes
+            .filter(n => isActiveNodeStatus(n.status) && (Number(n.risk_score) || 0) >= 0.5)
+            .sort((a, b) => ((Number(b.risk_score) || 0) - (Number(a.risk_score) || 0)) || String(a.id).localeCompare(String(b.id)))
+            .slice(0, 12);
+        html = items.length ? items.map(n => {
+            const pct = Math.round((Number(n.risk_score) || 0) * 100) + '%%';
+            return '<div class="triage-item" data-id="' + escapeHTML(n.id || '') + '">' +
+                '<div class="triage-item-header"><span class="triage-item-id">⚠ ' + escapeHTML(n.id || '-') + '</span><span class="triage-item-score" style="color:#f87171">' + escapeHTML(pct) + '</span></div>' +
+                '<div class="triage-item-title">' + escapeHTML(n.title || '') + '</div>' +
+                '<div class="triage-item-reason">' + escapeHTML(n.risk_explanation || 'Elevated operational risk') + '</div></div>';
+        }).join('') : '<div class="triage-item-reason">No active high-risk issues (≥50%%)</div>';
+    } else if (activeTriageTab === 'structural') {
+        const adv = DATA.advanced_insights || {};
+        const topK = Array.isArray(adv.top_k_set?.items) ? adv.top_k_set.items.slice(0, 5) : [];
+        const pCuts = Array.isArray(adv.parallel_cut?.suggestions) ? adv.parallel_cut.suggestions.slice(0, 5) : [];
+        const kPaths = Array.isArray(adv.k_paths?.paths) ? adv.k_paths.paths.slice(0, 5) : [];
+        const parts = [];
+        if (topK.length > 0) {
+            parts.push('<div class="triage-item-reason" style="font-weight:700;color:#c7d2fe;margin:0.2rem 0 0.35rem">🔓 Top-K Unlock Sequence (+' + escapeHTML(adv.top_k_set?.total_gain ?? 0) + ')</div>');
+            topK.forEach((it, idx) => {
+                const unb = Array.isArray(it.unblocks) ? it.unblocks : [];
+                const hlIds = [it.id, ...unb].filter(Boolean);
+                parts.push('<div class="triage-item structural-item" data-id="' + escapeHTML(it.id || '') + '" data-path="' + escapeHTML(JSON.stringify(hlIds)) + '">' +
+                    '<div class="triage-item-header"><span class="triage-item-id">#' + (idx + 1) + ' ' + escapeHTML(it.id || '-') + '</span><span class="triage-item-score">+' + escapeHTML(it.marginal_gain ?? 0) + '</span></div>' +
+                    '<div class="triage-item-title">' + escapeHTML(it.title || '') + '</div>' +
+                    (unb.length ? '<div class="triage-item-reason">Unblocks: ' + escapeHTML(unb.slice(0, 4).join(', ')) + (unb.length > 4 ? (' +' + (unb.length - 4)) : '') + '</div>' : '') + '</div>');
+            });
+        }
+        if (pCuts.length > 0) {
+            parts.push('<div class="triage-item-reason" style="font-weight:700;color:#a7f3d0;margin:0.5rem 0 0.35rem">⚡ Parallelism Unlockers</div>');
+            pCuts.forEach(pc => {
+                parts.push('<div class="triage-item" data-id="' + escapeHTML(pc.id || '') + '">' +
+                    '<div class="triage-item-header"><span class="triage-item-id">' + escapeHTML(pc.id || '-') + '</span><span class="triage-item-score">Δ‖ +' + escapeHTML(pc.parallel_gain ?? 0) + '</span></div>' +
+                    '<div class="triage-item-title">' + escapeHTML(pc.title || '') + '</div></div>');
+            });
+        }
+        if (kPaths.length > 0) {
+            parts.push('<div class="triage-item-reason" style="font-weight:700;color:#fde68a;margin:0.5rem 0 0.35rem">🔗 Critical Chains (K-Paths)</div>');
+            kPaths.forEach((kp, idx) => {
+                const ids = Array.isArray(kp.issue_ids) ? kp.issue_ids : [];
+                parts.push('<div class="triage-item structural-path-item" data-id="' + escapeHTML(ids[0] || '') + '" data-path="' + escapeHTML(JSON.stringify(ids)) + '">' +
+                    '<div class="triage-item-header"><span class="triage-item-id">Chain #' + (idx + 1) + '</span><span class="triage-item-score">' + escapeHTML(kp.length ?? ids.length) + ' nodes</span></div>' +
+                    '<div class="triage-item-reason" style="font-family:monospace">' + escapeHTML(ids.slice(0, 5).join(' → ')) + (ids.length > 5 ? (' → … (+' + (ids.length - 5) + ')') : '') + '</div></div>');
+            });
+        }
+        html = parts.length ? parts.join('') : '<div class="triage-item-reason">No structural unlock insights available</div>';
     }
     list.innerHTML = html;
     list.querySelectorAll('.triage-item').forEach(item => {
-        item.onclick = () => focusVisibleGraphNode(item.dataset.id);
+        item.onclick = () => {
+            const rawPath = item.dataset.path;
+            if (rawPath) {
+                let parsedIds = [];
+                try {
+                    const parsed = JSON.parse(rawPath);
+                    if (Array.isArray(parsed)) parsedIds = parsed;
+                } catch (_) {
+                    parsedIds = rawPath.split(',');
+                }
+                const visibleNodes = (Graph.graphData().nodes || []).filter(currentVisibilityFilter);
+                const visibleSet = new Set(visibleNodes.map(n => n.id));
+                const pathIds = parsedIds.filter(id => id && visibleSet.has(id));
+                if (pathIds.length > 0) {
+                    cancelPathFinder();
+                    clearSelection();
+                    hideHoverPanel();
+                    highlightPath(pathIds);
+                    const focusId = (item.dataset.id && visibleSet.has(item.dataset.id)) ? item.dataset.id : pathIds[0];
+                    const targetNode = visibleNodes.find(n => n.id === focusId);
+                    if (targetNode && Number.isFinite(targetNode.x) && Number.isFinite(targetNode.y)) {
+                        Graph.centerAt(targetNode.x, targetNode.y, 400);
+                    }
+                    return;
+                }
+            }
+            focusVisibleGraphNode(item.dataset.id);
+        };
     });
 }
 document.querySelectorAll('.triage-tab-btn').forEach(btn => {
@@ -3186,6 +3823,20 @@ document.getElementById('btn-triage').onclick = () => {
         const alertCount = (DATA.triage?.alerts || []).length;
         const alertTabBtn = document.querySelector('.triage-tab-btn[data-tab="alerts"]');
         if (alertTabBtn) alertTabBtn.textContent = alertCount > 0 ? ('Alerts (' + alertCount + ')') : 'Alerts';
+        const highRiskCount = DATA.nodes.filter(n => isActiveNodeStatus(n.status) && (Number(n.risk_score) || 0) >= 0.5).length;
+        const highRiskTabBtn = document.querySelector('.triage-tab-btn[data-tab="high_risk"]');
+        if (highRiskTabBtn) highRiskTabBtn.textContent = highRiskCount > 0 ? ('High Risk (' + highRiskCount + ')') : 'High Risk';
+        const crBox = document.getElementById('triage-cross-repo-summary');
+        const crf = DATA.triage?.project_health?.cross_repo_flow;
+        if (crBox && crf && Number(crf.total_cross_repo_deps) > 0) {
+            const bRepos = Array.isArray(crf.bottleneck_repos) ? crf.bottleneck_repos.slice(0, 3) : [];
+            const bnPart = bRepos.length ? (' · Bottlenecks: ' + bRepos.map(r => '<strong>' + escapeHTML(r) + '</strong>').join(', ')) : '';
+            crBox.innerHTML = '🔀 <strong>' + escapeHTML(crf.total_cross_repo_deps) + '</strong> cross-repo edge' + (crf.total_cross_repo_deps === 1 ? '' : 's') + bnPart;
+            crBox.style.display = 'block';
+        } else if (crBox) {
+            crBox.style.display = 'none';
+            crBox.innerHTML = '';
+        }
         renderTriageTab(activeTriageTab);
     }
 };

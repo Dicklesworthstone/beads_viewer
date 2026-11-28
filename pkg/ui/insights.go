@@ -154,6 +154,7 @@ type InsightsModel struct {
 	globalCapacity   *GlobalCapacitySummary
 	feedbackSummary  *analysis.FeedbackJSON
 	crossRepoFlow    *analysis.CrossRepoFlow
+	riskByID         map[string]analysis.RiskSignals
 	priorityHints    map[string]*analysis.PriorityRecommendation
 	issueMap         map[string]*model.Issue
 	theme            Theme
@@ -166,6 +167,9 @@ type InsightsModel struct {
 	recommendations   []analysis.Recommendation
 	recommendationMap map[string]*analysis.Recommendation // ID -> Recommendation for quick lookup
 	triageDataHash    string                              // Hash of data used for triage
+
+	// Cycle-cut removal preflight verdict for PanelCycles (RC-C41)
+	cycleCutPreflight *graphCheckDepResult
 
 	// Navigation state
 	focusedPanel  MetricPanel
@@ -311,7 +315,32 @@ func (m *InsightsModel) adjustDetailRatio(delta float64) {
 
 func (m *InsightsModel) SetInsights(ins analysis.Insights) {
 	m.insights = ins
+	m.cycleCutPreflight = nil
 	m.detailContent = ""
+}
+
+// SetCycleCutPreflight stores (or clears with nil) the live dependency-removal preflight
+// verdict for the currently selected cycle in PanelCycles (RC-C41).
+func (m *InsightsModel) SetCycleCutPreflight(res *graphCheckDepResult) {
+	m.cycleCutPreflight = res
+	m.detailContent = ""
+	if m.ready && m.focusedPanel == PanelCycles {
+		m.updateDetailContent()
+	}
+}
+
+// CycleCutPreflight returns the active cycle-cut removal preflight verdict, if any.
+func (m *InsightsModel) CycleCutPreflight() *graphCheckDepResult {
+	return m.cycleCutPreflight
+}
+
+// SelectedCycle returns the currently selected cycle slice in PanelCycles (or nil).
+func (m *InsightsModel) SelectedCycle() []string {
+	idx := m.selectedIndex[PanelCycles]
+	if idx < 0 || idx >= len(m.insights.Cycles) {
+		return nil
+	}
+	return m.insights.Cycles[idx]
 }
 
 // SetAdvancedInsights sets advanced graph analysis results (cycle break, top-k unlock,
@@ -360,6 +389,15 @@ func (m *InsightsModel) SetCrossRepoFlow(flow *analysis.CrossRepoFlow) {
 	}
 }
 
+// SetRiskByID attaches scoped operational risk signals for the High-Risk Watchlist on PanelPriority (W35-2).
+func (m *InsightsModel) SetRiskByID(riskMap map[string]analysis.RiskSignals) {
+	m.riskByID = riskMap
+	m.detailContent = ""
+	if m.ready && m.focusedPanel == PanelPriority {
+		m.updateDetailContent()
+	}
+}
+
 // SetPriorityHints attaches priority misalignment recommendations for display in issue details.
 func (m *InsightsModel) SetPriorityHints(hints map[string]*analysis.PriorityRecommendation) {
 	m.priorityHints = hints
@@ -369,6 +407,7 @@ func (m *InsightsModel) SetPriorityHints(hints map[string]*analysis.PriorityReco
 // SetIssueMap updates the issue lookup map used when rendering panel items and details.
 func (m *InsightsModel) SetIssueMap(issueMap map[string]*model.Issue) {
 	m.issueMap = issueMap
+	m.cycleCutPreflight = nil
 	m.detailContent = ""
 }
 
@@ -439,6 +478,18 @@ func (m *InsightsModel) isPanelSkipped(panel MetricPanel) (bool, string) {
 	return false, ""
 }
 
+// cyclesTruncationReason returns the cycles truncation notice if cycle enumeration hit its cap.
+func (m *InsightsModel) cyclesTruncationReason() string {
+	if m.insights.Stats == nil {
+		return ""
+	}
+	reason := strings.TrimSpace(m.insights.Stats.Status().Cycles.Reason)
+	if strings.Contains(strings.ToLower(reason), "truncated") {
+		return reason
+	}
+	return ""
+}
+
 // Navigation methods
 func (m *InsightsModel) MoveUp() {
 	count := m.currentPanelItemCount()
@@ -447,6 +498,9 @@ func (m *InsightsModel) MoveUp() {
 	}
 	if m.selectedIndex[m.focusedPanel] > 0 {
 		m.selectedIndex[m.focusedPanel]--
+		if m.focusedPanel == PanelCycles {
+			m.cycleCutPreflight = nil
+		}
 		m.updateDetailContent()
 	}
 }
@@ -458,6 +512,9 @@ func (m *InsightsModel) MoveDown() {
 	}
 	if m.selectedIndex[m.focusedPanel] < count-1 {
 		m.selectedIndex[m.focusedPanel]++
+		if m.focusedPanel == PanelCycles {
+			m.cycleCutPreflight = nil
+		}
 		m.updateDetailContent()
 	}
 }
@@ -475,8 +532,12 @@ func (m *InsightsModel) MoveToTop() {
 	if m.currentPanelItemCount() == 0 {
 		return
 	}
+	prevIdx := m.selectedIndex[m.focusedPanel]
 	m.selectedIndex[m.focusedPanel] = 0
 	m.scrollOffset[m.focusedPanel] = 0
+	if m.focusedPanel == PanelCycles && prevIdx != 0 {
+		m.cycleCutPreflight = nil
+	}
 	m.updateDetailContent()
 }
 
@@ -496,7 +557,11 @@ func (m *InsightsModel) MoveToBottom() {
 	if count == 0 {
 		return
 	}
+	prevIdx := m.selectedIndex[m.focusedPanel]
 	m.selectedIndex[m.focusedPanel] = count - 1
+	if m.focusedPanel == PanelCycles && prevIdx != count-1 {
+		m.cycleCutPreflight = nil
+	}
 	m.updateDetailContent()
 }
 
@@ -517,7 +582,11 @@ func (m *InsightsModel) PageDown() {
 	if count == 0 {
 		return
 	}
+	prevIdx := m.selectedIndex[m.focusedPanel]
 	m.selectedIndex[m.focusedPanel] = min(count-1, m.selectedIndex[m.focusedPanel]+step)
+	if m.focusedPanel == PanelCycles && prevIdx != m.selectedIndex[PanelCycles] {
+		m.cycleCutPreflight = nil
+	}
 	m.updateDetailContent()
 }
 
@@ -535,9 +604,13 @@ func (m *InsightsModel) PageUp() {
 	if m.currentPanelItemCount() == 0 {
 		return
 	}
+	prevIdx := m.selectedIndex[m.focusedPanel]
 	m.selectedIndex[m.focusedPanel] = max(0, m.selectedIndex[m.focusedPanel]-step)
 	if m.scrollOffset[m.focusedPanel] > m.selectedIndex[m.focusedPanel] {
 		m.scrollOffset[m.focusedPanel] = m.selectedIndex[m.focusedPanel]
+	}
+	if m.focusedPanel == PanelCycles && prevIdx != m.selectedIndex[PanelCycles] {
+		m.cycleCutPreflight = nil
 	}
 	m.updateDetailContent()
 }
@@ -615,6 +688,9 @@ func (m *InsightsModel) renderMarkdownExplanation(text string, width int) string
 
 func (m *InsightsModel) NextPanel() {
 	m.focusedPanel = (m.focusedPanel + 1) % PanelCount
+	if m.focusedPanel != PanelCycles {
+		m.cycleCutPreflight = nil
+	}
 	m.updateDetailContent()
 }
 
@@ -623,6 +699,9 @@ func (m *InsightsModel) PrevPanel() {
 		m.focusedPanel = PanelCount - 1
 	} else {
 		m.focusedPanel--
+	}
+	if m.focusedPanel != PanelCycles {
+		m.cycleCutPreflight = nil
 	}
 	m.updateDetailContent()
 }
@@ -848,6 +927,7 @@ func (m *InsightsModel) panelItemCount(panel MetricPanel) int {
 // ClampSelections keeps focusedPanel, per-panel selectedIndex/scrollOffset, and
 // heatmap drilldown state within bounds after rebuilding insights/recommendations.
 func (m *InsightsModel) ClampSelections() {
+	prevCycleIdx := m.selectedIndex[PanelCycles]
 	if m.focusedPanel < 0 || m.focusedPanel >= PanelCount {
 		m.focusedPanel = 0
 	}
@@ -870,6 +950,9 @@ func (m *InsightsModel) ClampSelections() {
 		if m.scrollOffset[p] < 0 {
 			m.scrollOffset[p] = 0
 		}
+	}
+	if len(m.insights.Cycles) == 0 || m.selectedIndex[PanelCycles] != prevCycleIdx {
+		m.cycleCutPreflight = nil
 	}
 	if m.showHeatmap {
 		m.rebuildHeatmapGrid()
@@ -1352,16 +1435,24 @@ func (m *InsightsModel) renderCyclesPanel(width, height int, t Theme) string {
 	var lines []string
 
 	// Header
+	truncReason := m.cyclesTruncationReason()
 	var headerLine string
 	if skipped {
 		headerLine = fmt.Sprintf("%s %s [Skipped]", info.Icon, info.Title)
+	} else if truncReason != "" {
+		headerLine = fmt.Sprintf("%s %s (%d, capped)", info.Icon, info.Title, len(cycles))
 	} else {
 		headerLine = fmt.Sprintf("%s %s (%d)", info.Icon, info.Title, len(cycles))
 	}
 	lines = append(lines, titleStyle.Render(headerLine))
 
 	subtitleStyle := t.Renderer.NewStyle().Foreground(t.Subtext).Italic(true)
-	lines = append(lines, subtitleStyle.Render(info.ShortDesc))
+	if !skipped && truncReason != "" {
+		warnSubStyle := t.Renderer.NewStyle().Foreground(t.Blocked).Italic(true)
+		lines = append(lines, warnSubStyle.Render(truncateRunesHelper("⚠ "+truncReason, max(12, width-4), "…")))
+	} else {
+		lines = append(lines, subtitleStyle.Render(info.ShortDesc))
+	}
 
 	// Explanation (if enabled) - render as markdown for **bold** etc.
 	var explanation []string
@@ -2250,6 +2341,9 @@ func (m *InsightsModel) buildDetailMarkdown(selectedID string) string {
 	if advMD := m.renderAdvancedInsightsMD(); advMD != "" {
 		sb.WriteString(advMD)
 	}
+	if preflightMD := m.renderCycleCutPreflightMD(); preflightMD != "" {
+		sb.WriteString(preflightMD)
+	}
 	if extraMD := m.renderPriorityExtrasMD(); extraMD != "" {
 		sb.WriteString(extraMD)
 	}
@@ -2413,7 +2507,7 @@ func (m *InsightsModel) renderCalculationProofMD(selectedID string) string {
 				sb.WriteString(fmt.Sprintf("%s %s\n", arrow, m.getBeadTitle(id, 35)))
 			}
 			sb.WriteString("```\n\n")
-			sb.WriteString("> These beads form a circular dependency. *Break the cycle* by removing or reversing one edge.\n\n")
+			sb.WriteString("> These beads form a circular dependency. *Break the cycle* by removing or reversing one edge. Press `X` to preflight removing a cycle edge (`c` to copy).\n\n")
 		}
 
 	default:
@@ -2421,6 +2515,50 @@ func (m *InsightsModel) renderCalculationProofMD(selectedID string) string {
 		sb.WriteString(fmt.Sprintf("> %s\n\n", info.HowToUse))
 	}
 
+	return sb.String()
+}
+
+// renderCycleCutPreflightMD renders the live PanelCycles edge-removal preflight verdict
+// independently of the `x` calculation-proof toggle (P26-A7 / W35-3).
+func (m *InsightsModel) renderCycleCutPreflightMD() string {
+	if m.focusedPanel != PanelCycles || m.cycleCutPreflight == nil {
+		return ""
+	}
+	res := m.cycleCutPreflight
+	var sb strings.Builder
+	sb.WriteString("### ✂️ Cycle-Cut Removal Preflight\n\n")
+	sb.WriteString(fmt.Sprintf("- **Edge:** `%s -> %s`\n", res.FromID, res.ToID))
+	if !res.Exists {
+		sb.WriteString(fmt.Sprintf("- **Status:** ⚠️ %s\n", res.Warning))
+		sb.WriteString("\n")
+		return sb.String()
+	}
+	if res.CyclesBefore > 0 {
+		switch {
+		case res.CyclesTruncated && res.WouldBreakAllCycles:
+			sb.WriteString(fmt.Sprintf("- **Cycles:** breaks `≥%d` (capped) → **acyclic**\n", res.CyclesBefore))
+		case res.CyclesTruncated && res.CyclesBroken > 0:
+			sb.WriteString(fmt.Sprintf("- **Cycles:** breaks `≥%d` (`%d` remaining; capped)\n", res.CyclesBroken, res.CyclesAfter))
+		case res.CyclesTruncated:
+			sb.WriteString(fmt.Sprintf("- **Cycles:** `%d` cycles (capped, inconclusive)\n", res.CyclesBefore))
+		case res.WouldBreakAllCycles:
+			sb.WriteString(fmt.Sprintf("- **Cycles:** breaks `%d/%d` → **acyclic**\n", res.CyclesBroken, res.CyclesBefore))
+		default:
+			sb.WriteString(fmt.Sprintf("- **Cycles:** breaks `%d/%d` (`%d` remaining)\n", res.CyclesBroken, res.CyclesBefore, res.CyclesAfter))
+		}
+	}
+	if len(res.NewlyUnblocked) > 0 {
+		sb.WriteString(fmt.Sprintf("- **Newly Unblocked (%d):** `%s`\n", len(res.NewlyUnblocked), strings.Join(res.NewlyUnblocked, "`, `")))
+	}
+	if res.Warning != "" {
+		sb.WriteString(fmt.Sprintf("- **Warning:** %s\n", res.Warning))
+	}
+	if res.Command != "" {
+		sb.WriteString(fmt.Sprintf("- **Command (`c` to copy):** `%s`\n", res.Command))
+	} else {
+		sb.WriteString("- **Command:** _withheld (read-only, historical, cross-repo, or workspace source)_\n")
+	}
+	sb.WriteString("\n")
 	return sb.String()
 }
 
@@ -2436,10 +2574,21 @@ func (m *InsightsModel) renderAdvancedInsightsMD() string {
 	var sb strings.Builder
 	switch m.focusedPanel {
 	case PanelCycles:
-		if adv.CycleBreak != nil && len(adv.CycleBreak.Suggestions) > 0 {
+		if adv.CycleBreak != nil && (len(adv.CycleBreak.Suggestions) > 0 || adv.CycleBreak.Status.Capped) {
 			sb.WriteString("### ✂️ Cycle Break Suggestions\n\n")
 			if adv.CycleBreak.CycleCount > 0 {
-				sb.WriteString(fmt.Sprintf("**Cycles Analyzed:** `%d`\n\n", adv.CycleBreak.CycleCount))
+				if adv.CycleBreak.Status.Capped {
+					sb.WriteString(fmt.Sprintf("**Cycles Analyzed:** `%d` _(capped)_\n\n", adv.CycleBreak.CycleCount))
+				} else {
+					sb.WriteString(fmt.Sprintf("**Cycles Analyzed:** `%d`\n\n", adv.CycleBreak.CycleCount))
+				}
+			}
+			if adv.CycleBreak.Status.Capped {
+				notice := strings.TrimSpace(adv.CycleBreak.Status.Reason)
+				if notice == "" {
+					notice = "Cycle enumeration reached its configured cap; counts and suggestions reflect a bounded sample."
+				}
+				sb.WriteString(fmt.Sprintf("> ⚠️ %s\n\n", notice))
 			}
 			limit := min(5, len(adv.CycleBreak.Suggestions))
 			for i := 0; i < limit; i++ {
@@ -2447,7 +2596,9 @@ func (m *InsightsModel) renderAdvancedInsightsMD() string {
 				sb.WriteString(fmt.Sprintf("- **`%s -> %s`** — breaks `%d` cycle(s) _(collateral: %d)_\n",
 					s.EdgeFrom, s.EdgeTo, s.Impact, s.Collateral))
 			}
-			sb.WriteString("\n")
+			if limit > 0 {
+				sb.WriteString("\n")
+			}
 		}
 
 	case PanelPriority:
@@ -2657,6 +2808,46 @@ func (m *InsightsModel) renderPriorityExtrasMD() string {
 			sb.WriteString("- **Key Blockers:** " + strings.Join(hbParts, " • ") + "\n")
 		}
 		sb.WriteString("\n")
+	}
+	if len(m.riskByID) > 0 {
+		type riskRow struct {
+			id    string
+			score float64
+			expl  string
+		}
+		highRisks := make([]riskRow, 0, 8)
+		for id, rs := range m.riskByID {
+			if rs.CompositeRisk < 0.50 {
+				continue
+			}
+			if iss := m.issueMap[id]; iss == nil || isClosedLikeStatus(iss.Status) || iss.IsTemplate || iss.Pinned || iss.Status == model.StatusPinned {
+				continue
+			}
+			highRisks = append(highRisks, riskRow{
+				id:    id,
+				score: rs.CompositeRisk,
+				expl:  strings.TrimSpace(rs.Explanation),
+			})
+		}
+		if len(highRisks) > 0 {
+			sort.Slice(highRisks, func(i, j int) bool {
+				if highRisks[i].score != highRisks[j].score {
+					return highRisks[i].score > highRisks[j].score
+				}
+				return highRisks[i].id < highRisks[j].id
+			})
+			sb.WriteString(fmt.Sprintf("### ⚠️ High-Risk Watchlist (%d)\n\n", len(highRisks)))
+			limit := min(5, len(highRisks))
+			for i := 0; i < limit; i++ {
+				r := highRisks[i]
+				line := fmt.Sprintf("- **`%s`** (`%.0f%%`) — %s", r.id, r.score*100, m.getBeadTitle(r.id, 30))
+				if r.expl != "" {
+					line += " _(" + truncateRunesHelper(r.expl, 42, "…") + ")_"
+				}
+				sb.WriteString(line + "\n")
+			}
+			sb.WriteString("\n")
+		}
 	}
 	return sb.String()
 }

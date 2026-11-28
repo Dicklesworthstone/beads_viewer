@@ -10,6 +10,7 @@ import (
 
 	"github.com/Dicklesworthstone/beads_viewer/pkg/cass"
 	"github.com/Dicklesworthstone/beads_viewer/pkg/correlation"
+	"github.com/Dicklesworthstone/beads_viewer/pkg/model"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -45,9 +46,10 @@ const (
 type historyViewMode int
 
 const (
-	historyModeBead    historyViewMode = iota // Default: beads on left, commits for selected bead
-	historyModeGit                            // Git mode: commits on left, related beads for selected commit
-	historyModeOrphans                        // Orphans mode: suspicious unlinked commits with probable beads (W29-3)
+	historyModeBead     historyViewMode = iota // Default: beads on left, commits for selected bead
+	historyModeGit                             // Git mode: commits on left, related beads for selected commit
+	historyModeOrphans                         // Orphans mode: suspicious unlinked commits with probable beads (W29-3)
+	historyModeHotspots                        // Hotspots mode: ranked code hotspots & co-change intelligence (W35-5)
 )
 
 // CommitListEntry represents a commit in git-centric mode (bv-tl3n)
@@ -156,18 +158,21 @@ type HistoryModel struct {
 	expandedBeads map[string]bool // Track which beads have commits expanded
 
 	// File tree state (bv-190l)
-	showFileTree       bool                                     // Whether file tree panel is visible
-	fileTree           []*FileTreeNode                          // Root-level nodes of the file tree
-	flatFileList       []*FileTreeNode                          // Flattened visible nodes for navigation
-	selectedFileIdx    int                                      // Index in flatFileList
-	fileTreeScroll     int                                      // Scroll offset for file tree
-	fileFilter         string                                   // Current file filter (empty = no filter)
-	fileTreeFocus      bool                                     // True when file tree has focus
-	fileLookup         *correlation.FileLookup                  // Prebuilt file-to-bead reverse index for hotspots & related work
-	hotspotOpenCounts  map[string]int                           // Normalized file path -> active bead count
-	hotspotTotalCounts map[string]int                           // Normalized file path -> total bead count
-	relatedCache       map[string][]correlation.RelatedWorkBead // Memoized related beads per bead ID
-	clusterPeersByBead map[string][]string                      // ImpactNetwork cluster peers per bead ID (W29-3)
+	showFileTree        bool                                     // Whether file tree panel is visible
+	fileTree            []*FileTreeNode                          // Root-level nodes of the file tree
+	flatFileList        []*FileTreeNode                          // Flattened visible nodes for navigation
+	selectedFileIdx     int                                      // Index in flatFileList
+	fileTreeScroll      int                                      // Scroll offset for file tree
+	fileFilter          string                                   // Current file filter (empty = no filter)
+	fileTreeFocus       bool                                     // True when file tree has focus
+	fileLookup          *correlation.FileLookup                  // Prebuilt file-to-bead reverse index for hotspots & related work
+	hotspots            []correlation.FileHotspot                // Ranked code hotspots for Hotspots leaderboard mode (W35-5)
+	selectedHotspot     int                                      // Selected index in filteredHotspots()
+	hotspotScrollOffset int                                      // Scroll offset in Hotspots mode
+	hotspotOpenCounts   map[string]int                           // Normalized file path -> active bead count
+	hotspotTotalCounts  map[string]int                           // Normalized file path -> total bead count
+	relatedCache        map[string][]correlation.RelatedWorkBead // Memoized related beads per bead ID
+	clusterPeersByBead  map[string][]string                      // ImpactNetwork cluster peers per bead ID (W29-3)
 
 	// Orphan commits audit mode state (W29-3)
 	orphans               []correlation.OrphanCandidate
@@ -195,6 +200,32 @@ type HistoryModel struct {
 
 	// Optional reference clock for relative/timeline timestamps (e.g. --as-of).
 	referenceNow time.Time
+	// Optional active issues for dependency-aware cluster peer detection (W37-6).
+	issues []model.Issue
+}
+
+// SetIssues attaches current scoped issues so cluster peer detection includes
+// dependency links (matching --robot-impact-network and Static Pages history.json).
+func (h *HistoryModel) SetIssues(issues []model.Issue) {
+	if len(issues) == 0 {
+		h.issues = nil
+	} else {
+		h.issues = append([]model.Issue(nil), issues...)
+	}
+	if h.report != nil {
+		h.refreshFileIntelligence()
+	}
+}
+
+// SetReportAndIssues atomically updates both scoped issues and the history report
+// so refreshFileIntelligence runs once per refresh rather than twice (P30-11).
+func (h *HistoryModel) SetReportAndIssues(report *correlation.HistoryReport, issues []model.Issue) {
+	if len(issues) == 0 {
+		h.issues = nil
+	} else {
+		h.issues = append([]model.Issue(nil), issues...)
+	}
+	h.SetReport(report)
 }
 
 // SetReferenceTime sets an optional reference clock for relative/timeline timestamps (e.g. --as-of).
@@ -212,12 +243,26 @@ func (h *HistoryModel) refreshFileIntelligence() {
 	h.causalityCache = nil
 	if h.report == nil || len(h.report.Histories) == 0 {
 		h.fileLookup = nil
+		h.hotspots = nil
+		h.selectedHotspot = 0
+		h.hotspotScrollOffset = 0
 		h.hotspotOpenCounts = nil
 		h.hotspotTotalCounts = nil
 		return
 	}
 	h.fileLookup = correlation.NewFileLookup(h.report)
 	hotspots := h.fileLookup.GetHotspots(0)
+	sort.Slice(hotspots, func(i, j int) bool {
+		if hotspots[i].OpenBeads != hotspots[j].OpenBeads {
+			return hotspots[i].OpenBeads > hotspots[j].OpenBeads
+		}
+		if hotspots[i].TotalBeads != hotspots[j].TotalBeads {
+			return hotspots[i].TotalBeads > hotspots[j].TotalBeads
+		}
+		return hotspots[i].FilePath < hotspots[j].FilePath
+	})
+	h.hotspots = hotspots
+	h.clampHotspotSelection()
 	h.hotspotOpenCounts = make(map[string]int, len(hotspots))
 	h.hotspotTotalCounts = make(map[string]int, len(hotspots))
 	for _, hs := range hotspots {
@@ -225,7 +270,13 @@ func (h *HistoryModel) refreshFileIntelligence() {
 		h.hotspotOpenCounts[cleanPath] = hs.OpenBeads
 		h.hotspotTotalCounts[cleanPath] = hs.TotalBeads
 	}
-	if net := correlation.NewNetworkBuilder(h.report).BuildAt(h.effectiveNow()); net != nil && len(net.Clusters) > 0 {
+	var netBuilder *correlation.NetworkBuilder
+	if len(h.issues) > 0 {
+		netBuilder = correlation.NewNetworkBuilderWithIssues(h.report, h.issues)
+	} else {
+		netBuilder = correlation.NewNetworkBuilder(h.report)
+	}
+	if net := netBuilder.BuildAt(h.effectiveNow()); net != nil && len(net.Clusters) > 0 {
 		peersByBead := make(map[string][]string)
 		for _, cl := range net.Clusters {
 			if len(cl.BeadIDs) < 2 {
@@ -348,12 +399,143 @@ func (h *HistoryModel) ToggleOrphansMode() {
 		}
 		h.applySearchFilter()
 	} else {
-		h.prevNonOrphanMode = h.viewMode
+		if h.viewMode == historyModeBead || h.viewMode == historyModeGit {
+			h.prevNonOrphanMode = h.viewMode
+		}
 		h.viewMode = historyModeOrphans
 		h.fileTreeFocus = false
 		h.clampOrphanSelection()
 	}
 	h.modeChangedAt = time.Now()
+}
+
+// IsHotspotsMode returns true when History View is in Code Hotspots & Co-Change mode (W35-5).
+func (h *HistoryModel) IsHotspotsMode() bool {
+	return h.viewMode == historyModeHotspots
+}
+
+// HotspotCount returns the total number of indexed code hotspot files.
+func (h *HistoryModel) HotspotCount() int {
+	return len(h.hotspots)
+}
+
+func (h *HistoryModel) hotspotsVisibleRows(panelHeight int) int {
+	return max(1, panelHeight-4)
+}
+
+func (h *HistoryModel) filteredHotspots() []correlation.FileHotspot {
+	if len(h.hotspots) == 0 {
+		return nil
+	}
+	q := strings.ToLower(strings.TrimSpace(h.searchInput.Value()))
+	if q == "" {
+		return h.hotspots
+	}
+	out := make([]correlation.FileHotspot, 0, len(h.hotspots))
+	for _, hs := range h.hotspots {
+		if strings.Contains(strings.ToLower(hs.FilePath), q) {
+			out = append(out, hs)
+		}
+	}
+	return out
+}
+
+func (h *HistoryModel) clampHotspotSelection() {
+	list := h.filteredHotspots()
+	if len(list) == 0 {
+		h.selectedHotspot = 0
+		h.hotspotScrollOffset = 0
+		return
+	}
+	if h.selectedHotspot < 0 {
+		h.selectedHotspot = 0
+	}
+	if h.selectedHotspot >= len(list) {
+		h.selectedHotspot = len(list) - 1
+	}
+	if h.hotspotScrollOffset > h.selectedHotspot {
+		h.hotspotScrollOffset = h.selectedHotspot
+	}
+	vis := h.hotspotsVisibleRows(h.currentPanelHeight())
+	if h.selectedHotspot >= h.hotspotScrollOffset+vis {
+		h.hotspotScrollOffset = h.selectedHotspot - vis + 1
+	}
+	if h.hotspotScrollOffset < 0 {
+		h.hotspotScrollOffset = 0
+	}
+}
+
+// ToggleHotspotsMode switches between Code Hotspots mode and the previous Bead/Git mode (W35-5).
+func (h *HistoryModel) ToggleHotspotsMode() {
+	if h.viewMode == historyModeHotspots {
+		if h.prevNonOrphanMode == historyModeGit {
+			h.viewMode = historyModeGit
+		} else {
+			h.viewMode = historyModeBead
+		}
+		h.applySearchFilter()
+	} else {
+		if h.viewMode == historyModeBead || h.viewMode == historyModeGit {
+			h.prevNonOrphanMode = h.viewMode
+		}
+		h.viewMode = historyModeHotspots
+		h.fileTreeFocus = false
+		h.clampHotspotSelection()
+	}
+	h.modeChangedAt = time.Now()
+}
+
+// SelectedHotspot returns the currently highlighted code hotspot file, or nil.
+func (h *HistoryModel) SelectedHotspot() *correlation.FileHotspot {
+	list := h.filteredHotspots()
+	if len(list) == 0 || h.selectedHotspot < 0 || h.selectedHotspot >= len(list) {
+		return nil
+	}
+	hs := list[h.selectedHotspot]
+	return &hs
+}
+
+// SelectedHotspotPrimaryBeadID returns the first open (or recent closed) bead linked to the selected hotspot.
+func (h *HistoryModel) SelectedHotspotPrimaryBeadID() string {
+	hs := h.SelectedHotspot()
+	if hs == nil || h.fileLookup == nil {
+		return ""
+	}
+	res := h.fileLookup.LookupByFile(hs.FilePath)
+	if res == nil {
+		return ""
+	}
+	if len(res.OpenBeads) > 0 {
+		return res.OpenBeads[0].BeadID
+	}
+	if len(res.ClosedBeads) > 0 {
+		return res.ClosedBeads[0].BeadID
+	}
+	return ""
+}
+
+// ApplyHotspotFileFilter filters History Bead view to the currently selected hotspot file and returns its path.
+func (h *HistoryModel) ApplyHotspotFileFilter() string {
+	hs := h.SelectedHotspot()
+	if hs == nil || hs.FilePath == "" {
+		return ""
+	}
+	h.fileFilter = hs.FilePath
+	h.viewMode = historyModeBead
+	// Clear any filename search query typed while browsing Hotspots so Bead mode
+	// doesn't immediately filter to 0 matches (Pass 2 Audit #4).
+	h.searchActive = false
+	h.searchInput.Blur()
+	h.searchInput.SetValue("")
+	h.searchMode = searchModeOff
+	h.lastSearchQuery = ""
+	h.selectedBead = 0
+	h.selectedCommit = 0
+	h.scrollOffset = 0
+	h.applySearchFilter()
+	h.clampMainFocusToPaneCount()
+	h.modeChangedAt = time.Now()
+	return hs.FilePath
 }
 
 // OrphanCount returns the number of suspicious unlinked orphan commits loaded.
@@ -567,6 +749,7 @@ func (h *HistoryModel) SetReport(report *correlation.HistoryReport) {
 
 	h.report = report
 	if report == nil {
+		h.issues = nil
 		h.orphans = nil
 		h.orphanRatio = 0
 		h.selectedOrphan = 0
@@ -1179,7 +1362,7 @@ func (h *HistoryModel) IsFileTreeVisible() bool {
 // FileTreeRendered returns whether the file tree panel is currently rendered
 // (toggled on, not in Orphans mode, and terminal width is wide enough, or width is not yet initialized).
 func (h *HistoryModel) FileTreeRendered() bool {
-	if h.viewMode == historyModeOrphans {
+	if h.viewMode == historyModeOrphans || h.viewMode == historyModeHotspots {
 		return false
 	}
 	return h.showFileTree && (h.width == 0 || h.width >= fileTreeMinWidth)
@@ -1302,6 +1485,15 @@ func (h *HistoryModel) CollapseFileNode() {
 
 // MoveUp moves selection up in the current focus pane
 func (h *HistoryModel) MoveUp() {
+	if h.viewMode == historyModeHotspots {
+		if h.selectedHotspot > 0 {
+			h.selectedHotspot--
+			if h.selectedHotspot < h.hotspotScrollOffset {
+				h.hotspotScrollOffset = h.selectedHotspot
+			}
+		}
+		return
+	}
 	if h.viewMode == historyModeOrphans {
 		if h.selectedOrphan > 0 {
 			h.selectedOrphan--
@@ -1337,6 +1529,17 @@ func (h *HistoryModel) MoveUp() {
 
 // MoveDown moves selection down in the current focus pane
 func (h *HistoryModel) MoveDown() {
+	if h.viewMode == historyModeHotspots {
+		list := h.filteredHotspots()
+		if h.selectedHotspot < len(list)-1 {
+			h.selectedHotspot++
+			vis := h.hotspotsVisibleRows(h.currentPanelHeight())
+			if h.selectedHotspot >= h.hotspotScrollOffset+vis {
+				h.hotspotScrollOffset = h.selectedHotspot - vis + 1
+			}
+		}
+		return
+	}
 	if h.viewMode == historyModeOrphans {
 		list := h.filteredOrphans()
 		if h.selectedOrphan < len(list)-1 {
@@ -1384,6 +1587,13 @@ func (h *HistoryModel) MoveDown() {
 
 // MoveToStart jumps to the first item in the currently focused pane
 func (h *HistoryModel) MoveToStart() {
+	if h.viewMode == historyModeHotspots {
+		if len(h.filteredHotspots()) > 0 {
+			h.selectedHotspot = 0
+			h.hotspotScrollOffset = 0
+		}
+		return
+	}
 	if h.viewMode == historyModeOrphans {
 		if len(h.filteredOrphans()) > 0 {
 			h.selectedOrphan = 0
@@ -1413,6 +1623,19 @@ func (h *HistoryModel) MoveToStart() {
 
 // MoveToEnd jumps to the last item in the currently focused pane
 func (h *HistoryModel) MoveToEnd() {
+	if h.viewMode == historyModeHotspots {
+		list := h.filteredHotspots()
+		if len(list) > 0 {
+			h.selectedHotspot = len(list) - 1
+			vis := h.hotspotsVisibleRows(h.currentPanelHeight())
+			if h.selectedHotspot >= vis {
+				h.hotspotScrollOffset = h.selectedHotspot - vis + 1
+			} else {
+				h.hotspotScrollOffset = 0
+			}
+		}
+		return
+	}
 	if h.viewMode == historyModeOrphans {
 		list := h.filteredOrphans()
 		if len(list) > 0 {
@@ -1735,6 +1958,9 @@ func (h *HistoryModel) applySearchFilter() {
 	}
 	if h.viewMode == historyModeOrphans {
 		h.clampOrphanSelection()
+	}
+	if h.viewMode == historyModeHotspots {
+		h.clampHotspotSelection()
 	}
 
 	query := strings.TrimSpace(h.searchInput.Value())
@@ -2387,6 +2613,9 @@ func (h *HistoryModel) View() string {
 	}
 	if h.viewMode == historyModeOrphans {
 		return h.renderOrphansView()
+	}
+	if h.viewMode == historyModeHotspots {
+		return h.renderHotspotsView()
 	}
 	if h.report == nil {
 		return h.renderEmpty("No history data loaded")
@@ -3121,6 +3350,9 @@ func (h *HistoryModel) renderHeader() string {
 	case historyModeOrphans:
 		modeIcon = "◎"
 		modeLabel = "Orphans"
+	case historyModeHotspots:
+		modeIcon = "🔥"
+		modeLabel = "Hotspots"
 	default:
 		modeIcon = "◈"
 		modeLabel = "Beads"
@@ -3306,10 +3538,10 @@ func (h *HistoryModel) renderFilterLine() string {
 
 	// Build active filters list
 	var activeFilters []string
-	if h.authorFilter != "" {
+	if h.viewMode != historyModeHotspots && h.authorFilter != "" {
 		activeFilters = append(activeFilters, fmt.Sprintf("@%s", h.authorFilter))
 	}
-	if h.viewMode != historyModeOrphans && h.minConfidence > 0 {
+	if h.viewMode != historyModeOrphans && h.viewMode != historyModeHotspots && h.minConfidence > 0 {
 		activeFilters = append(activeFilters, fmt.Sprintf("≥%.0f%% conf", h.minConfidence*100))
 	}
 	if query := strings.TrimSpace(h.searchInput.Value()); query != "" {
@@ -3317,7 +3549,7 @@ func (h *HistoryModel) renderFilterLine() string {
 	}
 
 	// Show file filter chip when active (bv-190l)
-	if h.viewMode != historyModeOrphans {
+	if h.viewMode != historyModeOrphans && h.viewMode != historyModeHotspots {
 		if h.fileFilter != "" {
 			parts = append(parts, activeFilterStyle.Render("File: "+h.fileFilter))
 		}
@@ -3332,7 +3564,15 @@ func (h *HistoryModel) renderFilterLine() string {
 	}
 
 	// Show count based on mode
-	if h.viewMode == historyModeOrphans {
+	if h.viewMode == historyModeHotspots {
+		filtered := h.filteredHotspots()
+		totalHotspots := len(h.hotspots)
+		if len(filtered) != totalHotspots {
+			parts = append(parts, filterStyle.Render(fmt.Sprintf("Showing %d/%d hotspot files", len(filtered), totalHotspots)))
+		} else {
+			parts = append(parts, filterStyle.Render(fmt.Sprintf("Showing all %d hotspot files", totalHotspots)))
+		}
+	} else if h.viewMode == historyModeOrphans {
 		filtered := h.filteredOrphans()
 		totalOrphans := len(h.orphans)
 		if len(filtered) != totalOrphans {
@@ -5277,4 +5517,150 @@ func (h *HistoryModel) renderGitBeadListPanel(width, height int) string {
 
 	content := clampHistoryPanelContent(lines, width-2, height-2)
 	return panelStyle.Render(content)
+}
+
+// renderHotspotsView renders the two-pane Code Hotspots & Co-Change Leaderboard view (W35-5).
+func (h *HistoryModel) renderHotspotsView() string {
+	t := h.theme
+	totalW := h.width
+	if totalW <= 0 {
+		totalW = 120
+	}
+	header := h.renderHeader()
+	panelHeight := h.panelHeightForHeader(header)
+
+	visible := h.filteredHotspots()
+	if len(h.hotspots) == 0 {
+		emptyBox := t.Renderer.NewStyle().
+			Width(totalW).
+			Height(panelHeight).
+			Align(lipgloss.Center, lipgloss.Center).
+			Foreground(t.Muted).
+			Render("No correlated file hotspots indexed yet\n\nPress H to return to History view")
+		return lipgloss.JoinVertical(lipgloss.Left, header, emptyBox)
+	}
+	if len(visible) == 0 {
+		emptyBox := t.Renderer.NewStyle().
+			Width(totalW).
+			Height(panelHeight).
+			Align(lipgloss.Center, lipgloss.Center).
+			Foreground(t.Muted).
+			Render("No hotspot files match current search filter\n\nPress / to adjust search or H to return to History view")
+		return lipgloss.JoinVertical(lipgloss.Left, header, emptyBox)
+	}
+
+	leftWidth := max(26, int(float64(totalW)*0.48))
+	rightWidth := max(26, totalW-leftWidth)
+	if leftWidth+rightWidth > totalW {
+		leftWidth = totalW / 2
+		rightWidth = totalW - leftWidth
+	}
+
+	// Left pane: ranked hotspot files
+	leftStyle := t.Renderer.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(t.Primary).
+		Width(leftWidth - 2).
+		Height(panelHeight - 2)
+	var leftLines []string
+	listTitle := fmt.Sprintf("CODE HOTSPOTS (%d)", len(visible))
+	if len(visible) != len(h.hotspots) {
+		listTitle = fmt.Sprintf("CODE HOTSPOTS (%d/%d)", len(visible), len(h.hotspots))
+	}
+	leftLines = append(leftLines, t.Renderer.NewStyle().Bold(true).Foreground(t.Primary).Render(listTitle))
+	leftLines = append(leftLines, t.Renderer.NewStyle().Foreground(t.Muted).Render(strings.Repeat("─", max(4, leftWidth-4))))
+	visRows := h.hotspotsVisibleRows(panelHeight)
+	h.clampHotspotSelection()
+	start := h.hotspotScrollOffset
+	if start < 0 {
+		start = 0
+	}
+	if start >= len(visible) {
+		start = max(0, len(visible)-1)
+	}
+	end := min(len(visible), start+visRows)
+	for i := start; i < end; i++ {
+		hs := visible[i]
+		cursor := "  "
+		rowStyle := t.Renderer.NewStyle().Foreground(t.Secondary)
+		if i == h.selectedHotspot {
+			cursor = "▸ "
+			rowStyle = t.Renderer.NewStyle().Foreground(t.Primary).Bold(true)
+		}
+		badge := fmt.Sprintf("[%d/%d]", hs.OpenBeads, hs.TotalBeads)
+		row := fmt.Sprintf("%s%-7s %s", cursor, badge, hs.FilePath)
+		leftLines = append(leftLines, rowStyle.Render(ansi.Truncate(row, max(8, leftWidth-4), "…")))
+	}
+	leftPanel := leftStyle.Render(clampHistoryPanelContent(leftLines, leftWidth-2, panelHeight-2))
+
+	// Right pane: hotspot detail, blast-radius impact, co-changed files, and linked beads
+	rightStyle := t.Renderer.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(t.Muted).
+		Width(rightWidth - 2).
+		Height(panelHeight - 2)
+	var rightLines []string
+	if hs := h.SelectedHotspot(); hs != nil {
+		innerW := max(10, rightWidth-4)
+		rightLines = append(rightLines, t.Renderer.NewStyle().Bold(true).Foreground(t.Primary).Render("HOTSPOT & CO-CHANGE DETAIL"))
+		rightLines = append(rightLines, t.Renderer.NewStyle().Foreground(t.Secondary).Bold(true).Render(ansi.Truncate(hs.FilePath, innerW, "…")))
+		rightLines = append(rightLines, t.Renderer.NewStyle().Foreground(t.Muted).Render(
+			ansi.Truncate(fmt.Sprintf("Open: %d  •  Closed: %d  •  Total: %d beads  •  Enter filter", hs.OpenBeads, hs.ClosedBeads, hs.TotalBeads), innerW, "…")))
+		rightLines = append(rightLines, "")
+
+		if h.fileLookup != nil {
+			if impact := h.fileLookup.ImpactAnalysisAt([]string{hs.FilePath}, h.effectiveNow()); impact != nil && len(impact.AffectedBeads) > 0 {
+				riskColor := t.Open
+				switch strings.ToLower(impact.RiskLevel) {
+				case "high", "critical":
+					riskColor = t.Blocked
+				case "medium":
+					riskColor = t.Feature
+				}
+				badge := t.Renderer.NewStyle().Foreground(riskColor).Bold(true).Render(strings.ToUpper(impact.RiskLevel))
+				rightLines = append(rightLines, ansi.Truncate(fmt.Sprintf("Blast Radius: %s (%d affected beads)", badge, len(impact.AffectedBeads)), innerW, "…"))
+				rightLines = append(rightLines, "")
+			}
+
+			if co := h.fileLookup.GetRelatedFiles(hs.FilePath, 0.3, 6); co != nil && len(co.RelatedFiles) > 0 {
+				rightLines = append(rightLines, t.Renderer.NewStyle().Bold(true).Foreground(t.InProgress).Render(fmt.Sprintf("Co-Changed Files (%d):", len(co.RelatedFiles))))
+				for _, rf := range co.RelatedFiles {
+					line := fmt.Sprintf("  • %s  (%.0f%% • %d shared)", rf.FilePath, rf.Correlation*100, rf.CoChangeCount)
+					rightLines = append(rightLines, t.Renderer.NewStyle().Foreground(t.Secondary).Render(ansi.Truncate(line, innerW, "…")))
+				}
+				rightLines = append(rightLines, "")
+			} else {
+				rightLines = append(rightLines, t.Renderer.NewStyle().Foreground(t.Muted).Italic(true).Render("Co-Changed Files: none ≥30% correlation"))
+				rightLines = append(rightLines, "")
+			}
+
+			if lookup := h.fileLookup.LookupByFile(hs.FilePath); lookup != nil {
+				if len(lookup.OpenBeads) > 0 {
+					rightLines = append(rightLines, t.Renderer.NewStyle().Bold(true).Foreground(t.Open).Render(fmt.Sprintf("Open Beads (%d):", len(lookup.OpenBeads))))
+					for i, ref := range lookup.OpenBeads {
+						if i >= 6 {
+							rightLines = append(rightLines, t.Renderer.NewStyle().Foreground(t.Muted).Italic(true).Render(fmt.Sprintf("  +%d more open", len(lookup.OpenBeads)-6)))
+							break
+						}
+						rightLines = append(rightLines, t.Renderer.NewStyle().Foreground(t.Secondary).Render(ansi.Truncate(fmt.Sprintf("  ○ %s — %s", ref.BeadID, ref.Title), innerW, "…")))
+					}
+					rightLines = append(rightLines, "")
+				}
+				if len(lookup.ClosedBeads) > 0 {
+					rightLines = append(rightLines, t.Renderer.NewStyle().Foreground(t.Muted).Render(fmt.Sprintf("Recent Closed Beads (%d):", len(lookup.ClosedBeads))))
+					for i, ref := range lookup.ClosedBeads {
+						if i >= 4 {
+							rightLines = append(rightLines, t.Renderer.NewStyle().Foreground(t.Muted).Italic(true).Render(fmt.Sprintf("  +%d more closed", len(lookup.ClosedBeads)-4)))
+							break
+						}
+						rightLines = append(rightLines, t.Renderer.NewStyle().Foreground(t.Muted).Render(ansi.Truncate(fmt.Sprintf("  ✓ %s — %s", ref.BeadID, ref.Title), innerW, "…")))
+					}
+				}
+			}
+		}
+	}
+	rightPanel := rightStyle.Render(clampHistoryPanelContent(rightLines, rightWidth-2, panelHeight-2))
+
+	body := lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, rightPanel)
+	return lipgloss.JoinVertical(lipgloss.Left, header, body)
 }

@@ -3473,11 +3473,16 @@ func TestWave28_Pass13AndW28_ExportParity(t *testing.T) {
 	inactStats := inactAn.Analyze()
 	extractNodeJSON := func(htmlStr, id string) string {
 		t.Helper()
-		needle := `"id":"` + id + `"`
-		idx := strings.Index(htmlStr, needle)
-		if idx < 0 {
-			t.Fatalf("missing node %s in interactive HTML", id)
+		nodesStart := strings.Index(htmlStr, `"nodes":[`)
+		if nodesStart < 0 {
+			t.Fatalf("missing nodes array in interactive HTML")
 		}
+		needle := `"id":"` + id + `"`
+		relIdx := strings.Index(htmlStr[nodesStart:], needle)
+		if relIdx < 0 {
+			t.Fatalf("missing node %s in interactive HTML nodes array", id)
+		}
+		idx := nodesStart + relIdx
 		end := strings.Index(htmlStr[idx:], "}")
 		return htmlStr[idx : idx+end+1]
 	}
@@ -4106,4 +4111,601 @@ func TestWave31_ExportRegressions(t *testing.T) {
 			t.Fatalf("P20A-8 regression: writeMarkdownDiffSummary mangled pipe or kept control rune:\n%q", diffMD)
 		}
 	})
+}
+
+func TestWave32_Pass21AndExecutiveParity(t *testing.T) {
+	now := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
+
+	t.Run("P21-2_NoHiddenDependentLeakWhenVisibleIDsNil", func(t *testing.T) {
+		root := model.Issue{ID: "VIS-A", Title: "Visible root", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now}
+		hidden := model.Issue{
+			ID: "HID-B", Title: "Hidden dependent", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "HID-B", DependsOnID: "VIS-A", Type: model.DepBlocks}},
+		}
+		all := []model.Issue{root, hidden}
+		an := analysis.NewAnalyzer(all)
+		an.SetNow(now)
+		stats := an.Analyze()
+
+		for _, incGraph := range []bool{true, false} {
+			opts := DefaultReportOptions()
+			opts.Format = "markdown"
+			opts.IncludeGraph = incGraph
+			opts.GeneratedAt = now
+			opts.Analyzer = an
+			opts.GraphStats = &stats
+			opts.VisibleIDs = nil // Deliberately nil!
+			mdBytes, err := GenerateReport([]model.Issue{root}, all, opts)
+			if err != nil {
+				t.Fatalf("GenerateReport(incGraph=%v): %v", incGraph, err)
+			}
+			if strings.Contains(string(mdBytes), "HID-B") {
+				t.Fatalf("P21-2 regression (incGraph=%v): hidden incoming dependent HID-B leaked into report:\n%s", incGraph, mdBytes)
+			}
+		}
+	})
+
+	t.Run("P21-3_TombstoneResolutionPreservedWhenIncludeGraphFalse", func(t *testing.T) {
+		tomb := model.Issue{ID: "TOMB-1", Title: "Deleted blocker", Status: model.StatusTombstone, CreatedAt: now, UpdatedAt: now}
+		sel := model.Issue{
+			ID: "SEL-1", Title: "Depends on tombstone", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "SEL-1", DependsOnID: "TOMB-1", Type: model.DepBlocks}},
+		}
+		all := []model.Issue{sel, tomb}
+		an := analysis.NewAnalyzer(all)
+		an.SetNow(now)
+		stats := an.Analyze()
+
+		opts := DefaultReportOptions()
+		opts.Format = "markdown"
+		opts.IncludeGraph = false
+		opts.Readiness = nil // Force fallback readiness inside GenerateReport
+		opts.GeneratedAt = now
+		opts.Analyzer = an
+		opts.GraphStats = &stats
+		mdBytes, err := GenerateReport([]model.Issue{sel}, all, opts)
+		if err != nil {
+			t.Fatalf("GenerateReport: %v", err)
+		}
+		// SEL-1's only blocker is tombstone TOMB-1, so it must NOT show "Start Here (Root Blockers)" for TOMB-1.
+		if strings.Contains(string(mdBytes), "Start Here (Root Blockers)") {
+			t.Fatalf("P21-3 regression: tombstone dependency treated as unresolved blocker when IncludeGraph=false:\n%s", mdBytes)
+		}
+	})
+
+	t.Run("P21-6_DiffRefSanitizationAndHTMLModifiedFieldsParity", func(t *testing.T) {
+		diff := &analysis.SnapshotDiff{
+			Summary: analysis.DiffSummary{IssuesModified: 1, HealthTrend: "stable"},
+			ModifiedIssues: []analysis.ModifiedIssue{{
+				IssueID: "MOD-1",
+				Changes: []analysis.FieldChange{
+					{Field: "   "},
+					{Field: "priority"},
+					{Field: "status"},
+				},
+			}},
+		}
+		var mdBuf, htmlBuf strings.Builder
+		writeMarkdownDiffSummary(&mdBuf, diff, "\x1b\x07")
+		writeHTMLDiffSummary(&htmlBuf, diff, "\x1b\x07")
+		if !strings.Contains(mdBuf.String(), "## Changes Since `baseline`") {
+			t.Fatalf("P21-6: control-only diffSince did not fall back to baseline in Markdown: %q", mdBuf.String())
+		}
+		if !strings.Contains(mdBuf.String(), "`MOD-1` (priority, status)") {
+			t.Fatalf("P21-6: empty FieldChange leaked or missing fields in Markdown: %q", mdBuf.String())
+		}
+		if !strings.Contains(htmlBuf.String(), "Changes Since <code>baseline</code>") ||
+			!strings.Contains(htmlBuf.String(), "<code>MOD-1</code> (priority, status)") {
+			t.Fatalf("P21-6: HTML diff summary missing fallback ref or modified field names: %q", htmlBuf.String())
+		}
+	})
+
+	t.Run("W32-5_ExecutiveParityCapacitySuggestionsAndCascades", func(t *testing.T) {
+		vis := []model.Issue{{ID: "VIS-1", Title: "Visible task", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now}}
+		opts := DefaultReportOptions()
+		opts.GeneratedAt = now
+		opts.VisibleIDs = map[string]bool{"VIS-1": true}
+		opts.GlobalCapacity = &PriorityBriefCapacity{
+			OpenCount: 1, TotalMinutes: 120, CriticalPathMinutes: 120, ParallelizablePct: 0,
+			Days1Agent: 1.0, Days2AgentsMin: 1.0, Days2AgentsMax: 1.0, Days4AgentsMin: 1.0, Days4AgentsMax: 1.0,
+			CriticalPathIDs: []string{"VIS-1", "HIDDEN-SECRET"},
+		}
+		opts.Suggestions = []analysis.Suggestion{
+			{Type: analysis.SuggestionLabelSuggestion, TargetBead: "VIS-1", Confidence: 0.9, Summary: "Add backend label"},
+			{Type: analysis.SuggestionPotentialDuplicate, TargetBead: "VIS-1", RelatedBead: "HIDDEN-SECRET", Confidence: 0.95, Summary: "Must be filtered out"},
+		}
+
+		for _, format := range []string{"markdown", "html"} {
+			opts.Format = format
+			outBytes, err := GenerateReport(vis, vis, opts)
+			if err != nil {
+				t.Fatalf("GenerateReport(%s): %v", format, err)
+			}
+			out := string(outBytes)
+			if !strings.Contains(out, "Global Backlog Capacity") || !strings.Contains(out, "Hygiene Suggestions") || !strings.Contains(out, "Add backend label") {
+				t.Fatalf("W32-5 (%s): missing capacity or hygiene suggestions:\n%s", format, out)
+			}
+			if strings.Contains(out, "HIDDEN-SECRET") || strings.Contains(out, "Must be filtered out") {
+				t.Fatalf("W32-5 (%s): leaked out-of-scope ID into report:\n%s", format, out)
+			}
+		}
+
+		briefJSON := `{"meta":{"version":"1.0","generated_at":"2026-11-24T12:00:00Z","phase2_ready":true,"issue_count":2},"quick_ref":{"open_count":2,"actionable_count":1,"blocked_count":1,"in_progress_count":0},"recommendations":[],"quick_wins":[],"blockers_to_clear":[]}`
+		cfg := DefaultPriorityBriefConfig()
+		cfg.Suggestions = []analysis.Suggestion{{Type: analysis.SuggestionMissingDependency, TargetBead: "VIS-1", RelatedBead: "VIS-2", Confidence: 0.85, Summary: "Likely depends on VIS-2"}}
+		cfg.LabelCascades = []analysis.BlockageCascadeResult{{
+			SourceLabel:     "api",
+			BlockedCount:    2,
+			TotalImpact:     5,
+			AffectedLabels:  []string{"web", "mobile"},
+			Recommendations: []analysis.UnblockRecommendation{{IssueID: "VIS-1", UnblocksCount: 3}},
+		}}
+		brief, err := GeneratePriorityBriefFromTriageJSON([]byte(briefJSON), cfg)
+		if err != nil {
+			t.Fatalf("GeneratePriorityBriefFromTriageJSON: %v", err)
+		}
+		for _, want := range []string{"## 🧹 Hygiene Suggestions", "Likely depends on VIS-2", "## 🏷️ Cross-Label Blockage Cascades", "`api`", "`web`, `mobile`", "`VIS-1` (3)"} {
+			if !strings.Contains(brief, want) {
+				t.Fatalf("W32-5 priority brief missing %q:\n%s", want, brief)
+			}
+		}
+	})
+
+	t.Run("W32-3_StandaloneHTMLDiffOverlayAndSafeDepGuard", func(t *testing.T) {
+		before := []model.Issue{
+			{ID: "G-1", Title: "Existing", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, CreatedAt: now.Add(-48 * time.Hour), UpdatedAt: now.Add(-48 * time.Hour)},
+		}
+		after := []model.Issue{
+			{ID: "G-1", Title: "Existing", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask, CreatedAt: now.Add(-48 * time.Hour), UpdatedAt: now},
+			{ID: "G-2", Title: "Newly added", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeFeature, CreatedAt: now, UpdatedAt: now,
+				Dependencies: []*model.Dependency{{IssueID: "G-2", DependsOnID: "G-1", Type: model.DepBlocks}}},
+		}
+		diff := analysis.CompareSnapshots(analysis.NewSnapshotAt(before, now.Add(-24*time.Hour), "HEAD~1"), analysis.NewSnapshotAt(after, now, "HEAD"))
+		an := analysis.NewAnalyzer(after)
+		an.SetNow(now)
+		stats := an.Analyze()
+		outPath := filepath.Join(t.TempDir(), "diff-graph.html")
+		written, err := GenerateInteractiveGraphHTML(InteractiveGraphOptions{
+			Issues:     after,
+			Stats:      &stats,
+			Diff:       diff,
+			DiffSince:  "HEAD~1",
+			Title:      "Diff Graph",
+			Path:       outPath,
+			ExportedAt: now,
+		})
+		if err != nil {
+			t.Fatalf("ExportInteractiveGraph: %v", err)
+		}
+		raw, err := os.ReadFile(written)
+		if err != nil {
+			t.Fatal(err)
+		}
+		htmlDoc := string(raw)
+		for _, want := range []string{`"diff_summary"`, `"diff_status":"added"`, `"diff_status":"modified"`, `"diff_fields":["priority"]`, `id="diff-banner"`, `id="ctx-whatif-batch"`, `Shift+Click`, `isSafeDepArg`} {
+			if !strings.Contains(htmlDoc, want) {
+				t.Fatalf("W32-3/P21-4 standalone HTML missing %q", want)
+			}
+		}
+	})
+}
+
+func TestWave33_W33_4_ExecutiveReportAndPriorityBriefParity(t *testing.T) {
+	now := time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC)
+	vis := []model.Issue{
+		{ID: "api-1", Title: "API auth gateway", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, SourceRepo: "api", Labels: []string{"api"}, CreatedAt: now, UpdatedAt: now},
+		{ID: "web-1", Title: "Web login screen", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeFeature, SourceRepo: "web", Labels: []string{"web"}, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "web-1", DependsOnID: "api-1", Type: model.DepBlocks}}},
+	}
+
+	opts := DefaultReportOptions()
+	opts.GeneratedAt = now
+	opts.VisibleIDs = map[string]bool{"api-1": true, "web-1": true}
+	opts.ActiveSprint = &ReportSprintSummary{
+		SprintID: "sprint-42", Name: "Sprint 42 <Alpha>", StartDate: "2026-11-18", EndDate: "2026-12-02",
+		TotalIssues: 4, CompletedIssues: 2, RemainingIssues: 2, PercentComplete: 50, DaysRemaining: 7,
+		OnTrack: true, AtRiskCount: 2, AtRiskIssueIDs: []string{"web-1", "HIDDEN-RISK"},
+	}
+	opts.BaselineDrift = &ReportDriftSummary{
+		BaselineCommit: "abc1234", BaselineCreatedAt: "2026-11-20", HasDrift: true,
+		CriticalCount: 1, WarningCount: 1, InfoCount: 0,
+		TopAlerts: []ReportDriftAlert{
+			{Severity: "critical", Type: "cycle_introduced", Message: "New cycle <script>alert(1)</script>"},
+			{Severity: "warning", Type: "stale_issue", IssueID: "api-1", Message: "API gateway stale"},
+			{Severity: "warning", Type: "stale_issue", IssueID: "HIDDEN-ALERT", Message: "Secret hidden alert"},
+		},
+	}
+	opts.CrossRepoFlow = &analysis.CrossRepoFlow{
+		Repos:              []string{"api", "web", "secret"},
+		TotalCrossRepoDeps: 2,
+		BottleneckRepos:    []string{"api"},
+		Dependencies: []analysis.RepoDependency{
+			{FromRepo: "api", ToRepo: "web", IssueCount: 1, IssueIDs: []string{"web-1"}, BlockerIDs: []string{"api-1"}},
+			{FromRepo: "api", ToRepo: "secret", IssueCount: 1, IssueIDs: []string{"HIDDEN-1"}, BlockerIDs: []string{"api-1"}},
+		},
+		TopHandoffBlockers: []analysis.RepoHandoffBlocker{
+			{IssueID: "api-1", SourceRepo: "api", BlockedCount: 2, BlockedIDs: []string{"web-1", "HIDDEN-1"}},
+		},
+	}
+	opts.LabelCascades = []analysis.BlockageCascadeResult{
+		{
+			SourceLabel:    "api",
+			BlockedCount:   1,
+			TotalImpact:    2,
+			AffectedLabels: []string{"web"},
+			Recommendations: []analysis.UnblockRecommendation{
+				{IssueID: "api-1", UnblocksCount: 1},
+				{IssueID: "HIDDEN-UNBLOCK", UnblocksCount: 9},
+			},
+		},
+	}
+
+	for _, format := range []string{"markdown", "html"} {
+		opts.Format = format
+		outBytes, err := GenerateReport(vis, vis, opts)
+		if err != nil {
+			t.Fatalf("GenerateReport(%s): %v", format, err)
+		}
+		out := string(outBytes)
+		for _, want := range []string{"Active Sprint Progress", "Baseline Drift", "Cross-Repo Dependency Flow", "Cross-Label Blockage Cascades", "abc1234", "api-1", "web-1"} {
+			if !strings.Contains(out, want) {
+				t.Fatalf("W33-4 (%s) missing %q:\n%s", format, want, out)
+			}
+		}
+		for _, leaked := range []string{"HIDDEN-RISK", "HIDDEN-ALERT", "Secret hidden alert", "HIDDEN-1", "HIDDEN-UNBLOCK"} {
+			if strings.Contains(out, leaked) {
+				t.Fatalf("W33-4 (%s) leaked out-of-scope token %q:\n%s", format, leaked, out)
+			}
+		}
+		if format == "html" {
+			if strings.Contains(out, "<script>alert(1)</script>") {
+				t.Fatalf("W33-4 (html) failed to escape script tag in drift alert")
+			}
+			if !strings.Contains(out, "&lt;script&gt;alert(1)&lt;/script&gt;") {
+				t.Fatalf("W33-4 (html) missing escaped drift message")
+			}
+		}
+	}
+
+	// Negative control: when optional executive structs are nil/empty, none of the 4 sections appear.
+	emptyOpts := DefaultReportOptions()
+	emptyOpts.GeneratedAt = now
+	for _, format := range []string{"markdown", "html"} {
+		emptyOpts.Format = format
+		outBytes, err := GenerateReport(vis, vis, emptyOpts)
+		if err != nil {
+			t.Fatalf("GenerateReport empty (%s): %v", format, err)
+		}
+		out := string(outBytes)
+		for _, forbidden := range []string{"Active Sprint Progress", "Baseline Drift", "Cross-Repo Dependency Flow", "Cross-Label Blockage Cascades"} {
+			if strings.Contains(out, forbidden) {
+				t.Fatalf("W33-4 negative control (%s) unexpectedly emitted %q", format, forbidden)
+			}
+		}
+	}
+
+	// Priority Brief parity (positive + negative control).
+	briefJSON := `{"meta":{"version":"1.0","generated_at":"2026-11-25T12:00:00Z","phase2_ready":true,"issue_count":2},"quick_ref":{"open_count":2,"actionable_count":1,"blocked_count":1,"in_progress_count":0},"recommendations":[],"quick_wins":[],"blockers_to_clear":[]}`
+	cfg := DefaultPriorityBriefConfig()
+	cfg.ActiveSprint = &ReportSprintSummary{SprintID: "sprint-42", Name: "Sprint 42", StartDate: "2026-11-18", EndDate: "2026-12-02", TotalIssues: 4, CompletedIssues: 2, RemainingIssues: 2, PercentComplete: 50, DaysRemaining: 7, OnTrack: true, AtRiskCount: 1, AtRiskIssueIDs: []string{"web-1"}}
+	cfg.BaselineDrift = &ReportDriftSummary{BaselineCommit: "abc1234", HasDrift: true, CriticalCount: 1, TopAlerts: []ReportDriftAlert{{Severity: "critical", Type: "cycle_introduced", Message: "Cycle detected"}}}
+	cfg.CrossRepoFlow = &analysis.CrossRepoFlow{Repos: []string{"api", "web"}, TotalCrossRepoDeps: 1, Dependencies: []analysis.RepoDependency{{FromRepo: "api", ToRepo: "web", IssueCount: 1, BlockerIDs: []string{"api-1"}}}, TopHandoffBlockers: []analysis.RepoHandoffBlocker{{IssueID: "api-1", SourceRepo: "api", BlockedCount: 1}}}
+	brief, err := GeneratePriorityBriefFromTriageJSON([]byte(briefJSON), cfg)
+	if err != nil {
+		t.Fatalf("GeneratePriorityBriefFromTriageJSON: %v", err)
+	}
+	for _, want := range []string{"## 🏃 Active Sprint Progress", "## 📉 Baseline Drift", "## 🔀 Cross-Repo Dependency Flow", "Sprint 42", "abc1234", "`api`", "`web`"} {
+		if !strings.Contains(brief, want) {
+			t.Fatalf("W33-4 priority brief missing %q:\n%s", want, brief)
+		}
+	}
+	emptyBrief, err := GeneratePriorityBriefFromTriageJSON([]byte(briefJSON), DefaultPriorityBriefConfig())
+	if err != nil {
+		t.Fatalf("GeneratePriorityBriefFromTriageJSON empty: %v", err)
+	}
+	for _, forbidden := range []string{"Active Sprint Progress", "Baseline Drift", "Cross-Repo Dependency Flow"} {
+		if strings.Contains(emptyBrief, forbidden) {
+			t.Fatalf("W33-4 priority brief negative control emitted %q", forbidden)
+		}
+	}
+
+	// P24A-2: attachExternalIntel must filter RelatedIssueID leaks, update counts & HasDrift when all alerts
+	// are hidden, and report Partial (skipped checks) instead of "Clean (no drift)" when SkippedChecksCount > 0.
+	p24Opts := DefaultReportOptions()
+	p24Opts.GeneratedAt = now
+	p24Opts.VisibleIDs = map[string]bool{"api-1": true}
+	p24Opts.BaselineDrift = &ReportDriftSummary{
+		BaselineCommit:      "def5678",
+		HasDrift:            true,
+		WarningCount:        1,
+		SkippedChecksCount:  1,
+		SkippedCheckReasons: []string{"saved baseline scope does not match active CLI scope"},
+		TopAlerts: []ReportDriftAlert{
+			{Severity: "warning", Type: "potential_duplicate", IssueID: "api-1", RelatedIssueID: "HIDDEN-DUP", Message: "Duplicates HIDDEN-DUP"},
+		},
+	}
+	for _, format := range []string{"markdown", "html"} {
+		p24Opts.Format = format
+		outBytes, err := GenerateReport(vis[:1], vis, p24Opts)
+		if err != nil {
+			t.Fatalf("P24A-2 GenerateReport(%s): %v", format, err)
+		}
+		out := string(outBytes)
+		if strings.Contains(out, "HIDDEN-DUP") || strings.Contains(out, "Drift detected") || strings.Contains(out, "Clean (no drift)") {
+			t.Fatalf("P24A-2 (%s) leaked hidden RelatedIssueID or stale status:\n%s", format, out)
+		}
+		if !strings.Contains(out, "Partial (1 check(s) skipped)") {
+			t.Fatalf("P24A-2 (%s) missing Partial skipped-checks status:\n%s", format, out)
+		}
+	}
+}
+
+func TestWave36_DecisionIntelAndBriefAdvancedInsights(t *testing.T) {
+	now := time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC)
+	// Build a clean visible DAG (V-1 -> V-2 -> V-3, V-1 -> V-4) plus a hidden branch (H-1 -> H-2)
+	// so AdvancedInsights produces non-empty TopKSet, ParallelCut, and KPaths while testing VisibleIDs isolation.
+	allIssues := []model.Issue{
+		{ID: "V-1", Title: "Visible keystone", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
+		{ID: "V-2", Title: "Visible middle", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "V-2", DependsOnID: "V-1", Type: model.DepBlocks}}},
+		{ID: "V-3", Title: "Visible leaf A", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "V-3", DependsOnID: "V-2", Type: model.DepBlocks}}},
+		{ID: "V-4", Title: "Visible leaf B", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "V-4", DependsOnID: "V-1", Type: model.DepBlocks}}},
+		{ID: "H-1", Title: "Hidden keystone", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
+		{ID: "H-2", Title: "Hidden child", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "H-2", DependsOnID: "H-1", Type: model.DepBlocks}}},
+	}
+	vis := allIssues[:4]
+	fullAn := analysis.NewAnalyzer(allIssues)
+	fullAn.SetNow(now)
+	fullSt := fullAn.Analyze()
+	opts := DefaultReportOptions()
+	opts.GeneratedAt = now
+	opts.Analyzer = fullAn
+	opts.GraphStats = &fullSt
+	opts.GraphIssues = allIssues
+	opts.VisibleIDs = map[string]bool{"V-1": true, "V-2": true, "V-3": true, "V-4": true}
+
+	for _, format := range []string{"markdown", "html"} {
+		opts.Format = format
+		outBytes, err := GenerateReport(vis, allIssues, opts)
+		if err != nil {
+			t.Fatalf("GenerateReport(%s): %v", format, err)
+		}
+		out := string(outBytes)
+		if strings.Contains(out, "H-1") || strings.Contains(out, "H-2") {
+			t.Fatalf("W36-4 (%s) leaked hidden IDs in AdvancedInsights output:\n%s", format, out)
+		}
+		for _, want := range []string{"Top-K Unlock Sequence", "Critical Dependency Chains (K-Paths)", "V-1", "V-2", "V-3"} {
+			if !strings.Contains(out, want) {
+				t.Fatalf("W36-4 (%s) missing %q in report:\n%s", format, want, out)
+			}
+		}
+	}
+
+	// Priority Brief parity: TopKItems, ParallelCut, KPaths, ExecutionTracks, FileHotspots, OrphanCommitCount.
+	an := analysis.NewAnalyzer(vis)
+	an.SetNow(now)
+	st := an.Analyze()
+	adv := an.GenerateAdvancedInsightsFromStats(&st, analysis.DefaultAdvancedInsightsConfig())
+	briefJSON := `{"meta":{"version":"1.0","generated_at":"2026-11-26T12:00:00Z","phase2_ready":true,"issue_count":4},"quick_ref":{"open_count":4,"actionable_count":1,"blocked_count":3,"in_progress_count":0},"recommendations":[],"quick_wins":[],"blockers_to_clear":[]}`
+	cfg := DefaultPriorityBriefConfig()
+	if adv != nil {
+		if adv.TopKSet != nil {
+			cfg.TopKItems = adv.TopKSet.Items
+			cfg.TopKTotalGain = adv.TopKSet.TotalGain
+		}
+		if adv.ParallelCut != nil {
+			cfg.ParallelCut = adv.ParallelCut.Suggestions
+		}
+		if adv.KPaths != nil {
+			cfg.KPaths = adv.KPaths.Paths
+		}
+	}
+	cfg.ExecutionTracks = []PriorityBriefTrackSummary{{TrackID: "track-A", Reason: "Auth track", ItemCount: 2, TopIssueID: "V-1", TopIssueTitle: "Visible keystone"}}
+	cfg.FileHotspots = []PriorityBriefHotspotSummary{{Path: "pkg/auth/core.go", OpenBeads: 2, TotalBeads: 3}}
+	cfg.OrphanCommitCount = 2
+	brief, err := GeneratePriorityBriefFromTriageJSON([]byte(briefJSON), cfg)
+	if err != nil {
+		t.Fatalf("GeneratePriorityBriefFromTriageJSON: %v", err)
+	}
+	for _, want := range []string{
+		"## 🔓 Structural Unlock Plan",
+		"Top-K Unlock Sequence",
+		"Critical Chains (K-Paths)",
+		"## 🛤️ Parallel Execution Tracks",
+		"track-A",
+		"## 🔥 Code Hotspots & Correlation",
+		"pkg/auth/core.go",
+		"2 commit(s) without linked beads",
+	} {
+		if !strings.Contains(brief, want) {
+			t.Fatalf("W36-4 priority brief missing %q:\n%s", want, brief)
+		}
+	}
+}
+
+func TestWave37_JSONReportExecutiveParity(t *testing.T) {
+	now := time.Date(2026, 11, 27, 12, 0, 0, 0, time.UTC)
+	est120, est60 := 120, 60
+	allIssues := []model.Issue{
+		{ID: "V-1", Title: "API auth core", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask, SourceRepo: "api", Labels: []string{"auth"}, EstimatedMinutes: &est120, CreatedAt: now, UpdatedAt: now},
+		{ID: "V-2", Title: "Web login integration", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, SourceRepo: "web", Labels: []string{"ui"}, EstimatedMinutes: &est60, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "V-2", DependsOnID: "V-1", Type: model.DepBlocks}}},
+		{ID: "V-3", Title: "Web settings polish", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, SourceRepo: "web", Labels: []string{"ui"}, EstimatedMinutes: &est60, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "V-3", DependsOnID: "V-2", Type: model.DepBlocks}}},
+		{ID: "H-1", Title: "Hidden root", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask, SourceRepo: "secret", CreatedAt: now, UpdatedAt: now},
+		{ID: "H-2", Title: "Hidden child", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask, SourceRepo: "secret", CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "H-2", DependsOnID: "H-1", Type: model.DepBlocks}}},
+	}
+	vis := allIssues[:3]
+	fullAn := analysis.NewAnalyzer(allIssues)
+	fullAn.SetNow(now)
+	fullSt := fullAn.Analyze()
+
+	opts := DefaultReportOptions()
+	opts.Format = "json"
+	opts.GeneratedAt = now
+	opts.Analyzer = fullAn
+	opts.GraphStats = &fullSt
+	opts.GraphIssues = allIssues
+	opts.VisibleIDs = map[string]bool{"V-1": true, "V-2": true, "V-3": true}
+	opts.GlobalCapacity = &PriorityBriefCapacity{
+		OpenCount:           3,
+		TotalMinutes:        240,
+		CriticalPathMinutes: 240,
+		ParallelizablePct:   0,
+		Days1Agent:          3.5,
+		Days2AgentsMin:      3.5,
+		Days2AgentsMax:      3.5,
+		Days4AgentsMin:      3.5,
+		Days4AgentsMax:      3.5,
+		CriticalPathIDs:     []string{"V-1", "V-2", "V-3", "H-1"},
+	}
+	opts.Suggestions = []analysis.Suggestion{
+		{Type: analysis.SuggestionMissingDependency, TargetBead: "V-1", RelatedBead: "V-2", Summary: "Visible hygiene suggestion", Confidence: 0.9},
+		{Type: analysis.SuggestionPotentialDuplicate, TargetBead: "V-1", RelatedBead: "H-1", Summary: "Hidden cross-scope duplicate", Confidence: 0.9},
+		{Type: analysis.SuggestionLabelSuggestion, TargetBead: "H-2", Summary: "Hidden target suggestion", Confidence: 0.9},
+	}
+	opts.CrossRepoFlow = &analysis.CrossRepoFlow{
+		Repos:              []string{"api", "secret", "web"},
+		TotalCrossRepoDeps: 2,
+		BottleneckRepos:    []string{"secret", "api"},
+		Dependencies: []analysis.RepoDependency{
+			{FromRepo: "api", ToRepo: "web", IssueCount: 1, IssueIDs: []string{"V-2"}, BlockerIDs: []string{"V-1"}},
+			{FromRepo: "secret", ToRepo: "web", IssueCount: 1, IssueIDs: []string{"V-2"}, BlockerIDs: []string{"H-1"}},
+		},
+		TopHandoffBlockers: []analysis.RepoHandoffBlocker{
+			{IssueID: "V-1", Title: "API auth core", SourceRepo: "api", BlockedRepos: []string{"web", "secret"}, BlockedCount: 2, BlockedIDs: []string{"V-2", "H-2"}},
+			{IssueID: "V-3", Title: "Web settings polish", SourceRepo: "web", BlockedRepos: []string{"secret"}, BlockedCount: 1, BlockedIDs: []string{"H-2"}},
+			{IssueID: "H-1", Title: "Hidden root", SourceRepo: "secret", BlockedRepos: []string{"web"}, BlockedCount: 1, BlockedIDs: []string{"V-2"}},
+		},
+	}
+	opts.ActiveSprint = &ReportSprintSummary{
+		SprintID:        "sprint-37",
+		Name:            "Sprint 37",
+		TotalIssues:     3,
+		CompletedIssues: 0,
+		RemainingIssues: 3,
+		OnTrack:         true,
+	}
+	opts.BaselineDrift = &ReportDriftSummary{
+		BaselineCommit:      "abc1234",
+		BaselineCreatedAt:   "2026-11-20",
+		HasDrift:            true,
+		WarningCount:        2,
+		SkippedChecksCount:  1,
+		SkippedCheckReasons: []string{"baseline_scope: scope guard"},
+		TopAlerts: []ReportDriftAlert{
+			{Severity: "warning", Type: "stale_issue", IssueID: "V-2", Message: "Visible stale warning"},
+			{Severity: "warning", Type: "stale_issue", IssueID: "H-1", Message: "Hidden stale warning"},
+		},
+	}
+	opts.LabelCascades = []analysis.BlockageCascadeResult{
+		{
+			SourceLabel:    "auth",
+			BlockedCount:   1,
+			TotalImpact:    2,
+			AffectedLabels: []string{"ui"},
+			Recommendations: []analysis.UnblockRecommendation{
+				{IssueID: "V-1", IssueTitle: "API auth core", Label: "auth", UnblocksCount: 1, Reason: "Visible unblock"},
+				{IssueID: "H-1", IssueTitle: "Hidden root", Label: "secret", UnblocksCount: 2, Reason: "Hidden unblock"},
+			},
+		},
+	}
+
+	outBytes, err := GenerateReport(vis, allIssues, opts)
+	if err != nil {
+		t.Fatalf("W37-7 GenerateReport(json): %v", err)
+	}
+	raw := string(outBytes)
+	if strings.Contains(raw, "H-1") || strings.Contains(raw, "H-2") || strings.Contains(raw, "Hidden") || strings.Contains(raw, "secret") {
+		t.Fatalf("W37-7 JSON report leaked hidden issues/suggestions/alerts/repos:\n%s", raw)
+	}
+	// Verify snake_case JSON tags (not PascalCase Go field names!).
+	for _, forbiddenPascal := range []string{`"OpenCount"`, `"TotalMinutes"`, `"SprintID"`, `"BaselineCommit"`, `"TopAlerts"`, `"IssueID"`} {
+		if strings.Contains(raw, forbiddenPascal) {
+			t.Fatalf("P30-4 JSON report emitted PascalCase key %s:\n%s", forbiddenPascal, raw)
+		}
+	}
+	var decoded struct {
+		DecisionIntel *struct {
+			TopKItems []analysis.TopKSetItem  `json:"top_k_items"`
+			KPaths    []analysis.CriticalPath `json:"k_paths"`
+		} `json:"decision_intel"`
+		GlobalCapacity *PriorityBriefCapacity           `json:"global_capacity"`
+		Suggestions    []analysis.Suggestion            `json:"suggestions"`
+		CrossRepoFlow  *analysis.CrossRepoFlow          `json:"cross_repo_flow"`
+		ActiveSprint   *ReportSprintSummary             `json:"active_sprint"`
+		BaselineDrift  *ReportDriftSummary              `json:"baseline_drift"`
+		LabelCascades  []analysis.BlockageCascadeResult `json:"label_cascades"`
+	}
+	if err := json.Unmarshal(outBytes, &decoded); err != nil {
+		t.Fatalf("W37-7 decode JSON report: %v\n%s", err, raw)
+	}
+	if decoded.DecisionIntel == nil || len(decoded.DecisionIntel.TopKItems) == 0 || len(decoded.DecisionIntel.KPaths) == 0 {
+		t.Fatalf("W37-7 expected populated decision_intel in JSON report, got %+v", decoded.DecisionIntel)
+	}
+	if decoded.GlobalCapacity == nil || decoded.GlobalCapacity.TotalMinutes != 240 || len(decoded.GlobalCapacity.CriticalPathIDs) != 3 {
+		t.Fatalf("W37-7 expected filtered global_capacity in JSON report, got %+v", decoded.GlobalCapacity)
+	}
+	if len(decoded.Suggestions) != 1 || decoded.Suggestions[0].TargetBead != "V-1" || decoded.Suggestions[0].RelatedBead != "V-2" {
+		t.Fatalf("W37-7 expected exactly 1 visible suggestion in JSON report, got %+v", decoded.Suggestions)
+	}
+	if decoded.CrossRepoFlow == nil || decoded.CrossRepoFlow.TotalCrossRepoDeps != 1 || len(decoded.CrossRepoFlow.Repos) != 2 || len(decoded.CrossRepoFlow.BottleneckRepos) != 1 || decoded.CrossRepoFlow.BottleneckRepos[0] != "api" {
+		t.Fatalf("W37-7 expected scoped cross_repo_flow api->web without hidden repo, got %+v", decoded.CrossRepoFlow)
+	}
+	if len(decoded.CrossRepoFlow.TopHandoffBlockers) != 1 || len(decoded.CrossRepoFlow.TopHandoffBlockers[0].BlockedRepos) != 1 || decoded.CrossRepoFlow.TopHandoffBlockers[0].BlockedRepos[0] != "web" {
+		t.Fatalf("P30-5 expected filtered TopHandoffBlockers.BlockedRepos=[web], got %+v", decoded.CrossRepoFlow.TopHandoffBlockers)
+	}
+	if decoded.ActiveSprint == nil || decoded.ActiveSprint.SprintID != "sprint-37" {
+		t.Fatalf("W37-7 expected active_sprint in JSON report, got %+v", decoded.ActiveSprint)
+	}
+	if decoded.BaselineDrift == nil || len(decoded.BaselineDrift.TopAlerts) != 1 || decoded.BaselineDrift.TopAlerts[0].IssueID != "V-2" || decoded.BaselineDrift.SkippedChecksCount != 1 {
+		t.Fatalf("W37-7 expected filtered baseline_drift with skipped_checks in JSON report, got %+v", decoded.BaselineDrift)
+	}
+	if len(decoded.LabelCascades) != 1 || decoded.LabelCascades[0].SourceLabel != "auth" {
+		t.Fatalf("W37-7 expected label_cascades in JSON report, got %+v", decoded.LabelCascades)
+	}
+
+	// P32 A#7: Even with opts.GraphIssues == nil & IncludeGraph == false, attachExternalIntel indexes `selected`
+	// issues and re-sorts TopHandoffBlockers by post-filter BlockedCount desc without leaking hidden repos.
+	optsNoGraph := DefaultReportOptions()
+	optsNoGraph.Format = "json"
+	optsNoGraph.GeneratedAt = now
+	optsNoGraph.IncludeGraph = false
+	optsNoGraph.VisibleIDs = map[string]bool{"V-1": true, "V-2": true, "V-3": true}
+	optsNoGraph.CrossRepoFlow = &analysis.CrossRepoFlow{
+		Repos:              []string{"api", "secret", "web"},
+		TotalCrossRepoDeps: 3,
+		Dependencies: []analysis.RepoDependency{
+			{FromRepo: "api", ToRepo: "web", IssueCount: 2, IssueIDs: []string{"V-2", "V-3"}, BlockerIDs: []string{"V-1"}},
+			{FromRepo: "api", ToRepo: "secret", IssueCount: 1, IssueIDs: []string{"H-2"}, BlockerIDs: []string{"V-1"}},
+		},
+		TopHandoffBlockers: []analysis.RepoHandoffBlocker{
+			// Originally ranked #1 (3 blocked), drops to 1 visible blocked (V-2)
+			{IssueID: "V-1", Title: "API auth core", SourceRepo: "api", BlockedRepos: []string{"web", "secret"}, BlockedCount: 3, BlockedIDs: []string{"V-2", "H-1", "H-2"}},
+			// Originally ranked #2 (2 blocked), stays 2 visible blocked -> must re-sort ahead of V-1!
+			{IssueID: "V-3", Title: "Web settings polish", SourceRepo: "web", BlockedRepos: []string{"api"}, BlockedCount: 2, BlockedIDs: []string{"V-1", "V-2"}},
+		},
+	}
+	noGraphBytes, err := GenerateReport(vis, nil, optsNoGraph)
+	if err != nil {
+		t.Fatalf("P32 A#7 GenerateReport(no GraphIssues): %v", err)
+	}
+	if strings.Contains(string(noGraphBytes), "secret") || strings.Contains(string(noGraphBytes), "H-1") {
+		t.Fatalf("P32 A#7 leaked hidden repo/id when GraphIssues==nil:\n%s", string(noGraphBytes))
+	}
+	var decodedNoGraph struct {
+		CrossRepoFlow *analysis.CrossRepoFlow `json:"cross_repo_flow"`
+	}
+	if err := json.Unmarshal(noGraphBytes, &decodedNoGraph); err != nil {
+		t.Fatalf("P32 A#7 decode JSON: %v", err)
+	}
+	if decodedNoGraph.CrossRepoFlow == nil || len(decodedNoGraph.CrossRepoFlow.TopHandoffBlockers) != 2 ||
+		decodedNoGraph.CrossRepoFlow.TopHandoffBlockers[0].IssueID != "V-3" ||
+		decodedNoGraph.CrossRepoFlow.TopHandoffBlockers[1].IssueID != "V-1" {
+		t.Fatalf("P32 A#7 expected TopHandoffBlockers re-sorted [V-3(2), V-1(1)], got %+v", decodedNoGraph.CrossRepoFlow)
+	}
 }

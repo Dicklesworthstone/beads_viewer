@@ -294,8 +294,10 @@ func GetKeyBindingDocs() []KeyBindingDoc {
 		{"L", "Scroll right", "Graph", "graph"},
 		{"J/K", "Scroll graph vertically", "Graph", "graph"},
 		{"space", "Expand/collapse dependency paths", "Graph", "graph"},
+		{"W", "Toggle issue in batch What-If", "Graph", "graph"},
 		{"D", "Check add dependency (A → B)", "Graph", "graph"},
-		{"c", "Copy checked dep command", "Graph", "graph"},
+		{"X", "Preflight remove dep / cycle cut", "Graph", "graph"},
+		{"c", "Copy checked dep / cycle-cut command", "Graph", "graph"},
 		{"PgUp", "Page nodes (prev 10)", "Graph", "graph"},
 		{"PgDn", "Page nodes (next 10)", "Graph", "graph"},
 
@@ -316,6 +318,7 @@ func GetKeyBindingDocs() []KeyBindingDoc {
 		{"s", "Cycle swimlane mode", "Board", "board"},
 		{"e", "Toggle empty columns", "Board", "board"},
 		{"d", "Expand/collapse card inline", "Board", "board"},
+		{"W", "Toggle issue in batch What-If", "Board", "board"},
 		{"tab", "Toggle detail", "Board", "board"},
 		{"ctrl+j", "Scroll detail down", "Board", "board"},
 		{"ctrl+k", "Scroll detail up", "Board", "board"},
@@ -333,9 +336,11 @@ func GetKeyBindingDocs() []KeyBindingDoc {
 		{"PgDn", "Page down", "Tree", "tree"},
 		{"b", "Toggle hierarchy / blocking tree mode", "Tree", "tree"},
 		{"m", "Toggle hierarchy / blocking tree mode", "Tree", "tree"},
+		{"W", "Toggle issue in batch What-If", "Tree", "tree"},
 		{"E", "Exit tree view", "Tree", "tree"},
 
 		// Actionable View (a)
+		{"W", "Toggle issue in batch What-If", "Actionable", "actionable"},
 		{"PgUp", "Page up", "Actionable", "actionable"},
 		{"PgDn", "Page down", "Actionable", "actionable"},
 		{"a", "Close actionable view", "Actionable", "actionable"},
@@ -354,6 +359,8 @@ func GetKeyBindingDocs() []KeyBindingDoc {
 		{"H", "Heatmap toggle", "Insights", "insights"},
 		{"<", "Widen detail panel", "Insights", "insights"},
 		{">", "Narrow detail panel", "Insights", "insights"},
+		{"X", "Preflight cycle-cut removal", "Insights", "insights"},
+		{"c", "Copy cycle-cut command", "Insights", "insights"},
 
 		// History View (h)
 		{"g", "Jump to graph view", "History", "history"},
@@ -371,6 +378,7 @@ func GetKeyBindingDocs() []KeyBindingDoc {
 		{"-", "Reject commit correlation", "History", "history"},
 		{"x", "Ignore commit correlation", "History", "history"},
 		{"O", "Toggle orphan commits audit", "History", "history"},
+		{"H", "Toggle code hotspots & co-change view", "History", "history"},
 		{"W", "Toggle causality & wait analysis", "History", "history"},
 		{"o", "Open in browser", "History", "history"},
 		{"h", "Close history view", "History", "history"},

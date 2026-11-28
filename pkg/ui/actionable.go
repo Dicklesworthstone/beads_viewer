@@ -18,16 +18,94 @@ type actionableWhatIf struct {
 
 // ActionableModel represents the actionable items view grouped by tracks
 type ActionableModel struct {
-	plan          analysis.ExecutionPlan
-	selectedTrack int
-	selectedItem  int
-	scrollOffset  int
-	width         int
-	height        int
-	theme         Theme
-	capacityText  string
-	etaByID       map[string]string
-	whatIfByID    map[string]actionableWhatIf
+	plan              analysis.ExecutionPlan
+	selectedTrack     int
+	selectedItem      int
+	scrollOffset      int
+	width             int
+	height            int
+	theme             Theme
+	capacityText      string
+	etaByID           map[string]string
+	riskByID          map[string]analysis.RiskSignals
+	whatIfByID        map[string]actionableWhatIf
+	whatIfBatch       []string
+	whatIfBatchSet    map[string]bool
+	whatIfBatchResult *analysis.WhatIfBatchResult
+}
+
+// ToggleWhatIfBatch adds or removes id from the multi-issue Batch What-If selection (W32-1).
+// Returns true if id is now in the batch, false if removed.
+func (m *ActionableModel) ToggleWhatIfBatch(id string) bool {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return false
+	}
+	if m.whatIfBatchSet == nil {
+		m.whatIfBatchSet = make(map[string]bool)
+	}
+	if m.whatIfBatchSet[id] {
+		delete(m.whatIfBatchSet, id)
+		filtered := m.whatIfBatch[:0]
+		for _, existing := range m.whatIfBatch {
+			if existing != id {
+				filtered = append(filtered, existing)
+			}
+		}
+		m.whatIfBatch = filtered
+		if len(m.whatIfBatch) == 0 {
+			m.whatIfBatchResult = nil
+		}
+		m.ensureVisible()
+		return false
+	}
+	m.whatIfBatchSet[id] = true
+	m.whatIfBatch = append(m.whatIfBatch, id)
+	m.ensureVisible()
+	return true
+}
+
+// ClearWhatIfBatch clears the active Batch What-If selection and cached result.
+func (m *ActionableModel) ClearWhatIfBatch() {
+	m.whatIfBatch = nil
+	m.whatIfBatchSet = nil
+	m.whatIfBatchResult = nil
+	m.ensureVisible()
+}
+
+// WhatIfBatchIDs returns a defensive copy of the currently selected Batch What-If IDs.
+func (m *ActionableModel) WhatIfBatchIDs() []string {
+	if len(m.whatIfBatch) == 0 {
+		return nil
+	}
+	out := make([]string, len(m.whatIfBatch))
+	copy(out, m.whatIfBatch)
+	return out
+}
+
+// HasWhatIfBatch reports whether any issues are queued in Batch What-If mode.
+func (m *ActionableModel) HasWhatIfBatch() bool {
+	return len(m.whatIfBatch) > 0
+}
+
+// IsInWhatIfBatch reports whether id is currently in the Batch What-If selection.
+func (m *ActionableModel) IsInWhatIfBatch(id string) bool {
+	return m.whatIfBatchSet[id]
+}
+
+// SetWhatIfBatchResult stores the evaluated multi-issue Batch What-If delta.
+func (m *ActionableModel) SetWhatIfBatchResult(res *analysis.WhatIfBatchResult) {
+	m.whatIfBatchResult = res
+	m.ensureVisible()
+}
+
+// WhatIfBatchResult returns the currently cached Batch What-If result (may be nil).
+func (m *ActionableModel) WhatIfBatchResult() *analysis.WhatIfBatchResult {
+	return m.whatIfBatchResult
+}
+
+func (m *ActionableModel) hasBatchBanner() bool {
+	return len(m.whatIfBatch) > 0 && m.whatIfBatchResult != nil
 }
 
 // SetCapacitySummary attaches a compact inline capacity summary rendered in the header bar.
@@ -38,6 +116,11 @@ func (m *ActionableModel) SetCapacitySummary(text string) {
 // SetETAByID attaches compact per-item ETA labels (e.g. "~1.5d") for track cards.
 func (m *ActionableModel) SetETAByID(eta map[string]string) {
 	m.etaByID = eta
+}
+
+// SetRiskByID attaches scoped operational risk signals for compact high-risk track indicators (W33-5).
+func (m *ActionableModel) SetRiskByID(risk map[string]analysis.RiskSignals) {
+	m.riskByID = risk
 }
 
 // SetWhatIfByID attaches transitive What-If unblock summaries for track cards.
@@ -201,6 +284,9 @@ func (m *ActionableModel) ensureVisible() {
 	if m.hasSummaryBanner() {
 		lineNum += 2 // summary banner + blank line
 	}
+	if m.hasBatchBanner() {
+		lineNum += 2 // batch what-if banner + blank line
+	}
 
 	// Each preceding track emits: track header (1) + divider (1) + items (N) + trailing blank (1) = N + 3 lines.
 	for i := 0; i < m.selectedTrack; i++ {
@@ -324,6 +410,39 @@ func (m *ActionableModel) Render() string {
 		lines = append(lines, "")
 	}
 
+	if m.hasBatchBanner() {
+		res := m.whatIfBatchResult
+		batchStyle := t.Renderer.NewStyle().
+			Foreground(t.Primary).
+			Background(t.Highlight).
+			Bold(true).
+			Padding(0, 2).
+			Width(headerWidth)
+		parts := []string{
+			fmt.Sprintf("⚡ BATCH WHAT-IF (%d)", len(m.whatIfBatch)),
+			fmt.Sprintf("+%d direct", res.Delta.DirectUnblocks),
+			fmt.Sprintf("+%d cascade", res.Delta.TransitiveUnblocks),
+		}
+		if res.SynergyUnblocks > 0 {
+			synText := fmt.Sprintf("★ %d synergy", res.SynergyUnblocks)
+			if len(res.SynergyIssueIDs) > 0 {
+				shown := res.SynergyIssueIDs
+				if len(shown) > 3 {
+					shown = shown[:3]
+				}
+				synText += " (" + strings.Join(shown, ",") + ")"
+			}
+			parts = append(parts, synText)
+		}
+		if res.Delta.EstimatedDaysSaved >= 0.1 {
+			parts = append(parts, fmt.Sprintf("~%.1fd saved", res.Delta.EstimatedDaysSaved))
+		}
+		parts = append(parts, "W toggle • Esc clear")
+		batchText := truncateRunesHelper(strings.Join(parts, " · "), innerBannerWidth, "…")
+		lines = append(lines, batchStyle.Render(batchText))
+		lines = append(lines, "")
+	}
+
 	// ══════════════════════════════════════════════════════════════════════════
 	// RENDER TRACKS - Card-based items with visual hierarchy
 	// ══════════════════════════════════════════════════════════════════════════
@@ -383,12 +502,19 @@ func (m *ActionableModel) Render() string {
 			itemLine.WriteString(GetPriorityIcon(item.Priority))
 			itemLine.WriteString(" ")
 
+			if m.whatIfBatchSet[item.ID] {
+				itemLine.WriteString(t.Renderer.NewStyle().Foreground(t.Primary).Bold(true).Render("[W] "))
+			}
+
 			// ID with secondary styling
 			idStyle := t.Renderer.NewStyle().Foreground(t.Secondary)
 			if isSelected {
 				idStyle = idStyle.Bold(true)
 			}
 			itemLine.WriteString(idStyle.Render(item.ID))
+			if item.NotReady {
+				itemLine.WriteString(t.Renderer.NewStyle().Foreground(t.Muted).Render(" [not-ready]"))
+			}
 			itemLine.WriteString(" ")
 
 			// Title with selection highlighting (strictly fit single terminal line so ensureVisible() math stays exact)
@@ -404,11 +530,25 @@ func (m *ActionableModel) Render() string {
 			if etaLabel != "" {
 				etaWidth = lipgloss.Width(etaLabel) + 1
 			}
-			maxTitleLen := lineBudget - prefixWidth - unblockWidth - etaWidth
+			riskLabel := ""
+			riskHigh := false
+			riskWidth := 0
+			if sig, ok := m.riskByID[item.ID]; ok && sig.CompositeRisk >= 0.50 {
+				riskLabel = fmt.Sprintf("⚠%.0f%%", sig.CompositeRisk*100)
+				riskHigh = sig.CompositeRisk >= 0.60
+				riskWidth = lipgloss.Width(riskLabel) + 1
+			}
+			maxTitleLen := lineBudget - prefixWidth - unblockWidth - etaWidth - riskWidth
 			if etaLabel != "" && maxTitleLen < 8 {
 				// Drop optional ETA badge on narrow terminals rather than wrapping onto 2 lines.
 				etaLabel = ""
 				etaWidth = 0
+				maxTitleLen = lineBudget - prefixWidth - unblockWidth - riskWidth
+			}
+			if riskLabel != "" && maxTitleLen < 8 {
+				// Drop optional risk badge next so ID + title stay legible on narrow terminals.
+				riskLabel = ""
+				riskWidth = 0
 				maxTitleLen = lineBudget - prefixWidth - unblockWidth
 			}
 			if maxTitleLen > 0 {
@@ -421,6 +561,18 @@ func (m *ActionableModel) Render() string {
 					titleStyle = titleStyle.Foreground(lipgloss.AdaptiveColor{Light: "#333333", Dark: "#E8E8E8"})
 				}
 				itemLine.WriteString(titleStyle.Render(title))
+			}
+
+			if riskLabel != "" {
+				riskColor := t.InProgress
+				if riskHigh {
+					riskColor = t.Blocked
+				}
+				riskBadge := t.Renderer.NewStyle().
+					Foreground(riskColor).
+					Bold(true).
+					Render(" " + riskLabel)
+				itemLine.WriteString(riskBadge)
 			}
 
 			if etaLabel != "" {

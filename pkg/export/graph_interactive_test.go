@@ -1059,3 +1059,110 @@ func TestWave30_W30_4_StandaloneGraphCheckAddDep(t *testing.T) {
 		}
 	}
 }
+
+func TestWave36_StandaloneGraphAdvancedInsightsAndStructuralTab(t *testing.T) {
+	now := time.Date(2026, 11, 26, 12, 0, 0, 0, time.UTC)
+	allIssues := []model.Issue{
+		{ID: "V-1", Title: "Visible root", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
+		{ID: "V-2", Title: "Visible mid", Status: model.StatusOpen, Priority: 1, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "V-2", DependsOnID: "V-1", Type: model.DepBlocks}}},
+		{ID: "V-3", Title: "Visible leaf", Status: model.StatusOpen, Priority: 2, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "V-3", DependsOnID: "V-2", Type: model.DepBlocks}}},
+		{ID: "H-1", Title: "Hidden root", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now},
+		{ID: "H-2", Title: "Hidden leaf", Status: model.StatusOpen, Priority: 0, IssueType: model.TypeTask, CreatedAt: now, UpdatedAt: now,
+			Dependencies: []*model.Dependency{{IssueID: "H-2", DependsOnID: "H-1", Type: model.DepBlocks}}},
+	}
+	an := analysis.NewAnalyzer(allIssues)
+	an.SetNow(now)
+	stats := an.Analyze()
+	visible := allIssues[:3]
+	written, err := GenerateInteractiveGraphHTML(InteractiveGraphOptions{
+		Issues:     visible,
+		Stats:      &stats,
+		Readiness:  an.Readiness(),
+		ExportedAt: now,
+		Title:      "Wave 36 Structural Graph",
+		Path:       filepath.Join(t.TempDir(), "w36_structural_graph.html"),
+	})
+	if err != nil {
+		t.Fatalf("GenerateInteractiveGraphHTML: %v", err)
+	}
+	raw, err := os.ReadFile(written)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	html := string(raw)
+	if strings.Contains(html, "%!(") {
+		t.Fatalf("W36-4 standalone graph HTML contains unescaped fmt.Sprintf artifact")
+	}
+	if !strings.Contains(html, `data-tab="structural"`) {
+		t.Fatalf("W36-4 standalone graph HTML missing Structural triage tab")
+	}
+	prefix := "const DATA = "
+	start := strings.Index(html, prefix)
+	if start < 0 {
+		t.Fatalf("DATA payload marker missing")
+	}
+	end := strings.Index(html[start+len(prefix):], ";\n")
+	if end < 0 {
+		t.Fatalf("DATA payload terminator missing")
+	}
+	payloadJSON := html[start+len(prefix) : start+len(prefix)+end]
+	if strings.Contains(payloadJSON, "H-1") || strings.Contains(payloadJSON, "H-2") {
+		t.Fatalf("W36-4 standalone graph DATA leaked hidden IDs: %s", payloadJSON)
+	}
+	var payload struct {
+		AdvancedInsights *struct {
+			TopKSet *struct {
+				Items []struct {
+					ID string `json:"id"`
+				} `json:"items"`
+			} `json:"top_k_set"`
+			KPaths *struct {
+				Paths []struct {
+					IssueIDs []string `json:"issue_ids"`
+				} `json:"paths"`
+			} `json:"k_paths"`
+		} `json:"advanced_insights"`
+	}
+	if err := json.Unmarshal([]byte(payloadJSON), &payload); err != nil {
+		t.Fatalf("Unmarshal DATA: %v", err)
+	}
+	if payload.AdvancedInsights == nil || payload.AdvancedInsights.TopKSet == nil || len(payload.AdvancedInsights.TopKSet.Items) == 0 {
+		t.Fatalf("W36-4 expected non-empty DATA.advanced_insights.top_k_set, got %+v", payload.AdvancedInsights)
+	}
+	if payload.AdvancedInsights.KPaths == nil || len(payload.AdvancedInsights.KPaths.Paths) == 0 || len(payload.AdvancedInsights.KPaths.Paths[0].IssueIDs) < 2 {
+		t.Fatalf("W36-4 expected non-empty DATA.advanced_insights.k_paths with issue_ids, got %+v", payload.AdvancedInsights)
+	}
+
+	// P28-A9: When CandidateIDs excludes 1-hop neighbor V-1 (present in opts.Issues as context),
+	// advanced_insights must NEVER leak V-1 into top_k_set.unblocks, parallel_cut, or k_paths.
+	scopedWritten, err := GenerateInteractiveGraphHTML(InteractiveGraphOptions{
+		Issues:       visible,
+		Stats:        &stats,
+		Readiness:    an.Readiness(),
+		CandidateIDs: map[string]bool{"V-2": true, "V-3": true},
+		ExportedAt:   now,
+		Title:        "Wave 36 Candidate Scoped",
+		Path:         filepath.Join(t.TempDir(), "w36_cand_scoped.html"),
+	})
+	if err != nil {
+		t.Fatalf("GenerateInteractiveGraphHTML(scoped): %v", err)
+	}
+	scopedRaw, err := os.ReadFile(scopedWritten)
+	if err != nil {
+		t.Fatalf("ReadFile(scoped): %v", err)
+	}
+	scopedHTML := string(scopedRaw)
+	sStart := strings.Index(scopedHTML, prefix)
+	sEnd := strings.Index(scopedHTML[sStart+len(prefix):], ";\n")
+	var scopedPayload struct {
+		AdvancedInsights json.RawMessage `json:"advanced_insights"`
+	}
+	if err := json.Unmarshal([]byte(scopedHTML[sStart+len(prefix):sStart+len(prefix)+sEnd]), &scopedPayload); err != nil {
+		t.Fatalf("Unmarshal scoped DATA: %v", err)
+	}
+	if strings.Contains(string(scopedPayload.AdvancedInsights), `"V-1"`) {
+		t.Fatalf("P28-A9 regression: CandidateIDs-scoped advanced_insights leaked 1-hop non-candidate V-1: %s", string(scopedPayload.AdvancedInsights))
+	}
+}

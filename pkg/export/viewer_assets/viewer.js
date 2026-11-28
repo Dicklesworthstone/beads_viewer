@@ -530,6 +530,8 @@ function cleanupWasm() {
   }
   GRAPH_STATE._issueMetricsCache = null;
   ROOT_BLOCKERS_CACHE = null;
+  HIGH_RISK_SUMMARY_CACHE = null;
+  DIFF_INDEX_CACHE = null;
 
   console.log(`[WASM Memory] Cleanup complete. Tracked: ${WASM_ALLOCATIONS.trackCount}, Freed: ${WASM_ALLOCATIONS.freedCount}`);
 }
@@ -789,6 +791,8 @@ async function loadDatabase(updateStatus) {
     const cached = await loadFromOPFS(DB_STATE.cacheKey);
     if (cached) {
       DB_STATE.db = new SQL.Database(cached);
+      HIGH_RISK_SUMMARY_CACHE = null;
+      DIFF_INDEX_CACHE = null;
       ensureSqlFunctions(DB_STATE.db);
       DB_STATE.source = 'cache';
       DIAGNOSTICS.dbSource = 'cache';
@@ -851,6 +855,8 @@ async function loadDatabase(updateStatus) {
 
   try {
     DB_STATE.db = new SQL.Database(dbData);
+    HIGH_RISK_SUMMARY_CACHE = null;
+    DIFF_INDEX_CACHE = null;
     ensureSqlFunctions(DB_STATE.db);
   } catch (err) {
     showError({
@@ -1330,7 +1336,7 @@ function checkProposedDependency(fromIdRaw, toIdRaw, opts = {}) {
   const blockingRows = execQuery(`
     SELECT issue_id, depends_on_id
     FROM dependencies
-    WHERE type IN ('blocks', 'conditional-blocks', 'waits-for')
+    WHERE COALESCE(type, 'blocks') IN ${BLOCKING_DEPENDENCY_TYPES_SQL}
   `);
   const adj = new Map();
   for (const r of blockingRows) {
@@ -1404,47 +1410,26 @@ function checkProposedDependency(fromIdRaw, toIdRaw, opts = {}) {
         }
       }
     } else {
-      // Fallback when WASM graph model is not yet built: check readiness directly via SQLite rows.
-      const statusRows = execQuery(`SELECT id, status FROM issue_overview_mv`);
-      const resolvedSet = new Set();
-      const statusMap = new Map();
-      for (const r of statusRows) {
-        statusMap.set(r.id, String(r.status || '').trim().toLowerCase());
-        if (isResolvedStatus(r.status)) resolvedSet.add(r.id);
+      // Fallback when WASM graph model is not yet built: use Go-precomputed is_actionable
+      // and full resolved IDs so defer_until, pinned/template, and tombstones match Go exactly (P18B-3).
+      const overviewRows = execQuery(`SELECT id, status, is_actionable FROM issue_overview_mv`);
+      const readySet = new Set();
+      for (const r of overviewRows) {
+        if (Boolean(r.is_actionable)) readySet.add(r.id);
       }
+      const resolvedSet = getResolvedIssueIDs();
       const pcRows = execQuery(`SELECT issue_id, depends_on_id FROM dependencies WHERE type = 'parent-child'`);
       const childrenByParent = new Map();
-      const parentsByChild = new Map();
       for (const r of pcRows) {
         if (!r.issue_id || !r.depends_on_id) continue;
         if (!childrenByParent.has(r.depends_on_id)) childrenByParent.set(r.depends_on_id, []);
         childrenByParent.get(r.depends_on_id).push(r.issue_id);
-        if (!parentsByChild.has(r.issue_id)) parentsByChild.set(r.issue_id, []);
-        parentsByChild.get(r.issue_id).push(r.depends_on_id);
       }
-      const isNodeReadyFallback = (id, stack = new Set()) => {
-        const st = statusMap.get(id);
-        if (st !== 'open' && st !== 'in_progress') return false;
-        if (stack.has(id)) return false;
-        stack.add(id);
-        for (const blk of (adj.get(id) || [])) {
-          if (!resolvedSet.has(blk)) return false;
-        }
-        for (const p of (parentsByChild.get(id) || [])) {
-          if (resolvedSet.has(p)) continue;
-          if (!statusMap.has(p)) return false;
-          for (const pBlk of (adj.get(p) || [])) {
-            if (!resolvedSet.has(pBlk)) return false;
-          }
-          if (!isNodeReadyFallback(p, stack)) return false;
-        }
-        return true;
-      };
       const seen = new Set([fromId]);
       const descQueue = [fromId];
       while (descQueue.length > 0) {
         const cur = descQueue.shift();
-        if (isNodeReadyFallback(cur)) {
+        if (readySet.has(cur)) {
           base.wouldBlockActionable = true;
           break;
         }
@@ -1459,7 +1444,8 @@ function checkProposedDependency(fromIdRaw, toIdRaw, opts = {}) {
   }
 
   base.canAdd = true;
-  if (opts.allowCommand !== false && !base.crossRepo) {
+  const isSafeDepArg = (s) => typeof s === 'string' && s.length > 0 && !s.startsWith('-') && !/[\x00-\x1f\x7f-\x9f]/.test(s);
+  if (opts.allowCommand !== false && !base.crossRepo && isSafeDepArg(fromId) && isSafeDepArg(toId)) {
     base.command = `br dep add ${shellQuoteArg(fromId)} ${shellQuoteArg(toId)}`;
   }
   return base;
@@ -1467,6 +1453,338 @@ function checkProposedDependency(fromIdRaw, toIdRaw, opts = {}) {
 
 if (typeof window !== 'undefined') {
   window.bvCheckProposedDependency = checkProposedDependency;
+}
+
+/**
+ * Pure pre-flight dependency removal / cycle-cut simulator matching `bv --robot-check-dep remove:FROM:TO` (W33-2).
+ * Evaluates active cycle counts before/after removing fromId -> toId, newly unblocked issues
+ * (preserving parent-child inheritance and lifecycle withholding), cross-repo status, and guarded br dep remove.
+ */
+function checkProposedDepRemoval(fromIdRaw, toIdRaw, opts = {}) {
+  const fromId = String(fromIdRaw || '').trim();
+  const toId = String(toIdRaw || '').trim();
+  const base = {
+    operation: 'remove',
+    fromId,
+    toId,
+    exists: false,
+    canRemove: false,
+    cyclesBefore: 0,
+    cyclesAfter: 0,
+    cyclesBroken: 0,
+    cyclesTruncated: false,
+    wouldBreakAllCycles: false,
+    newlyUnblocked: [],
+    crossRepo: false,
+    warning: '',
+    command: '',
+  };
+  if (!fromId || !toId) {
+    base.warning = 'Both source and target issue IDs are required';
+    return base;
+  }
+
+  const repoCol = hasSourceRepoColumn() ? ', source_repo' : '';
+  const rows = execQuery(`SELECT id, status${repoCol} FROM issue_overview_mv WHERE id IN (?, ?)`, [fromId, toId]);
+  const byId = new Map();
+  for (const r of rows) byId.set(r.id, r);
+  const fromRow = byId.get(fromId);
+  const toRow = byId.get(toId);
+  if (!fromRow || !toRow) {
+    const missing = [];
+    if (!fromRow) missing.push(fromId);
+    if (!toRow && toId !== fromId) missing.push(toId);
+    base.warning = `Unknown issue ID(s): ${missing.join(', ')}`;
+    return base;
+  }
+
+  const fromRepo = String(fromRow.source_repo || '').trim();
+  const toRepo = String(toRow.source_repo || '').trim();
+  base.crossRepo = Boolean(fromRepo && toRepo && fromRepo.toLowerCase() !== toRepo.toLowerCase());
+
+  const blockingRows = execQuery(`
+    SELECT issue_id, depends_on_id
+    FROM dependencies
+    WHERE COALESCE(type, 'blocks') IN ${BLOCKING_DEPENDENCY_TYPES_SQL}
+  `);
+  let edgeExists = false;
+  for (const r of blockingRows) {
+    if (r.issue_id === fromId && r.depends_on_id === toId) {
+      edgeExists = true;
+      break;
+    }
+  }
+  if (!edgeExists) {
+    base.warning = `Blocking dependency ${fromId} → ${toId} does not exist`;
+    return base;
+  }
+  base.exists = true;
+  base.canRemove = true;
+
+  const isResolvedStatus = (st) => {
+    const norm = String(st || '').trim().toLowerCase();
+    return norm === 'closed' || norm === 'tombstone';
+  };
+  // Reuse queryIssuesForWhatIf() so lifecycle columns (defer_until, pinned, is_template,
+  // ephemeral) are read from the authoritative `issues` table (not issue_overview_mv).
+  const issueById = queryIssuesForWhatIf();
+  const activeIds = new Set();
+  const resolvedSet = getResolvedIssueIDs();
+  for (const [id, r] of issueById.entries()) {
+    if (isResolvedStatus(r.status)) {
+      resolvedSet.add(id);
+    } else {
+      activeIds.add(id);
+    }
+  }
+
+  // Count active blocking cycles before and after removing fromId -> toId.
+  const countActiveCycles = (excludeEdge) => {
+    const wasmMod = typeof window !== 'undefined' ? window.bvGraphWasm : null;
+    if (wasmMod && typeof wasmMod.DiGraph === 'function') {
+      const dg = new wasmMod.DiGraph();
+      try {
+        const idxMap = new Map();
+        const sortedActive = [...activeIds].sort();
+        for (const id of sortedActive) {
+          idxMap.set(id, dg.addNode(id));
+        }
+        const seen = new Set();
+        for (const r of blockingRows) {
+          if (excludeEdge && r.issue_id === fromId && r.depends_on_id === toId) continue;
+          const u = idxMap.get(r.issue_id);
+          const v = idxMap.get(r.depends_on_id);
+          if (u === undefined || v === undefined) continue;
+          const ek = `${u}:${v}`;
+          if (seen.has(ek)) continue;
+          seen.add(ek);
+          dg.addEdge(u, v);
+        }
+        const res = typeof dg.enumerateCycles === 'function' ? dg.enumerateCycles(100) : null;
+        if (res && Array.isArray(res.cycles)) {
+          return { count: res.cycles.length, truncated: Boolean(res.truncated) };
+        }
+        return { count: typeof dg.hasCycles === 'function' && dg.hasCycles() ? 1 : 0, truncated: false };
+      } finally {
+        dg.free();
+      }
+    }
+    // Pure-JS Tarjan SCC + bounded Johnson elementary cycle enumeration fallback (P24B-7)
+    // when WASM DiGraph is unavailable, matching WASM enumerateCycles(100) semantics.
+    const sortedActive = [...activeIds].sort();
+    const adj = new Map();
+    for (const id of sortedActive) adj.set(id, []);
+    const seen = new Set();
+    let selfLoopCycles = 0;
+    for (const r of blockingRows) {
+      if (excludeEdge && r.issue_id === fromId && r.depends_on_id === toId) continue;
+      if (!activeIds.has(r.issue_id) || !activeIds.has(r.depends_on_id)) continue;
+      const ek = `${r.issue_id}\0${r.depends_on_id}`;
+      if (seen.has(ek)) continue;
+      seen.add(ek);
+      if (r.issue_id === r.depends_on_id) {
+        selfLoopCycles++;
+      } else {
+        adj.get(r.issue_id).push(r.depends_on_id);
+      }
+    }
+    for (const arr of adj.values()) arr.sort();
+    const MAX_CYCLES = 100;
+    const MAX_STEPS = 50000;
+    let cycleCount = Math.min(selfLoopCycles, MAX_CYCLES);
+    if (cycleCount >= MAX_CYCLES) return { count: cycleCount, truncated: true };
+
+    // Tarjan SCC decomposition (O(V+E)) so acyclic DAGs never trigger cycle enumeration.
+    let tarjanIdx = 0;
+    const indexMap = new Map();
+    const lowlink = new Map();
+    const onStack = new Set();
+    const tStack = [];
+    const sccs = [];
+    const strongConnect = (v) => {
+      indexMap.set(v, tarjanIdx);
+      lowlink.set(v, tarjanIdx);
+      tarjanIdx++;
+      tStack.push(v);
+      onStack.add(v);
+      for (const w of (adj.get(v) || [])) {
+        if (!indexMap.has(w)) {
+          strongConnect(w);
+          lowlink.set(v, Math.min(lowlink.get(v), lowlink.get(w)));
+        } else if (onStack.has(w)) {
+          lowlink.set(v, Math.min(lowlink.get(v), indexMap.get(w)));
+        }
+      }
+      if (lowlink.get(v) === indexMap.get(v)) {
+        const comp = [];
+        while (true) {
+          const w = tStack.pop();
+          onStack.delete(w);
+          comp.push(w);
+          if (w === v) break;
+        }
+        if (comp.length > 1) {
+          comp.sort();
+          sccs.push(comp);
+        }
+      }
+    };
+    for (const id of sortedActive) {
+      if (!indexMap.has(id)) strongConnect(id);
+    }
+
+    // Bounded Johnson elementary cycle enumeration inside each non-trivial SCC.
+    let steps = 0;
+    for (const comp of sccs) {
+      if (cycleCount >= MAX_CYCLES) break;
+      const compSet = new Set(comp);
+      const beforeComp = cycleCount;
+      const idxInComp = new Map(comp.map((id, i) => [id, i]));
+      for (let s = 0; s < comp.length && cycleCount < MAX_CYCLES && steps < MAX_STEPS; s++) {
+        const startId = comp[s];
+        const blocked = new Set();
+        const blockMap = new Map();
+        const unblock = (u) => {
+          blocked.delete(u);
+          const bs = blockMap.get(u);
+          if (bs) {
+            for (const w of [...bs]) {
+              bs.delete(w);
+              if (blocked.has(w)) unblock(w);
+            }
+          }
+        };
+        const circuit = (v) => {
+          if (cycleCount >= MAX_CYCLES || steps >= MAX_STEPS) return false;
+          steps++;
+          let found = false;
+          blocked.add(v);
+          for (const w of (adj.get(v) || [])) {
+            if (!compSet.has(w) || idxInComp.get(w) < s) continue;
+            if (w === startId) {
+              cycleCount++;
+              found = true;
+              if (cycleCount >= MAX_CYCLES) return true;
+            } else if (!blocked.has(w)) {
+              if (circuit(w)) found = true;
+            }
+          }
+          if (found) {
+            unblock(v);
+          } else {
+            for (const w of (adj.get(v) || [])) {
+              if (!compSet.has(w) || idxInComp.get(w) < s) continue;
+              if (!blockMap.has(w)) blockMap.set(w, new Set());
+              blockMap.get(w).add(v);
+            }
+          }
+          return found;
+        };
+        circuit(startId);
+      }
+      // Guarantee non-trivial SCC always contributes >= 1 cycle even if step budget exhausted.
+      if (cycleCount === beforeComp) {
+        cycleCount = Math.min(MAX_CYCLES, cycleCount + 1);
+      }
+    }
+    return { count: cycleCount, truncated: cycleCount >= MAX_CYCLES || steps >= MAX_STEPS };
+  };
+
+  const beforeCycles = countActiveCycles(false);
+  const afterCycles = countActiveCycles(true);
+  base.cyclesBefore = beforeCycles.count;
+  base.cyclesAfter = afterCycles.count;
+  base.cyclesTruncated = Boolean(beforeCycles.truncated || afterCycles.truncated);
+  if (base.cyclesTruncated) {
+    if (afterCycles.truncated || (base.cyclesBefore > 0 && base.cyclesAfter >= base.cyclesBefore)) {
+      base.cyclesBroken = 0;
+      base.wouldBreakAllCycles = false;
+      base.warning = 'Cycle enumeration reached cap (100); exact cycle reduction is inconclusive';
+    } else if (base.cyclesAfter === 0) {
+      base.cyclesBroken = base.cyclesBefore;
+      base.wouldBreakAllCycles = base.cyclesBefore > 0;
+      base.warning = 'Cycle enumeration reached cap (100) before removal; removal leaves 0 active cycles (acyclic)';
+    } else {
+      base.cyclesBroken = Math.max(0, base.cyclesBefore - base.cyclesAfter);
+      base.wouldBreakAllCycles = false;
+      base.warning = `Cycle enumeration reached cap (100); exact cycle reduction is approximate (≥ ${base.cyclesBroken} broken, ${base.cyclesAfter} remaining)`;
+    }
+  } else {
+    base.cyclesBroken = Math.max(0, base.cyclesBefore - base.cyclesAfter);
+    base.wouldBreakAllCycles = base.cyclesBefore > 0 && base.cyclesAfter === 0;
+  }
+
+  // Compute newly unblocked issues (respecting parent-child inheritance and lifecycle withholding).
+  const pcRows = execQuery(`SELECT issue_id, depends_on_id FROM dependencies WHERE type = 'parent-child'`);
+  const parentsByChild = new Map();
+  for (const r of pcRows) {
+    if (!r.issue_id || !r.depends_on_id) continue;
+    if (!parentsByChild.has(r.issue_id)) parentsByChild.set(r.issue_id, new Set());
+    parentsByChild.get(r.issue_id).add(r.depends_on_id);
+  }
+  const refNowMs = getReferenceNowMs();
+  const computeReadySet = (excludeEdge) => {
+    const directBlockers = new Map();
+    for (const r of blockingRows) {
+      if (excludeEdge && r.issue_id === fromId && r.depends_on_id === toId) continue;
+      if (!r.issue_id || !r.depends_on_id) continue;
+      if (!directBlockers.has(r.issue_id)) directBlockers.set(r.issue_id, new Set());
+      directBlockers.get(r.issue_id).add(r.depends_on_id);
+    }
+    const memo = new Map();
+    const visiting = new Set();
+    const depsSatisfied = (id) => {
+      if (resolvedSet.has(id)) return true;
+      if (memo.has(id)) return memo.get(id);
+      if (visiting.has(id)) return false;
+      visiting.add(id);
+      let ok = true;
+      for (const bId of (directBlockers.get(id) || [])) {
+        if (!resolvedSet.has(bId)) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) {
+        for (const pId of (parentsByChild.get(id) || [])) {
+          if (resolvedSet.has(pId)) continue;
+          if (!issueById.has(pId) || !depsSatisfied(pId)) {
+            ok = false;
+            break;
+          }
+        }
+      }
+      visiting.delete(id);
+      memo.set(id, ok);
+      return ok;
+    };
+    const ready = new Set();
+    for (const [id, row] of issueById.entries()) {
+      if (resolvedSet.has(id)) continue;
+      if (isIssueLifecycleWithheld(row, refNowMs)) continue;
+      if (depsSatisfied(id)) ready.add(id);
+    }
+    return ready;
+  };
+
+  const beforeReady = computeReadySet(false);
+  const afterReady = computeReadySet(true);
+  const newly = [];
+  for (const id of afterReady) {
+    if (!beforeReady.has(id)) newly.push(id);
+  }
+  newly.sort();
+  base.newlyUnblocked = newly;
+
+  const isSafeDepArg = (s) => typeof s === 'string' && s.length > 0 && !s.startsWith('-') && !/[\x00-\x1f\x7f-\x9f]/.test(s);
+  if (opts.allowCommand !== false && !base.crossRepo && isSafeDepArg(fromId) && isSafeDepArg(toId)) {
+    base.command = `br dep remove ${shellQuoteArg(fromId)} ${shellQuoteArg(toId)}`;
+  }
+  return base;
+}
+
+if (typeof window !== 'undefined') {
+  window.bvCheckProposedDepRemoval = checkProposedDepRemoval;
 }
 
 function createWhatIfDepsEvaluator(model, closedMask) {
@@ -1547,6 +1865,9 @@ function simulateWhatIfCloseIndices(model, targetIndices) {
       transitive_unblocks: 0,
       unblocked_ids: [],
       cascade_ids: [],
+      synergy_ids: [],
+      synergy_unblocks: 0,
+      active_count: 0,
       parallel_gain: 0,
     };
   }
@@ -1614,12 +1935,31 @@ function simulateWhatIfCloseIndices(model, targetIndices) {
     }
   }
 
+  let synergyIds = [];
+  if (uniqueTargets.length >= 2 && unblockedIds.length > 0) {
+    const singleDirectUnion = new Set();
+    for (const tIdx of uniqueTargets) {
+      const singleClosed = new Uint8Array(model.baseClosed);
+      singleClosed[tIdx] = 1;
+      const singleReady = evaluateWhatIfReadyMask(model, singleClosed);
+      for (let u = 0; u < realCount; u++) {
+        if (!singleClosed[u] && !beforeReady[u] && singleReady[u]) {
+          singleDirectUnion.add(u);
+        }
+      }
+    }
+    synergyIds = unblockedIds.filter(u => !singleDirectUnion.has(u));
+  }
+
   return {
     direct_unblocks: unblockedIds.length,
     transitive_unblocks: cascadeIds.length,
     unblocked_ids: unblockedIds,
     cascade_ids: cascadeIds,
-    parallel_gain: Math.max(0, unblockedIds.length - 1),
+    synergy_ids: synergyIds,
+    synergy_unblocks: synergyIds.length,
+    active_count: uniqueTargets.length,
+    parallel_gain: unblockedIds.length - uniqueTargets.length,
   };
 }
 
@@ -1636,6 +1976,8 @@ function getIssueSummaryRow(issueId) {
  */
 // Non-reactive cache for transitive root-blocker chains keyed on (DB instance, whatIfModel instance)
 let ROOT_BLOCKERS_CACHE = null;
+let HIGH_RISK_SUMMARY_CACHE = null;
+let DIFF_INDEX_CACHE = null;
 
 function getCachedRootBlockerChain(issueId) {
   if (!issueId) return null;
@@ -2162,9 +2504,11 @@ function whatIfClose(issueId) {
 
   const g = GRAPH_STATE.whatIfGraph || GRAPH_STATE.graph;
   const realCount = GRAPH_STATE.graph.nodeCount();
+  const closedSet = buildClosedSet();
+  const isActiveTarget = !closedSet[idx];
   const result = GRAPH_STATE.whatIfModel?.hasParentChild
     ? simulateWhatIfCloseIndices(GRAPH_STATE.whatIfModel, [idx])
-    : clampWhatIfResult(g.whatIfClose(idx, buildClosedSet()), realCount);
+    : clampWhatIfResult(g.whatIfClose(idx, closedSet), realCount);
 
   // Convert node indices back to issue IDs
   if (result) {
@@ -2174,6 +2518,11 @@ function whatIfClose(issueId) {
     result.cascade_issue_ids = (result.cascade_ids || [])
       .map(i => GRAPH_STATE.graph.nodeId(i))
       .filter(Boolean);
+    result.synergy_ids = [];
+    result.synergy_issue_ids = [];
+    result.synergy_unblocks = 0;
+    result.active_count = isActiveTarget ? 1 : 0;
+    result.parallel_gain = isActiveTarget ? (result.direct_unblocks || 0) - 1 : 0;
   }
 
   return result;
@@ -2280,19 +2629,48 @@ function whatIfCloseBatch(issueIds = []) {
 
   try {
     const realCount = GRAPH_STATE.graph.nodeCount();
-    const indices = issueIds
-      .map(id => GRAPH_STATE.nodeMap.get(id))
-      .filter(idx => idx !== undefined && idx < realCount);
+    const closedSet = buildClosedSet();
+    const seen = new Set();
+    const indices = [];
+    for (const id of issueIds) {
+      const idx = GRAPH_STATE.nodeMap.get(id);
+      if (idx === undefined || idx >= realCount || closedSet[idx] || seen.has(idx)) continue;
+      seen.add(idx);
+      indices.push(idx);
+    }
     if (indices.length === 0) return null;
 
-    const result = GRAPH_STATE.whatIfModel?.hasParentChild
-      ? simulateWhatIfCloseIndices(GRAPH_STATE.whatIfModel, indices)
-      : clampWhatIfResult(g.whatIfCloseBatch(new Uint32Array(indices), buildClosedSet()), realCount);
+    let result;
+    if (GRAPH_STATE.whatIfModel?.hasParentChild) {
+      result = simulateWhatIfCloseIndices(GRAPH_STATE.whatIfModel, indices);
+    } else {
+      result = clampWhatIfResult(g.whatIfCloseBatch(new Uint32Array(indices), closedSet), realCount);
+      if (result) {
+        let synergyIds = [];
+        if (indices.length >= 2 && (result.unblocked_ids?.length || 0) > 0) {
+          const singleUnion = new Set();
+          for (const idx of indices) {
+            const single = clampWhatIfResult(g.whatIfClose(idx, closedSet), realCount);
+            for (const u of (single?.unblocked_ids || [])) {
+              singleUnion.add(u);
+            }
+          }
+          synergyIds = (result.unblocked_ids || []).filter(u => !singleUnion.has(u));
+        }
+        result.synergy_ids = synergyIds;
+        result.synergy_unblocks = synergyIds.length;
+        result.active_count = indices.length;
+        result.parallel_gain = (result.direct_unblocks || 0) - indices.length;
+      }
+    }
     if (result) {
       result.unblocked_issue_ids = (result.unblocked_ids || [])
         .map(i => GRAPH_STATE.graph.nodeId(i))
         .filter(Boolean);
       result.cascade_issue_ids = (result.cascade_ids || [])
+        .map(i => GRAPH_STATE.graph.nodeId(i))
+        .filter(Boolean);
+      result.synergy_issue_ids = (result.synergy_ids || [])
         .map(i => GRAPH_STATE.graph.nodeId(i))
         .filter(Boolean);
     }
@@ -2483,6 +2861,60 @@ function getCycleBreakSuggestions(limit = 5) {
   if (!GRAPH_STATE.ready || !activeGraph) return null;
 
   const result = activeGraph.cycleBreakSuggestions(limit, 100);
+  if (result) {
+    const list = Array.isArray(result.suggestions)
+      ? result.suggestions
+      : (Array.isArray(result.top_suggestions) ? result.top_suggestions : null);
+    if (list && list.length > 0) {
+      const isValidCollateral = v => (typeof v === 'number' && Number.isFinite(v)) || (typeof v === 'string' && v.trim() !== '' && Number.isFinite(Number(v)));
+      const needsCollateralFallback = list.some(item => item && !isValidCollateral(item.collateral));
+      const activeInDegree = new Map();
+      if (needsCollateralFallback) {
+        try {
+          if (DB_STATE.db) {
+            const rows = execQuery(`
+              SELECT d.depends_on_id AS to_id, COUNT(DISTINCT d.issue_id) AS cnt
+              FROM dependencies d
+              JOIN issues src ON src.id = d.issue_id
+              JOIN issues tgt ON tgt.id = d.depends_on_id
+              WHERE COALESCE(d.type, 'blocks') IN ('', 'blocks', 'conditional-blocks', 'waits-for')
+                AND LOWER(src.status) NOT IN ('closed', 'tombstone')
+                AND LOWER(tgt.status) NOT IN ('closed', 'tombstone')
+              GROUP BY d.depends_on_id
+            `);
+            for (const row of rows) {
+              if (row?.to_id) activeInDegree.set(String(row.to_id), Number(row.cnt) || 0);
+            }
+          }
+        } catch {
+          // Ignore SQLite lookup errors and fall back to WASM collateral
+        }
+        for (const item of list) {
+          if (!item) continue;
+          const toId = item.to_id || (typeof item.to === 'number' ? activeGraph.nodeId(item.to) : item.to);
+          if (!isValidCollateral(item.collateral)) {
+            item.collateral = toId ? (activeInDegree.get(String(toId)) ?? 0) : 0;
+          } else {
+            item.collateral = Number(item.collateral);
+          }
+        }
+        list.sort((a, b) => {
+          const aBroken = Number(a?.cycles_broken ?? a?.cyclesBroken ?? 0) || 0;
+          const bBroken = Number(b?.cycles_broken ?? b?.cyclesBroken ?? 0) || 0;
+          if (bBroken !== aBroken) return bBroken - aBroken;
+          const aCol = Number(a?.collateral ?? 0) || 0;
+          const bCol = Number(b?.collateral ?? 0) || 0;
+          if (aCol !== bCol) return aCol - bCol;
+          const aFrom = String(a?.from_id || (typeof a?.from === 'number' ? activeGraph.nodeId(a.from) : a?.from) || '');
+          const bFrom = String(b?.from_id || (typeof b?.from === 'number' ? activeGraph.nodeId(b.from) : b?.from) || '');
+          if (aFrom !== bFrom) return aFrom.localeCompare(bFrom);
+          const aTo = String(a?.to_id || (typeof a?.to === 'number' ? activeGraph.nodeId(a.to) : a?.to) || '');
+          const bTo = String(b?.to_id || (typeof b?.to === 'number' ? activeGraph.nodeId(b.to) : b?.to) || '');
+          return aTo.localeCompare(bTo);
+        });
+      }
+    }
+  }
   return result;
 }
 
@@ -2749,6 +3181,26 @@ function buildFilterClauses(filters = {}, tableAlias = '') {
     }
   }
 
+  // Historical diff changed-only filter (W33-3)
+  if (filters.changedOnly === true || filters.changedOnly === 'true') {
+    const changedIds = Array.isArray(filters.changedIds) ? filters.changedIds.filter(Boolean) : [];
+    if (changedIds.length === 0) {
+      clauses.push('1 = 0');
+    } else {
+      clauses.push(`${col('id')} IN (${changedIds.map(() => '?').join(',')})`);
+      params.push(...changedIds);
+    }
+  }
+
+  // High operational risk filter (active issues with composite risk_score >= 0.50, W34-5)
+  if (filters.highRisk === true || filters.highRisk === 'true') {
+    if (getOverviewColumnSet().has('risk_score')) {
+      clauses.push(`LOWER(${col('status')}) NOT IN ('closed', 'tombstone') AND COALESCE(${col('risk_score')}, 0) >= 0.5`);
+    } else {
+      clauses.push('1 = 0');
+    }
+  }
+
   // Overdue filter (open issues whose due_date precedes reference snapshot clock)
   if (filters.overdue === true || filters.overdue === 'true') {
     if (getOverviewColumnSet().has('due_date')) {
@@ -2984,6 +3436,12 @@ function getGraphIssueMetricsCache() {
     graph: g,
     nodeMap: nMap,
     kcore: null,
+    degeneracy: null,
+    criticalPathLength: null,
+    totalFloat: null,
+    hasCycles: false,
+    topoOrder: null,
+    executionWaves: [],
     slack: null,
     slackAvailable: false,
     articulationSet: new Set(),
@@ -2993,10 +3451,106 @@ function getGraphIssueMetricsCache() {
     if (typeof g.kcore === 'function') {
       cache.kcore = g.kcore();
     }
+    if (typeof g.degeneracy === 'function') {
+      const deg = Number(g.degeneracy());
+      if (Number.isFinite(deg)) cache.degeneracy = deg;
+    }
     const hasCycles = typeof g.hasCycles === 'function' ? g.hasCycles() : false;
+    cache.hasCycles = Boolean(hasCycles);
     if (!hasCycles && typeof g.slack === 'function') {
       cache.slack = g.slack();
       cache.slackAvailable = Boolean(cache.slack);
+    }
+    if (!hasCycles && typeof g.criticalPathLength === 'function') {
+      const cpLen = Number(g.criticalPathLength());
+      if (Number.isFinite(cpLen)) cache.criticalPathLength = cpLen;
+    }
+    if (!hasCycles && typeof g.totalFloat === 'function') {
+      const tf = Number(g.totalFloat());
+      if (Number.isFinite(tf)) cache.totalFloat = tf;
+    }
+    if (!hasCycles && typeof g.topologicalSort === 'function') {
+      const rawTopo = g.topologicalSort();
+      if (rawTopo && typeof rawTopo.length === 'number') {
+        const topoArr = Array.from(rawTopo);
+        cache.topoOrder = topoArr;
+        // Edges in activeGraph point dependent -> blocker (issue_id -> depends_on_id),
+        // so Kahn's topologicalSort places dependents before blockers.
+        // Reverse traversal computes bottom-up execution wave depth: Wave 1 = no active blockers.
+        const depthByIdx = new Map();
+        const waveBuckets = new Map();
+        const knownIssuesById = new Map();
+        let lifecycleById = new Map();
+        try {
+          const cols = typeof getOverviewColumnSet === 'function' ? getOverviewColumnSet() : new Set();
+          const hasActionableCol = cols.has('is_actionable');
+          const rows = execQuery(
+            hasActionableCol
+              ? `SELECT id, title, status, priority, is_actionable FROM issue_overview_mv`
+              : `SELECT id, title, status, priority FROM issue_overview_mv`
+          );
+          for (const r of rows) {
+            if (r?.id) knownIssuesById.set(r.id, r);
+          }
+          lifecycleById = queryIssuesForWhatIf();
+        } catch {
+          // Ignore if DB not ready
+        }
+        const waveRefNowMs = getReferenceNowMs();
+        for (let i = topoArr.length - 1; i >= 0; i--) {
+          const u = topoArr[i];
+          const succ = typeof g.successors === 'function' ? Array.from(g.successors(u) || []) : [];
+          let maxBlockerDepth = -1;
+          for (const v of succ) {
+            const d = depthByIdx.get(v);
+            if (d !== undefined && d > maxBlockerDepth) {
+              maxBlockerDepth = d;
+            }
+          }
+          const myDepth = maxBlockerDepth + 1;
+          depthByIdx.set(u, myDepth);
+          const id = typeof g.nodeId === 'function' ? g.nodeId(u) : null;
+          if (!id) continue;
+          const metaRow = knownIssuesById.get(id);
+          if (knownIssuesById.size > 0 && !metaRow) continue;
+          const waveNum = myDepth + 1;
+          if (!waveBuckets.has(waveNum)) waveBuckets.set(waveNum, []);
+          const lifecycleRow = lifecycleById.get(id) || metaRow;
+          const isWithheld = lifecycleRow
+            ? isIssueLifecycleWithheld(lifecycleRow, waveRefNowMs)
+            : false;
+          const isActionable = metaRow && metaRow.is_actionable !== undefined
+            ? Boolean(Number(metaRow.is_actionable))
+            : !isWithheld;
+          const isNotReady = waveNum === 1 ? !isActionable : isWithheld;
+          waveBuckets.get(waveNum).push({
+            id,
+            title: metaRow?.title || id,
+            status: metaRow?.status || 'open',
+            priority: Number(metaRow?.priority ?? 2),
+            isActionable,
+            isNotReady,
+          });
+        }
+        const sortedWaveNums = [...waveBuckets.keys()].sort((a, b) => a - b);
+        cache.executionWaves = sortedWaveNums.map((wNum) => {
+          const items = waveBuckets.get(wNum).sort((a, b) =>
+            (Number(a.isNotReady) - Number(b.isNotReady)) ||
+            (a.priority - b.priority) ||
+            a.id.localeCompare(b.id)
+          );
+          const readyCount = items.filter(it => it.isActionable).length;
+          return {
+            wave: wNum,
+            label: wNum === 1
+              ? (readyCount === items.length ? 'Wave 1 (Ready Now)' : `Wave 1 (No Blocking Deps · ${readyCount} ready)`)
+              : `Wave ${wNum}`,
+            count: items.length,
+            readyCount,
+            items,
+          };
+        });
+      }
     }
     if (hasCycles) {
       if (typeof g.tarjanScc === 'function') {
@@ -3039,6 +3593,48 @@ function isIssueInCycle(id) {
   if (!cache) return false;
   const idx = cache.nodeMap.get(id);
   return idx !== undefined && cache.cycleIdxSet.has(idx);
+}
+
+function getGraphHealthTelemetry() {
+  const cache = getGraphIssueMetricsCache();
+  if (!cache) {
+    return {
+      ready: false,
+      hasCycles: false,
+      degeneracy: null,
+      criticalPathLength: null,
+      totalFloat: null,
+      waveCount: 0,
+    };
+  }
+  return {
+    ready: true,
+    hasCycles: Boolean(cache.hasCycles),
+    degeneracy: cache.degeneracy,
+    criticalPathLength: cache.criticalPathLength,
+    totalFloat: cache.totalFloat,
+    waveCount: Array.isArray(cache.executionWaves) ? cache.executionWaves.length : 0,
+  };
+}
+
+function getExecutionWaves() {
+  const cache = getGraphIssueMetricsCache();
+  if (!cache) {
+    return { ready: false, hasCycles: false, waves: [], totalIssues: 0 };
+  }
+  const waves = Array.isArray(cache.executionWaves) ? cache.executionWaves : [];
+  const totalIssues = waves.reduce((sum, w) => sum + (w.count || 0), 0);
+  return {
+    ready: true,
+    hasCycles: Boolean(cache.hasCycles),
+    waves,
+    totalIssues,
+  };
+}
+
+if (typeof window !== 'undefined') {
+  window.bvGetGraphHealthTelemetry = getGraphHealthTelemetry;
+  window.bvGetExecutionWaves = getExecutionWaves;
 }
 
 function getTriageRecommendation(id) {
@@ -4516,6 +5112,12 @@ function getMeta() {
   const meta = {};
   const rows = execQuery(`SELECT key, value FROM export_meta`);
   rows.forEach(row => {
+    if (row.key === 'source_authority' && typeof row.value === 'string' && row.value.trim().startsWith('{')) {
+      try {
+        meta[row.key] = JSON.parse(row.value);
+        return;
+      } catch (_) {}
+    }
     meta[row.key] = row.value;
   });
   return meta;
@@ -4618,12 +5220,23 @@ function getIssueDependencyGroups(id) {
       };
     };
 
+    const seenBlockedBy = new Set();
+    const seenBlocks = new Set();
+    const seenParents = new Set();
+    const seenChildren = new Set();
+
     for (const row of outgoing) {
       const depType = row.dep_type ?? '';
       if (blockingTypes.has(depType)) {
-        groups.blockedBy.push(toEntry(row, 'upstream'));
+        if (!seenBlockedBy.has(row.dep_id)) {
+          seenBlockedBy.add(row.dep_id);
+          groups.blockedBy.push(toEntry(row, 'upstream'));
+        }
       } else if (depType === 'parent-child') {
-        groups.parents.push(toEntry(row, 'parent'));
+        if (!seenParents.has(row.dep_id)) {
+          seenParents.add(row.dep_id);
+          groups.parents.push(toEntry(row, 'parent'));
+        }
       } else {
         const normalizedType = depType || 'related';
         const key = `${row.dep_id}:${normalizedType}`;
@@ -4637,9 +5250,15 @@ function getIssueDependencyGroups(id) {
     for (const row of incoming) {
       const depType = row.dep_type ?? '';
       if (blockingTypes.has(depType)) {
-        groups.blocks.push(toEntry(row, 'downstream'));
+        if (!seenBlocks.has(row.dep_id)) {
+          seenBlocks.add(row.dep_id);
+          groups.blocks.push(toEntry(row, 'downstream'));
+        }
       } else if (depType === 'parent-child') {
-        groups.children.push(toEntry(row, 'child'));
+        if (!seenChildren.has(row.dep_id)) {
+          seenChildren.add(row.dep_id);
+          groups.children.push(toEntry(row, 'child'));
+        }
       } else {
         const normalizedType = depType || 'related';
         const key = `${row.dep_id}:${normalizedType}`;
@@ -4662,6 +5281,30 @@ function getIssueDependencyGroups(id) {
 
 const VALID_SEARCH_MODES = new Set(['text', 'hybrid']);
 const VALID_SEARCH_PRESETS = new Set(['default', 'bug-hunting', 'sprint-planning', 'impact-first', 'text-only']);
+
+/**
+ * Single canonical factory for default Issues filter state (RC-C41 / MR-11).
+ * Used by beadsApp().filters, handleHashChange, clearFilters(), and hasActiveFilters
+ * so every new filter is automatically reset and reflected in active-filter detection.
+ */
+function createDefaultFilters() {
+  return {
+    status: [],
+    type: [],
+    priority: [],
+    labels: [],
+    assignee: '',
+    repo: '',
+    hasBlockers: null,
+    isBlocking: null,
+    criticalPath: false,
+    inCycle: false,
+    overdue: false,
+    articulation: false,
+    changedOnly: false,
+    highRisk: false,
+  };
+}
 
 /**
  * Serialize filters to URL search params
@@ -4724,6 +5367,12 @@ function filtersToURL(filters = {}, sort = 'priority', searchQuery = '', searchM
   }
   if (filters.articulation === true || filters.articulation === 'true') {
     params.set('cutvertex', 'true');
+  }
+  if (filters.changedOnly === true || filters.changedOnly === 'true') {
+    params.set('changed', 'true');
+  }
+  if (filters.highRisk === true || filters.highRisk === 'true') {
+    params.set('highrisk', 'true');
   }
 
   if (searchQuery) {
@@ -4822,6 +5471,14 @@ function filtersFromURL() {
   const cutVertexParam = params.get('cutvertex');
   if (cutVertexParam === 'true' || cutVertexParam === '1') {
     filters.articulation = true;
+  }
+  const changedParam = params.get('changed');
+  if (changedParam === 'true' || changedParam === '1') {
+    filters.changedOnly = true;
+  }
+  const highRiskParam = params.get('highrisk');
+  if (highRiskParam === 'true' || highRiskParam === '1') {
+    filters.highRisk = true;
   }
 
   const rawMode = params.get('mode') || 'text';
@@ -5123,7 +5780,8 @@ function resolveEffectiveTriageWeights(triageData) {
   const base = { ...DEFAULT_TRIAGE_WEIGHTS };
   if (!triageData || typeof triageData !== 'object') return base;
   const root = triageData.triage && typeof triageData.triage === 'object' ? triageData.triage : triageData;
-  const fb = triageData.feedback || root.feedback || null;
+  const rawFb = triageData.feedback || root.feedback || null;
+  const fb = (rawFb && typeof rawFb === 'object' && rawFb.enabled !== false && rawFb.applied !== false) ? rawFb : null;
   const candidate =
     fb?.effective_weights ||
     fb?.adjusted_weights ||
@@ -5193,7 +5851,7 @@ function resolveEffectiveTriageWeights(triageData) {
 function getScoreBreakdownBars(breakdown, weightsOverride = null) {
   if (!breakdown) return [];
 
-  const effWeights = weightsOverride || DEFAULT_TRIAGE_WEIGHTS;
+  const effWeights = weightsOverride || resolveEffectiveTriageWeights(LATEST_TRIAGE_DATA);
   const components = [
     { name: 'PageRank', key: 'pagerank', color: '#3b82f6', colorClass: 'sb-c-pagerank', weight: effWeights.pagerank ?? 0.22 },
     { name: 'Betweenness', key: 'betweenness', color: '#f97316', colorClass: 'sb-c-betweenness', weight: effWeights.betweenness ?? 0.20 },
@@ -5374,6 +6032,7 @@ function beadsApp() {
     // State
     loading: true,
     loadingMessage: 'Initializing...',
+    dbVersion: 0,
     error: null,
     globalError: null,       // Modal error from ERROR_STATE
     showDiagnostics: false,  // Toggle for diagnostics panel (press 'd')
@@ -5411,20 +6070,7 @@ function beadsApp() {
     },
 
     // Filters (supports multi-select arrays)
-    filters: {
-      status: [],      // Array for multi-select
-      type: [],        // Array for multi-select
-      priority: [],    // Array for multi-select
-      labels: [],      // Array for multi-select
-      assignee: '',    // Single select
-      repo: '',        // Multi-repo workspace filter (empty = all)
-      hasBlockers: null, // true/false/null
-      isBlocking: null,  // true/false/null
-      criticalPath: false, // Filter to critical path issues
-      inCycle: false,      // Filter to dependency cycle issues
-      overdue: false,      // Filter to overdue open issues
-      articulation: false, // Filter to articulation point (cut vertex) issues
-    },
+    filters: createDefaultFilters(),
     sort: 'priority',
     searchQuery: '',
     searchMode: 'text',
@@ -5443,13 +6089,20 @@ function beadsApp() {
 
     // Selected issue & list cursor
     selectedIssue: null,
+    modalDepRemovalResult: null, // Inline dependency-removal preflight in Issue Detail Modal (W34-1)
+    modalCheckAddTarget: '', // Target issue ID input for Modal Check Add Dep (W35-6)
+    modalCheckAddResult: null, // Inline dependency-addition preflight in Issue Detail Modal (W35-6)
+    modalWhatIfBatchIds: [], // Persistent multi-issue batch queue in Issue Detail Modal (W35-6)
+    modalWhatIfBatchResult: null, // Combined batch What-If result with synergy (W35-6)
     copyLinkMessage: '',
     showDepGraph: false,
     issueNavList: [], // List of issue IDs for j/k navigation
     focusedIssueIndex: -1, // Highlighted row cursor in #/issues list view
     issuesViewMode: 'list', // 'list' | 'board' | 'tree' (W30-6)
     issuesModeRows: [], // Capped unpaginated rows for Board / Tree modes
+    issuesTreeMode: 'hierarchy', // 'hierarchy' (parent-child) | 'blocking' (blocker -> blocked)
     issuesTreeCollapsed: {}, // Map<issueId, boolean> for collapsible Tree nodes
+    issuesTreeParentIds: [], // All parent IDs in the active Tree hierarchy (P18B-8)
     issuesTreeFlatRows: [], // Precomputed DFS rows for Tree mode
     showKeyboardHelp: false, // Keyboard shortcuts help modal
 
@@ -5476,6 +6129,9 @@ function beadsApp() {
     graphWhatIfNodes: [],
     graphWhatIfDirectUnblocks: 0,
     graphWhatIfTransitiveUnblocks: 0,
+    graphWhatIfSynergyCount: 0,
+    graphWhatIfSynergyIds: [],
+    graphWhatIfParallelGain: 0,
     graphWhatIfUnblockedIds: [],
     graphWhatIfBatchIds: [],
     graphCheckDepMode: false, // Two-click pre-flight dependency validator (W30-4)
@@ -5489,6 +6145,8 @@ function beadsApp() {
       repo: '',
       search: '',
       showClosed: true,
+      changedOnly: false,
+      highRiskOnly: false,
     },
     graphVisibleTotal: 0,
     graphVisibleOpen: 0,
@@ -5573,8 +6231,20 @@ function beadsApp() {
     forecastData: null,
     hasForecast: false,
 
+    // Historical Snapshot Diff (data/diff.json, gated on meta.has_diff)
+    diffData: null,
+    hasDiff: false,
+
+    // Baseline Drift Report (data/drift.json, gated on meta.has_drift, W32-4)
+    driftData: null,
+    hasDrift: false,
+
     // Loaded git correlation history (populated when data/history.json loads)
     historyData: null,
+    _historyLoadPromise: null,
+    _historyLoadAttempted: false,
+    _historyLoadGen: 0,
+    _historyLoadMetaFlag: false,
 
     syncModalOpenBodyClass() {
       const hasModal = !!(this.selectedIssue || (this.view === 'graph' && this.graphDetailNode));
@@ -5626,6 +6296,7 @@ function beadsApp() {
             this.forceGraphModule?.resetWhatIf?.({ force: true });
             this.forceGraphModule?.resetCriticalPath?.();
             this.forceGraphModule?.stopTimeTravel?.();
+            this.clearGraphCheckDepState({ clearHighlight: true });
           }
           this.syncModalOpenBodyClass();
         }
@@ -5719,13 +6390,13 @@ function beadsApp() {
           this.graphContextMenu = { open: false, x: 0, y: 0, node: null };
           return;
         }
-        if (e.key === 'Escape' && (this.graphCheckDepMode || this.graphCheckDepResult)) {
+        if (e.key === 'Escape' && !this.selectedIssue && !this.showKeyboardHelp && this.view === 'graph' && (this.graphCheckDepMode || this.graphCheckDepResult)) {
           e.preventDefault();
           e.stopImmediatePropagation();
           this.resetGraphCheckDep();
           return;
         }
-        if (e.key === 'Escape' && this.graphFiltersOpen) {
+        if (e.key === 'Escape' && !this.selectedIssue && !this.showKeyboardHelp && this.graphFiltersOpen) {
           e.preventDefault();
           e.stopImmediatePropagation();
           this.graphFiltersOpen = false;
@@ -5857,6 +6528,12 @@ function beadsApp() {
         const ev = e?.detail?.event;
         if (!nodeId) return;
 
+        // P18B-2: Never open the issue detail modal while picking a Check Add Dep target.
+        if (this.graphCheckDepMode) {
+          _lastNodeClick = { id: null, t: 0 };
+          return;
+        }
+
         // Let graph interactions work:
         // - Shift+click triggers what-if
         // - Ctrl/Meta+click highlights dependency paths
@@ -5880,6 +6557,7 @@ function beadsApp() {
 
       // Sync graph cycle navigator, view mode, and time-travel state
       document.addEventListener('bv-graph:cycleHighlightChange', (e) => {
+        this.clearGraphCheckDepState();
         this.cycleNavigatorActive = true;
         this.currentCycleIdx = e.detail?.currentIndex ?? 0;
         this.totalCycles = e.detail?.cycleCount ?? (this.cycleInfo?.cycleCount || 0);
@@ -5893,6 +6571,7 @@ function beadsApp() {
         this.currentCycleBreakEdge = null;
       });
       document.addEventListener('bv-graph:criticalPathChange', (e) => {
+        this.clearGraphCheckDepState();
         this.criticalPathNavActive = Boolean(e.detail?.active ?? true);
         this.currentCriticalPathIdx = e.detail?.currentIndex ?? 0;
         this.totalCriticalPaths = e.detail?.pathCount ?? (this.topCriticalPaths?.length || 0);
@@ -5903,15 +6582,14 @@ function beadsApp() {
         this.currentCriticalPathIdx = 0;
         this.currentCriticalPathLabel = '';
       });
+      document.addEventListener('bv-graph:checkDepReset', () => {
+        this.clearGraphCheckDepState();
+      });
       document.addEventListener('bv-graph:timeTravelReady', (e) => {
         this.timeTravelAvailable = (e.detail?.commits || 0) > 0;
       });
       document.addEventListener('bv-graph:timeTravelStart', () => {
-        if (this.graphCheckDepMode || this.graphCheckDepResult) {
-          this.graphCheckDepMode = false;
-          this.graphCheckDepFromId = '';
-          this.graphCheckDepResult = null;
-        }
+        this.clearGraphCheckDepState();
         this.timeTravelActive = true;
       });
       document.addEventListener('bv-graph:timeTravelCommit', () => {
@@ -5930,21 +6608,16 @@ function beadsApp() {
       // Dashboard chart click-to-filter integration
       const applyChartDrilldown = (filterOverrides) => {
         this.selectedIssue = null;
+        this.modalDepRemovalResult = null;
+      this.modalCheckAddResult = null;
+      this.modalCheckAddTarget = '';
         this.graphDetailNode = null;
         this.showCriticalPath = false;
         this.criticalPathData = null;
         this.criticalPathAnimationStep = -1;
         this.searchQuery = '';
         this.filters = {
-          status: [],
-          type: [],
-          priority: [],
-          labels: [],
-          assignee: '',
-          repo: '',
-          hasBlockers: null,
-          isBlocking: null,
-          criticalPath: false,
+          ...createDefaultFilters(),
           ...filterOverrides,
         };
         this.page = 1;
@@ -5984,6 +6657,7 @@ function beadsApp() {
         await loadDatabase((msg) => {
           this.loadingMessage = msg;
         });
+        this.dbVersion++;
 
         // Check for global errors that may have occurred during loading
         if (ERROR_STATE.error) {
@@ -6102,6 +6776,9 @@ function beadsApp() {
           if (triageResp.ok) {
             this.triageData = await triageResp.json();
             LATEST_TRIAGE_DATA = this.triageData;
+            if (this.selectedIssue?.triage_breakdown) {
+              this.selectedIssue.score_breakdown_bars = this.getScoreBreakdownBars(this.selectedIssue.triage_breakdown);
+            }
             if (!this.graphReady) {
               this.cycleInfo = getCycleInfo(this.triageData);
               this.totalCycles = this.cycleInfo?.cycleCount || 0;
@@ -6182,20 +6859,56 @@ function beadsApp() {
             }
           })());
         }
-        if (this.meta?.has_history === true || this.meta?.has_history === 'true') {
+        if (this.meta?.has_diff === true || this.meta?.has_diff === 'true') {
           optTasks.push((async () => {
             try {
-              const histResp = await fetch(`./data/history.json?_t=${Date.now()}`, optionalFetchOpts());
-              if (histResp.ok) {
-                this.historyData = await histResp.json();
+              const diffResp = await fetch(`./data/diff.json?_t=${Date.now()}`, optionalFetchOpts());
+              if (diffResp.ok) {
+                this.diffData = await diffResp.json();
+                this.hasDiff = Boolean(this.diffData && this.diffData.diff);
+                if (this.hasDiff) {
+                  if (this.forceGraphReady) {
+                    this.forceGraphModule?.setDiffStatusMap?.(this.getDiffStatusMap());
+                  }
+                  if (this.view === 'issues' && this.filters.changedOnly) {
+                    this.loadIssues();
+                  }
+                }
               }
-            } catch (histErr) {
-              console.log('[Viewer] Optional history.json unavailable:', histErr);
+            } catch (diffErr) {
+              console.log('[Viewer] Optional diff.json unavailable:', diffErr);
             }
           })());
         }
+        if (this.meta?.has_drift === true || this.meta?.has_drift === 'true') {
+          optTasks.push((async () => {
+            try {
+              const driftResp = await fetch(`./data/drift.json?_t=${Date.now()}`, optionalFetchOpts());
+              if (driftResp.ok) {
+                this.driftData = await driftResp.json();
+                this.hasDrift = Boolean(this.driftData && typeof this.driftData === 'object');
+              }
+            } catch (driftErr) {
+              console.log('[Viewer] Optional drift.json unavailable:', driftErr);
+            }
+          })());
+        }
+        if (this.meta?.has_history === true || this.meta?.has_history === 'true') {
+          optTasks.push(this.ensureHistoryLoaded(optionalFetchOpts()));
+        }
         if (optTasks.length > 0) {
           await Promise.allSettled(optTasks);
+        }
+
+        // Clear stale ?changed=true URL filter when this export has no diff.json (P25B-2)
+        // so non-diff sites never trap users on an empty table with an invisible filter chip.
+        if (!this.hasDiff && this.filters.changedOnly) {
+          this.filters.changedOnly = false;
+          this.loadIssues();
+          if (this.view === 'issues' && window.location.hash.includes('changed=')) {
+            const cleanedParams = filtersToURL(this.filters, this.sort, this.searchQuery, this.searchMode, this.searchPreset);
+            window.history.replaceState(null, '', '#/issues' + (cleanedParams ? '?' + cleanedParams : ''));
+          }
         }
 
         this.loading = false;
@@ -6253,14 +6966,18 @@ function beadsApp() {
               }
             }
             this.whatIfResult = null;
+            this.modalDepRemovalResult = null;
+      this.modalCheckAddResult = null;
+      this.modalCheckAddTarget = '';
             const resolvedIssue = getIssue(route.params.id);
             this.selectedIssue = resolvedIssue;
             if (!resolvedIssue) {
               showToast(`Issue ${route.params.id} is excluded from this filtered export`, 'warning');
             }
-            // Update nav list from current issues
-            if (this.issues.length) {
-              this.issueNavList = this.issues.map(i => i.id);
+            // Update nav list from current issues mode (P18B-11)
+            const navIds = this.currentIssueNavIds();
+            if (navIds.length) {
+              this.issueNavList = navIds;
             }
           }
           this.syncModalOpenBodyClass();
@@ -6269,28 +6986,24 @@ function beadsApp() {
         case 'issues':
           this.view = 'issues';
           this.graphDetailNode = null;
+          this.clearGraphCheckDepState({ clearHighlight: true });
           if (this.$refs && this.$refs.depGraph) {
             this.$refs.depGraph.innerHTML = '';
           }
           this.selectedIssue = null;
           this.showDepGraph = false;
           this.whatIfResult = null;
+          this.modalDepRemovalResult = null;
+          this.modalCheckAddResult = null;
+          this.modalCheckAddTarget = '';
           this.syncModalOpenBodyClass();
           this.filters = {
-            status: [],
-            type: [],
-            priority: [],
-            labels: [],
-            assignee: '',
-            repo: '',
-            hasBlockers: null,
-            isBlocking: null,
-            criticalPath: false,
-            inCycle: false,
-            overdue: false,
-            articulation: false,
+            ...createDefaultFilters(),
             ...urlState.filters,
           };
+          if (!this.loading && !this.hasDiff) {
+            this.filters.changedOnly = false;
+          }
           if (this.filters.criticalPath && this.graphReady) {
             this.criticalPathData = this.criticalPathData || getCriticalPathSequence();
             this.showCriticalPath = Boolean(this.criticalPathData?.path?.length);
@@ -6309,14 +7022,22 @@ function beadsApp() {
         case 'insights':
           this.view = 'insights';
           this.selectedIssue = null;
+          this.modalDepRemovalResult = null;
+      this.modalCheckAddResult = null;
+      this.modalCheckAddTarget = '';
           this.graphDetailNode = null;
+          this.clearGraphCheckDepState({ clearHighlight: true });
           this.syncModalOpenBodyClass();
           break;
 
         case 'sprints':
           this.view = 'sprints';
           this.selectedIssue = null;
+          this.modalDepRemovalResult = null;
+      this.modalCheckAddResult = null;
+      this.modalCheckAddTarget = '';
           this.graphDetailNode = null;
+          this.clearGraphCheckDepState({ clearHighlight: true });
           this.syncModalOpenBodyClass();
           this.$nextTick(() => this.renderSelectedSprintChart());
           break;
@@ -6324,6 +7045,9 @@ function beadsApp() {
         case 'graph':
           this.view = 'graph';
           this.selectedIssue = null;
+          this.modalDepRemovalResult = null;
+      this.modalCheckAddResult = null;
+      this.modalCheckAddTarget = '';
           this.syncModalOpenBodyClass();
           this.$nextTick(() => {
             this.initForceGraphView();
@@ -6333,16 +7057,76 @@ function beadsApp() {
         default:
           this.view = 'dashboard';
           this.selectedIssue = null;
+          this.modalDepRemovalResult = null;
+      this.modalCheckAddResult = null;
+      this.modalCheckAddTarget = '';
           this.graphDetailNode = null;
+          this.clearGraphCheckDepState({ clearHighlight: true });
           this.syncModalOpenBodyClass();
       }
+    },
+
+    /**
+     * Load optional data/history.json at most once across concurrent init() and direct #/graph boots.
+     * Pass `{ force: true }` when an explicit refresh needs to bypass the boot cache.
+     */
+    ensureHistoryLoaded(fetchOpts, { force = false } = {}) {
+      const hasHistory = this.meta?.has_history === true || this.meta?.has_history === 'true';
+      if (hasHistory && !this._historyLoadMetaFlag) {
+        this._historyLoadAttempted = false;
+      }
+      this._historyLoadMetaFlag = hasHistory;
+      if (!force && this.historyData) return Promise.resolve(this.historyData);
+      if (!force && this._historyLoadAttempted) return Promise.resolve(this.historyData);
+      if (!force && !hasHistory) return Promise.resolve(null);
+      if (!this._historyLoadPromise || force) {
+        const gen = ++this._historyLoadGen;
+        const p = (async () => {
+          try {
+            const resp = await fetch(`./data/history.json?_t=${Date.now()}`, fetchOpts);
+            if (resp.ok) {
+              const parsed = await resp.json();
+              if (gen === this._historyLoadGen) {
+                this.historyData = parsed;
+                return parsed;
+              }
+              return (this._historyLoadPromise && this._historyLoadPromise !== p)
+                ? await this._historyLoadPromise
+                : this.historyData;
+            }
+            if (force && gen === this._historyLoadGen) {
+              this.historyData = null;
+            }
+          } catch (histErr) {
+            if (force && gen === this._historyLoadGen) {
+              this.historyData = null;
+            }
+            console.log('[Viewer] Optional history.json unavailable:', histErr);
+          } finally {
+            if (gen === this._historyLoadGen) {
+              this._historyLoadAttempted = true;
+              if (this._historyLoadPromise === p) {
+                this._historyLoadPromise = null;
+              }
+            }
+          }
+          if (gen !== this._historyLoadGen) {
+            return (this._historyLoadPromise && this._historyLoadPromise !== p)
+              ? await this._historyLoadPromise
+              : this.historyData;
+          }
+          return null;
+        })();
+        this._historyLoadPromise = p;
+      }
+      return this._historyLoadPromise;
     },
 
     /**
      * Initialize (or refresh) the interactive force-graph view.
      * This is invoked when navigating to #/graph.
      */
-    async initForceGraphView() {
+    async initForceGraphView({ forceHistoryRefresh = false } = {}) {
       if (this.forceGraphLoading) return;
 
       this.forceGraphLoading = true;
@@ -6439,6 +7223,9 @@ function beadsApp() {
               this.evaluateGraphCheckDep(this.graphCheckDepFromId, e.detail.node.id);
               return;
             }
+            if (this.graphCheckDepResult) {
+              this.clearGraphCheckDepState();
+            }
             handleGraphNodeDetail(e);
           });
           document.addEventListener('bv-graph:nodeSelect', handleGraphNodeDetail);
@@ -6472,6 +7259,8 @@ function beadsApp() {
                 repo: detail.filters.repo || '',
                 search: detail.filters.search || '',
                 showClosed: detail.filters.showClosed !== false,
+                changedOnly: Boolean(detail.filters.changedOnly),
+                highRiskOnly: Boolean(detail.filters.highRiskOnly),
               };
             }
             this.reconcileVisibleGraphOverlays({ skipCounts: Number.isFinite(detail.visibleCount) });
@@ -6488,6 +7277,9 @@ function beadsApp() {
           });
           document.addEventListener('bv-graph:backgroundClick', () => {
             this.graphDetailNode = null;
+            if (this.graphCheckDepMode || this.graphCheckDepResult) {
+              this.clearGraphCheckDepState({ clearHighlight: true });
+            }
             if (this.graphContextMenu?.open) {
               this.graphContextMenu = { open: false, x: 0, y: 0, node: null };
             }
@@ -6497,11 +7289,7 @@ function beadsApp() {
 
           // Sync What-If cascade state for Graph HUD
           document.addEventListener('bv-graph:whatIfStart', (e) => {
-            if (this.graphCheckDepMode || this.graphCheckDepResult) {
-              this.graphCheckDepMode = false;
-              this.graphCheckDepFromId = '';
-              this.graphCheckDepResult = null;
-            }
+            this.clearGraphCheckDepState();
             const nodes = Array.isArray(e.detail?.nodes) && e.detail.nodes.length > 0
               ? e.detail.nodes
               : (e.detail?.node ? [e.detail.node] : []);
@@ -6509,11 +7297,17 @@ function beadsApp() {
             const direct = Number(result.direct_unblocks ?? (result.unblocked_ids?.length || 0)) || 0;
             const transitive = Number(result.transitive_unblocks ?? direct) || direct;
             const nodeIds = nodes.map(n => n?.id || String(n)).filter(Boolean);
+            const synergyIds = Array.isArray(result.synergy_issue_ids) ? result.synergy_issue_ids : [];
+            const synergyCount = Number(result.synergy_unblocks ?? synergyIds.length) || 0;
+            const parallelGain = Number.isFinite(Number(result.parallel_gain)) ? Number(result.parallel_gain) : (direct - nodeIds.length);
             this.graphWhatIfActive = nodeIds.length > 0;
             this.graphWhatIfNodes = nodeIds;
             this.graphWhatIfBatchIds = [...nodeIds];
             this.graphWhatIfDirectUnblocks = direct;
             this.graphWhatIfTransitiveUnblocks = transitive;
+            this.graphWhatIfSynergyCount = synergyCount;
+            this.graphWhatIfSynergyIds = synergyIds;
+            this.graphWhatIfParallelGain = parallelGain;
             this.graphWhatIfUnblockedIds = [];
           });
           document.addEventListener('bv-graph:whatIfComplete', (e) => {
@@ -6528,6 +7322,11 @@ function beadsApp() {
             }
             this.graphWhatIfDirectUnblocks = Number(e.detail?.directUnblocks ?? this.graphWhatIfDirectUnblocks) || 0;
             this.graphWhatIfTransitiveUnblocks = Number(e.detail?.transitiveUnblocks ?? this.graphWhatIfTransitiveUnblocks) || 0;
+            this.graphWhatIfSynergyCount = Number(e.detail?.synergyUnblocks ?? this.graphWhatIfSynergyCount) || 0;
+            this.graphWhatIfSynergyIds = Array.isArray(e.detail?.synergyIssueIds) ? e.detail.synergyIssueIds : this.graphWhatIfSynergyIds;
+            if (Number.isFinite(Number(e.detail?.parallelGain))) {
+              this.graphWhatIfParallelGain = Number(e.detail.parallelGain);
+            }
             this.graphWhatIfUnblockedIds = Array.isArray(e.detail?.unblockedIds) ? e.detail.unblockedIds : [];
           });
           document.addEventListener('bv-graph:whatIfReset', () => {
@@ -6536,6 +7335,9 @@ function beadsApp() {
             this.graphWhatIfBatchIds = [];
             this.graphWhatIfDirectUnblocks = 0;
             this.graphWhatIfTransitiveUnblocks = 0;
+            this.graphWhatIfSynergyCount = 0;
+            this.graphWhatIfSynergyIds = [];
+            this.graphWhatIfParallelGain = 0;
             this.graphWhatIfUnblockedIds = [];
           });
 
@@ -6551,10 +7353,8 @@ function beadsApp() {
 
           // Sync transitive dependency cone isolation state
           document.addEventListener('bv-graph:dependencyConeChange', (e) => {
-            if (e.detail?.active && (this.graphCheckDepMode || this.graphCheckDepResult)) {
-              this.graphCheckDepMode = false;
-              this.graphCheckDepFromId = '';
-              this.graphCheckDepResult = null;
+            if (e.detail?.active) {
+              this.clearGraphCheckDepState();
             }
             this.dependencyConeActive = Boolean(e.detail?.active);
             this.dependencyConeFocusId = e.detail?.focusNodeId || null;
@@ -6592,7 +7392,7 @@ function beadsApp() {
         this.graphSimulationDone = false;
 
         console.log(`[ForceGraph] Loading ${issues.length} issues, ${dependencies.length} dependencies`);
-        this.graphFilters = { status: '', priority: '', label: '', repo: '', search: '', showClosed: true };
+        this.graphFilters = { status: '', priority: '', label: '', repo: '', search: '', showClosed: true, changedOnly: false, highRiskOnly: false };
         this.graphFiltersOpen = false;
         this.graphHeatmapActive = false;
         this.currentPreset = 'force';
@@ -6602,27 +7402,28 @@ function beadsApp() {
         this.graphWhatIfDirectUnblocks = 0;
         this.graphWhatIfTransitiveUnblocks = 0;
         this.graphWhatIfUnblockedIds = [];
+        this.graphWhatIfSynergyCount = 0;
+        this.graphWhatIfSynergyIds = [];
+        this.graphWhatIfParallelGain = 0;
+        this.clearGraphCheckDepState();
         this.forceGraphModule.loadData(issues, dependencies, precomputedLayout);
+        if (this.hasDiff) {
+          this.forceGraphModule.setDiffStatusMap?.(this.getDiffStatusMap());
+        }
         this.syncGraphVisibleCounts(this.forceGraphModule.getGraph?.()?.graphData?.()?.nodes || issues);
 
-        // Try to load history data for time-travel feature (bv-z38b)
-        // Use cache-busting to avoid stale data from CDN
+        // Initialize time-travel history without redundant fetches or 404s when !has_history (P25B-1).
         this.timeTravelAvailable = false;
         this.timeTravelActive = false;
         try {
-          // Optional history must not leave graph refresh locked on a stalled
-          // response. The deadline also covers consumption of the JSON body.
-          const historyResp = await fetch(`./data/history.json?_t=${Date.now()}`, {
-            signal: AbortSignal.timeout(3000),
-          });
-          if (historyResp.ok) {
-            const historyData = await historyResp.json();
-            this.historyData = historyData;
-            if (historyData?.commits?.length > 0 && this.forceGraphModule.initTimeTravel) {
-              const ready = this.forceGraphModule.initTimeTravel(historyData);
-              this.timeTravelAvailable = Boolean(ready ?? true);
-              console.log('[Viewer] Time-travel history loaded');
-            }
+          const histFetchOpts = (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function')
+            ? { signal: AbortSignal.timeout(3000) }
+            : undefined;
+          const historyData = await this.ensureHistoryLoaded(histFetchOpts, { force: forceHistoryRefresh });
+          if (historyData?.commits?.length > 0 && this.forceGraphModule.initTimeTravel) {
+            const ready = this.forceGraphModule.initTimeTravel(historyData);
+            this.timeTravelAvailable = Boolean(ready ?? true);
+            console.log('[Viewer] Time-travel history loaded');
           }
         } catch (histErr) {
           // history.json is optional, silently ignore if not found
@@ -6758,6 +7559,9 @@ function beadsApp() {
       if (filters.articulation) {
         filters.articulationIds = (this.articulationPoints || getArticulationPoints() || []).map(a => a?.id || a).filter(Boolean);
       }
+      if (filters.changedOnly) {
+        filters.changedIds = Object.keys(this.getDiffStatusMap());
+      }
 
       if (this.searchQuery) {
         this.issues = searchIssues(this.searchQuery, {
@@ -6830,6 +7634,7 @@ function beadsApp() {
         return Array.isArray(val) ? [...val] : [val];
       };
       const nextFilters = {
+        ...createDefaultFilters(),
         status: normalizeArr(overrides.status),
         type: normalizeArr(overrides.type),
         priority: normalizeArr(overrides.priority),
@@ -6842,6 +7647,8 @@ function beadsApp() {
         inCycle: Boolean(overrides.inCycle),
         overdue: Boolean(overrides.overdue),
         articulation: Boolean(overrides.articulation),
+        changedOnly: Boolean(overrides.changedOnly),
+        highRisk: Boolean(overrides.highRisk),
       };
       this.filters = nextFilters;
       if (!nextFilters.criticalPath) {
@@ -6851,7 +7658,11 @@ function beadsApp() {
       }
       this.searchQuery = '';
       this.selectedIssue = null;
+      this.modalDepRemovalResult = null;
+      this.modalCheckAddResult = null;
+      this.modalCheckAddTarget = '';
       this.graphDetailNode = null;
+      this.clearGraphCheckDepState({ clearHighlight: true });
       this.page = 1;
       this.view = 'issues';
       this.loadIssues();
@@ -6880,7 +7691,9 @@ function beadsApp() {
         this.graphFilters.label ||
         this.graphFilters.repo ||
         (this.graphFilters.search || '').trim() ||
-        this.graphFilters.showClosed === false
+        this.graphFilters.showClosed === false ||
+        this.graphFilters.changedOnly === true ||
+        this.graphFilters.highRiskOnly === true
       );
     },
 
@@ -6928,13 +7741,22 @@ function beadsApp() {
         case 'showClosed':
           this.forceGraphModule.setFilter('showClosed', Boolean(value));
           break;
+        case 'changedOnly':
+          if (this.hasDiff) {
+            this.forceGraphModule.setDiffStatusMap?.(this.getDiffStatusMap());
+          }
+          this.forceGraphModule.setFilter('changedOnly', Boolean(value));
+          break;
+        case 'highRiskOnly':
+          this.forceGraphModule.setFilter('highRiskOnly', Boolean(value));
+          break;
         default:
           break;
       }
     },
 
     clearGraphFilters() {
-      this.graphFilters = { status: '', priority: '', label: '', repo: '', search: '', showClosed: true };
+      this.graphFilters = { status: '', priority: '', label: '', repo: '', search: '', showClosed: true, changedOnly: false, highRiskOnly: false };
       if (this.forceGraphModule?.clearFilters && this.forceGraphReady) {
         this.forceGraphModule.clearFilters();
       }
@@ -6944,20 +7766,7 @@ function beadsApp() {
      * Clear all filters
      */
     clearFilters() {
-      this.filters = {
-        status: [],
-        type: [],
-        priority: [],
-        labels: [],
-        assignee: '',
-        repo: '',
-        hasBlockers: null,
-        isBlocking: null,
-        criticalPath: false,
-        inCycle: false,
-        overdue: false,
-        articulation: false,
-      };
+      this.filters = createDefaultFilters();
       this.showCriticalPath = false;
       this.criticalPathData = null;
       this.criticalPathAnimationStep = -1;
@@ -6968,22 +7777,134 @@ function beadsApp() {
     },
 
     /**
-     * Check if any filters are active
+     * Check if any filters are active (derived from createDefaultFilters() registry)
      */
     get hasActiveFilters() {
-      return this.filters.status?.length > 0 ||
-             this.filters.type?.length > 0 ||
-             this.filters.priority?.length > 0 ||
-             this.filters.labels?.length > 0 ||
-             this.filters.assignee ||
-             this.filters.repo ||
-             this.filters.hasBlockers !== null ||
-             this.filters.isBlocking !== null ||
-             Boolean(this.filters.criticalPath) ||
-             Boolean(this.filters.inCycle) ||
-             Boolean(this.filters.overdue) ||
-             Boolean(this.filters.articulation) ||
-             this.searchQuery;
+      const defaults = createDefaultFilters();
+      for (const [key, defVal] of Object.entries(defaults)) {
+        const cur = this.filters?.[key];
+        if (Array.isArray(defVal)) {
+          if (Array.isArray(cur) && cur.length > 0) return true;
+        } else if (typeof defVal === 'boolean') {
+          if (Boolean(cur)) return true;
+        } else if (defVal === null) {
+          if (cur !== null && cur !== undefined) return true;
+        } else if (cur) {
+          return true;
+        }
+      }
+      return Boolean(this.searchQuery);
+    },
+
+    /**
+     * Build (and memoize per diffData reference) an issue-ID -> diff metadata index
+     * from optional data/diff.json for per-issue badges, changed-only filtering,
+     * graph diff halos, and issue detail field-delta banners (W33-3).
+     */
+    getDiffIndex() {
+      const diffDataRef = this.diffData;
+      const diff = diffDataRef?.diff;
+      if (!this.hasDiff || !diff || typeof diff !== 'object') {
+        return {};
+      }
+      if (DIFF_INDEX_CACHE && DIFF_INDEX_CACHE.source === diffDataRef && DIFF_INDEX_CACHE.diff === diff) {
+        return DIFF_INDEX_CACHE.index;
+      }
+      const diffSince = String(
+        this.diffData?.diff_since ||
+        this.diffData?.from_revision ||
+        diff.from_revision ||
+        'baseline'
+      );
+      const index = {};
+      const statusLabels = {
+        added: '+NEW',
+        closed: '✓CLOSED',
+        reopened: '↺REOPENED',
+        removed: '-REMOVED',
+        modified: '~MODIFIED',
+      };
+      const put = (id, status, changes) => {
+        const key = String(id || '').trim();
+        if (!key) return;
+        const existing = index[key];
+        const mergedChanges = Array.isArray(changes) && changes.length > 0
+          ? changes
+          : (existing?.changes || []);
+        // Preserve higher-specificity lifecycle status (added/closed/reopened/removed) over generic modified
+        const finalStatus = (existing && status === 'modified') ? existing.status : status;
+        index[key] = {
+          id: key,
+          status: finalStatus,
+          label: statusLabels[finalStatus] || '~CHANGED',
+          diffSince,
+          changes: mergedChanges,
+        };
+      };
+      for (const item of (Array.isArray(diff.new_issues) ? diff.new_issues : [])) {
+        put(item?.id, 'added', []);
+      }
+      for (const item of (Array.isArray(diff.closed_issues) ? diff.closed_issues : [])) {
+        put(item?.id, 'closed', []);
+      }
+      for (const item of (Array.isArray(diff.reopened_issues) ? diff.reopened_issues : [])) {
+        put(item?.id, 'reopened', []);
+      }
+      for (const item of (Array.isArray(diff.removed_issues) ? diff.removed_issues : [])) {
+        put(item?.id, 'removed', []);
+      }
+      for (const item of (Array.isArray(diff.modified_issues) ? diff.modified_issues : [])) {
+        const rawChanges = Array.isArray(item?.changes) ? item.changes : [];
+        const changes = rawChanges
+          .filter(ch => ch && typeof ch === 'object' && ch.field)
+          .map(ch => ({
+            field: String(ch.field),
+            oldValue: ch.old_value != null ? String(ch.old_value) : '',
+            newValue: ch.new_value != null ? String(ch.new_value) : '',
+          }));
+        put(item?.issue_id || item?.id, 'modified', changes);
+      }
+      DIFF_INDEX_CACHE = { source: diffDataRef, diff, index };
+      return index;
+    },
+
+    /**
+     * Plain object mapping changed issue ID -> diff status ('added'|'closed'|'reopened'|'removed'|'modified').
+     */
+    getDiffStatusMap() {
+      const idx = this.getDiffIndex();
+      const map = {};
+      for (const [id, info] of Object.entries(idx)) {
+        if (info?.status) map[id] = info.status;
+      }
+      return map;
+    },
+
+    /**
+     * Look up diff metadata for a specific issue ID, or null if unchanged / no diff loaded.
+     */
+    getIssueDiffInfo(issueId) {
+      if (!this.hasDiff || !issueId) return null;
+      return this.getDiffIndex()[String(issueId)] || null;
+    },
+
+    /**
+     * Tailwind badge classes for historical diff status pills.
+     */
+    diffBadgeClass(status) {
+      switch (status) {
+        case 'added':
+          return 'bg-emerald-100 dark:bg-emerald-900/50 text-emerald-700 dark:text-emerald-300';
+        case 'closed':
+          return 'bg-blue-100 dark:bg-blue-900/50 text-blue-700 dark:text-blue-300';
+        case 'reopened':
+          return 'bg-amber-100 dark:bg-amber-900/50 text-amber-700 dark:text-amber-300';
+        case 'removed':
+          return 'bg-rose-100 dark:bg-rose-900/50 text-rose-700 dark:text-rose-300';
+        case 'modified':
+        default:
+          return 'bg-purple-100 dark:bg-purple-900/50 text-purple-700 dark:text-purple-300';
+      }
     },
 
     /**
@@ -7018,7 +7939,13 @@ function beadsApp() {
       if (String(this.searchQuery || '').trim().length > 0 && this.view !== 'issues') {
         this.selectedIssue = null;
         this.graphDetailNode = null;
+        this.whatIfResult = null;
+        this.modalDepRemovalResult = null;
+        this.modalCheckAddResult = null;
+        this.modalCheckAddTarget = '';
+        this.clearGraphCheckDepState({ clearHighlight: true });
         this.view = 'issues';
+        this.syncModalOpenBodyClass();
       }
       this.loadIssues();
     },
@@ -7061,10 +7988,14 @@ function beadsApp() {
         }
       }
       this.whatIfResult = null;
+      this.modalDepRemovalResult = null;
+      this.modalCheckAddResult = null;
+      this.modalCheckAddTarget = '';
       this.selectedIssue = issue;
 
-      if (this.issues.length) {
-        this.issueNavList = this.issues.map(i => i.id);
+      const navIds = this.currentIssueNavIds();
+      if (navIds.length) {
+        this.issueNavList = navIds;
       }
     },
 
@@ -7230,6 +8161,9 @@ function beadsApp() {
       this.selectedIssue = null;
       this.showDepGraph = false;
       this.whatIfResult = null;
+      this.modalDepRemovalResult = null;
+      this.modalCheckAddResult = null;
+      this.modalCheckAddTarget = '';
       ROOT_BLOCKERS_CACHE = null;
 
       // Navigate back
@@ -7267,9 +8201,12 @@ function beadsApp() {
     navigateIssue(direction, event) {
       if (!this.selectedIssue || this.isEditableEventTarget(event)) return;
 
-      // Build navigation list from current issues if not set
-      if (!this.issueNavList.length && this.issues.length) {
-        this.issueNavList = this.issues.map(i => i.id);
+      // Build navigation list from current issues mode if not set (P18B-11)
+      if (!this.issueNavList.length) {
+        const navIds = this.currentIssueNavIds();
+        if (navIds.length) {
+          this.issueNavList = navIds;
+        }
       }
 
       // Find current position
@@ -7290,6 +8227,9 @@ function beadsApp() {
         this.$refs.depGraph.innerHTML = '';
       }
       this.whatIfResult = null;
+      this.modalDepRemovalResult = null;
+      this.modalCheckAddResult = null;
+      this.modalCheckAddTarget = '';
       const route = parseRoute(window.location.hash);
       if (route.view === 'issue') {
         navigateToIssue(newId);
@@ -7699,6 +8639,9 @@ function beadsApp() {
       if (switchedView) {
         this.view = 'graph';
         this.selectedIssue = null;
+        this.modalDepRemovalResult = null;
+      this.modalCheckAddResult = null;
+      this.modalCheckAddTarget = '';
         if (window.location.hash !== '#/graph') {
           window.history.replaceState(null, '', '#/graph');
         }
@@ -7774,7 +8717,11 @@ function beadsApp() {
         this.filters.labels.splice(idx, 1);
       }
       this.selectedIssue = null;
+      this.modalDepRemovalResult = null;
+      this.modalCheckAddResult = null;
+      this.modalCheckAddTarget = '';
       this.graphDetailNode = null;
+      this.clearGraphCheckDepState({ clearHighlight: true });
       this.page = 1;
       if (this.view !== 'issues') {
         navigateToIssues(this.filters, this.sort, this.searchQuery, this.searchMode, this.searchPreset);
@@ -7840,6 +8787,7 @@ function beadsApp() {
         hitsHub: 'HITS Hub Score',
         hitsAuth: 'HITS Authority Score',
         slack: 'Schedule Slack',
+        risk: 'Operational Risk Score',
       };
       showToast(`Metric: ${metricLabels[metric] || metric}`, 'info');
     },
@@ -7913,6 +8861,12 @@ function beadsApp() {
       return resolveEffectiveTriageWeights(this.triageData);
     },
 
+    hasAppliedFeedbackWeights() {
+      const root = this.triageData?.triage && typeof this.triageData.triage === 'object' ? this.triageData.triage : this.triageData;
+      const fb = this.triageData?.feedback || root?.feedback || null;
+      return Boolean(fb && typeof fb === 'object' && fb.enabled !== false && fb.applied !== false && (fb.effective_weights || fb.adjusted_weights || fb.weights || fb.by_factor));
+    },
+
     getTriageWeightComponents() {
       const w = this.getEffectiveTriageWeights();
       return [
@@ -7983,7 +8937,10 @@ function beadsApp() {
     },
 
     getTriageSourceAuthority() {
-      return this.triageData?.source_authority ?? this.triageData?.triage?.source_authority ?? null;
+      return this.triageData?.source_authority ??
+        this.triageData?.triage?.source_authority ??
+        this.meta?.source_authority ??
+        null;
     },
 
     hasProvisionalSourceAuthority() {
@@ -8045,6 +9002,87 @@ function beadsApp() {
       return list.filter(s => s?.type === this.suggestionsTypeFilter);
     },
 
+    getIssueAlerts(id) {
+      const target = String(id || '').trim();
+      if (!target) return [];
+      const sevRank = (s) => {
+        const v = String(s || '').toLowerCase();
+        if (v === 'critical' || v === 'error') return 0;
+        if (v === 'warning') return 1;
+        if (v === 'info') return 2;
+        return 3;
+      };
+      const out = [];
+      const seenByKey = new Map();
+      const pushAlert = (raw, source) => {
+        if (!raw || typeof raw !== 'object') return;
+        const severity = String(raw.severity || 'warning').toLowerCase();
+        const type = String(raw.type || source || 'alert');
+        const message = String(raw.message || raw.summary || type).trim();
+        if (!message) return;
+        const suggestedAction = typeof raw.suggested_action === 'string' ? raw.suggested_action.trim() : '';
+        const delta = raw.delta ?? null;
+        const key = `${severity}\0${type}\0${message}`;
+        if (seenByKey.has(key)) {
+          const existing = seenByKey.get(key);
+          if (!existing.suggested_action && suggestedAction) existing.suggested_action = suggestedAction;
+          if (existing.delta === null && delta !== null) existing.delta = delta;
+          return;
+        }
+        const entry = {
+          source,
+          type,
+          severity,
+          message,
+          suggested_action: suggestedAction,
+          delta,
+          _idx: out.length,
+        };
+        seenByKey.set(key, entry);
+        out.push(entry);
+      };
+      for (const a of this.getTriageAlerts()) {
+        if (!a) continue;
+        const ids = Array.isArray(a.issue_ids) ? a.issue_ids : (a.issue_id ? [a.issue_id] : []);
+        if (a.issue_id === target || ids.includes(target)) {
+          pushAlert(a, 'triage');
+        }
+      }
+      const driftAlerts = this.hasDrift && Array.isArray(this.driftData?.alerts) ? this.driftData.alerts : [];
+      for (const a of driftAlerts) {
+        if (!a) continue;
+        if (a.issue_id === target || a.related_issue_id === target) {
+          pushAlert(a, 'drift');
+        }
+      }
+      return out.sort((a, b) => (sevRank(a.severity) - sevRank(b.severity)) || (a._idx - b._idx));
+    },
+
+    getIssueSuggestions(id) {
+      const target = String(id || '').trim();
+      if (!target) return [];
+      const list = Array.isArray(this.suggestionsData?.suggestions) ? this.suggestionsData.suggestions : [];
+      const canEmit = this.canEmitMutationCommand();
+      const matched = [];
+      for (const s of list) {
+        if (!s || typeof s !== 'object') continue;
+        if (s.target_bead !== target && s.related_bead !== target) continue;
+        const rawOther = s.target_bead === target ? (s.related_bead || '') : (s.target_bead || '');
+        const otherId = rawOther && rawOther !== target ? String(rawOther) : '';
+        matched.push({
+          type: String(s.type || 'suggestion'),
+          summary: String(s.summary || s.reason || s.type || 'Hygiene suggestion'),
+          reason: String(s.reason || ''),
+          confidence: Number(s.confidence) || 0,
+          target_bead: String(s.target_bead || ''),
+          related_bead: String(s.related_bead || ''),
+          other_bead: otherId,
+          action_command: canEmit && typeof s.action_command === 'string' ? s.action_command.trim() : '',
+        });
+      }
+      return matched.sort((a, b) => (b.confidence - a.confidence) || a.summary.localeCompare(b.summary)).slice(0, 6);
+    },
+
     async copySuggestionCommand(cmd) {
       if (!cmd) return;
       try {
@@ -8067,11 +9105,32 @@ function beadsApp() {
       }
     },
 
+    hydrateHistoryCommit(entry) {
+      if (!entry || typeof entry !== 'object') return entry;
+      const sha = typeof entry.sha === 'string' ? entry.sha : '';
+      const catalog = this.historyData?.commit_catalog;
+      const cat = (sha && catalog && Object.prototype.hasOwnProperty.call(catalog, sha)) ? catalog[sha] : null;
+      const shortSha = (entry.short_sha != null && entry.short_sha !== '') ? entry.short_sha : (cat?.short_sha || (sha.length >= 7 ? sha.slice(0, 7) : sha));
+      const message = (entry.message != null && entry.message !== '') ? entry.message : (cat?.message || '');
+      const author = (entry.author != null && entry.author !== '') ? entry.author : (cat?.author || '');
+      const timestamp = (entry.timestamp != null && entry.timestamp !== '') ? entry.timestamp : (cat?.timestamp || '');
+      return {
+        sha,
+        short_sha: shortSha,
+        message,
+        author,
+        timestamp,
+        method: entry.method || '',
+        confidence: typeof entry.confidence === 'number' ? entry.confidence : 0,
+      };
+    },
+
     getIssueCommits(id) {
       if (!id || !this.historyData) return [];
-      const h = this.historyData.histories?.[id];
+      const histories = this.historyData.histories;
+      const h = (histories && Object.prototype.hasOwnProperty.call(histories, id)) ? histories[id] : null;
       if (Array.isArray(h?.commits) && h.commits.length > 0) {
-        return h.commits;
+        return h.commits.filter(c => c && typeof c === 'object').map(c => this.hydrateHistoryCommit(c));
       }
       const commits = Array.isArray(this.historyData.commits) ? this.historyData.commits : [];
       if (commits.length === 0) return [];
@@ -8083,7 +9142,7 @@ function beadsApp() {
         else if (Array.isArray(c.beads_added) && c.beads_added.includes(id)) method = 'lifecycle:created';
         else if (Array.isArray(c.beads_removed) && c.beads_removed.includes(id)) method = 'lifecycle:deleted';
         if (method) {
-          derived.push({
+          derived.push(this.hydrateHistoryCommit({
             sha: c.sha,
             short_sha: String(c.sha).slice(0, 7),
             message: c.message || '',
@@ -8091,10 +9150,47 @@ function beadsApp() {
             timestamp: c.date || '',
             method,
             confidence: 1.0,
-          });
+          }));
         }
       }
       return derived.reverse();
+    },
+
+    getIssueLifecycle(id) {
+      if (!id || !this.historyData?.histories) return null;
+      const histories = this.historyData.histories;
+      const h = Object.prototype.hasOwnProperty.call(histories, id) ? histories[id] : null;
+      if (!h) return null;
+      const rawCt = h.cycle_time && typeof h.cycle_time === 'object' ? h.cycle_time : null;
+      const validHour = (v) => v !== null && v !== undefined && v !== '' && Number.isFinite(Number(v)) && Number(v) >= 0;
+      const ct = rawCt && (
+        validHour(rawCt.create_to_claim_hours) ||
+        validHour(rawCt.claim_to_close_hours) ||
+        validHour(rawCt.total_hours)
+      ) ? rawCt : null;
+      let milestones = [];
+      if (Array.isArray(h.milestones)) {
+        milestones = h.milestones.filter(m => m && m.event_type);
+      } else if (h.milestones && typeof h.milestones === 'object') {
+        for (const key of ['created', 'claimed', 'closed', 'reopened']) {
+          const ts = h.milestones[key];
+          if (typeof ts === 'string' && ts.trim() !== '') {
+            milestones.push({ event_type: key, timestamp: ts });
+          }
+        }
+      }
+      if (!ct && milestones.length === 0) return null;
+      return { cycleTime: ct, milestones };
+    },
+
+    formatLifecycleHours(hours) {
+      if (hours === null || hours === undefined || hours === '') return '';
+      const n = Number(hours);
+      if (!Number.isFinite(n) || n < 0) return '';
+      const mins = Math.round(n * 60);
+      if (mins < 60) return mins + 'm';
+      if (n < 48) return n.toFixed(1) + 'h';
+      return (n / 24).toFixed(1) + 'd';
     },
 
     getFileHotspots() {
@@ -8118,15 +9214,121 @@ function beadsApp() {
       return Math.round(ratio * 100);
     },
 
+    hydrateHistoryRelated(entry) {
+      if (!entry || typeof entry !== 'object') return entry;
+      const beadId = typeof entry.bead_id === 'string' ? entry.bead_id : '';
+      const catalog = this.historyData?.bead_catalog;
+      const cat = (beadId && catalog && Object.prototype.hasOwnProperty.call(catalog, beadId)) ? catalog[beadId] : null;
+      const out = {
+        bead_id: beadId,
+        title: (entry.title != null && entry.title !== '') ? entry.title : (cat?.title || ''),
+        status: (entry.status != null && entry.status !== '') ? entry.status : (cat?.status || ''),
+        relation_type: entry.relation_type || '',
+        relevance: typeof entry.relevance === 'number' ? entry.relevance : 0,
+      };
+      if (Array.isArray(entry.shared_files) && entry.shared_files.length > 0) {
+        out.shared_files = entry.shared_files;
+      }
+      if (typeof entry.shared_commits === 'number' && entry.shared_commits > 0) {
+        out.shared_commits = entry.shared_commits;
+      }
+      return out;
+    },
+
     getIssueRelatedWork(id) {
       if (!id || !this.historyData) return [];
-      const h = this.historyData.histories?.[id];
-      return Array.isArray(h?.related) ? h.related : [];
+      const histories = this.historyData.histories;
+      const h = (histories && Object.prototype.hasOwnProperty.call(histories, id)) ? histories[id] : null;
+      return Array.isArray(h?.related)
+        ? h.related.filter(r => r && typeof r === 'object').map(r => this.hydrateHistoryRelated(r))
+        : [];
     },
 
     getLabelCascades() {
       const list = Array.isArray(this.labelsData?.cascades) ? this.labelsData.cascades : [];
       return list.slice(0, 6);
+    },
+
+    getGraphHealthTelemetry() {
+      if (!this.graphReady) {
+        return { ready: false, hasCycles: false, degeneracy: null, criticalPathLength: null, totalFloat: null, waveCount: 0 };
+      }
+      return getGraphHealthTelemetry();
+    },
+
+    getExecutionWaves() {
+      if (!this.graphReady) {
+        return { ready: false, hasCycles: false, waves: [], totalIssues: 0 };
+      }
+      return getExecutionWaves();
+    },
+
+    getCrossRepoFlow() {
+      const flow = this.triageData?.project_health?.cross_repo_flow
+        ?? this.triageData?.triage?.project_health?.cross_repo_flow
+        ?? null;
+      if (!flow || !Array.isArray(flow.dependencies) || flow.dependencies.length === 0) {
+        return null;
+      }
+      return flow;
+    },
+
+    getDriftSummary() {
+      if (!this.hasDrift || !this.driftData) return null;
+      const d = this.driftData;
+      const sevRank = (s) => {
+        const v = String(s || '').toLowerCase();
+        if (v === 'critical') return 0;
+        if (v === 'warning') return 1;
+        if (v === 'info') return 2;
+        return 3;
+      };
+      const rawAlerts = Array.isArray(d.alerts) ? d.alerts : [];
+      const sortedAlerts = rawAlerts
+        .map((a, idx) => ({ a, idx }))
+        .sort((x, y) => (sevRank(x.a?.severity) - sevRank(y.a?.severity)) || (x.idx - y.idx))
+        .map(x => x.a);
+      const critical = sortedAlerts.filter(a => String(a?.severity || '').toLowerCase() === 'critical').length;
+      const warnings = sortedAlerts.filter(a => String(a?.severity || '').toLowerCase() === 'warning').length;
+      const infos = sortedAlerts.filter(a => String(a?.severity || '').toLowerCase() === 'info').length;
+      const status = critical > 0
+        ? 'critical'
+        : (warnings > 0 ? 'warning' : (infos > 0 || d.has_drift ? 'info' : 'ok'));
+      const rawSummary = typeof d.summary === 'string' ? d.summary.trim() : '';
+      const isCleanSingleLineSummary = rawSummary.length > 0 && !rawSummary.includes('\n') && !rawSummary.includes('====');
+      let summary = isCleanSingleLineSummary ? rawSummary : '';
+      if (!summary) {
+        if (sortedAlerts.length === 0) {
+          summary = d.has_drift ? 'Baseline drift detected' : 'No baseline drift detected';
+        } else {
+          const parts = [];
+          if (critical > 0) parts.push(`${critical} critical`);
+          if (warnings > 0) parts.push(`${warnings} warning`);
+          if (infos > 0) parts.push(`${infos} info`);
+          summary = parts.length > 0
+            ? `${sortedAlerts.length} drift alert(s) (${parts.join(', ')})`
+            : `${sortedAlerts.length} drift alert(s) detected`;
+        }
+      }
+      const skippedChecks = Array.isArray(d.skipped_checks)
+        ? d.skipped_checks.filter(sc => sc && typeof sc === 'object' && (sc.type || sc.check || sc.reason))
+        : [];
+      return {
+        status,
+        hasDrift: Boolean(d.has_drift || sortedAlerts.length > 0),
+        alertCount: sortedAlerts.length,
+        criticalCount: critical,
+        warningCount: warnings,
+        infoCount: infos,
+        alerts: sortedAlerts.slice(0, 6),
+        skippedChecks,
+        baselineCommit: d.baseline_commit || d.baseline?.commit_sha || d.baseline?.git_commit || '',
+        baselineCreatedAt: d.baseline_created_at || d.baseline?.created_at || '',
+        baselineDescription: typeof (d.baseline_description || d.baseline?.description) === 'string'
+          ? String(d.baseline_description || d.baseline?.description).trim()
+          : '',
+        summary,
+      };
     },
 
     getLabelTopUnblocks() {
@@ -8169,7 +9371,7 @@ function beadsApp() {
       const rec = this.getTriageRecommendations().find(r => r && r.id === issueId);
       const actions = rec?.actions || null;
       if (!actions) return null;
-      if (this.hasProvisionalSourceAuthority()) {
+      if (!this.canEmitRoutedMutationCommand()) {
         if (!actions.show) return null;
         const { claim: _claim, ...rest } = actions;
         return rest;
@@ -8177,13 +9379,13 @@ function beadsApp() {
       return actions;
     },
 
-    async copyShellCommand(cmd) {
+    async copyShellCommand(cmd, toastMsg = 'Command copied') {
       const text = String(cmd || '').trim();
       if (!text) return false;
       this.copiedCommandText = text;
       try {
         await navigator.clipboard.writeText(text);
-        showToast('Command copied', 'info');
+        showToast(toastMsg || 'Command copied', 'info');
         return true;
       } catch {
         showToast('Select command to copy manually', 'warning');
@@ -8210,7 +9412,11 @@ function beadsApp() {
       const next = String(repo || '').trim();
       this.filters.repo = this.filters.repo === next ? '' : next;
       this.selectedIssue = null;
+      this.modalDepRemovalResult = null;
+      this.modalCheckAddResult = null;
+      this.modalCheckAddTarget = '';
       this.graphDetailNode = null;
+      this.clearGraphCheckDepState({ clearHighlight: true });
       this.page = 1;
       if (this.view !== 'issues' || window.location.hash.startsWith('#/issue/')) {
         navigateToIssues(this.filters, this.sort, this.searchQuery, this.searchMode, this.searchPreset);
@@ -8231,8 +9437,8 @@ function beadsApp() {
       if (!nodeId) return false;
       this.closeGraphContextMenu();
       const ready = await this.initForceGraph();
-      if (!ready || !this.graphReady) {
-        showToast('What-If simulation requires WASM graph engine', 'info');
+      if (!ready || !this.forceGraphReady) {
+        showToast('Graph view is not ready for What-If simulation', 'info');
         return false;
       }
       const result = this.forceGraphModule?.performWhatIf?.(nodeId);
@@ -8243,8 +9449,8 @@ function beadsApp() {
       if (!nodeId) return;
       this.closeGraphContextMenu();
       const ready = await this.initForceGraph();
-      if (!ready || !this.graphReady) {
-        showToast('What-If simulation requires WASM graph engine', 'info');
+      if (!ready || !this.forceGraphReady) {
+        showToast('Graph view is not ready for What-If simulation', 'info');
         return;
       }
       const prevBatchIds = [...this.graphWhatIfBatchIds];
@@ -8273,8 +9479,8 @@ function beadsApp() {
       if (batchIds.length === 0) return false;
       this.closeGraphContextMenu();
       const ready = await this.initForceGraph();
-      if (!ready || !this.graphReady) {
-        showToast('What-If simulation requires WASM graph engine', 'info');
+      if (!ready || !this.forceGraphReady) {
+        showToast('Graph view is not ready for What-If simulation', 'info');
         return false;
       }
       const res = batchIds.length === 1
@@ -8289,6 +9495,18 @@ function beadsApp() {
     },
 
     // W30-4: Pre-Flight Dependency Validator ("Check Add Dep A → B")
+    clearGraphCheckDepState({ clearHighlight = false } = {}) {
+      const had = this.graphCheckDepMode || Boolean(this.graphCheckDepResult) || Boolean(this.graphCheckDepFromId);
+      this.graphCheckDepMode = false;
+      this.graphCheckDepFromId = '';
+      this.graphCheckDepResult = null;
+      this.forceGraphModule?.setCheckDepPicking?.(false);
+      if (clearHighlight && had) {
+        this.forceGraphModule?.clearCheckDepHighlight?.();
+      }
+      return had;
+    },
+
     startGraphCheckDep(fromId) {
       const id = String(fromId || '').trim();
       this.closeGraphContextMenu();
@@ -8296,26 +9514,30 @@ function beadsApp() {
       this.graphCheckDepMode = true;
       this.graphCheckDepFromId = id;
       this.graphCheckDepResult = null;
+      this.forceGraphModule?.setCheckDepPicking?.(true);
       this.forceGraphModule?.highlightCheckDepPath?.([id]);
       showToast(`Check Add Dep: click target blocker node for ${id}`, 'info');
       return true;
     },
 
     evaluateGraphCheckDep(fromId, toId) {
-      const allowCommand = !this.hasProvisionalSourceAuthority() &&
-        !this.meta?.as_of &&
-        !this.meta?.as_of_commit &&
-        !this.timeTravelActive;
+      const allowCommand = this.canEmitMutationCommand();
       const result = checkProposedDependency(fromId, toId, { allowCommand });
       this.graphCheckDepMode = false;
       this.graphCheckDepFromId = result.fromId;
       this.graphCheckDepResult = result;
-      const highlightIds = result.wouldCycle && result.cyclePath.length > 0
-        ? result.cyclePath
-        : [result.fromId, result.toId].filter(Boolean);
-      this.forceGraphModule?.highlightCheckDepPath?.(highlightIds);
+      this.forceGraphModule?.setCheckDepPicking?.(false);
+      if (result.wouldCycle && result.cyclePath.length > 0) {
+        this.forceGraphModule?.highlightCheckDepPath?.(result.cyclePath);
+      } else if (result.canAdd) {
+        this.forceGraphModule?.highlightCheckDepPath?.([result.fromId, result.toId].filter(Boolean));
+      } else {
+        this.forceGraphModule?.clearCheckDepHighlight?.();
+      }
       if (result.wouldCycle) {
         showToast(result.warning || `Cycle detected: ${result.cyclePath.join(' → ')}`, 'error');
+      } else if (!result.canAdd) {
+        showToast(result.warning || 'Invalid dependency endpoints', 'error');
       } else if (result.alreadyExists) {
         showToast(result.warning || 'Dependency already exists', 'info');
       } else {
@@ -8329,14 +9551,248 @@ function beadsApp() {
       return result;
     },
 
-    resetGraphCheckDep() {
-      const had = this.graphCheckDepMode || Boolean(this.graphCheckDepResult) || Boolean(this.graphCheckDepFromId);
-      this.graphCheckDepMode = false;
-      this.graphCheckDepFromId = '';
-      this.graphCheckDepResult = null;
-      if (had) {
-        this.forceGraphModule?.clearCheckDepHighlight?.();
+    // Go-verified origin-routed commands (claim, priority, orphan confirm) are valid in
+    // single-repo and multi-repo workspaces, but suppressed for provisional/read-only/time-travel snapshots.
+    canEmitRoutedMutationCommand() {
+      return !this.hasProvisionalSourceAuthority() &&
+        !this.meta?.as_of &&
+        !this.meta?.as_of_commit &&
+        !this.triageData?.as_of &&
+        !this.triageData?.as_of_commit &&
+        !this.timeTravelActive;
+    },
+
+    // JS-synthesized CLI commands (dep add/remove) additionally require non-workspace single-tracker context.
+    canEmitMutationCommand() {
+      return this.canEmitRoutedMutationCommand() &&
+        this.meta?.source_kind !== 'workspace' &&
+        this.triageData?.source_kind !== 'workspace';
+    },
+
+    evaluateModalDepRemoval(fromId, toId) {
+      const allowCommand = this.canEmitMutationCommand();
+      const result = checkProposedDepRemoval(fromId, toId, { allowCommand });
+      this.modalDepRemovalResult = result;
+      return result;
+    },
+
+    evaluateModalCheckAddDep(fromId, rawTargetId) {
+      const from = String(fromId || '').trim();
+      const to = String(rawTargetId ?? this.modalCheckAddTarget ?? '').trim();
+      if (!from || !to) {
+        this.modalCheckAddResult = {
+          operation: 'add',
+          fromId: from,
+          toId: to,
+          canAdd: false,
+          alreadyExists: false,
+          wouldCycle: false,
+          cyclePath: [],
+          wouldBlockActionable: false,
+          crossRepo: false,
+          missingIds: to ? [] : ['(target ID)'],
+          warning: 'Enter a target blocker issue ID to check',
+          command: '',
+        };
+        return this.modalCheckAddResult;
       }
+      const allowCommand = this.canEmitMutationCommand();
+      const result = checkProposedDependency(from, to, { allowCommand });
+      this.modalCheckAddResult = result;
+      return result;
+    },
+
+    isInModalWhatIfBatch(issueId) {
+      return Boolean(issueId) && this.modalWhatIfBatchIds.includes(issueId);
+    },
+
+    toggleModalWhatIfBatch(issueId) {
+      const id = String(issueId || '').trim();
+      if (!id || !this.graphReady) return null;
+      const exists = this.modalWhatIfBatchIds.includes(id);
+      const prevIds = this.modalWhatIfBatchIds;
+      const prevResult = this.modalWhatIfBatchResult;
+      const next = exists
+        ? prevIds.filter(x => x !== id)
+        : [...prevIds, id];
+      if (next.length === 0) {
+        this.modalWhatIfBatchIds = [];
+        this.modalWhatIfBatchResult = null;
+        return null;
+      }
+      const computed = next.length === 1
+        ? whatIfClose(next[0])
+        : whatIfCloseBatch(next);
+      if (!exists && (!computed || Number(computed.active_count || 0) < next.length)) {
+        this.modalWhatIfBatchIds = prevIds;
+        this.modalWhatIfBatchResult = prevResult;
+        showToast(`Cannot add ${id} to Batch What-If (closed or unavailable)`, 'info');
+        return null;
+      }
+      this.modalWhatIfBatchIds = next;
+      this.modalWhatIfBatchResult = computed;
+      return this.modalWhatIfBatchResult;
+    },
+
+    clearModalWhatIfBatch() {
+      this.modalWhatIfBatchIds = [];
+      this.modalWhatIfBatchResult = null;
+    },
+
+    getHighRiskSummary(limit = 8) {
+      // Touch reactive Alpine fields BEFORE any early return so x-show/x-for effects
+      // subscribe to loading/dbVersion/triageData transitions whenever DB_STATE.db loads/reloads (P28-B2/P29-10).
+      const loading = this.loading;
+      const dbVer = this.dbVersion;
+      const triageRef = this.triageData;
+      const normalizedLimit = Math.max(1, Number(limit) || 8);
+      const cols = getOverviewColumnSet();
+      if (loading || !DB_STATE.db || !cols.has('risk_score')) {
+        return { total: 0, items: [] };
+      }
+      if (
+        !HIGH_RISK_SUMMARY_CACHE ||
+        HIGH_RISK_SUMMARY_CACHE.db !== DB_STATE.db ||
+        HIGH_RISK_SUMMARY_CACHE.dbVer !== dbVer ||
+        HIGH_RISK_SUMMARY_CACHE.triage !== triageRef
+      ) {
+        HIGH_RISK_SUMMARY_CACHE = { db: DB_STATE.db, dbVer, triage: triageRef, byLimit: new Map() };
+      }
+      if (HIGH_RISK_SUMMARY_CACHE.byLimit.has(normalizedLimit)) {
+        return HIGH_RISK_SUMMARY_CACHE.byLimit.get(normalizedLimit);
+      }
+      try {
+        const countRows = execQuery(`
+          SELECT COUNT(*) AS cnt
+          FROM issue_overview_mv
+          WHERE LOWER(status) NOT IN ('closed', 'tombstone')
+            AND COALESCE(risk_score, 0) >= 0.5
+        `);
+        const total = Number(countRows?.[0]?.cnt) || 0;
+        if (total === 0) {
+          const empty = { total: 0, items: [] };
+          HIGH_RISK_SUMMARY_CACHE.byLimit.set(normalizedLimit, empty);
+          return empty;
+        }
+        const hasRiskExpl = cols.has('risk_explanation');
+        const rows = execQuery(`
+          SELECT id, title, status, priority, risk_score${hasRiskExpl ? ', risk_explanation' : ''}
+          FROM issue_overview_mv
+          WHERE LOWER(status) NOT IN ('closed', 'tombstone')
+            AND COALESCE(risk_score, 0) >= 0.5
+          ORDER BY risk_score DESC, priority ASC, id ASC
+          LIMIT ?
+        `, [normalizedLimit]);
+        const explById = new Map();
+        const recs = triageRef?.recommendations || triageRef?.triage?.recommendations || [];
+        if (Array.isArray(recs)) {
+          for (const rec of recs) {
+            if (!rec?.id) continue;
+            const expl = rec.breakdown?.risk_explanation || rec.breakdown?.risk_signals?.explanation || '';
+            if (expl) explById.set(String(rec.id), String(expl));
+          }
+        }
+        const items = rows.map(r => ({
+          id: r.id,
+          title: r.title || r.id,
+          status: r.status || 'open',
+          priority: Number(r.priority ?? 2),
+          risk_score: Number(r.risk_score) || 0,
+          risk_explanation: (hasRiskExpl && r.risk_explanation) || explById.get(String(r.id)) || 'Elevated operational risk',
+        }));
+        const value = { total, items };
+        HIGH_RISK_SUMMARY_CACHE.byLimit.set(normalizedLimit, value);
+        return value;
+      } catch {
+        return { total: 0, items: [] };
+      }
+    },
+
+    getHighRiskIssues(limit = 8) {
+      return this.getHighRiskSummary(limit).items;
+    },
+
+    getGraphDetailDirectBlockers() {
+      const id = this.graphDetailNode?.id;
+      if (!id) return [];
+      const groups = getIssueDependencyGroups(id);
+      const blockedBy = groups?.blockedBy;
+      if (Array.isArray(blockedBy) && blockedBy.length > 0) {
+        const seenIds = new Set();
+        const deduped = [];
+        for (const d of blockedBy) {
+          if (!d || !d.id || d.available === false || d.status === 'missing' || seenIds.has(d.id)) continue;
+          seenIds.add(d.id);
+          deduped.push(d);
+        }
+        return deduped;
+      }
+      const links = this.forceGraphModule?.getGraph?.()?.graphData?.()?.links || [];
+      const seen = new Set();
+      const out = [];
+      for (const l of links) {
+        const src = typeof l.source === 'object' ? l.source?.id : l.source;
+        const tgt = typeof l.target === 'object' ? l.target?.id : l.target;
+        const depType = String(l.type || 'blocks').trim().toLowerCase();
+        if (src === id && tgt && (!depType || depType === 'blocks' || depType === 'conditional-blocks' || depType === 'waits-for') && !seen.has(tgt)) {
+          seen.add(tgt);
+          const tgtNode = typeof l.target === 'object' ? l.target : null;
+          out.push({ id: tgt, title: tgtNode?.title || tgt, status: tgtNode?.status || 'open', dep_type: depType || 'blocks' });
+        }
+      }
+      return out;
+    },
+
+    evaluateGraphCheckDepRemoval(fromId, toId) {
+      const allowCommand = this.canEmitMutationCommand();
+      const result = checkProposedDepRemoval(fromId, toId, { allowCommand });
+      this.graphCheckDepMode = false;
+      this.graphCheckDepFromId = result.fromId;
+      this.graphCheckDepResult = result;
+      this.forceGraphModule?.setCheckDepPicking?.(false);
+      if (result.exists) {
+        this.forceGraphModule?.highlightCheckDepPath?.([result.fromId, result.toId, ...(result.newlyUnblocked || [])].filter(Boolean));
+        const parts = [];
+        if (result.cyclesTruncated) {
+          if (result.wouldBreakAllCycles) {
+            parts.push(`breaks ≥${result.cyclesBefore} (capped) → acyclic`);
+          } else if (result.cyclesBroken > 0) {
+            parts.push(`breaks ≥${result.cyclesBroken} (${result.cyclesAfter} remaining, capped)`);
+          } else {
+            parts.push('cycle cap reached (inconclusive)');
+          }
+        } else if (result.cyclesBefore > 0) {
+          parts.push(result.wouldBreakAllCycles
+            ? `breaks ${result.cyclesBroken}/${result.cyclesBefore} cycles → acyclic`
+            : `breaks ${result.cyclesBroken}/${result.cyclesBefore} cycles`);
+        }
+        if (result.newlyUnblocked.length > 0) {
+          parts.push(`unblocks ${result.newlyUnblocked.length}`);
+        }
+        showToast(
+          `Remove ${result.fromId} → ${result.toId}${parts.length ? ': ' + parts.join(', ') : ''}`,
+          result.wouldBreakAllCycles ? 'success' : (result.cyclesTruncated ? 'warning' : 'info')
+        );
+      } else {
+        this.forceGraphModule?.clearCheckDepHighlight?.();
+        showToast(result.warning || 'Blocking dependency does not exist', 'error');
+      }
+      return result;
+    },
+
+    resetGraphCheckDep() {
+      this.clearGraphCheckDepState({ clearHighlight: true });
+    },
+
+    // W30-6 / P18B-11 / P19-13: Current active issues navigation ID order across List | Board | Tree
+    currentIssueNavIds() {
+      if (this.issuesViewMode === 'tree' && this.issuesTreeFlatRows.length) {
+        return this.issuesTreeFlatRows.map(r => r.issue.id);
+      }
+      if (this.issuesViewMode === 'board' && this.issuesModeRows.length) {
+        return this.getIssuesBoardColumns().flatMap(col => col.items.map(i => i.id));
+      }
+      return this.issues.map(i => i.id);
     },
 
     // W30-6: Static Site Issues List | Board | Tree Mode Switcher
@@ -8369,9 +9825,18 @@ function beadsApp() {
       return cols;
     },
 
+    setIssuesTreeMode(mode) {
+      const next = mode === 'blocking' ? 'blocking' : 'hierarchy';
+      if (this.issuesTreeMode === next) return;
+      this.issuesTreeMode = next;
+      this.issuesTreeCollapsed = {};
+      this.rebuildIssuesTreeRows();
+    },
+
     rebuildIssuesTreeRows() {
       const rows = this.issuesModeRows || [];
       if (rows.length === 0) {
+        this.issuesTreeParentIds = [];
         this.issuesTreeFlatRows = [];
         return;
       }
@@ -8382,12 +9847,33 @@ function beadsApp() {
         orderIndex.set(iss.id, idx);
       });
 
-      const pcRows = execQuery(`
-        SELECT issue_id, depends_on_id
-        FROM dependencies
-        WHERE type = 'parent-child'
-        ORDER BY issue_id, depends_on_id
-      `);
+      const isBlockingMode = this.issuesTreeMode === 'blocking';
+      const pcRows = execQuery(isBlockingMode
+        ? `
+          SELECT issue_id, depends_on_id
+          FROM dependencies
+          WHERE LOWER(COALESCE(type, 'blocks')) IN ${BLOCKING_DEPENDENCY_TYPES_SQL}
+          ORDER BY issue_id, depends_on_id
+        `
+        : `
+          SELECT issue_id, depends_on_id
+          FROM dependencies
+          WHERE LOWER(type) = 'parent-child'
+          ORDER BY issue_id, depends_on_id
+        `);
+      if (isBlockingMode && pcRows.length > 1) {
+        const isClosedId = (id) => {
+          const st = String(byId.get(id)?.status || '').trim().toLowerCase();
+          return st === 'closed' || st === 'tombstone';
+        };
+        pcRows.sort((a, b) => {
+          const ac = isClosedId(a.depends_on_id) ? 1 : 0;
+          const bc = isClosedId(b.depends_on_id) ? 1 : 0;
+          if (ac !== bc) return ac - bc;
+          if (a.issue_id !== b.issue_id) return a.issue_id < b.issue_id ? -1 : 1;
+          return a.depends_on_id < b.depends_on_id ? -1 : (a.depends_on_id > b.depends_on_id ? 1 : 0);
+        });
+      }
       const parentOf = new Map();
       const childrenOf = new Map();
       const createsCycle = (childId, candParentId) => {
@@ -8442,6 +9928,26 @@ function beadsApp() {
         return res;
       };
 
+      const reachable = new Set();
+      const markReachable = (id) => {
+        if (reachable.has(id)) return;
+        reachable.add(id);
+        for (const kidId of (childrenOf.get(id) || [])) {
+          markReachable(kidId);
+        }
+      };
+      for (const rootId of roots) {
+        markReachable(rootId);
+      }
+      // Safety fallback: include any unreached cyclic parent-child components as roots
+      // without resurrecting children intentionally hidden under a collapsed parent.
+      for (const iss of rows) {
+        if (!reachable.has(iss.id)) {
+          roots.push(iss.id);
+          markReachable(iss.id);
+        }
+      }
+
       const flat = [];
       const visited = new Set();
       const walk = (id, depth) => {
@@ -8470,10 +9976,7 @@ function beadsApp() {
       for (const rootId of roots) {
         walk(rootId, 0);
       }
-      // Safety fallback: include any unvisited nodes as roots.
-      for (const iss of rows) {
-        if (!visited.has(iss.id)) walk(iss.id, 0);
-      }
+      this.issuesTreeParentIds = [...childrenOf.keys()];
       this.issuesTreeFlatRows = flat;
     },
 
@@ -8493,12 +9996,11 @@ function beadsApp() {
 
     collapseAllIssuesTree() {
       const next = {};
+      for (const id of (this.issuesTreeParentIds || [])) {
+        next[id] = true;
+      }
       for (const row of (this.issuesTreeFlatRows || [])) {
         if (row.hasChildren) next[row.issue.id] = true;
-      }
-      // Also mark any collapsed parent nodes already in the tree.
-      for (const row of (this.issuesModeRows || [])) {
-        if (this.issuesTreeCollapsed[row.id]) next[row.id] = true;
       }
       this.issuesTreeCollapsed = next;
       this.rebuildIssuesTreeRows();
@@ -8582,6 +10084,7 @@ window.beadsViewer = {
   getViewerAssetQuerySuffix,
 
   // URL State & Router
+  createDefaultFilters,
   filtersToURL,
   filtersFromURL,
   syncFiltersToURL,

@@ -46,6 +46,8 @@ type InteractiveGraphOptions struct {
 	ForceFullAnalysis bool                       // Honor --force-full-analysis when computing auxiliary ETA stats
 	Triage            *analysis.TriageResult     // Full triage output for display
 	History           *correlation.HistoryReport // Git history correlation data
+	Diff              *analysis.SnapshotDiff     // Optional historical diff overlay (--diff-since, W32-3)
+	DiffSince         string                     // Optional historical ref label passed to --diff-since
 	Title             string
 	DataHash          string
 	Path              string // Output path - if empty, auto-generates based on project
@@ -114,20 +116,22 @@ type graphNode struct {
 	PriorityReason    string   `json:"priority_reason,omitempty"`
 
 	// Graph metrics
-	PageRank        float64 `json:"pagerank"`
-	Betweenness     float64 `json:"betweenness"`
-	Eigenvector     float64 `json:"eigenvector"`
-	Hub             float64 `json:"hub"`
-	Authority       float64 `json:"authority"`
-	CriticalPath    float64 `json:"critical_path"`
-	InDegree        int     `json:"in_degree"`
-	OutDegree       int     `json:"out_degree"`
-	CoreNumber      int     `json:"core_number"`
-	Slack           float64 `json:"slack"`
-	SlackAvailable  bool    `json:"slack_available"`
-	IsArticulation  bool    `json:"is_articulation"`
-	PageRankRank    int     `json:"pagerank_rank"`
-	BetweennessRank int     `json:"betweenness_rank"`
+	PageRank        float64  `json:"pagerank"`
+	Betweenness     float64  `json:"betweenness"`
+	Eigenvector     float64  `json:"eigenvector"`
+	Hub             float64  `json:"hub"`
+	Authority       float64  `json:"authority"`
+	CriticalPath    float64  `json:"critical_path"`
+	InDegree        int      `json:"in_degree"`
+	OutDegree       int      `json:"out_degree"`
+	CoreNumber      int      `json:"core_number"`
+	Slack           float64  `json:"slack"`
+	SlackAvailable  bool     `json:"slack_available"`
+	IsArticulation  bool     `json:"is_articulation"`
+	PageRankRank    int      `json:"pagerank_rank"`
+	BetweennessRank int      `json:"betweenness_rank"`
+	DiffStatus      string   `json:"diff_status,omitempty"` // added|closed|reopened|modified when --diff-since is set (W32-3)
+	DiffFields      []string `json:"diff_fields,omitempty"`
 }
 
 // graphLink represents an edge in the interactive graph
@@ -471,6 +475,7 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 	var priorityHints map[string]analysis.PriorityRecommendation
 
 	var riskSignals map[string]analysis.RiskSignals
+	var advInsightsPayload map[string]interface{}
 	if opts.Stats != nil {
 		etaSource := opts.VelocityIssues
 		etaStats := opts.Stats
@@ -541,6 +546,116 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 				}
 			}
 		}
+		// W36-4 / P28-A9: Embed strictly scoped TopKSet, ParallelCut, and KPaths for Standalone Graph Structural tab.
+		inScope := func(id string) bool {
+			return issueMap[id] && (opts.CandidateIDs == nil || opts.CandidateIDs[id])
+		}
+		if adv := prioAn.GenerateAdvancedInsightsFromStats(opts.Stats, analysis.DefaultAdvancedInsightsConfig()); adv != nil {
+			advMap := make(map[string]interface{})
+			if adv.TopKSet != nil && len(adv.TopKSet.Items) > 0 {
+				var topK []analysis.TopKSetItem
+				totalGain := 0
+				for _, item := range adv.TopKSet.Items {
+					if !inScope(item.ID) {
+						continue
+					}
+					cloned := item
+					if len(item.Unblocks) > 0 {
+						kept := make([]string, 0, len(item.Unblocks))
+						for _, uid := range item.Unblocks {
+							if inScope(uid) {
+								kept = append(kept, uid)
+							}
+						}
+						cloned.Unblocks = kept
+						if len(kept) != len(item.Unblocks) || opts.CandidateIDs != nil {
+							cloned.MarginalGain = len(kept)
+						}
+					}
+					if cloned.MarginalGain <= 0 && len(cloned.Unblocks) == 0 {
+						continue
+					}
+					topK = append(topK, cloned)
+					totalGain += cloned.MarginalGain
+					if len(topK) >= 5 {
+						break
+					}
+				}
+				if len(topK) > 0 {
+					advMap["top_k_set"] = map[string]interface{}{
+						"items":      topK,
+						"total_gain": totalGain,
+					}
+				}
+			}
+			if adv.ParallelCut != nil && len(adv.ParallelCut.Suggestions) > 0 {
+				var pcuts []analysis.ParallelCutItem
+				maxPar := 0
+				for _, pc := range adv.ParallelCut.Suggestions {
+					if !inScope(pc.ID) {
+						continue
+					}
+					clonedPC := pc
+					if len(pc.EnabledTracks) > 0 {
+						keptTracks := make([]string, 0, len(pc.EnabledTracks))
+						for _, tid := range pc.EnabledTracks {
+							if inScope(tid) {
+								keptTracks = append(keptTracks, tid)
+							}
+						}
+						clonedPC.EnabledTracks = keptTracks
+						if len(keptTracks) != len(pc.EnabledTracks) || opts.CandidateIDs != nil {
+							clonedPC.ParallelGain = len(keptTracks) - 1
+						}
+					}
+					if clonedPC.ParallelGain <= 0 {
+						continue
+					}
+					if clonedPC.ParallelGain+1 > maxPar {
+						maxPar = clonedPC.ParallelGain + 1
+					}
+					pcuts = append(pcuts, clonedPC)
+					if len(pcuts) >= 5 {
+						break
+					}
+				}
+				if len(pcuts) > 0 {
+					advMap["parallel_cut"] = map[string]interface{}{
+						"suggestions":  pcuts,
+						"max_parallel": maxPar,
+					}
+				}
+			}
+			if adv.KPaths != nil && len(adv.KPaths.Paths) > 0 {
+				var kpaths []analysis.CriticalPath
+				for _, p := range adv.KPaths.Paths {
+					if len(p.IssueIDs) < 2 {
+						continue
+					}
+					allVis := true
+					for _, id := range p.IssueIDs {
+						if !inScope(id) {
+							allVis = false
+							break
+						}
+					}
+					if allVis {
+						kpaths = append(kpaths, p)
+						if len(kpaths) >= 5 {
+							break
+						}
+					}
+				}
+				if len(kpaths) > 0 {
+					advMap["k_paths"] = map[string]interface{}{
+						"paths": kpaths,
+					}
+				}
+			}
+			if len(advMap) > 0 {
+				advInsightsPayload = advMap
+			}
+		}
 		pageRank = opts.Stats.PageRank()
 		betweenness = opts.Stats.Betweenness()
 		eigenvector = opts.Stats.Eigenvector()
@@ -594,6 +709,33 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 			if dep != nil && dep.Type.IsBlocking() && isActiveIssue(dep.DependsOnID) {
 				blocksMap[dep.DependsOnID] = append(blocksMap[dep.DependsOnID], iss.ID)
 			}
+		}
+	}
+
+	// Build optional historical diff status maps when --diff-since was supplied (W32-3)
+	diffStatusByID := make(map[string]string)
+	diffFieldsByID := make(map[string][]string)
+	if opts.Diff != nil {
+		for _, iss := range opts.Diff.ModifiedIssues {
+			diffStatusByID[iss.IssueID] = "modified"
+			var fields []string
+			for _, ch := range iss.Changes {
+				if f := strings.TrimSpace(ch.Field); f != "" {
+					fields = append(fields, f)
+				}
+			}
+			if len(fields) > 0 {
+				diffFieldsByID[iss.IssueID] = fields
+			}
+		}
+		for _, iss := range opts.Diff.ReopenedIssues {
+			diffStatusByID[iss.ID] = "reopened"
+		}
+		for _, iss := range opts.Diff.ClosedIssues {
+			diffStatusByID[iss.ID] = "closed"
+		}
+		for _, iss := range opts.Diff.NewIssues {
+			diffStatusByID[iss.ID] = "added"
 		}
 	}
 
@@ -705,6 +847,8 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 			IsArticulation:  isActiveIssue(iss.ID) && articulationSet[iss.ID],
 			PageRankRank:    pageRankRank[iss.ID],
 			BetweennessRank: betweennessRank[iss.ID],
+			DiffStatus:      diffStatusByID[iss.ID],
+			DiffFields:      diffFieldsByID[iss.ID],
 		}
 		if !isActiveIssue(iss.ID) {
 			node.Betweenness = 0
@@ -896,6 +1040,9 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 	if len(cycleBreaks) > 0 {
 		graphData["cycle_breaks"] = cycleBreaks
 	}
+	if len(advInsightsPayload) > 0 {
+		graphData["advanced_insights"] = advInsightsPayload
+	}
 	for key, value := range opts.RobotEnvelope {
 		graphData[key] = value
 	}
@@ -909,6 +1056,32 @@ func GenerateInteractiveGraphHTML(opts InteractiveGraphOptions) (string, error) 
 	if opts.History != nil {
 		graphData["history_stats"] = opts.History.Stats
 		graphData["git_range"] = opts.History.GitRange
+	}
+
+	// Add historical diff summary if --diff-since was supplied (W32-3)
+	if opts.Diff != nil {
+		ref := strings.TrimSpace(opts.DiffSince)
+		if ref == "" {
+			ref = strings.TrimSpace(opts.Diff.FromRevision)
+		}
+		if ref == "" {
+			ref = "baseline"
+		}
+		removedIDs := make([]string, 0, len(opts.Diff.RemovedIssues))
+		for _, rm := range opts.Diff.RemovedIssues {
+			removedIDs = append(removedIDs, rm.ID)
+		}
+		graphData["diff_summary"] = map[string]interface{}{
+			"diff_since":      ref,
+			"issues_added":    opts.Diff.Summary.IssuesAdded,
+			"issues_closed":   opts.Diff.Summary.IssuesClosed,
+			"issues_reopened": opts.Diff.Summary.IssuesReopened,
+			"issues_removed":  opts.Diff.Summary.IssuesRemoved,
+			"issues_modified": opts.Diff.Summary.IssuesModified,
+			"cycle_delta":     opts.Diff.MetricDeltas.CycleCount,
+			"health_trend":    opts.Diff.Summary.HealthTrend,
+			"removed_ids":     removedIDs,
+		}
 	}
 
 	dataJSON, err := json.Marshal(graphData)

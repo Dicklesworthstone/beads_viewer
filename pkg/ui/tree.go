@@ -336,10 +336,11 @@ type TreeModel struct {
 	hasParentChildEdges bool          // True when ≥1 parent-child edge exists in issues
 	hasBlockingEdges    bool          // True when ≥1 blocking edge exists in issues
 
-	// Optional enrichment telemetry (W28-3)
+	// Optional enrichment telemetry (W28-3 + W33-5)
 	workspaceMode     bool
 	showPriorityHints bool
 	priorityHints     map[string]*analysis.PriorityRecommendation
+	riskByID          map[string]analysis.RiskSignals
 	analyzer          *analysis.Analyzer
 	analysis          *analysis.GraphStats
 	etaCtx            *analysis.ETAContext
@@ -349,6 +350,94 @@ type TreeModel struct {
 	// Persistence state (bv-19vz)
 	beadsDir string // Directory containing .beads (for tree-state.json)
 	readOnly bool   // When true, saveState is a strict no-op (e.g., --as-of / time-travel)
+
+	// Multi-issue Batch What-If state (W38-5, matching Graph/Actionable/Board parity)
+	whatIfBatchIDs    []string
+	whatIfBatchSet    map[string]bool
+	whatIfBatchResult *analysis.WhatIfBatchResult
+}
+
+// ToggleWhatIfBatch adds or removes an issue ID from the Tree Batch What-If selection.
+func (t *TreeModel) ToggleWhatIfBatch(id string) bool {
+	if id == "" {
+		return false
+	}
+	if t.whatIfBatchSet == nil {
+		t.whatIfBatchSet = make(map[string]bool)
+	}
+	if t.whatIfBatchSet[id] {
+		delete(t.whatIfBatchSet, id)
+		filtered := t.whatIfBatchIDs[:0]
+		for _, existing := range t.whatIfBatchIDs {
+			if existing != id {
+				filtered = append(filtered, existing)
+			}
+		}
+		t.whatIfBatchIDs = filtered
+		if len(t.whatIfBatchIDs) == 0 {
+			t.whatIfBatchResult = nil
+		}
+		t.ensureCursorVisible()
+		return false
+	}
+	t.whatIfBatchSet[id] = true
+	t.whatIfBatchIDs = append(t.whatIfBatchIDs, id)
+	t.ensureCursorVisible()
+	return true
+}
+
+// ClearWhatIfBatch resets the Tree Batch What-If selection and cached result.
+func (t *TreeModel) ClearWhatIfBatch() {
+	t.whatIfBatchIDs = nil
+	t.whatIfBatchSet = nil
+	t.whatIfBatchResult = nil
+	t.ensureCursorVisible()
+}
+
+// HasWhatIfBatch reports whether any issue is currently queued in Tree Batch What-If.
+func (t *TreeModel) HasWhatIfBatch() bool {
+	return len(t.whatIfBatchIDs) > 0
+}
+
+// IsInWhatIfBatch reports whether id is currently queued in Tree Batch What-If.
+func (t *TreeModel) IsInWhatIfBatch(id string) bool {
+	return t.whatIfBatchSet != nil && t.whatIfBatchSet[id]
+}
+
+// WhatIfBatchIDs returns a defensive copy of the queued Tree Batch What-If IDs.
+func (t *TreeModel) WhatIfBatchIDs() []string {
+	return append([]string(nil), t.whatIfBatchIDs...)
+}
+
+// SetWhatIfBatchResult stores the latest joint What-If computation for Tree view.
+func (t *TreeModel) SetWhatIfBatchResult(res *analysis.WhatIfBatchResult) {
+	t.whatIfBatchResult = res
+}
+
+// SyncWhatIfBatch prunes any queued IDs that are no longer open/present in the
+// active tree and returns true if any batch IDs remain.
+func (t *TreeModel) SyncWhatIfBatch() bool {
+	if len(t.whatIfBatchIDs) == 0 {
+		return false
+	}
+	kept := make([]string, 0, len(t.whatIfBatchIDs))
+	nextSet := make(map[string]bool, len(t.whatIfBatchIDs))
+	for _, id := range t.whatIfBatchIDs {
+		node, ok := t.issueMap[id]
+		if !ok || node == nil || node.Issue == nil || isClosedLikeStatus(node.Issue.Status) || node.Issue.Status == model.StatusTombstone {
+			continue
+		}
+		kept = append(kept, id)
+		nextSet[id] = true
+	}
+	if len(kept) == 0 {
+		t.ClearWhatIfBatch()
+		return false
+	}
+	t.whatIfBatchIDs = kept
+	t.whatIfBatchSet = nextSet
+	t.ensureCursorVisible()
+	return true
 }
 
 // SetWorkspaceMode enables multi-repo source_repo badges on tree rows.
@@ -360,6 +449,11 @@ func (t *TreeModel) SetWorkspaceMode(enabled bool) {
 func (t *TreeModel) SetPriorityHints(hints map[string]*analysis.PriorityRecommendation, show bool) {
 	t.priorityHints = hints
 	t.showPriorityHints = show
+}
+
+// SetRiskByID injects scoped operational risk signals for compact high-risk row badges (W33-5).
+func (t *TreeModel) SetRiskByID(risk map[string]analysis.RiskSignals) {
+	t.riskByID = risk
 }
 
 // SetTelemetry injects scoped graph analyzer, stats, and ETA context for tree badges.
@@ -1066,6 +1160,9 @@ func (t *TreeModel) treeViewportLayout() (headerLines, visibleCount int, showFoo
 		return 0, 1, false
 	}
 	headerLines = 1
+	if len(t.whatIfBatchIDs) > 0 && totalHeight >= 3 {
+		headerLines = 2
+	}
 	availAfterHeader := totalHeight - headerLines
 	if len(t.flatList) <= availAfterHeader {
 		return headerLines, availAfterHeader, false
@@ -1076,6 +1173,38 @@ func (t *TreeModel) treeViewportLayout() (headerLines, visibleCount int, showFoo
 	return headerLines, 1, false
 }
 
+func (t *TreeModel) renderWhatIfBatchBanner() string {
+	r := t.theme.Renderer
+	count := len(t.whatIfBatchIDs)
+	shown := t.whatIfBatchIDs
+	more := ""
+	if len(shown) > 4 {
+		more = fmt.Sprintf(" +%d", len(shown)-4)
+		shown = shown[:4]
+	}
+	summary := fmt.Sprintf("⚡ Batch What-If (%d: %s%s)", count, strings.Join(shown, ", "), more)
+	if t.whatIfBatchResult != nil {
+		syn := ""
+		if t.whatIfBatchResult.SynergyUnblocks > 0 {
+			syn = fmt.Sprintf(", ★ %d synergy", t.whatIfBatchResult.SynergyUnblocks)
+		}
+		summary = fmt.Sprintf("%s → +%d direct (+%d cascade%s) • W: toggle • Esc: clear",
+			summary,
+			t.whatIfBatchResult.Delta.DirectUnblocks,
+			t.whatIfBatchResult.Delta.TransitiveUnblocks,
+			syn)
+	}
+	line := r.NewStyle().Foreground(t.theme.Open).Bold(true).Render(summary)
+	if t.width > 0 && lipgloss.Width(line) > t.width {
+		tail := "…"
+		if t.width <= 1 {
+			tail = ""
+		}
+		line = ansi.Truncate(line, t.width, tail)
+	}
+	return line
+}
+
 func (t *TreeModel) renderHeader() string {
 	r := t.theme.Renderer
 	badgeStyle := r.NewStyle().Foreground(t.theme.Primary).Bold(true)
@@ -1083,11 +1212,11 @@ func (t *TreeModel) renderHeader() string {
 
 	var header string
 	if t.mode == TreeModeBlocking {
-		header = badgeStyle.Render("Tree [Blocking Chain]") + hintStyle.Render(" — b/m: Hierarchy mode")
+		header = badgeStyle.Render("Tree [Blocking Chain]") + hintStyle.Render(" — b/m: Hierarchy • W: batch What-If")
 	} else {
-		hint := " — b/m: Blocking Tree mode"
+		hint := " — b/m: Blocking Tree • W: batch What-If"
 		if !t.hasParentChildEdges && len(t.issues) > 0 {
-			hint = " — no parent-child deps (Press b/m for Blocking Tree mode)"
+			hint = " — no parent-child deps (press b/m for Blocking Tree mode • W: batch)"
 		}
 		header = badgeStyle.Render("Tree [Hierarchy]") + hintStyle.Render(hint)
 	}
@@ -1112,6 +1241,9 @@ func (t *TreeModel) View() string {
 	lines := make([]string, 0, headerLines+(end-start)+1)
 	if headerLines > 0 {
 		lines = append(lines, t.renderHeader())
+	}
+	if headerLines >= 2 && len(t.whatIfBatchIDs) > 0 {
+		lines = append(lines, t.renderWhatIfBatchBanner())
 	}
 
 	// Render only visible nodes (bv-db02: windowed rendering)
@@ -1329,6 +1461,10 @@ func (t *TreeModel) renderNode(node *IssueTreeNode, isSelected bool) string {
 	idStyle := r.NewStyle().Foreground(t.theme.Highlight)
 	leftBuilder.WriteString(idStyle.Render(cleanID))
 	leftBuilder.WriteString(" ")
+	if t.IsInWhatIfBatch(issue.ID) {
+		leftBuilder.WriteString(r.NewStyle().Foreground(t.theme.Open).Bold(true).Render("[W]"))
+		leftBuilder.WriteString(" ")
+	}
 
 	leftBase := leftBuilder.String()
 
@@ -1364,7 +1500,17 @@ func (t *TreeModel) renderNode(node *IssueTreeNode, isSelected bool) string {
 
 	graphSeg := ""
 	etaSeg := ""
+	riskSeg := ""
 	if !isClosedLikeStatus(issue.Status) && issue.Status != model.StatusTombstone {
+		if !issue.IsTemplate && !issue.Pinned && issue.Status != model.StatusPinned && t.riskByID != nil {
+			if sig, ok := t.riskByID[issue.ID]; ok && sig.CompositeRisk >= 0.50 {
+				riskColor := t.theme.InProgress
+				if sig.CompositeRisk >= 0.60 {
+					riskColor = t.theme.Blocked
+				}
+				riskSeg = " " + r.NewStyle().Foreground(riskColor).Bold(true).Render(fmt.Sprintf("⚠%.0f%%", sig.CompositeRisk*100))
+			}
+		}
 		tel := t.nodeTelemetry(issue)
 		var gParts []string
 		if tel.directUnblocks > 0 {
@@ -1401,13 +1547,17 @@ func (t *TreeModel) renderNode(node *IssueTreeNode, isSelected bool) string {
 		}
 		buildParts := func() (string, string, int) {
 			lp := leftBase + repoSeg
-			rp := rollupSeg + prioHintSeg + graphSeg + etaSeg + statusPart
+			rp := rollupSeg + prioHintSeg + riskSeg + graphSeg + etaSeg + statusPart
 			return lp, rp, availRowWidth - lipgloss.Width(lp) - lipgloss.Width(rp)
 		}
 		leftPart, rightPart, maxTitleLen := buildParts()
 		// Progressively shed optional badges so narrow terminals keep ID + Title + Status legible.
 		if maxTitleLen < 12 && etaSeg != "" {
 			etaSeg = ""
+			leftPart, rightPart, maxTitleLen = buildParts()
+		}
+		if maxTitleLen < 12 && riskSeg != "" {
+			riskSeg = ""
 			leftPart, rightPart, maxTitleLen = buildParts()
 		}
 		if maxTitleLen < 12 && graphSeg != "" {
@@ -1443,7 +1593,7 @@ func (t *TreeModel) renderNode(node *IssueTreeNode, isSelected bool) string {
 	}
 
 	leftPart := leftBase + repoSeg
-	rightPart := rollupSeg + prioHintSeg + graphSeg + etaSeg + statusPart
+	rightPart := rollupSeg + prioHintSeg + riskSeg + graphSeg + etaSeg + statusPart
 	title = t.truncateTitle(title, 80)
 	return leftPart + title + rightPart
 }

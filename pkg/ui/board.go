@@ -47,10 +47,12 @@ type BoardModel struct {
 	readiness *model.ReadinessIndex
 
 	// Optional graph intelligence for the Kanban detail pane (What-If cascade,
-	// transitive root blockers, structural metrics, and ETA forecast).
-	analyzer *analysis.Analyzer
-	analysis *analysis.GraphStats
-	etaCtx   *analysis.ETAContext
+	// transitive root blockers, structural metrics, ETA forecast, risk & priority alignment).
+	analyzer      *analysis.Analyzer
+	analysis      *analysis.GraphStats
+	etaCtx        *analysis.ETAContext
+	priorityHints map[string]*analysis.PriorityRecommendation
+	riskByID      map[string]analysis.RiskSignals
 
 	// Optional reference clock (e.g. --as-of) for time-gated deferral and card age.
 	referenceNow time.Time
@@ -87,6 +89,11 @@ type BoardModel struct {
 	// expandedCardID tracks which card is currently expanded inline
 	// Empty string means no card is expanded
 	expandedCardID string
+
+	// Multi-issue Batch What-If state (W35-6)
+	whatIfBatchIDs    []string
+	whatIfBatchSet    map[string]bool
+	whatIfBatchResult *analysis.WhatIfBatchResult
 }
 
 // boardDetailCache shares rendered detail markdown across value-receiver View()
@@ -102,9 +109,11 @@ type boardDetailCache struct {
 }
 
 func (b *BoardModel) invalidateDetailCache() {
-	b.lastDetailID = ""
+	// P24A-7: Invalidate cached width/rendered output without zeroing b.lastDetailID so
+	// in-place metadata refreshes (risk/priority/ETA updates) preserve the user's scroll
+	// offset (clamped to maxY) while still forcing a full Glamour re-render.
+	b.lastDetailWidth = 0
 	if b.detailCache != nil {
-		b.detailCache.issueID = ""
 		b.detailCache.width = 0
 		b.detailCache.rendered = ""
 	}
@@ -161,6 +170,7 @@ func (b *BoardModel) SetAnalyzer(a *analysis.Analyzer) {
 		return
 	}
 	b.analyzer = a
+	b.reconcileWhatIfBatchScope()
 	b.invalidateDetailCache()
 }
 
@@ -170,6 +180,7 @@ func (b *BoardModel) SetAnalysis(s *analysis.GraphStats) {
 		return
 	}
 	b.analysis = s
+	b.reconcileWhatIfBatchScope()
 	b.invalidateDetailCache()
 }
 
@@ -180,6 +191,158 @@ func (b *BoardModel) SetETAContext(ctx *analysis.ETAContext) {
 	}
 	b.etaCtx = ctx
 	b.invalidateDetailCache()
+}
+
+func boardPriorityHintsEqual(a, b map[string]*analysis.PriorityRecommendation) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	firstReason := func(rec *analysis.PriorityRecommendation) string {
+		if rec == nil || len(rec.Reasoning) == 0 {
+			return ""
+		}
+		return strings.TrimSpace(rec.Reasoning[0])
+	}
+	for k, va := range a {
+		vb, ok := b[k]
+		if !ok {
+			return false
+		}
+		if va == vb {
+			continue
+		}
+		if va == nil || vb == nil ||
+			va.CurrentPriority != vb.CurrentPriority ||
+			va.SuggestedPriority != vb.SuggestedPriority ||
+			va.Direction != vb.Direction ||
+			va.Confidence != vb.Confidence ||
+			firstReason(va) != firstReason(vb) {
+			return false
+		}
+	}
+	return true
+}
+
+func boardRiskMapsEqual(a, b map[string]analysis.RiskSignals) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, va := range a {
+		vb, ok := b[k]
+		if !ok || va.CompositeRisk != vb.CompositeRisk || va.Explanation != vb.Explanation {
+			return false
+		}
+	}
+	return true
+}
+
+// SetPriorityHints attaches scoped priority misalignment recommendations for the detail pane (W33-5).
+func (b *BoardModel) SetPriorityHints(hints map[string]*analysis.PriorityRecommendation) {
+	if boardPriorityHintsEqual(b.priorityHints, hints) {
+		return
+	}
+	b.priorityHints = hints
+	b.invalidateDetailCache()
+}
+
+// SetRiskByID attaches scoped operational risk signals for Kanban cards and detail pane (W33-5).
+func (b *BoardModel) SetRiskByID(risk map[string]analysis.RiskSignals) {
+	if boardRiskMapsEqual(b.riskByID, risk) {
+		return
+	}
+	b.riskByID = risk
+	b.invalidateDetailCache()
+}
+
+// ToggleWhatIfBatch adds or removes id from the Kanban board's multi-issue Batch What-If selection (W35-6).
+func (b *BoardModel) ToggleWhatIfBatch(id string) bool {
+	if id == "" {
+		return false
+	}
+	if b.whatIfBatchSet == nil {
+		b.whatIfBatchSet = make(map[string]bool)
+	}
+	if b.whatIfBatchSet[id] {
+		delete(b.whatIfBatchSet, id)
+		filtered := make([]string, 0, len(b.whatIfBatchIDs))
+		for _, cur := range b.whatIfBatchIDs {
+			if cur != id {
+				filtered = append(filtered, cur)
+			}
+		}
+		b.whatIfBatchIDs = filtered
+		if len(b.whatIfBatchIDs) == 0 {
+			b.whatIfBatchResult = nil
+		}
+		return false
+	}
+	b.whatIfBatchSet[id] = true
+	b.whatIfBatchIDs = append(b.whatIfBatchIDs, id)
+	return true
+}
+
+// ClearWhatIfBatch clears the active Kanban Batch What-If selection and cached result.
+func (b *BoardModel) ClearWhatIfBatch() {
+	b.whatIfBatchIDs = nil
+	b.whatIfBatchSet = nil
+	b.whatIfBatchResult = nil
+}
+
+// WhatIfBatchIDs returns a defensive copy of the currently selected Batch What-If IDs.
+func (b *BoardModel) WhatIfBatchIDs() []string {
+	if len(b.whatIfBatchIDs) == 0 {
+		return nil
+	}
+	out := make([]string, len(b.whatIfBatchIDs))
+	copy(out, b.whatIfBatchIDs)
+	return out
+}
+
+// HasWhatIfBatch reports whether any issues are queued in Batch What-If mode.
+func (b BoardModel) HasWhatIfBatch() bool {
+	return len(b.whatIfBatchIDs) > 0
+}
+
+// IsInWhatIfBatch reports whether id is part of the active Batch What-If selection.
+func (b BoardModel) IsInWhatIfBatch(id string) bool {
+	return b.whatIfBatchSet != nil && b.whatIfBatchSet[id]
+}
+
+// SetWhatIfBatchResult stores the evaluated multi-issue Batch What-If delta.
+func (b *BoardModel) SetWhatIfBatchResult(res *analysis.WhatIfBatchResult) {
+	b.whatIfBatchResult = res
+}
+
+// WhatIfBatchResult returns the currently cached Batch What-If result (may be nil).
+func (b BoardModel) WhatIfBatchResult() *analysis.WhatIfBatchResult {
+	return b.whatIfBatchResult
+}
+
+// reconcileWhatIfBatchScope prunes closed/missing IDs from the Kanban Batch What-If queue
+// and recomputes the cached batch delta whenever issues, snapshot, or analysis change.
+func (b *BoardModel) reconcileWhatIfBatchScope() {
+	if len(b.whatIfBatchIDs) == 0 {
+		return
+	}
+	kept := make([]string, 0, len(b.whatIfBatchIDs))
+	keptSet := make(map[string]bool, len(b.whatIfBatchIDs))
+	for _, id := range b.whatIfBatchIDs {
+		if iss := b.issueMap[id]; iss != nil && !isClosedLikeStatus(iss.Status) {
+			kept = append(kept, id)
+			keptSet[id] = true
+		}
+	}
+	if len(kept) == 0 {
+		b.ClearWhatIfBatch()
+		return
+	}
+	b.whatIfBatchIDs = kept
+	b.whatIfBatchSet = keptSet
+	if b.analyzer != nil && b.analysis != nil {
+		b.whatIfBatchResult = b.analyzer.ComputeWhatIfBatch(kept, b.analysis)
+	} else {
+		b.whatIfBatchResult = nil
+	}
 }
 
 // SetFullIssues attaches the full unscoped issue slice so downstream-unblock
@@ -791,6 +954,7 @@ func (b *BoardModel) SetIssues(issues []model.Issue) {
 	for i := range issues {
 		b.issueMap[issues[i].ID] = &issues[i]
 	}
+	b.reconcileWhatIfBatchScope()
 
 	// Reset detail panel cache to force refresh if same issue is selected
 	b.invalidateDetailCache()
@@ -859,6 +1023,7 @@ func (b *BoardModel) SetSnapshot(s *DataSnapshot) {
 
 	// Use snapshot issue map for blocker titles.
 	b.issueMap = s.IssueMap
+	b.reconcileWhatIfBatchScope()
 
 	// Reset detail panel cache to force refresh if same issue is selected
 	b.invalidateDetailCache()
@@ -1728,6 +1893,23 @@ func (b BoardModel) renderTitleBar(width int, t Theme) string {
 		}
 		title = title + "  " + searchInfo
 	}
+	if b.HasWhatIfBatch() {
+		var batchInfo string
+		if res := b.whatIfBatchResult; res != nil {
+			extra := ""
+			if res.SynergyUnblocks > 0 {
+				extra += fmt.Sprintf(" ★%d syn", res.SynergyUnblocks)
+			}
+			if res.Delta.ParallelizationGain != nil {
+				extra += fmt.Sprintf(" Δ‖%+d", *res.Delta.ParallelizationGain)
+			}
+			batchInfo = fmt.Sprintf("⚡ Batch(%d): +%d dir/+%d tot%s • Esc clear",
+				len(b.whatIfBatchIDs), res.Delta.DirectUnblocks, res.Delta.TransitiveUnblocks, extra)
+		} else {
+			batchInfo = fmt.Sprintf("⚡ Batch(%d) • W toggle • Esc clear", len(b.whatIfBatchIDs))
+		}
+		title = title + "  " + batchInfo
+	}
 	if width > 4 {
 		title = truncateRunesHelper(title, width-2, "…")
 	}
@@ -1908,6 +2090,10 @@ func (b BoardModel) renderCard(issue model.Issue, width int, selected bool, colI
 		badgeStyle := t.Renderer.NewStyle().Foreground(t.Secondary).Bold(true)
 		meta = append(meta, badgeStyle.Render(statusBadge))
 	}
+	if b.IsInWhatIfBatch(issue.ID) {
+		batchStyle := t.Renderer.NewStyle().Foreground(t.Feature).Bold(true)
+		meta = append(meta, batchStyle.Render("⚡BATCH"))
+	}
 
 	// Blocked-by indicator: 🚫←bv-456 (title...) - show first active blocking dep with title (bv-kklp)
 	if len(activeBlockers) > 0 {
@@ -1929,6 +2115,18 @@ func (b BoardModel) renderCard(issue model.Issue, width int, selected bool, colI
 	if blockedIDs, ok := b.blocksIndex[issue.ID]; ok && len(blockedIDs) > 0 {
 		blocksStyle := t.Renderer.NewStyle().Foreground(t.Feature)
 		meta = append(meta, blocksStyle.Render(fmt.Sprintf("⚡→%d", len(blockedIDs))))
+	}
+
+	// High operational risk indicator on active cards (W33-5)
+	if !isClosedLikeStatus(issue.Status) && !issue.Status.IsTombstone() && !issue.IsTemplate && !issue.Pinned && issue.Status != model.StatusPinned {
+		if sig, ok := b.riskByID[issue.ID]; ok && sig.CompositeRisk >= 0.50 {
+			riskColor := t.InProgress
+			if sig.CompositeRisk >= 0.60 {
+				riskColor = t.Blocked
+			}
+			riskStyle := t.Renderer.NewStyle().Foreground(riskColor).Bold(true)
+			meta = append(meta, riskStyle.Render(fmt.Sprintf("⚠%.0f%%", sig.CompositeRisk*100)))
+		}
 	}
 
 	// Labels: show 2-3 label names (no "+N" count per spec)
@@ -2411,6 +2609,34 @@ func (b *BoardModel) syncDetailContent() {
 		}
 		if len(metricParts) > 0 {
 			content.WriteString(fmt.Sprintf("**Graph:** %s\n\n", strings.Join(metricParts, " • ")))
+		}
+	}
+
+	// Operational Risk & Priority Alignment (suppressed on closed/tombstone/template/pinned issues, W33-5)
+	if isActive && !issue.Status.IsTombstone() && !issue.IsTemplate && !issue.Pinned && issue.Status != model.StatusPinned {
+		if sig, ok := b.riskByID[issue.ID]; ok && sig.CompositeRisk >= 0.35 {
+			riskIcon := "🟡"
+			if sig.CompositeRisk >= 0.60 {
+				riskIcon = "🔴"
+			}
+			expl := strings.TrimSpace(sig.Explanation)
+			if expl != "" {
+				content.WriteString(fmt.Sprintf("**Operational Risk:** %s %.0f%% — %s\n\n", riskIcon, sig.CompositeRisk*100, expl))
+			} else {
+				content.WriteString(fmt.Sprintf("**Operational Risk:** %s %.0f%%\n\n", riskIcon, sig.CompositeRisk*100))
+			}
+		}
+		if hint := b.priorityHints[issue.ID]; hint != nil && hint.SuggestedPriority != issue.Priority {
+			arrow := "↓"
+			if hint.Direction == "increase" {
+				arrow = "↑"
+			}
+			reasonSuffix := ""
+			if len(hint.Reasoning) > 0 && strings.TrimSpace(hint.Reasoning[0]) != "" {
+				reasonSuffix = " — " + strings.TrimSpace(hint.Reasoning[0])
+			}
+			content.WriteString(fmt.Sprintf("**Priority Alignment:** %s P%d → P%d (%.0f%% conf)%s\n\n",
+				arrow, hint.CurrentPriority, hint.SuggestedPriority, hint.Confidence*100, reasonSuffix))
 		}
 	}
 

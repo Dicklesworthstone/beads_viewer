@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/Dicklesworthstone/beads_viewer/pkg/analysis"
 	"github.com/charmbracelet/lipgloss"
 )
 
@@ -12,9 +13,15 @@ type RepoPickerModel struct {
 	repos         []string
 	selectedIndex int
 	selected      map[string]bool // repo -> selected
+	crossRepoFlow *analysis.CrossRepoFlow
 	width         int
 	height        int
 	theme         Theme
+}
+
+// SetCrossRepoFlow attaches cross-repository dependency counts for display in the picker (W32-6).
+func (m *RepoPickerModel) SetCrossRepoFlow(flow *analysis.CrossRepoFlow) {
+	m.crossRepoFlow = flow
 }
 
 // NewRepoPickerModel creates a new repo picker. By default, all repos are selected.
@@ -111,7 +118,7 @@ func (m *RepoPickerModel) View() string {
 
 	t := m.theme
 
-	// Calculate box dimensions
+	// Calculate box dimensions (P24A-8: never exceed m.width-2 even on ultra-narrow panes)
 	boxWidth := 50
 	if m.width < 60 {
 		boxWidth = m.width - 10
@@ -119,19 +126,58 @@ func (m *RepoPickerModel) View() string {
 	if boxWidth < 30 {
 		boxWidth = 30
 	}
+	if maxBox := max(1, m.width-2); boxWidth > maxBox {
+		boxWidth = maxBox
+	}
+	padH := 2
+	if boxWidth < 16 {
+		padH = 0
+	} else if boxWidth < 26 {
+		padH = 1
+	}
+	innerW := max(1, boxWidth-2*padH)
 
 	var lines []string
 
+	ultraShort := m.height < 8
+	compactChrome := m.height <= 13
 	titleStyle := t.Renderer.NewStyle().
 		Foreground(t.Primary).
-		Bold(true).
-		MarginBottom(1)
-	lines = append(lines, titleStyle.Render("Repo Filter"))
-	lines = append(lines, "")
+		Bold(true)
+	if !ultraShort {
+		titleStyle = titleStyle.MarginBottom(1)
+	}
+	lines = append(lines, titleStyle.Render(truncateRunesHelper("Repo Filter", innerW, "…")))
+	if !compactChrome {
+		lines = append(lines, "")
+	}
+
+	footerStyle := t.Renderer.NewStyle().
+		Foreground(ColorFooterHint).
+		Italic(true)
+	footerText := "j/k: navigate • space: toggle • a: all • enter: apply • esc: cancel"
+	footerRendered := footerStyle.Width(innerW).Render(footerText)
+	footerLines := strings.Count(footerRendered, "\n") + 1
+	// Vertical chrome: border(2) + padding(2 or 0) + title/blanks(3, 2, or 1) + blank before footer(1 or 0) + footerLines.
+	baseChrome := 8
+	if ultraShort {
+		baseChrome = 3
+	} else if compactChrome {
+		baseChrome = 5
+	}
+	minItems := 2
+	if m.height <= 9 {
+		minItems = 1
+	}
+	if m.height < baseChrome+footerLines+minItems {
+		footerText = truncateRunesHelper("j/k • space • a:all • enter • esc", innerW, "…")
+		footerRendered = footerStyle.Width(innerW).Render(footerText)
+		footerLines = strings.Count(footerRendered, "\n") + 1
+	}
 
 	if len(m.repos) == 0 {
 		emptyStyle := t.Renderer.NewStyle().Foreground(t.Secondary).Italic(true)
-		lines = append(lines, emptyStyle.Render("No repos available."))
+		lines = append(lines, emptyStyle.Render(truncateRunesHelper("No repos available.", innerW, "…")))
 	} else {
 		selIdx := m.selectedIndex
 		if selIdx < 0 {
@@ -140,15 +186,29 @@ func (m *RepoPickerModel) View() string {
 			selIdx = len(m.repos) - 1
 		}
 
-		maxVisible := m.height - 10
-		if maxVisible < 5 {
-			maxVisible = 5
+		chromeLines := baseChrome + footerLines
+		showFlowSummary := m.crossRepoFlow != nil && m.crossRepoFlow.TotalCrossRepoDeps > 0 && m.height >= chromeLines+4
+		if showFlowSummary {
+			chromeLines += 2
+		}
+		maxVisible := m.height - chromeLines
+		if maxVisible < minItems {
+			maxVisible = minItems
 		}
 
 		startIdx := 0
 		endIdx := len(m.repos)
+		compactScrollHint := ""
 		if len(m.repos) > maxVisible {
-			if selIdx < maxVisible-1 {
+			if maxVisible == 1 {
+				startIdx = selIdx
+				endIdx = selIdx + 1
+			} else if maxVisible < 3 {
+				startIdx = selIdx
+				endIdx = selIdx + 1
+				rem := len(m.repos) - endIdx
+				compactScrollHint = fmt.Sprintf("  ↑ %d / ↓ %d more", startIdx, rem)
+			} else if selIdx < maxVisible-1 {
 				startIdx = 0
 				endIdx = maxVisible - 1
 			} else if selIdx >= len(m.repos)-(maxVisible-1) {
@@ -167,9 +227,22 @@ func (m *RepoPickerModel) View() string {
 			}
 		}
 
+		blocksByRepo := make(map[string]int)
+		blockedByRepo := make(map[string]int)
+		if m.crossRepoFlow != nil {
+			for _, dep := range m.crossRepoFlow.Dependencies {
+				if fromKey := normalizeRepoKey(dep.FromRepo); fromKey != "" {
+					blocksByRepo[fromKey] += dep.IssueCount
+				}
+				if toKey := normalizeRepoKey(dep.ToRepo); toKey != "" {
+					blockedByRepo[toKey] += dep.IssueCount
+				}
+			}
+		}
+
 		moreStyle := t.Renderer.NewStyle().Foreground(t.Secondary).Italic(true)
-		if startIdx > 0 {
-			lines = append(lines, moreStyle.Render(fmt.Sprintf("  ↑ %d more", startIdx)))
+		if compactScrollHint == "" && startIdx > 0 {
+			lines = append(lines, moreStyle.Render(truncateRunesHelper(fmt.Sprintf("  ↑ %d more", startIdx), innerW, "…")))
 		}
 		for i := startIdx; i < endIdx; i++ {
 			repo := m.repos[i]
@@ -190,26 +263,54 @@ func (m *RepoPickerModel) View() string {
 				check = "[x]"
 			}
 
-			line := truncateRunesHelper(prefix+check+" "+repo, boxWidth-4, "…")
+			flowSuffix := ""
+			repoKey := normalizeRepoKey(repo)
+			outCnt := blocksByRepo[repoKey]
+			inCnt := blockedByRepo[repoKey]
+			if outCnt > 0 || inCnt > 0 {
+				var parts []string
+				if outCnt > 0 {
+					parts = append(parts, fmt.Sprintf("→%d", outCnt))
+				}
+				if inCnt > 0 {
+					parts = append(parts, fmt.Sprintf("←%d", inCnt))
+				}
+				flowSuffix = " (" + strings.Join(parts, " ") + ")"
+			}
+
+			line := truncateRunesHelper(prefix+check+" "+repo+flowSuffix, innerW, "…")
 			lines = append(lines, nameStyle.Render(line))
 		}
-		if rem := len(m.repos) - endIdx; rem > 0 {
-			lines = append(lines, moreStyle.Render(fmt.Sprintf("  ↓ %d more", rem)))
+		if compactScrollHint != "" {
+			lines = append(lines, moreStyle.Render(truncateRunesHelper(compactScrollHint, innerW, "…")))
+		} else if rem := len(m.repos) - endIdx; rem > 0 {
+			lines = append(lines, moreStyle.Render(truncateRunesHelper(fmt.Sprintf("  ↓ %d more", rem), innerW, "…")))
+		}
+		if showFlowSummary {
+			flowSummary := fmt.Sprintf("Cross-repo: %d blocking edge(s)", m.crossRepoFlow.TotalCrossRepoDeps)
+			if len(m.crossRepoFlow.BottleneckRepos) > 0 {
+				flowSummary += " • top blocker: " + m.crossRepoFlow.BottleneckRepos[0]
+			}
+			lines = append(lines, "")
+			lines = append(lines, moreStyle.Render(truncateRunesHelper(flowSummary, innerW, "…")))
 		}
 	}
 
-	lines = append(lines, "")
-	footerStyle := t.Renderer.NewStyle().
-		Foreground(ColorFooterHint).
-		Italic(true)
-	lines = append(lines, footerStyle.Render("j/k: navigate • space: toggle • a: all • enter: apply • esc: cancel"))
+	if !ultraShort {
+		lines = append(lines, "")
+	}
+	lines = append(lines, footerStyle.Render(footerText))
 
 	content := strings.Join(lines, "\n")
 
+	padV := 1
+	if compactChrome {
+		padV = 0
+	}
 	boxStyle := t.Renderer.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(t.Primary).
-		Padding(1, 2).
+		Padding(padV, padH).
 		Width(boxWidth)
 	box := boxStyle.Render(content)
 
